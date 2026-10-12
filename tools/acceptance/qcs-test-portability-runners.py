@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,16 @@ def load(name):
 runner = load("qcs-two-checkout-portability")
 observer = load("qcs-portability-sentinel")
 launcher = load("qcs-launch-portability-sentinel")
+WINDOWS_SKIP_REASON = "Windows native PowerShell and NTFS ACL contract"
+WINDOWS_NATIVE_CASES = frozenset(
+    "qcs_test_portability_runners.PortabilityContracts." + name for name in (
+        "test_windows_powershell_bridge_preserves_developer_arguments",
+        "test_windows_acl_restoration_restores_effective_access",
+        "test_windows_acl_comparison_rejects_semantic_changes"))
+
+
+def is_windows_platform_skip(test, reason, platform):
+    return platform != "nt" and test.id() in WINDOWS_NATIVE_CASES and reason == WINDOWS_SKIP_REASON
 
 
 class PortabilityContracts(unittest.TestCase):
@@ -37,6 +48,144 @@ class PortabilityContracts(unittest.TestCase):
     def tearDown(self):
         # TemporaryDirectory.cleanup propagates errors, including retained handles.
         self.temporary.cleanup()
+
+    def powershell(self, script, *arguments):
+        executable = shutil.which("pwsh")
+        self.assertIsNotNone(executable, "The Windows contract requires PowerShell 7")
+        return subprocess.run([executable, "-NoProfile", "-File", str(script), *map(str, arguments)],
+                              cwd=self.root, capture_output=True, encoding="utf-8", errors="replace", timeout=45)
+
+    def test_only_exact_non_windows_native_cases_are_not_applicable(self):
+        aggregate = load("qcs-test-runners")
+        for name in WINDOWS_NATIVE_CASES:
+            case = mock.Mock()
+            case.id.return_value = name
+            for platform, reason, expected in (("posix", WINDOWS_SKIP_REASON, True),
+                                               ("nt", WINDOWS_SKIP_REASON, False),
+                                               ("posix", "PowerShell missing", False)):
+                with self.subTest(case=name, platform=platform, reason=reason):
+                    self.assertEqual(is_windows_platform_skip(case, reason, platform), expected)
+                    result = mock.Mock(skipped=[(case, reason)])
+                    self.assertEqual(aggregate.unexpected_skips(result, platform), [] if expected else result.skipped)
+        unknown = mock.Mock()
+        unknown.id.return_value = "qcs_test_portability_runners.PortabilityContracts.unknown"
+        self.assertFalse(is_windows_platform_skip(unknown, WINDOWS_SKIP_REASON, "posix"))
+        result = mock.Mock(skipped=[(unknown, WINDOWS_SKIP_REASON)])
+        self.assertEqual(aggregate.unexpected_skips(result, "posix"), result.skipped)
+
+    @unittest.skipUnless(os.name == "nt", WINDOWS_SKIP_REASON)
+    def test_windows_powershell_bridge_preserves_developer_arguments(self):
+        checkout = self.root / "中文 源码"
+        (checkout / "tools").mkdir(parents=True)
+        # Execute the actual public entry point's bytes, replacing only its
+        # Python consumer with a fixture that records literal argv and exits.
+        shutil.copyfile(DIRECTORY.parents[1] / "qcs-dev.ps1", checkout / "qcs-dev.ps1")
+        (checkout / "tools/qcs-dev.py").write_text(
+            "import json, os, sys\nfrom pathlib import Path\n"
+            "Path(os.environ['QCS_ARGV_RESULT']).write_text(json.dumps(sys.argv[1:], ensure_ascii=False), encoding='utf-8')\n"
+            "sys.exit(int(os.environ.get('QCS_ARGV_EXIT', '0')))\n", encoding="utf-8")
+        bridge = self.root / "bridge.ps1"
+        bridge.write_text(runner.POWERSHELL_BRIDGE_SCRIPT, encoding="utf-8")
+        result_path = self.root / "argv.json"
+        arguments = ["configure", "--build-root", str(self.root / "外置 构建"),
+                     "--cmake-arg=-DROOT=" + str(self.root / "中文 空格"),
+                     "--cmake-arg=-DROOT:PATH=" + str(self.root / "中文 空格"),
+                     "--cmake-arg=-DURL=https://example.test/a=b=c", "--cmake-arg=-DEMPTY=", "",
+                     "literal $([IO.File]::WriteAllText('injected.txt','bad')) ` \" quotes", "tail\\"]
+        executable = shutil.which("pwsh")
+        self.assertIsNotNone(executable, "The Windows contract requires PowerShell 7")
+        command = runner.powershell_command(executable, bridge, self.root / "request.json",
+                                            checkout / "qcs-dev.ps1", arguments)
+        environment = dict(os.environ, QCOPILOTS_SEARCH_PYTHON=sys.executable,
+                           QCS_ARGV_RESULT=str(result_path), PYTHONDONTWRITEBYTECODE="1")
+        for code in (0, 23):
+            with self.subTest(exitCode=code):
+                result = subprocess.run(list(map(str, command)), cwd=self.root,
+                                        env=dict(environment, QCS_ARGV_EXIT=str(code)), capture_output=True,
+                                        encoding="utf-8", errors="replace", timeout=45)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result_path.read_text(encoding="utf-8")), arguments)
+                self.assertFalse((self.root / "injected.txt").exists())
+        # Also pass the original failure shape through the real Python parser
+        # and CMake. A language-free project needs no product/dependency build.
+        for filename in ("qcs-dev.py", "qcs-path-budget.py"):
+            shutil.copyfile(DIRECTORY.parent / filename, checkout / "tools" / filename)
+        (checkout / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.28)\nproject(qcs-argument-fixture NONE)\n", encoding="utf-8")
+        build, supplied = self.root / "外置 构建", self.root / "中文 values"
+        actual_arguments = ["configure", "--build-root", str(build), "--qt-root", str(self.root / "SDK 空格"),
+                            "--cmake-arg=-DQCS_TYPED:PATH=" + str(supplied),
+                            "--cmake-arg=-DQCS_RAW:STRING=" + str(supplied),
+                            "--cmake-arg=-DQCS_URL:STRING=https://example.test/a=b=c",
+                            "--cmake-arg=-DQCS_EMPTY:STRING="]
+        command = runner.powershell_command(executable, bridge, self.root / "configure.json",
+                                            checkout / "qcs-dev.ps1", actual_arguments)
+        result = subprocess.run(list(map(str, command)), cwd=self.root, env=environment, capture_output=True,
+                                encoding="utf-8", errors="replace", timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cache = dict(line.split("=", 1) for line in (build / "release/CMakeCache.txt").read_text(encoding="utf-8").splitlines()
+                     if line.startswith("QCS_"))
+        self.assertEqual(Path(cache["QCS_TYPED:PATH"]), supplied)
+        self.assertEqual(cache["QCS_RAW:STRING"], str(supplied))
+        self.assertEqual(cache["QCS_URL:STRING"], "https://example.test/a=b=c")
+        self.assertEqual(cache["QCS_EMPTY:STRING"], "")
+
+    @unittest.skipUnless(os.name == "nt", WINDOWS_SKIP_REASON)
+    def test_windows_acl_comparison_rejects_semantic_changes(self):
+        base = "O:SYG:BAD:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)"
+        cases = [(base, base, True), (base, base.replace("D:", "D:AI"), True),
+                 (base.replace("D:", "D:AI"), base, False)]
+        for old, new in (("O:SY", "O:BA"), ("G:BA", "G:SY"), ("D:", "D:P"), ("D:", "D:AR"),
+                         ("OICIID", "CIID"), ("OICIID", "OIID"), ("OICIID", "OICI"),
+                         ("OICIID", "OICIIOID"), ("OICIID", "OICINPID"), (";FA;", ";FR;"),
+                         ("(A;OICIID;FA;;;BA)", ""), ("D:", "D:(D;;FW;;;WD)")):
+            cases.append((base, base.replace(old, new, 1), False))
+        cases.append((base, "O:SYG:BAD:(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)", False))
+        cases.append((base, base + "(A;;FR;;;WD)", False))
+        cases.extend([("O:SYG:BAD:", "O:SYG:BAD:NO_ACCESS_CONTROL", False),
+                      (base + "S:(AU;SA;FR;;;WD)", base + "S:AI(AU;SA;FR;;;WD)", False)])
+        runner.write(self.root / "cases.json", cases)
+        script = self.root / "compare.ps1"
+        script.write_text(runner.ACL_COMPARE_SCRIPT + "\n$rows = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'cases.json') -Raw | ConvertFrom-Json\n"
+                          "$results = @($rows | ForEach-Object { Compare-QcsAclSddl $_[0] $_[1] })\n"
+                          "ConvertTo-Json -InputObject $results -Depth 5 -Compress\n", encoding="utf-8")
+        result = self.powershell(script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        reports = json.loads(result.stdout)
+        self.assertEqual(len(reports), len(cases))
+        for case, report in zip(cases, reports):
+            with self.subTest(original=case[0], actual=case[1]):
+                self.assertEqual(report["semanticMatch"], case[2])
+                self.assertEqual(report["originalSddl"], case[0])
+                self.assertEqual(report["actualSddl"], case[1])
+        self.assertTrue(reports[1]["daclAutoInheritedAdded"])
+        self.assertFalse(reports[1]["sddlExactlyEqual"])
+
+    @unittest.skipUnless(os.name == "nt", WINDOWS_SKIP_REASON)
+    def test_windows_acl_restoration_restores_effective_access(self):
+        source, reports = self.root / "中文 源码", self.root / "reports"
+        (source / "src/core").mkdir(parents=True)
+        (source / ".git").mkdir()
+        reports.mkdir()
+        (source / "CMakeLists.txt").write_bytes(b"owned source bytes\n")
+        for operation in ("delete", "rename"):
+            (source / ".git" / ("qcs-acl-" + operation + ".tmp")).write_bytes(b"owned disposable\n")
+        before = runner.snapshot(source)
+        runner.write(self.root / ".qcs-owned-run.json", {"source": str(source)})
+        script, original = reports / "qcs-owned-acl.ps1", reports / "source-original-acl.json"
+        script.write_text(runner.ACL_SCRIPT, encoding="utf-8")
+        try:
+            denied = self.powershell(script, "-Source", source, "-Report", original, "-Mode", "deny")
+            self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
+            self.assertTrue(all(item["denied"] for item in runner.write_probes(source)))
+        finally:
+            if original.is_file():
+                restored = self.powershell(script, "-Source", source, "-Report", original, "-Mode", "restore")
+                self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+                report = json.loads(restored.stdout)
+                self.assertTrue(report["semanticMatch"])
+                self.assertEqual(len(runner.restored_write_probes(source)), 6)
+        self.assertEqual(before, runner.snapshot(source))
 
     def wrapper(self, name="qcs-tests-core", *, workflow=False):
         source, build, tests = self.root / "中文 源码", self.root / "独立 build", self.root / "自定 temp"

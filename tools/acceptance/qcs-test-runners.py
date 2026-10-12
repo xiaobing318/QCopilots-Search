@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -52,6 +53,12 @@ class RecorderIntegration(unittest.TestCase):
         self.assertTrue(result["temporaryEvidenceDeleted"])
 
 
+def unexpected_skips(result, platform=None):
+    portability = load_script("qcs-test-portability-runners.py")
+    return [(test, reason) for test, reason in result.skipped
+            if not portability.is_windows_platform_skip(test, reason, os.name if platform is None else platform)]
+
+
 def main():
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -68,8 +75,9 @@ def main():
     print("QCS_ACCEPTANCE_TEST_CAPABILITIES " + json.dumps(capabilities, ensure_ascii=False),
           file=sys.stderr, flush=True)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
-    # Required skips are not successes, matching the release evidence parser.
-    return 0 if result.wasSuccessful() and not result.skipped else 1
+    # Only the three exact Windows-native contracts are inapplicable elsewhere.
+    # Missing tools on Windows and every other skip remain required failures.
+    return 0 if result.wasSuccessful() and not unexpected_skips(result) else 1
 
 
 if __name__ == "__main__":

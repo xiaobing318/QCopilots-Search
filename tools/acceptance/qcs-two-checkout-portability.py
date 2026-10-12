@@ -260,7 +260,37 @@ class WindowsProcesses:
         return result
 
 
+ACL_COMPARE_SCRIPT = r'''function Compare-QcsAclSddl([string]$Original, [string]$Actual) {
+  $before = [System.Security.AccessControl.RawSecurityDescriptor]::new($Original)
+  $after = [System.Security.AccessControl.RawSecurityDescriptor]::new($Actual)
+  $beforeFlags = [int]$before.ControlFlags
+  $afterFlags = [int]$after.ControlFlags
+  $autoInherited = [int][System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited
+  $originalBytes = [byte[]]::new($before.BinaryLength)
+  $actualBytes = [byte[]]::new($after.BinaryLength)
+  $before.GetBinaryForm($originalBytes, 0)
+  $after.GetBinaryForm($actualBytes, 0)
+  # NTFS may set AI while reapplying an inherited DACL. Only that 0 -> 1
+  # transition is acceptable. All other flags and ordered ACE bytes remain exact.
+  $added = (($beforeFlags -band $autoInherited) -eq 0) -and ($afterFlags -eq ($beforeFlags -bor $autoInherited))
+  if ($added) { $after.SetFlags($before.ControlFlags) }
+  $beforeBytes = [byte[]]::new($before.BinaryLength)
+  $afterBytes = [byte[]]::new($after.BinaryLength)
+  $before.GetBinaryForm($beforeBytes, 0)
+  $after.GetBinaryForm($afterBytes, 0)
+  [pscustomobject]@{
+    originalSddl=$Original;actualSddl=$Actual
+    originalBinaryBase64=[Convert]::ToBase64String($originalBytes)
+    actualBinaryBase64=[Convert]::ToBase64String($actualBytes)
+    originalControlFlags=$beforeFlags;actualControlFlags=$afterFlags
+    daclAutoInheritedAdded=$added;sddlExactlyEqual=($Original -ceq $Actual)
+    semanticMatch=([Convert]::ToBase64String($beforeBytes) -ceq [Convert]::ToBase64String($afterBytes))
+  }
+}
+'''
+
 ACL_SCRIPT = r'''param([string]$Source,[string]$Report,[string]$Mode)
+''' + ACL_COMPARE_SCRIPT + r'''
 $ErrorActionPreference = 'Stop'
 $ownedRoot = Split-Path -Parent $PSScriptRoot
 $marker = Get-Content -LiteralPath (Join-Path $ownedRoot '.qcs-owned-run.json') -Raw | ConvertFrom-Json
@@ -293,11 +323,35 @@ if ($Mode -eq 'deny') {
   $acl = Get-Acl -LiteralPath $Source
   $acl.SetSecurityDescriptorSddlForm($original.sddl)
   Set-Acl -LiteralPath $Source -AclObject $acl
-  if ((Get-Acl -LiteralPath $Source).Sddl -ne $original.sddl) { throw 'ACL restoration did not reproduce original SDDL' }
+  $comparison = Compare-QcsAclSddl $original.sddl (Get-Acl -LiteralPath $Source).Sddl
+  $comparison | ConvertTo-Json -Compress
+  if (-not $comparison.semanticMatch) { throw 'ACL restoration did not reproduce original security semantics' }
 } elseif ($Mode -eq 'inspect') {
   Get-Acl -LiteralPath $Source | Select-Object Owner,Sddl | ConvertTo-Json -Compress
 } else { throw 'Unknown bounded ACL operation' }
 '''
+
+POWERSHELL_BRIDGE_SCRIPT = r'''param([Parameter(Mandatory=$true)][string]$Request)
+$ErrorActionPreference = 'Stop'
+$requestData = Get-Content -LiteralPath $Request -Raw -Encoding utf8 | ConvertFrom-Json
+if ($requestData.script -isnot [string] -or $requestData.arguments -isnot [array]) {
+  throw 'Invalid developer invocation request'
+}
+foreach ($argument in $requestData.arguments) {
+  if ($argument -isnot [string]) { throw 'Developer arguments must be strings' }
+}
+# PowerShell's native -File parser splits dash-prefixed arguments at a colon.
+# Deserialize literal strings and splat directly, without evaluating their text.
+$scriptPath = $requestData.script
+$scriptArguments = @($requestData.arguments)
+& $scriptPath @scriptArguments
+exit $LASTEXITCODE
+'''
+
+
+def powershell_command(pwsh, bridge, request, script, arguments):
+    write(request, {"script": str(script), "arguments": [str(value) for value in arguments]})
+    return [pwsh, "-NoProfile", "-File", bridge, "-Request", request]
 
 ENV_SCRIPT = r'''$ErrorActionPreference = 'Stop'
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -337,6 +391,45 @@ def write_probes(source):
         else:
             records.append({"path": str(path), "operation": operation, "denied": False})
     require(all(item["denied"] for item in records), "The isolated source is not effectively read-only")
+    return records
+
+
+def restored_write_probes(source):
+    """Exercise restored access using only this invocation's disposable files."""
+    source = Path(source)
+    records = []
+    for relative in (".", "src/core", ".git"):
+        directory = source / relative
+        require(directory.is_dir() and not (getattr(directory.lstat(), "st_file_attributes", 0) & 0x400)
+                and not directory.is_symlink() and directory.resolve().is_relative_to(source.resolve()),
+                "Restored write probe directory is not an owned plain directory")
+        path = directory / ("qcs-acl-r-" + uuid.uuid4().hex[:12] + ".tmp")
+        renamed = path.with_suffix(".renamed")
+        created = False
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            created = True
+            try:
+                os.write(descriptor, b"owned restored access probe\n")
+            finally:
+                os.close(descriptor)
+            require(path.read_bytes() == b"owned restored access probe\n", "Restored file bytes differ")
+            path.rename(renamed)
+        finally:
+            if created and path.exists():
+                path.unlink()
+            if created and renamed.exists():
+                renamed.unlink()
+        records.append({"directory": str(directory), "createWriteReadRenameDelete": True})
+    descriptor = os.open(source / "CMakeLists.txt", os.O_WRONLY)
+    os.close(descriptor)  # Open without truncation or changing the source bytes.
+    records.append({"path": str(source / "CMakeLists.txt"), "existingFileWritable": True})
+    for operation in ("delete", "rename"):
+        path = source / ".git" / ("qcs-acl-" + operation + ".tmp")
+        if operation == "rename":
+            path = path.rename(path.with_suffix(".renamed"))
+        path.unlink()
+        records.append({"operation": operation, "originalProbeRestored": True})
     return records
 
 
@@ -429,12 +522,16 @@ def main():
     write(root / ".qcs-owned-run.json", plan)
     (reports / "qcs-owned-acl.ps1").write_text(ACL_SCRIPT, encoding="utf-8")
     (reports / "qcs-vs-environment.ps1").write_text(ENV_SCRIPT, encoding="utf-8")
+    bridge = reports / "qcs-dev-bridge.ps1"
+    bridge.write_text(POWERSHELL_BRIDGE_SCRIPT, encoding="utf-8")
+    bridge_sha = sha(bridge)
     processes = WindowsProcesses()
     pwsh = shutil.which("pwsh")
     require(pwsh is not None, "PowerShell 7 is required")
     commands, jobs, children, streams = [], [], [], []
     record = {**plan, "schemaVersion": 2, "kind": "two-checkout-portability", "passed": False, "startedAt": utc(),
               "identity": original_identity, "buildRecordSha256": initial_receipt_sha, "runnerSha256": runner_sha,
+              "developerBridgeSha256": bridge_sha,
               "freeBeforeBytes": free, "commands": commands,
               "mainProducerHashesBefore": original_producers, "preservedBuildRecord": "main-build/build-record.json"}
     record["nsisTool"] = {"root": str(nsis_root), "lockPath": str(nsis_lock_path), "lockSha256": sha(nsis_lock_path),
@@ -501,6 +598,14 @@ def main():
         guard()
         return entry
 
+    def developer_command(checkout, label, arguments):
+        request = reports / (label + "-arguments.json")
+        command = powershell_command(pwsh, bridge, request, checkout / "qcs-dev.ps1", arguments)
+        record.setdefault("developerInvocations", {})[label] = {
+            "request": str(request), "sha256": sha(request),
+            "script": str(checkout / "qcs-dev.ps1"), "arguments": list(map(str, arguments))}
+        return command
+
     def command_env(base, build, git_dll):
         env = dict(base)
         exclude = {str(main_build / "release/bin").casefold(), str(main_build / "release/lib").casefold()}
@@ -549,16 +654,15 @@ def main():
         record["sharedSourceRoots"] = list(map(str, cached_sources))
         before_native = {str(path): snapshot(path) for path in cached_sources}
         write(reports / "shared-source-before.json", before_native)
-        wrapper = [pwsh, "-NoProfile", "-File", clone / "qcs-dev.ps1"]
         common = ["--build-root", external, "--qt-root", args.qt_root, "--model-dir", model_dir]
-        run([*wrapper, "doctor", *common], "doctor", env, caller)
-        configure = [*wrapper, "configure", *common,
+        run(developer_command(clone, "doctor", ["doctor", *common]), "doctor", env, caller)
+        configure = ["configure", *common,
                      "--cmake-arg=-DQCOPILOTS_SEARCH_DEPENDENCY_ROOT=" + str(dependency),
                      "--cmake-arg=-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
                      "--cmake-arg=-DFETCHCONTENT_SOURCE_DIR_QCS_CALLIGRA=" + str(args.calligra_source.resolve()),
                      "--cmake-arg=-DQCOPILOTS_SEARCH_NATIVE_BINARY_ROOT=" + str(clone_build / "nd"),
                      "--cmake-arg=-DQCOPILOTS_SEARCH_LLAMA_BINARY_DIR=" + str(clone_build / "nd/llama")]
-        run(configure, "configure", env, caller)
+        run(developer_command(clone, "configure", configure), "configure", env, caller)
         run(["cmake", "--build", clone_build, "--config", "Release", "--parallel", args.jobs, "--target", *TARGETS], "subset-build", env, caller)
         clone_dll = clone_build / "bin/git2.dll"
         main_dll = main_build / "release/bin/git2.dll"
@@ -579,9 +683,9 @@ def main():
                                                          build, configured_test_root)
                 record.setdefault("testWrapperIdentities", {})[label] = wrapper_identity
             write(reports / (label + "-inventory.json"), inventory)
-        test_a = [*wrapper, "test", *common, "--jobs", "1", "--test-label", "^(core|workflow)$", "--report-dir", reports / "clone-tests"]
-        test_b = [pwsh, "-NoProfile", "-File", source / "qcs-dev.ps1", "test", "--build-root", main_build,
-                  "--qt-root", args.qt_root, "--jobs", "1", "--test-label", "^core$", "--report-dir", reports / "original-tests"]
+        test_a = developer_command(clone, "clone-tests", ["test", *common, "--jobs", "1", "--test-label", "^(core|workflow)$", "--report-dir", reports / "clone-tests"])
+        test_b = developer_command(source, "original-tests", ["test", "--build-root", main_build,
+                  "--qt-root", args.qt_root, "--jobs", "1", "--test-label", "^core$", "--report-dir", reports / "original-tests"])
         if args.sentinel_launch_record:
             launch = json.loads(args.sentinel_launch_record.read_text(encoding="utf-8-sig"))
             require(launch.get("preparationComplete") is True,
@@ -710,6 +814,9 @@ def main():
             record["mainProducersUnchanged"] = record["mainProducerHashesAfter"] == original_producers
             record["buildRecordUnchanged"] = sha(args.build_record) == initial_receipt_sha
             record["runnerUnchanged"] = sha(__file__) == runner_sha
+            invocations = record.get("developerInvocations", {})
+            record["developerInputsUnchanged"] = (sha(bridge) == bridge_sha and len(invocations) == 4
+                and all(sha(item["request"]) == item["sha256"] for item in invocations.values()))
             record["testWrappersUnchanged"] = (len(record.get("testWrapperIdentities", {})) == 2
                 and all(sha(item["path"]) == item["sha256"] for item in record["testWrapperIdentities"].values()))
             nsis_after = snapshot(nsis_root)
@@ -732,13 +839,18 @@ def main():
                 (reports / "acl-restore.stdout.log").write_bytes(restoration.stdout)
                 (reports / "acl-restore.stderr.log").write_bytes(restoration.stderr)
                 record["isolatedSourceAclRestored"] = restoration.returncode == 0
+                if restoration.returncode == 0:
+                    record["isolatedSourceAclRestoration"] = json.loads(restoration.stdout.decode("utf-8-sig"))
+                    record["isolatedSourceAclRestored"] = record["isolatedSourceAclRestoration"].get("semanticMatch") is True
+                    record["restoredWriteProbes"] = restored_write_probes(clone)
         except BaseException as error:
+            record["isolatedSourceAclRestored"] = False
             record["aclRestorationError"] = str(error)
         record["finishedAt"], record["freeAfterBytes"] = utc(), shutil.disk_usage(root).free
         record["runBytes"] = run_size(root)
         required = ("testExecutionPassed", "ownedProcessesExited", "sourceFilesUnchanged", "cloneIdentityUnchanged", "sharedSourceBytesUnchanged",
                     "originalBinariesUnchanged", "originalSourceBytesUnchanged", "originalSourceIdentityUnchanged", "originalSourceAclUnchanged", "mainProducersUnchanged",
-                    "buildRecordUnchanged", "runnerUnchanged", "testWrappersUnchanged", "nsisToolsUnchanged", "isolatedSourceAclRestored")
+                    "buildRecordUnchanged", "runnerUnchanged", "developerInputsUnchanged", "testWrappersUnchanged", "nsisToolsUnchanged", "isolatedSourceAclRestored")
         record["passed"] = all(record.get(key) is True for key in required) and not record.get("error") and not record.get("finalVerificationError")
         if args.sentinel_launch_record:
             record["passed"] = record["passed"] and record["sentinelObservation"].get("passed") is True and record.get("sentinelObserverUnchanged") is True

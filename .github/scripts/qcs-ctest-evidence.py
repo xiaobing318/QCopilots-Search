@@ -61,6 +61,14 @@ WORKFLOW_JUNCTION_CASE = "__main__.WorkflowTests.test_clean_rejects_windows_junc
 RUNNER_TEST = "qcs-tests-runner"
 RUNNER_WINDOWS_HANDLE_CASE = "__main__.TestRunner.test_real_windows_exclusive_handle_still_fails_cleanup"
 RUNNER_WINDOWS_HANDLE_SKIP_REASON = "Windows exclusive file handles require Windows"
+ACCEPTANCE_TEST = "qcs-tests-acceptance-runners"
+ACCEPTANCE_WINDOWS_SKIP_REASON = "Windows native PowerShell and NTFS ACL contract"
+ACCEPTANCE_WINDOWS_CASES = {
+    "qcs_test_portability_runners.PortabilityContracts." + name for name in (
+        "test_windows_powershell_bridge_preserves_developer_arguments",
+        "test_windows_acl_restoration_restores_effective_access",
+        "test_windows_acl_comparison_rejects_semantic_changes")
+}
 UNITTEST_CASE = re.compile(r"^(test\S+) \((\S+)\) \.\.\. (ok|FAIL|ERROR|expected failure|unexpected success|skipped [^\r\n]*)\r?$", re.MULTILINE)
 UNITTEST_TOTAL = re.compile(r"^Ran (\d+) tests? in [\d.]+s\r?$", re.MULTILINE)
 UNITTEST_RESULT = re.compile(r"^(OK(?: \(skipped=\d+\))?|FAILED(?: \([^\r\n]*\))?)\r?$", re.MULTILINE)
@@ -95,12 +103,16 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
                 or (program == WORKFLOW_TEST and operating_system in ("Linux", "Darwin")
                     and identifier == WORKFLOW_JUNCTION_CASE and reason == WORKFLOW_JUNCTION_SKIP_REASON)
                 or (program == RUNNER_TEST and operating_system in ("Linux", "Darwin")
-                    and identifier == RUNNER_WINDOWS_HANDLE_CASE and reason == RUNNER_WINDOWS_HANDLE_SKIP_REASON))
+                    and identifier == RUNNER_WINDOWS_HANDLE_CASE and reason == RUNNER_WINDOWS_HANDLE_SKIP_REASON)
+                or (program == ACCEPTANCE_TEST and operating_system in ("Linux", "Darwin")
+                    and identifier in ACCEPTANCE_WINDOWS_CASES and reason == ACCEPTANCE_WINDOWS_SKIP_REASON))
             entry = {"program": program, "case": identifier, "reason": reason,
                      "classification": "notApplicable" if applicable else "requiredNotRun"}
             if applicable and program == WORKFLOW_TEST and identifier in WORKFLOW_POSIX_LINK_CASES:
                 entry["requiredNativePlatforms"] = ["Linux", "Darwin"]
             if applicable and program == RUNNER_TEST and identifier == RUNNER_WINDOWS_HANDLE_CASE:
+                entry["requiredNativePlatforms"] = ["Windows"]
+            if applicable and program == ACCEPTANCE_TEST and identifier in ACCEPTANCE_WINDOWS_CASES:
                 entry["requiredNativePlatforms"] = ["Windows"]
             skips.append(entry)
             record["reason"] = reason
@@ -132,6 +144,13 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
     if program == RUNNER_TEST and operating_system == "Windows":
         if not any(record["case"] == RUNNER_WINDOWS_HANDLE_CASE and record["status"] == "ok" for record in records):
             errors.append(f"Required native cleanup case did not pass: {RUNNER_WINDOWS_HANDLE_CASE}")
+    if program == ACCEPTANCE_TEST:
+        for identifier in sorted(ACCEPTANCE_WINDOWS_CASES - set(identifiers)):
+            errors.append(f"Required native portability case is missing: {identifier}")
+        if operating_system == "Windows":
+            executed = {record["case"] for record in records if record["status"] == "ok"}
+            for identifier in sorted(ACCEPTANCE_WINDOWS_CASES - executed):
+                errors.append(f"Required native portability case did not pass: {identifier}")
     return counts, records, skips, errors
 
 

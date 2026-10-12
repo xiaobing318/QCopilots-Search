@@ -1422,6 +1422,123 @@ class PythonLicenseEvidenceTests(unittest.TestCase):
 class PythonAcceptanceRunnerEvidenceTests(PythonLicenseEvidenceTests):
     program = "qcs-tests-acceptance-runners"
 
+    def test_verbose_license_cases_are_counted_without_qt_totals(self):
+        rows = [f"{identifier.rsplit('.', 1)[-1]} ({identifier}) ... ok"
+                for identifier in sorted(evidence.ACCEPTANCE_WINDOWS_CASES)]
+        output = "\n".join(rows) + f"\nRan {len(rows)} tests in 0.001s\n\nOK\n"
+        for system in ("Windows", "Linux", "Darwin"):
+            with self.subTest(system=system):
+                result = self.inspect(output, system)
+                self.assertTrue(result["releaseComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"]["passed"], len(rows))
+                self.assertFalse(result["ctestPrograms"][0]["qtTest"])
+
+
+class AcceptanceNativePortabilityEvidenceTests(unittest.TestCase):
+    prefix = "qcs_test_portability_runners.PortabilityContracts."
+    methods = (
+        "test_windows_powershell_bridge_preserves_developer_arguments",
+        "test_windows_acl_restoration_restores_effective_access",
+        "test_windows_acl_comparison_rejects_semantic_changes",
+    )
+    reason = "Windows native PowerShell and NTFS ACL contract"
+
+    def inspect(self, *, system="Linux", omitted=(), changed=None,
+                program="qcs-tests-acceptance-runners"):
+        rows = [("qcs_test_portability_runners.PortabilityContracts.test_other", "ok")]
+        for method in self.methods:
+            if method in omitted:
+                continue
+            identifier = self.prefix + method
+            status = "ok" if system == "Windows" else "skipped " + repr(self.reason)
+            identifier, status = (changed or {}).get(method, (identifier, status))
+            rows.append((identifier, status))
+        skipped = sum(status.startswith("skipped ") for _, status in rows)
+        output = "\n".join(f"{identifier.rsplit('.', 1)[-1]} ({identifier}) ... {status}"
+                           for identifier, status in rows)
+        output += f"\nRan {len(rows)} tests in 0.012s\n\n"
+        output += (f"OK (skipped={skipped})" if skipped else "OK") + "\n"
+        return EvidenceTests.inspect(self, output, name=program, system=system, raw=True)
+
+    def test_exact_posix_skips_keep_raw_status_and_required_native_platform(self):
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system=system):
+                result = self.inspect(system=system)
+                self.assertTrue(result["releaseComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"],
+                    {"run": 4, "passed": 1, "failed": 0, "skipped": 3, "notApplicable": 3})
+                self.assertEqual({item["case"] for item in result["pythonTestSkips"]},
+                                 {self.prefix + method for method in self.methods})
+                for entry in result["pythonTestSkips"]:
+                    self.assertEqual(entry["reason"], self.reason)
+                    self.assertEqual(entry["classification"], "notApplicable")
+                    self.assertEqual(entry["requiredNativePlatforms"], ["Windows"])
+                for row in result["ctestPrograms"][0]["cases"][1:]:
+                    self.assertEqual(row["status"], "skipped " + repr(self.reason))
+
+    def test_windows_requires_all_three_actual_passes(self):
+        result = self.inspect(system="Windows")
+        self.assertTrue(result["releaseComplete"], result["errors"])
+        self.assertEqual(result["pythonTestTotals"]["passed"], 4)
+        for method in self.methods:
+            for status in ("skipped " + repr(self.reason), "FAIL", "ERROR"):
+                with self.subTest(method=method, status=status):
+                    result = self.inspect(system="Windows", changed={method: (self.prefix + method, status)})
+                    self.assertFalse(result["releaseComplete"])
+                    self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+                    self.assertTrue(any("Required native portability case did not pass" in error
+                                        for error in result["errors"]))
+
+    def test_omitted_platform_case_cannot_hide_behind_consistent_totals(self):
+        for system in ("Windows", "Linux", "Darwin"):
+            for method in self.methods:
+                with self.subTest(system=system, method=method):
+                    result = self.inspect(system=system, omitted=(method,))
+                    self.assertFalse(result["releaseComplete"])
+                    self.assertTrue(any("Required native portability case is missing" in error
+                                        for error in result["errors"]))
+
+    def test_changed_reason_module_class_or_method_is_required_not_run(self):
+        method = self.methods[0]
+        identifier = self.prefix + method
+        variants = [(identifier, "skipped " + repr(self.reason + " unavailable")),
+                    (identifier, "skipped 'Windows only'"),
+                    ("__main__.PortabilityContracts." + method, "skipped " + repr(self.reason)),
+                    ("qcs_test_portability_runners.OtherTests." + method, "skipped " + repr(self.reason)),
+                    (self.prefix + "test_windows_other_contract", "skipped " + repr(self.reason))]
+        for system in ("Linux", "Darwin"):
+            for changed in variants:
+                with self.subTest(system=system, changed=changed):
+                    result = self.inspect(system=system, changed={method: changed})
+                    self.assertFalse(result["releaseComplete"])
+                    self.assertEqual(result["pythonTestTotals"]["notApplicable"], 2)
+                    self.assertTrue(any(item["classification"] == "requiredNotRun"
+                                        for item in result["pythonTestSkips"]))
+
+    def test_platform_exception_cannot_apply_to_another_program(self):
+        for system in ("Linux", "Darwin"):
+            for program in ("qcs-tests-runner", "qcs-tests-path-budget", "qcs-tests-license-materials"):
+                with self.subTest(system=system, program=program):
+                    result = self.inspect(system=system, program=program)
+                    self.assertFalse(result["releaseComplete"])
+                    self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+
+    def test_parser_registry_matches_real_acceptance_suite_case_ids(self):
+        directory = Path(__file__).resolve().parents[2] / "tools" / "acceptance"
+        spec = importlib.util.spec_from_file_location("qcs_ci_acceptance_registry", directory / "qcs-test-runners.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # Import definitions and enumerate the suite without executing native ACL operations.
+        contracts = module.load_script("qcs-test-portability-runners.py")
+        actual_ids = {item.id() for item in unittest.defaultTestLoader.loadTestsFromTestCase(
+            contracts.PortabilityContracts)}
+        expected = {self.prefix + name for name in self.methods}
+        self.assertTrue(expected <= actual_ids)
+        self.assertEqual(evidence.ACCEPTANCE_WINDOWS_CASES, expected)
+        self.assertEqual(contracts.WINDOWS_NATIVE_CASES, expected)
+        self.assertEqual(contracts.WINDOWS_SKIP_REASON, self.reason)
+        self.assertEqual(evidence.ACCEPTANCE_WINDOWS_SKIP_REASON, self.reason)
+
 
 class PythonTestRunnerEvidenceTests(PythonLicenseEvidenceTests):
     program = "qcs-tests-runner"
