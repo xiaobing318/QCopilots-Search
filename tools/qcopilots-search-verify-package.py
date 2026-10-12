@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -254,6 +255,19 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     work.mkdir(parents=True)
     report = {"package":str(package) if package else None, "installedRoot":str(installed_root) if installed_root else None,
               "runId":run_id, "workingDirectory":str(work), "checks":[], "passed":False}
+    report["commit"] = os.environ.get("QCOPILOTS_SEARCH_SOURCE_COMMIT") or os.environ.get("GITHUB_SHA")
+    report["workingTreeModified"] = None
+    if shutil.which("git"):
+        checkout_status = subprocess.run(["git", "status", "--porcelain"], cwd=Path(__file__).resolve().parent.parent,
+                                         capture_output=True, text=True, encoding="utf-8", timeout=30)
+        if checkout_status.returncode == 0:
+            report["workingTreeModified"] = bool(checkout_status.stdout.strip())
+    if package:
+        package_hash = hashlib.sha256()
+        with package.open("rb") as package_stream:
+            for block in iter(lambda: package_stream.read(1024 * 1024), b""):
+                package_hash.update(block)
+        report["packageSha256"] = package_hash.hexdigest()
     gui = worker = service = None
     installer = None
     service_started = False

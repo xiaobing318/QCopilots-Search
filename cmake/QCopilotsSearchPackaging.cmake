@@ -31,6 +31,18 @@ foreach(_program qcopilots-search qcopilots-search-service qcopilots-search-work
   endif()
 endforeach()
 if(TARGET qcopilots-search AND QCOPILOTS_SEARCH_DEPLOY_QT)
+  if(NOT TARGET Qt6::QOffscreenIntegrationPlugin)
+    message(FATAL_ERROR "The Qt SDK must provide the offscreen platform plugin used by the worker")
+  endif()
+  if(APPLE)
+    set(_qcopilots_offscreen_destination "qcopilots-search.app/Contents/PlugIns/platforms")
+  else()
+    set(_qcopilots_offscreen_destination "plugins/platforms")
+  endif()
+  # Workers use a QGuiApplication for image/PDF extraction without requiring a
+  # desktop session. Qt's deployment tool otherwise selects only qwindows/qxcb.
+  install(FILES "$<TARGET_FILE:Qt6::QOffscreenIntegrationPlugin>"
+    DESTINATION "${_qcopilots_offscreen_destination}")
   set(_qcopilots_runtime_options)
   if(MSVC)
     set(_qcopilots_runtime_options NO_COMPILER_RUNTIME)
