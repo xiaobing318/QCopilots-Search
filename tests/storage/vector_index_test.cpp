@@ -1,8 +1,13 @@
 #include "storage/vector_index.h"
 
+#include <QCryptographicHash>
+#include <QDataStream>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -337,6 +342,108 @@ private slots:
             QCOMPARE(retry.size(), qsizetype(1));
             QCOMPARE(retry.first().id, qint64(16));
         }
+    }
+
+    void legacy512SearchBudgetLoadsWithoutRewritingStoredGraph()
+    {
+        QTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        QString error;
+        QVector<VectorNeighbor> expected;
+        {
+            VectorIndex original(temporary.path(), 4);
+            QVERIFY2(original.rebuildShard(0, 1,
+                {{16, basis(0)}, {32, {0.8f, 0.6f, 0.0f, 0.0f}}, {48, basis(1)}},
+                &error), qPrintable(error));
+            expected = original.search(original.snapshot(), basis(0), 3, nullptr, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(expected.size(), qsizetype(3));
+        }
+
+        QFile manifest(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-ann-manifest.json")));
+        QVERIFY2(manifest.open(QIODevice::ReadOnly), qPrintable(manifest.errorString()));
+        QJsonParseError parseError;
+        auto document = QJsonDocument::fromJson(manifest.readAll(), &parseError);
+        manifest.close();
+        QCOMPARE(parseError.error, QJsonParseError::NoError);
+        QVERIFY(document.isObject());
+        auto manifestObject = document.object();
+        auto shards = manifestObject.value(QStringLiteral("shards")).toArray();
+        QCOMPARE(shards.size(), qsizetype(VectorIndex::shardCount));
+        auto shard = shards.at(0).toObject();
+        const QString graphPath = QDir(temporary.path()).filePath(shard.value(QStringLiteral("file")).toString());
+        QFile graph(graphPath);
+        QVERIFY2(graph.open(QIODevice::ReadOnly), qPrintable(graph.errorString()));
+        QByteArray legacyGraph = graph.readAll();
+        graph.close();
+        const qsizetype originalBytes = legacyGraph.size();
+        QCOMPARE(shard.value(QStringLiteral("bytes")).toString().toLongLong(), qint64(originalBytes));
+
+        {
+            // Consume the v1 field sequence to locate efQuery, rather than
+            // hard-coding an offset. The magic includes its terminating NUL.
+            // efQuery records search effort and does not change graph topology.
+            constexpr char magic[] = "qcopilots-search-hnsw-v1";
+            QDataStream header(&legacyGraph, QIODevice::ReadWrite);
+            header.setByteOrder(QDataStream::LittleEndian);
+            QByteArray actualMagic(sizeof(magic), '\0');
+            QCOMPARE(header.readRawData(actualMagic.data(), int(sizeof(magic))), int(sizeof(magic)));
+            QCOMPARE(actualMagic, QByteArray(magic, sizeof(magic)));
+            quint32 format = 0, dimensions = 0, shardNumber = 0, graphM = 0, efBuild = 0;
+            quint64 generation = 0, count = 0;
+            header >> format >> dimensions >> shardNumber >> generation >> count >> graphM >> efBuild;
+            QCOMPARE(header.status(), QDataStream::Ok);
+            QCOMPARE(format, quint32(1));
+            QCOMPARE(dimensions, quint32(4));
+            QCOMPARE(shardNumber, quint32(0));
+            QCOMPARE(generation, quint64(1));
+            QCOMPARE(count, quint64(3));
+            QCOMPARE(graphM, quint32(24));
+            QCOMPARE(efBuild, quint32(200));
+            const qint64 searchBudgetOffset = header.device()->pos();
+            quint32 savedSearchBudget = 0;
+            header >> savedSearchBudget;
+            QCOMPARE(savedSearchBudget, quint32(VectorIndex::searchEf));
+            QVERIFY(savedSearchBudget != 512);
+            QVERIFY(header.device()->seek(searchBudgetOffset));
+            header << quint32(512);
+            QCOMPARE(header.status(), QDataStream::Ok);
+        }
+        QCOMPARE(legacyGraph.size(), originalBytes);
+        QVERIFY2(graph.open(QIODevice::WriteOnly | QIODevice::Truncate), qPrintable(graph.errorString()));
+        QCOMPARE(graph.write(legacyGraph), qint64(legacyGraph.size()));
+        graph.close();
+        shard.insert(QStringLiteral("sha256"), QString::fromLatin1(
+            QCryptographicHash::hash(legacyGraph, QCryptographicHash::Sha256).toHex()));
+        shards[0] = shard;
+        manifestObject.insert(QStringLiteral("shards"), shards);
+        const QByteArray legacyManifest = QJsonDocument(manifestObject).toJson(QJsonDocument::Compact);
+        QVERIFY2(manifest.open(QIODevice::WriteOnly | QIODevice::Truncate), qPrintable(manifest.errorString()));
+        QCOMPARE(manifest.write(legacyManifest), qint64(legacyManifest.size()));
+        manifest.close();
+
+        const auto beforeFiles = filesBelow(temporary.path());
+        {
+            VectorIndex restored(temporary.path(), 4);
+            QVERIFY2(restored.loadManifest(&error), qPrintable(error));
+            QCOMPARE(restored.snapshot()->size(), qsizetype(3));
+            QCOMPARE(restored.snapshot()->generation(), quint64(1));
+            const auto actual = restored.search(restored.snapshot(), basis(0), 3, nullptr, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(actual.size(), expected.size());
+            for (qsizetype index = 0; index < actual.size(); ++index) {
+                QCOMPARE(actual[index].id, expected[index].id);
+                QCOMPARE(actual[index].distance, expected[index].distance);
+            }
+        }
+        QVERIFY(QFileInfo::exists(graphPath));
+        QCOMPARE(filesBelow(temporary.path()), beforeFiles);
+        QVERIFY2(graph.open(QIODevice::ReadOnly), qPrintable(graph.errorString()));
+        QCOMPARE(graph.readAll(), legacyGraph);
+        graph.close();
+        QVERIFY2(manifest.open(QIODevice::ReadOnly), qPrintable(manifest.errorString()));
+        QCOMPARE(manifest.readAll(), legacyManifest);
+        manifest.close();
     }
 
     void oldSnapshotSurvivesRebuild()

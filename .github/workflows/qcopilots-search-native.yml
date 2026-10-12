@@ -5,11 +5,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      release_preflight:
-        description: 'Require release evidence in addition to native tests. Does not publish.'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -51,7 +46,6 @@ jobs:
       QCOPILOTS_SEARCH_CI_ARCH: ${{ matrix.arch }}
       QCOPILOTS_SEARCH_CI_GENERATORS: ${{ matrix.generators }}
       QCOPILOTS_SEARCH_KEEP_FAILED_TESTS: '1'
-      QCOPILOTS_SEARCH_RELEASE_PREFLIGHT: ${{ inputs.release_preflight || false }}
     steps:
       - name: Checkout in a path containing Chinese and a space
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -81,7 +75,9 @@ jobs:
                   print(f"{name}={path}", file=output)
           PY
       - name: Verify case-level release evidence parser
-        run: python .github/scripts/qcopilots-search-tests-ci-evidence.py
+        run: |
+          python .github/scripts/qcopilots-search-tests-ci-evidence.py
+          python .github/scripts/qcopilots-search-tests-release-evidence.py
       - name: Install Linux host libraries and test display
         if: runner.os == 'Linux'
         run: |
@@ -127,8 +123,7 @@ jobs:
       - name: Record acceptance and signature status
         if: always()
         run: python .github/scripts/qcopilots-search-native-ci.py report
-      - name: Require explicit release evidence
-        if: inputs.release_preflight
+      - name: Verify this native evidence unit
         run: python .github/scripts/qcopilots-search-native-ci.py preflight
       - name: Upload reports and test packages
         if: always()
@@ -141,6 +136,8 @@ jobs:
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/reports
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/packages/qcopilots-search-*
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/packages/SHA256SUMS
+            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/packages/_CPack_Packages/**/NSISOutput.log
+            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/packages/_CPack_Packages/**/project.nsi
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/Testing/Temporary
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/CMakeFiles/CMakeConfigureLog.yaml
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/tests/**/qcopilots-search-tests-*.xml
@@ -151,7 +148,38 @@ jobs:
     if: always()
     needs: native
     steps:
+      - name: Checkout evidence validators
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Download all four native evidence units
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: qcopilots-search-*
+          path: ${{ runner.temp }}/qcopilots-search-native-artifacts
+      - name: Aggregate native raw reports and immutable source identities
+        if: always()
+        shell: bash
+        env:
+          CANDIDATE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python tools/qcopilots-search-release-evidence.py aggregate-native \
+            --candidate-commit "$CANDIDATE_HEAD" \
+            --native-artifacts-dir "$RUNNER_TEMP/qcopilots-search-native-artifacts" \
+            --output "$RUNNER_TEMP/qcopilots-search-native-aggregate.json"
+      - name: Upload native aggregate report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qcopilots-search-native-aggregate-${{ github.sha }}
+          path: ${{ runner.temp }}/qcopilots-search-native-aggregate.json
+          if-no-files-found: error
       - name: Check all native jobs
+        if: always()
         shell: bash
         env:
           NATIVE_RESULT: ${{ needs.native.result }}

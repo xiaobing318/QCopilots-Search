@@ -94,6 +94,50 @@ private slots:
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
     }
 
+    void recentFilesLimitCountsFilesInsteadOfNewestFileSegments()
+    {
+        TestEnvironment environment(QStringLiteral("recent-files-regression"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        const QString oldest = environment.path(QStringLiteral("oldest.txt"));
+        const QString middle = environment.path(QStringLiteral("middle.txt"));
+        const QString newest = environment.path(QStringLiteral("newest.txt"));
+        auto image = makeSegment(QStringLiteral("image"));
+        image.kind = QStringLiteral("image");
+        QVector<Segment> longFile(400, makeSegment(QStringLiteral("newest text")));
+        longFile.append(image);
+        QVERIFY2(repository.replaceFiles({
+            {oldest, QStringLiteral("one"), false, {makeSegment(QStringLiteral("oldest text"))}},
+            {middle, QStringLiteral("one"), false, {makeSegment(QStringLiteral("middle text"))}},
+            {newest, QStringLiteral("one"), false, longFile}
+        }, &error), qPrintable(error));
+        SearchOptions options;
+        options.limit = 2;
+        auto hits = repository.search(options, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hits.size(), qsizetype(2));
+        QCOMPARE(hits[0].path, newest);
+        QCOMPARE(hits[1].path, middle);
+        QCOMPARE(hits[0].kind, QStringLiteral("image"));
+        options.kind = QStringLiteral("text");
+        hits = repository.search(options, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hits.size(), qsizetype(2));
+        QCOMPARE(hits[0].path, newest);
+        QCOMPARE(hits[0].kind, QStringLiteral("text"));
+        QCOMPARE(hits[1].path, middle);
+        options.enforceFolderRules = true;
+        options.allowedRoots = {environment.root()};
+        options.excludedRoots = {newest};
+        hits = repository.search(options, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hits.size(), qsizetype(2));
+        QCOMPARE(hits[0].path, middle);
+        QCOMPARE(hits[1].path, oldest);
+    }
+
     void scatteredCommonWordsDoNotDisplaceStrongSemanticImage()
     {
         TestEnvironment environment(QStringLiteral("conjunctive-hybrid"));
@@ -282,6 +326,61 @@ private slots:
         options.allowedRoots.clear();
         QVERIFY(repository.search(options, &error).isEmpty());
         QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
+    void indexedFolderRangePreservesLiteralAndBoundarySemantics()
+    {
+        TestEnvironment environment(QStringLiteral("folders-binary-range"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        const QString root = environment.path(QString::fromUtf8("资料 %_ 空格"));
+        const QString child = QDir(root).filePath(QString::fromUtf8("中文/照片😀.txt"));
+        const QString image = QDir(root).filePath(QStringLiteral("picture.png"));
+        const QString excluded = QDir(root).filePath(QStringLiteral("hidden"));
+        const QString hiddenChild = QDir(excluded).filePath(QStringLiteral("secret.txt"));
+        const QString exclusionNeighbor = QDir(root).filePath(QStringLiteral("hidden0/visible.txt"));
+        const QString upperBoundary = root + QStringLiteral("0");
+        const QString prefixNeighbor = root + QStringLiteral("-extra/file.txt");
+        const QString patternNeighbor = environment.path(QString::fromUtf8("资料 arbitraryX 空格/file.txt"));
+        QVector<float> embedding(embeddingDimensions, 0.0f);
+        embedding[0] = 1.0f;
+        QVector<IndexedFile> files;
+        for (const auto &path : {root, child, image, excluded, hiddenChild,
+                                 exclusionNeighbor, upperBoundary, prefixNeighbor, patternNeighbor}) {
+            auto segment = makeSegment(QStringLiteral("needle"), embedding);
+            if (path == image)
+                segment.kind = QStringLiteral("image");
+            files.append({path, QStringLiteral("one"), false, {segment}});
+        }
+        QVERIFY2(repository.replaceFiles(files, &error), qPrintable(error));
+
+        // Both FTS and exact-vector paths must retain the old directory
+        // boundary semantics. No wildcard interpretation or root0 leak is
+        // allowed when the SQL predicate becomes an indexed range.
+        for (const bool semantic : {false, true}) {
+            SearchOptions options;
+            options.limit = 20;
+            if (semantic)
+                options.queryEmbedding = embedding;
+            else
+                options.query = QStringLiteral("needle");
+            options.root = root + u'/';
+            QCOMPARE(distinctPaths(repository.search(options, &error)),
+                     (QSet<QString>{root, child, image, excluded, hiddenChild, exclusionNeighbor}));
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            options.enforceFolderRules = true;
+            options.allowedRoots = {root + u'/'};
+            options.excludedRoots = {excluded};
+            QCOMPARE(distinctPaths(repository.search(options, &error)),
+                     (QSet<QString>{root, child, image, exclusionNeighbor}));
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            options.kind = QStringLiteral("text");
+            QCOMPARE(distinctPaths(repository.search(options, &error)),
+                     (QSet<QString>{root, child, exclusionNeighbor}));
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+        }
     }
 
     void explicitlySelectedNestedRootOverridesAncestorAndSelfExclusions()

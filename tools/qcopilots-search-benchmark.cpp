@@ -3,6 +3,7 @@
 #include "core/runtime_paths.h"
 #include "core/types.h"
 #include "storage/index_repository.h"
+#include "storage/vector_index.h"
 
 #include <QCommandLineParser>
 #include <QCoreApplication>
@@ -815,6 +816,7 @@ int main(int argc, char **argv)
         report.insert(QStringLiteral("segmentsPerFile"), segmentsPerFile);
         report.insert(QStringLiteral("segments"), files * segmentsPerFile);
         report.insert(QStringLiteral("dimensions"), embeddingDimensions);
+        report.insert(QStringLiteral("annEfSearch"), VectorIndex::searchEf);
         report.insert(QStringLiteral("seed"), QString::number(seed));
         report.insert(QStringLiteral("generatorVersion"), QStringLiteral("splitmix64-v1-cluster64-noise008-uniform10percent"));
         report.insert(QStringLiteral("semanticQualityEvaluated"), false);

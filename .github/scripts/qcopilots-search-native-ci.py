@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,6 +21,38 @@ for stream in (sys.stdout, sys.stderr):
 
 SOURCE = Path(__file__).resolve().parents[2]
 PRODUCT = "qcopilots-search"
+sys.dont_write_bytecode = True
+
+
+def release_evidence():
+    spec = importlib.util.spec_from_file_location("qcopilots_search_release_evidence",
+                                                SOURCE / "tools/qcopilots-search-release-evidence.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def candidate_head():
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    event = json.loads(Path(event_path).read_text(encoding="utf-8")) if event_path else {}
+    return event.get("pull_request", {}).get("head", {}).get("sha") or os.environ.get("GITHUB_SHA")
+
+
+def build():
+    evidence = release_evidence()
+    identity = evidence.source_identity(SOURCE, candidate_head())
+    errors = evidence.valid_identity(identity)
+    if errors:
+        raise RuntimeError("Native build requires clean immutable source: " + ", ".join(errors))
+    started = datetime.now(timezone.utc).isoformat()
+    evidence.write_json(REPORTS / "build-begin.json", {"identity": identity, "startedAt": started, "action": "build"})
+    dev("build")
+    if evidence.source_identity(SOURCE, candidate_head()) != identity:
+        raise RuntimeError("Source changed during native build")
+    programs = {name: {"sha256": evidence.digest(find_program(name, installed=False))}
+                for name in sorted(evidence.APPLICATIONS | {PRODUCT + "-benchmark"})}
+    evidence.write_json(REPORTS / "build-provenance.json", {"identity": identity, "completed": True,
+                        "startedAt": started, "finishedAt": datetime.now(timezone.utc).isoformat(), "programs": programs})
 
 
 def environment_path(name: str) -> Path:
@@ -56,6 +90,7 @@ def find_program(name: str, *, installed: bool) -> Path:
     prefix = ROOT / ("stage" if installed else "release")
     suffix = ".exe" if os.name == "nt" else ""
     candidates = [prefix / "bin" / (name + suffix),
+                  prefix / "bin/qcopilots-search.app/Contents/MacOS" / name,
                   prefix / "qcopilots-search.app/Contents/MacOS" / name]
     for candidate in candidates:
         if candidate.is_file():
@@ -80,7 +115,8 @@ def models():
     MODELS.mkdir(parents=True, exist_ok=True)
     cli = find_program(PRODUCT + "-cli", installed=True)
     common = [cli, "--model-dir", MODELS, "--profile-dir", ROOT / "ci-model-profile"]
-    run([*common, "models", "manifest"], environment=native_environment())
+    manifest = run([*common, "models", "manifest"], environment=native_environment(), capture=True)
+    (REPORTS / "models-manifest.json").write_text(manifest.stdout, encoding="utf-8")
     run([*common, "--timeout", "1800000", "--progress", "models", "download"], environment=native_environment())
     verified = run([*common, "models", "verify"], environment=native_environment(), capture=True)
     print(verified.stdout)
@@ -177,7 +213,10 @@ def signature_evidence(stage: Path, *, system: str | None = None):
 def report():
     case_evidence = test_evidence()
     signature = signature_evidence(ROOT / "stage")
+    evidence = release_evidence()
+    identity = evidence.source_identity(SOURCE, candidate_head())
     document = {"schemaVersion": 1, "product": PRODUCT,
+                "sourceIdentity": identity, "system": platform.system(),
                 "commit": os.environ.get("GITHUB_SHA"),
                 "runId": os.environ.get("GITHUB_RUN_ID"),
                 "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
@@ -201,30 +240,17 @@ def report():
                 "timestampUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     (REPORTS / "native-acceptance.json").write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(document, ensure_ascii=False, indent=2))
+    platform_id = next(name for name, expected in evidence.PLATFORMS.items()
+                       if expected == (platform.system(), os.environ.get("QCOPILOTS_SEARCH_CI_ARCH")))
+    evidence.capture_native(ROOT, identity, platform_id)
 
 
 def preflight():
-    # Publication stays manual. A workflow-dispatch request must fail clearly if
-    # the independent human-machine, semantic and local-capacity evidence is absent.
-    required = ["tests/ctest.xml", "models.json", "capacity-ci.json", "package/report.json",
-                "semantic-quality.json", "windows-computer-use.json", "million.json",
-                "source-integrity.json"]
-    if os.name == "nt":
-        required.append("package-nsis/report.json")
-    elif platform.system() == "Linux":
-        required.append("package-deb/report.json")
-    missing = [name for name in required if not (REPORTS / name).is_file()]
-    if missing:
-        raise RuntimeError("Release acceptance evidence is missing: " + ", ".join(missing))
-    junit = ET.parse(REPORTS / required[0]).getroot()
-    if not list(junit.iter("testcase")) or list(junit.iter("failure")) or list(junit.iter("error")) or list(junit.iter("skipped")):
-        raise RuntimeError("Release CTest evidence is empty or contains failures/errors/skips")
-    test_evidence(require_complete=True)
-    for name in required[1:]:
-        document = json.loads((REPORTS / name).read_text(encoding="utf-8"))
-        success_field = "ok" if name == "models.json" else "passed"
-        if document.get(success_field) is not True:
-            raise RuntimeError(f"Release evidence is not successful: {name}")
+    evidence = release_evidence()
+    result = evidence.inspect_native(ROOT, expected_head=candidate_head())
+    evidence.write_json(REPORTS / "native-gate.json", result)
+    if not result["passed"]:
+        raise RuntimeError("Native evidence gate failed: " + ", ".join(result["errors"]))
 
 
 def main():
@@ -240,8 +266,10 @@ def main():
         raise RuntimeError(f"Expected native architecture {expected}, got {actual}")
     if action == "configure":
         dev(action, "--cmake-arg=-DGGML_NATIVE=OFF", "--cmake-arg=-DGGML_CUDA=OFF", "--cmake-arg=-DGGML_METAL=OFF", "--cmake-arg=-DQCOPILOTS_SEARCH_REQUIRE_FULL_FEATURES=ON")
-    elif action in ("bootstrap", "doctor", "build", "install"):
+    elif action in ("bootstrap", "doctor", "install"):
         dev(action)
+    elif action == "build":
+        build()
     elif action == "models":
         models()
     elif action == "test":

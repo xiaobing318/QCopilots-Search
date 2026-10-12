@@ -37,7 +37,7 @@ constexpr char graphMagic[] = "qcopilots-search-hnsw-v1";
 constexpr auto manifestName = "qcopilots-search-ann-manifest.json";
 constexpr int graphM = 24;
 constexpr int constructionEf = 200;
-constexpr int queryEf = 512;
+constexpr int queryEf = VectorIndex::searchEf;
 constexpr qsizetype exactFilterLimit = 8192;
 constexpr qsizetype maximumManifestBytes = 1024 * 1024;
 constexpr quint64 maximumShardElements = 10000000;
@@ -178,7 +178,9 @@ bool loadGraph(Graph &graph, const QString &path, int dimensions, int shard,
         savedDimensions != quint32(dimensions) || savedShard != quint32(shard) ||
         savedGeneration != generation || count != expectedCount || count == 0 ||
         count > maximumShardElements || m != graphM || efBuild != constructionEf ||
-        efQuery != queryEf || stride != graph.size_data_per_element_ ||
+        // Saved query breadth is informational. In particular, a graph built
+        // with the initial ef=512 remains valid when the runtime budget changes.
+        efQuery == 0 || stride != graph.size_data_per_element_ ||
         maxLevel < 0 || maxLevel > 64 || entry >= count ||
         quint64(file.bytesAvailable()) < count * stride + count * sizeof(qint32))
         return fail(error, QStringLiteral("ANN shard header is inconsistent with its manifest"));

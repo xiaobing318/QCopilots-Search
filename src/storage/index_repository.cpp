@@ -204,9 +204,16 @@ struct Filter {
   bool code = false;
   QString within(const QString &root) {
     const QString prefix = root.endsWith(u'/') ? root : root + u'/';
-    paths.append({root, prefix, prefix});
+    // The normalized prefix always ends in ASCII '/'. Advancing just that
+    // final byte to '0' gives the exclusive BINARY upper bound for every
+    // descendant, including Unicode names and literal '%'/'_' characters.
+    // Unlike substr(), these comparisons can use the path_key index before
+    // joining a large segment table. The root itself remains an exact match.
+    const QString upper = prefix.chopped(1) + u'0';
+    paths.append({root, prefix, upper});
     return QStringLiteral("(f.path_key=? OR "
-                          "substr(f.path_key,1,length(?))=? COLLATE BINARY)");
+                          "(f.path_key>=? COLLATE BINARY AND "
+                          "f.path_key<? COLLATE BINARY))");
   }
   explicit Filter(const SearchOptions &options)
       : kind(options.kind), code(options.code) {
@@ -1038,8 +1045,10 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
           db,
           QStringLiteral("SELECT ") + hitColumns +
               QStringLiteral(
-                  " FROM segments s JOIN files f ON f.id=s.file_id WHERE ") +
-              filter.sql + QStringLiteral(" ORDER BY s.id DESC LIMIT ?"));
+                  " FROM segments s JOIN files f ON f.id=s.file_id WHERE s.id IN "
+                  "(SELECT max(s.id) FROM segments s JOIN files f ON f.id=s.file_id WHERE ") +
+              filter.sql + QStringLiteral(" GROUP BY s.file_id ORDER BY max(s.id) DESC LIMIT ?) "
+                                           "ORDER BY s.id DESC"));
       const auto end = filter.bind(q);
       q.bind(end, qint64(candidates));
       while (q.next())
@@ -1101,6 +1110,7 @@ QJsonObject IndexRepository::status(QString *error) const {
         {"generation", d->generation()},
         {"annVectors", qint64(d->published->size())},
         {"annGeneration", qint64(d->published->generation())},
+        {"annEfSearch", VectorIndex::searchEf},
         {"schemaVersion", schemaVersion},
         {"pendingShards",
          scalar(db, "SELECT count(DISTINCT shard) FROM ann_events")},

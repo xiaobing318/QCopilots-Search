@@ -34,6 +34,15 @@ function(qcopilots_search_add_image_codec_dependencies)
     endif()
     set_target_properties(qcopilots-search-native-zlib PROPERTIES
         OUTPUT_NAME "${zlib_output_name}" VERSION 1.3.2 SOVERSION 1)
+    if(UNIX AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "AIX"
+            AND NOT CMAKE_SYSTEM_NAME STREQUAL "SunOS")
+        # Preserve the upstream ELF symbol versions. Qt's binary SDK and system
+        # libraries bind to names such as compressBound@ZLIB_1.2.0.
+        target_link_options(qcopilots-search-native-zlib PRIVATE
+            "LINKER:--version-script,${qcopilots_search_zlib_SOURCE_DIR}/zlib.map")
+        set_property(TARGET qcopilots-search-native-zlib APPEND PROPERTY LINK_DEPENDS
+            "${qcopilots_search_zlib_SOURCE_DIR}/zlib.map")
+    endif()
     add_library(qcopilots-search::zlib ALIAS qcopilots-search-native-zlib)
     add_library(ZLIB::ZLIB ALIAS qcopilots-search-native-zlib)
 
@@ -108,6 +117,12 @@ function(qcopilots_search_add_image_codec_dependencies)
     if(WIN32)
         set_target_properties(qcopilots-search-native-jpeg PROPERTIES
             IMPORTED_IMPLIB "${jpeg_stage}/Release/${jpeg_import}")
+    elseif(APPLE)
+        # The ExternalProject library does not exist at initial configure time.
+        # Declare its actual install name so CMake can generate consumer build
+        # rpaths without trying to inspect that not-yet-built Mach-O file.
+        set_target_properties(qcopilots-search-native-jpeg PROPERTIES
+            IMPORTED_SONAME "@rpath/libjpeg.62.dylib")
     endif()
     foreach(config IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
         string(TOUPPER "${config}" upper_config)
@@ -117,6 +132,9 @@ function(qcopilots_search_add_image_codec_dependencies)
         if(WIN32)
             set_target_properties(qcopilots-search-native-jpeg PROPERTIES
                 IMPORTED_IMPLIB_${upper_config} "${jpeg_stage}/${config}/${jpeg_import}")
+        elseif(APPLE)
+            set_target_properties(qcopilots-search-native-jpeg PROPERTIES
+                IMPORTED_SONAME_${upper_config} "@rpath/libjpeg.62.dylib")
         endif()
     endforeach()
     add_dependencies(qcopilots-search-native-jpeg qcopilots-search-build-jpeg)

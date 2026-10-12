@@ -2,6 +2,17 @@ set(_qcopilots_runtime_tests
   "image-sizing|image_sizing_test.cpp|unit"
   "runtime|runtime_unit_test.cpp|unit"
   "reference-vectors|reference_vectors_test.cpp|real-model")
+add_executable(qcopilots-search-tests-backend-layout backend_layout_test.cpp)
+target_include_directories(qcopilots-search-tests-backend-layout PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(qcopilots-search-tests-backend-layout PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME qcopilots-search-tests-backend-layout
+  COMMAND "$<TARGET_FILE:qcopilots-search-tests-backend-layout>" -o "-,txt")
+set_tests_properties(qcopilots-search-tests-backend-layout PROPERTIES LABELS "unit;runtime;package" TIMEOUT 60)
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+add_test(NAME qcopilots-search-tests-inference-install-layout
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/install_layout_test.py"
+    --cmake "${CMAKE_COMMAND}" --generator "${CMAKE_GENERATOR}" --compiler "${CMAKE_C_COMPILER}")
+set_tests_properties(qcopilots-search-tests-inference-install-layout PROPERTIES LABELS "integration;runtime;package" TIMEOUT 180)
 foreach(_entry IN LISTS _qcopilots_runtime_tests)
   string(REPLACE "|" ";" _parts "${_entry}")
   list(GET _parts 0 _name)

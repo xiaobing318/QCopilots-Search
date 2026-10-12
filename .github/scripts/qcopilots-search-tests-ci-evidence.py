@@ -131,9 +131,28 @@ class EvidenceTests(unittest.TestCase):
         for name in evidence.NON_QT_TESTS:
             self.assertTrue(self.inspect("success\n", name=name)["releaseComplete"])
 
+    def test_python_inference_install_layout_is_not_a_qt_test(self):
+        self.assertTrue(self.inspect("Ran 8 tests\nOK\n",
+            name="qcopilots-search-tests-inference-install-layout")["releaseComplete"])
+        self.assertFalse(self.inspect("success\n",
+            name="qcopilots-search-tests-backend-layout")["releaseComplete"])
+
     def test_ctest_failure_error_or_skip_cannot_pass(self):
         for kind in ("failure", "error", "skipped"):
             self.assertFalse(self.inspect(failure=kind)["releaseComplete"])
+
+
+class NativeIdentityTests(unittest.TestCase):
+    def test_pr_candidate_head_is_distinct_from_merge_checkout(self):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-event-") as directory:
+            path = Path(directory) / "event.json"
+            path.write_text(json.dumps({"pull_request": {"head": {"sha": "a" * 40}}}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(path), "GITHUB_SHA": "b" * 40}):
+                self.assertEqual(native.candidate_head(), "a" * 40)
+
+    def test_non_pr_candidate_uses_actual_trigger_commit(self):
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": "", "GITHUB_SHA": "b" * 40}):
+            self.assertEqual(native.candidate_head(), "b" * 40)
 
 
 class SignatureEvidenceTests(unittest.TestCase):

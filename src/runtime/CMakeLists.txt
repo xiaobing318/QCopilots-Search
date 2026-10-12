@@ -67,21 +67,22 @@ file(LOCK "${_qcopilots_llama_lock}" RELEASE)
 # EXCLUDE_FROM_ALL prevents upstream developer headers/tools from entering application packages.
 add_subdirectory("${qcopilots_search_llama_SOURCE_DIR}" "${qcopilots_search_llama_BINARY_DIR}" EXCLUDE_FROM_ALL)
 
-add_library(qcopilots-search-runtime STATIC EmbeddingRuntime.cpp EmbeddingRuntime.h ImageSizing.cpp ImageSizing.h)
+add_library(qcopilots-search-runtime STATIC EmbeddingRuntime.cpp EmbeddingRuntime.h ImageSizing.cpp ImageSizing.h BackendPaths.h)
 target_compile_features(qcopilots-search-runtime PUBLIC cxx_std_20)
 target_include_directories(qcopilots-search-runtime PUBLIC "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(qcopilots-search-runtime PUBLIC Qt6::Core Qt6::Gui PRIVATE llama mtmd)
 if(_qcopilots_cpu_dispatch)
   target_compile_definitions(qcopilots-search-runtime PRIVATE QCOPILOTS_SEARCH_CPU_DISPATCH=1)
   set(_qcopilots_runtime_libraries llama mtmd ggml ggml-base)
+  set(_qcopilots_cpu_libraries)
   foreach(_variant x64 sse42 sandybridge ivybridge piledriver haswell skylakex cannonlake cascadelake icelake cooperlake zen4 alderlake sapphirerapids)
     if(TARGET ggml-cpu-${_variant})
-      list(APPEND _qcopilots_runtime_libraries ggml-cpu-${_variant})
+      list(APPEND _qcopilots_cpu_libraries ggml-cpu-${_variant})
     endif()
   endforeach()
-  set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS "${_qcopilots_runtime_libraries}")
-  install(TARGETS ${_qcopilots_runtime_libraries}
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    ARCHIVE EXCLUDE_FROM_ALL)
+  set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS "${_qcopilots_runtime_libraries};${_qcopilots_cpu_libraries}")
+  set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_CPU_RUNTIME_TARGETS "${_qcopilots_cpu_libraries}")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/install_inference_runtime.cmake")
+  qcopilots_search_install_inference_runtime(
+    LIBRARIES ${_qcopilots_runtime_libraries} CPU_BACKENDS ${_qcopilots_cpu_libraries})
 endif()

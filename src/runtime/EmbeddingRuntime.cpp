@@ -1,5 +1,6 @@
 // Adapted from DigUp LlamaRuntime, Copyright (c) 2026 Abdur Rahim, MIT.
 #include "EmbeddingRuntime.h"
+#include "BackendPaths.h"
 #include "ImageSizing.h"
 #include "core/pipeline_manifest.h"
 
@@ -53,9 +54,14 @@ void initializeBackend() {
                     QStringLiteral("skylakex"), QStringLiteral("alderlake"), QStringLiteral("haswell"),
                     QStringLiteral("piledriver"), QStringLiteral("ivybridge"), QStringLiteral("sandybridge"),
                     QStringLiteral("sse42"), QStringLiteral("x64")};
-    const QDir bin(QCoreApplication::applicationDirPath());
-    const QStringList roots{bin.absolutePath(), bin.filePath(QStringLiteral("../lib")),
-                            bin.filePath(QStringLiteral("../Frameworks"))};
+#ifdef Q_OS_MACOS
+    constexpr auto platform = detail::BackendPlatform::MacOS;
+#elif defined(Q_OS_WIN)
+    constexpr auto platform = detail::BackendPlatform::Windows;
+#else
+    constexpr auto platform = detail::BackendPlatform::Unix;
+#endif
+    const auto roots = detail::cpuBackendSearchRoots(QCoreApplication::applicationDirPath(), platform);
     bool loaded = false;
     for (const auto& variant : variants) {
 #ifdef Q_OS_WIN

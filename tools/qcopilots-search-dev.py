@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import venv
 
@@ -24,6 +25,23 @@ def run(command, *, cwd=None, env=None):
     command = [str(item) for item in command]
     print("+ " + subprocess.list2cmdline(command), flush=True)
     subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def report_package_errors(root: Path, started: float):
+    packaging = (root / "packages/_CPack_Packages").resolve()
+    if not packaging.is_dir():
+        return
+    for name in ("NSISOutput.log", "CPackError.log"):
+        for log in sorted(packaging.rglob(name)):
+            resolved = log.resolve()
+            if packaging not in resolved.parents or log.stat().st_mtime < started - 2:
+                continue
+            # Surface the generator's actual diagnostic even when CPack prints
+            # only a temporary path that will disappear with a CI runner.
+            with log.open("rb") as stream:
+                stream.seek(max(0, log.stat().st_size - 65536))
+                diagnostic = stream.read().decode("utf-8", errors="replace")
+            print(f"Package generator diagnostic ({log}):\n{diagnostic}", file=sys.stderr, flush=True)
 
 
 def assert_external(path: Path):
@@ -165,7 +183,12 @@ def main():
         command = ["cpack", "--config", build / "CPackConfig.cmake", "-C", args.config]
         if args.generator:
             command.extend(["-G", args.generator])
-        run(command, cwd=root, env=environment)
+        started = time.time()
+        try:
+            run(command, cwd=root, env=environment)
+        except subprocess.CalledProcessError:
+            report_package_errors(root, started)
+            raise
         checksums = []
         for package in sorted((root / "packages").glob("qcopilots-search-*")):
             if package.is_file() and package.suffix != ".sha256":

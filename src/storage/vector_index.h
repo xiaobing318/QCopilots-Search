@@ -33,6 +33,8 @@ class VectorIndex {
 
 public:
     static constexpr int shardCount = 16;
+    // Query breadth is a runtime policy, not part of the persisted graph shape.
+    static constexpr int searchEf = 4096;
 
     class Snapshot {
     public:

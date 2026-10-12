@@ -32,8 +32,10 @@ if(APPLE AND TARGET qcopilots-search)
   get_property(_qcopilots_native GLOBAL PROPERTY QCOPILOTS_SEARCH_NATIVE_RUNTIME_TARGETS)
   get_property(_qcopilots_imported GLOBAL PROPERTY QCOPILOTS_SEARCH_IMAGE_IMPORTED_RUNTIME_TARGETS)
   get_property(_qcopilots_inference GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS)
+  get_property(_qcopilots_inference_cpu GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_CPU_RUNTIME_TARGETS)
   set(_qcopilots_bundle_commands COMMAND "${CMAKE_COMMAND}" -E make_directory
-    "$<TARGET_FILE_DIR:qcopilots-search>/../Frameworks")
+    "$<TARGET_FILE_DIR:qcopilots-search>/../Frameworks"
+    "$<TARGET_FILE_DIR:qcopilots-search>/../PlugIns/ggml")
   set(_qcopilots_bundle_dependencies qcopilots-search)
   foreach(_helper qcopilots-search-service qcopilots-search-worker qcopilots-search-cli)
     if(TARGET ${_helper})
@@ -47,8 +49,18 @@ if(APPLE AND TARGET qcopilots-search)
       get_target_property(_kind ${_library} TYPE)
       if(_kind STREQUAL "SHARED_LIBRARY" OR _kind STREQUAL "MODULE_LIBRARY")
         list(APPEND _qcopilots_bundle_dependencies ${_library})
+        if(_library IN_LIST _qcopilots_inference_cpu)
+          set(_qcopilots_library_directory "PlugIns/ggml")
+          # Remove only this generated target's obsolete development copy.
+          # Leaving it in Frameworks would also copy an unsigned duplicate
+          # into subsequent installs of a reused development bundle.
+          list(APPEND _qcopilots_bundle_commands COMMAND "${CMAKE_COMMAND}" -E rm -f
+            "$<TARGET_FILE_DIR:qcopilots-search>/../Frameworks/$<TARGET_FILE_NAME:${_library}>")
+        else()
+          set(_qcopilots_library_directory "Frameworks")
+        endif()
         list(APPEND _qcopilots_bundle_commands COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-          "$<TARGET_FILE:${_library}>" "$<TARGET_FILE_DIR:qcopilots-search>/../Frameworks/$<TARGET_FILE_NAME:${_library}>")
+          "$<TARGET_FILE:${_library}>" "$<TARGET_FILE_DIR:qcopilots-search>/../${_qcopilots_library_directory}/$<TARGET_FILE_NAME:${_library}>")
       endif()
     endif()
   endforeach()

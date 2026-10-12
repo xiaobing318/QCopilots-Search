@@ -59,12 +59,11 @@ if(TARGET qcopilots-search AND QCOPILOTS_SEARCH_DEPLOY_QT)
   endforeach()
   if(APPLE)
     set(_qcopilots_deploy_executable "qcopilots-search.app")
-    # Qt 6.12's macdeployqt resolves @rpath through the app's LC_RPATH entries,
-    # not -libpath. JPEG's ExternalProject output is outside the common library
-    # directory, so expose that locked source only during deployment and require
-    # macdeployqt to remove it before signing. Installed libraries stay in Frameworks.
-    set(_qcopilots_deploy_prepare "include(\"${CMAKE_CURRENT_LIST_DIR}/QCopilotsSearchCheckedDeploy.cmake\")\nqcopilots_search_deploy_rpath(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app/Contents/MacOS/qcopilots-search\" \"$<TARGET_FILE_DIR:qcopilots-search-native-jpeg>\" ADD)\n")
-    set(_qcopilots_deploy_finish "\nqcopilots_search_deploy_rpath(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app/Contents/MacOS/qcopilots-search\" \"$<TARGET_FILE_DIR:qcopilots-search-native-jpeg>\" VERIFY_REMOVED)\nqcopilots_search_verify_bundle_signature(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\")\n")
+    # Imported library SONAME metadata gives each source library its correct
+    # build rpaths. macdeployqt then resolves those libraries and removes the
+    # paths before signing. No executable-only temporary path is injected.
+    set(_qcopilots_deploy_prepare "include(\"${CMAKE_CURRENT_LIST_DIR}/QCopilotsSearchCheckedDeploy.cmake\")\n")
+    set(_qcopilots_deploy_finish "\nqcopilots_search_verify_deploy_rpath(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app/Contents/MacOS/qcopilots-search\" \"$<TARGET_FILE_DIR:qcopilots-search-native-jpeg>\")\nqcopilots_search_verify_bundle_signature(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\")\n")
   else()
     set(_qcopilots_deploy_executable "$<TARGET_FILE:qcopilots-search>")
     set(_qcopilots_deploy_prepare "")

@@ -81,10 +81,26 @@ function(qcopilots_search_add_ocr_codec_dependencies)
     set(PNG_TESTS OFF)
     set(PNG_TOOLS OFF)
     set(PNG_HARDWARE_OPTIMIZATIONS OFF)
-    set(PNG_LIBCONF_HEADER "${qcopilots_search_png_SOURCE_DIR}/scripts/pnglibconf.h.prebuilt")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # A libpng16.so.16 loaded beside system FreeType must export PNG16_0.
+        # Upstream only generates libpng.vers in the AWK configuration branch.
+        # The prebuilt header skips that branch and produces an incompatible
+        # unversioned-symbol library despite retaining the same ELF soname.
+        set(PNG_LIBCONF_HEADER "")
+        set(ld-version-script ON)
+        find_program(AWK NAMES gawk nawk awk REQUIRED)
+    else()
+        set(PNG_LIBCONF_HEADER "${qcopilots_search_png_SOURCE_DIR}/scripts/pnglibconf.h.prebuilt")
+    endif()
     set(SKIP_INSTALL_ALL ON)
     add_subdirectory("${qcopilots_search_png_SOURCE_DIR}"
                      "${qcopilots_search_png_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        get_target_property(png_link_flags png_shared LINK_FLAGS)
+        if(NOT png_link_flags MATCHES "--version-script=")
+            message(FATAL_ERROR "The Linux libpng build must export the PNG16_0 symbol version")
+        endif()
+    endif()
     add_library(PNG::PNG ALIAS png_shared)
     add_library(qcopilots-search::png ALIAS png_shared)
     qcopilots_search_add_ocr_tiff_dependency()

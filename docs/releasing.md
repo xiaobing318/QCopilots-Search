@@ -64,6 +64,72 @@ Linux CI 在固定 Ubuntu 22.04 容器中使用 `dpkg --install` 安装最终 DE
 
 `.github/workflows/qcopilots-search-native.yml` 在 PR 创建或同步、main 推送时运行四个原生组合，也支持手动触发。每个 job 使用独立外置根，执行校验过的模型下载、测试、小规模容量和平台打包，并上传报告与测试包。
 
-手动 `release_preflight` 只检查验收材料是否完整且成功，不执行公开发布。独立 Windows Computer Use、语义和百万规模证据必须提供后才能通过这一门槛。没有证据的工作流应明确失败，不能自动制造通过摘要。
+CI 的 `required` job 下载当前运行的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `qcopilots-search-native-aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。这个结果只代表四个原生组合，最终 Windows 百万规模和 Computer Use 由下面的本机门禁单独核验。
+
+PR 的候选提交使用事件中的 `pull_request.head.sha`。实际 CI checkout 通常是 GitHub 生成的 merge commit，两者分别记录。四个原生 job 必须执行同一 checkout，最终本机候选必须与其候选 head、Git tree 和依赖锁哈希一致。不能把 merge commit 与 head 字符串不同误判为构建失败，也不能将旧报告事后绑定到新的 HEAD。
+
+## 本机最终证据流程
+
+使用 `tools/qcopilots-search-release-evidence.py` 记录构建与验收。它使用 Python 标准库，所有运行创建外置唯一目录，保留执行前来源、实际命令、退出码、原始 stdout / stderr、执行时间和产物 SHA-256。聚合器不执行发布，也不根据报告中的单个 `passed` 字段放行。
+
+先提交并冻结候选，然后在干净 checkout 下记录一次实际完整构建。路径均由调用者提供，下面的 `$source`、`$buildRoot`、`$qtRoot`、`$evidenceRoot` 和 `$python` 分别指向当前源码、外置构建根、SDK、证据根及 Python。`--program` 至少记录四个应用程序、百万容量程序和物理文件测试程序，程序的实际生成路径以当前构建为准。
+
+```powershell
+$tool = Join-Path $source 'tools/qcopilots-search-release-evidence.py'
+& $python $tool record-build --source $source --output-root $evidenceRoot `
+  --program "qcopilots-search=$buildRoot/release/bin/qcopilots-search.exe" `
+  --program "qcopilots-search-service=$buildRoot/release/bin/qcopilots-search-service.exe" `
+  --program "qcopilots-search-worker=$buildRoot/release/bin/qcopilots-search-worker.exe" `
+  --program "qcopilots-search-cli=$buildRoot/release/bin/qcopilots-search-cli.exe" `
+  --program "qcopilots-search-benchmark=$buildRoot/release/bin/qcopilots-search-benchmark.exe" `
+  --program "qcopilots-search-tests-file-capacity=$physicalTest" `
+  -- pwsh -NoProfile -File "$source/qcopilots-search-dev.ps1" build `
+       --build-root $buildRoot --qt-root $qtRoot
+```
+
+命令输出新的 `build-record.json` 路径。将它保存为 `$buildRecord`，后续 `run-local` 在实际启动前核对 clean source 和 producer 的 SHA-256，在进程结束后再次核对。`{program}`、`{evidence}`、`{report}` 由工具展开，分别表示已经核验的程序、本次唯一目录和报告路径。不要将旧报告复制到新目录冒充新执行。
+
+```powershell
+& $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot `
+  --kind physical --program-name qcopilots-search-tests-file-capacity `
+  --report physical.json --env 'QCOPILOTS_SEARCH_PHYSICAL_FILE_COUNT=100000' `
+  --env 'QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT={report}' `
+  --env 'QCOPILOTS_SEARCH_TEST_ROOT={evidence}/temporary' `
+  --env 'QT_FORCE_STDERR_LOGGING=1' -- '{program}' -o -,txt
+```
+
+物理测试需要由运行环境提供构建依赖的位置，且 `QCOPILOTS_SEARCH_TEST_ROOT` 的父目录必须可写。百万向量测试使用独立监控器，通过 `--input` 保留监控脚本原文和执行前后哈希。监控器的 `ExternalRoot` 必须使用 `{evidence}`，让原始 benchmark JSON、采样 JSONL 和输出日志都保留在本次根内。下面的 `$millionRunner` 是维护者选择并审查的实际监控脚本路径，不是假定另一台电脑存在的固定路径。
+
+```powershell
+& $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot `
+  --kind million --program-name qcopilots-search-benchmark `
+  --report 'reports/*.monitor.json' --input $millionRunner `
+  -- pwsh -NoProfile -File $millionRunner -BenchmarkExe '{program}' `
+       -ExternalRoot '{evidence}' -QtBin $qtBin -Mode Run
+```
+
+百万验收要求实际写入和重载至少 1,000,000 个 768 维向量、至少 100 条不同 oracle 查询和 500 次预热后计时，同时验证过滤、CRUD、后台重建、四个崩溃恢复边界及独立磁盘采样。原始报告和监控报告均保留，绝对路径只作为原始记录，由附件映射对应到可移植相对路径。采样峰值不冒充连续测量峰值。
+
+执行 `package` 和 `verify-package` 后，将最终 ZIP、验证报告和上述 build record 交给 `record-package`。该命令核对 ZIP 内四个可执行文件与本次构建的字节一致，生成 `package-candidate.json`。`$modelFingerprint` 和 `$extractionFingerprint` 来自相同候选实际语义验收，不使用人工编造的版本名称。
+
+```powershell
+& $python $tool record-package --build-record $buildRecord --package $finalZip `
+  --verification $packageReport --output-root $evidenceRoot `
+  --model-fingerprint $modelFingerprint --extraction-fingerprint $extractionFingerprint
+```
+
+以新生成的 package candidate 初始化 Windows Computer Use 记录，再对这一个最终包完成十个场景。报告必须带相同候选身份、包哈希、四个程序哈希、模型和提取指纹，每个场景保留预期、实际操作、结果、时间、截图与操作日志。JSON 和其 `files` 清单位于同一个运行根，附件路径为相对 POSIX 路径。旧跨包报告保留历史价值，但缺少执行前来源链时属于 `unbound`，不能充当最终候选验收。
+
+将 `record-package`、两个 `run-local` 和 Computer Use 的原始 JSON 路径分别赋给下列变量。`collect-local` 只复制已列入哈希清单的证据，不导入整个数据库目录。四份 GitHub 原生 artifact 分别解压到 `$nativeArtifacts` 的四个子目录，保持各自 `reports` 和 `packages` 布局。
+
+```powershell
+& $python $tool collect-local --candidate $candidateRecord --million $millionRecord `
+  --physical $physicalRecord --computer-use $computerUseRecord --output-root $evidenceRoot
+& $python $tool preflight --candidate-commit $candidateHead `
+  --native-artifacts-dir $nativeArtifacts --local-evidence-dir $collectedLocalRoot `
+  --output "$evidenceRoot/final-preflight.json"
+```
+
+最终命令只有在四组合原生证据及全部本机门槛满足时返回 0。其失败报告逐项保留缺失、规模不足、原始结果不一致或来源失配的原因。纯粹整理旧报告、合成验证器 fixture 通过、部分平台测试通过，都不会成为最终发布完成证明。
 
 macOS 部署使用 ad-hoc 签名，验收报告以实际 `codesign` 命令及退出码为依据。ad-hoc 不等于 Developer ID 分发签名，签名验证也不证明已公证。报告中的签名范围是 staging APP，未生成 APP、命令不可用或身份无法识别时记为未知，其他平台尚未配置签名验证时同样记为未知。正式签名、公证凭据通过受控发布环境配置，不能写入仓库、日志或普通测试产物。签名后重新计算包校验和，并验证签名后的最终包。维护者确认全部验收和许可材料后再决定公开发布。

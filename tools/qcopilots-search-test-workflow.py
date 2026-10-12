@@ -74,6 +74,24 @@ class WorkflowTests(unittest.TestCase):
                 if not expected:
                     self.assertIn("Qt deployment failed", result.stderr)
 
+    def test_package_failure_reports_current_generator_diagnostics(self):
+        import contextlib
+        import io
+        import time
+        current = self.root / "packages/_CPack_Packages/win64/NSIS/NSISOutput.log"
+        current.parent.mkdir(parents=True)
+        current.write_text("LicenseData: unable to open 中文路径", encoding="utf-8")
+        stale = current.parent.parent / "ZIP/CPackError.log"
+        stale.parent.mkdir()
+        stale.write_text("stale package failure", encoding="utf-8")
+        os.utime(stale, (1, 1))
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            workflow.report_package_errors(self.root, time.time())
+        self.assertIn("LicenseData: unable to open 中文路径", output.getvalue())
+        self.assertNotIn("stale package failure", output.getvalue())
+        self.assertTrue(current.is_file())
+
     def test_distribution_archive_traversal_rejected_before_write(self):
         import zipfile
         package = self.root / "qcopilots-search-test.zip"

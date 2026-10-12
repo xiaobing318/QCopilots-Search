@@ -13,6 +13,7 @@ NON_QT_TESTS = {
     "qcopilots-search-tests-semantic-manifest",
     "qcopilots-search-tests-semantic",
     "qcopilots-search-tests-workflow",
+    "qcopilots-search-tests-inference-install-layout",
 }
 TOTALS = re.compile(r"^Totals:\s+(\d+) passed,\s+(\d+) failed,\s+(\d+) skipped,\s+(\d+) blacklisted", re.MULTILINE)
 SKIP = re.compile(r"^SKIP\s*:\s*(\S+)\s+(.*)$", re.MULTILINE)
