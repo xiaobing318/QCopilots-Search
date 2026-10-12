@@ -10,6 +10,9 @@
 #include <QtEndian>
 #include <cmath>
 #include <numbers>
+#if defined(Q_OS_LINUX)
+#include <dlfcn.h>
+#endif
 
 using namespace qcopilots_search;
 
@@ -159,7 +162,18 @@ class MediaTests final : public QObject {
 private slots:
     void initTestCase() {
         QStandardPaths::setTestModeEnabled(true);
+#if defined(Q_OS_LINUX)
+        // This process has not initialized Qt Multimedia or our media backend.
+        // Loading local files must not publish FFmpeg or its OpenSSL stubs to
+        // unrelated code that resolves symbols in the global namespace.
+        const auto previousFormat = dlsym(RTLD_DEFAULT, "avformat_version");
+        const auto previousRandom = dlsym(RTLD_DEFAULT, "RAND_bytes");
+#endif
         QVERIFY2(mediaBackendError().isEmpty(), qPrintable(mediaBackendError()));
+#if defined(Q_OS_LINUX)
+        QCOMPARE(dlsym(RTLD_DEFAULT, "avformat_version"), previousFormat);
+        QCOMPARE(dlsym(RTLD_DEFAULT, "RAND_bytes"), previousRandom);
+#endif
     }
     void extensions() {
         QVERIFY(supportsAudio(QStringLiteral("/samples/中文 speech.WAV")));

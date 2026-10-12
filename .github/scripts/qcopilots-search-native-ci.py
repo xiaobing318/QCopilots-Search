@@ -315,6 +315,130 @@ def gui_failure_diagnostics(junit: Path, destination: Path):
     return result
 
 
+def bounded_linux_diagnostic(command, log: Path, environment, *, timeout=10, output_limit=512 * 1024):
+    """Record an owned diagnostic process with bounded time and retained output."""
+    result = {"command": [str(part) for part in command], "log": log.name,
+              "timeoutSeconds": timeout, "outputLimitBytes": output_limit}
+    try:
+        with log.open("wb") as output:
+            process = subprocess.Popen(result["command"], cwd=ROOT, env=environment,
+                                       stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                if time.monotonic() >= deadline or log.stat().st_size > output_limit:
+                    result["stoppedAtLimit"] = True
+                    break
+                time.sleep(.05)
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            result["exitCode"] = process.wait(timeout=5)
+        size = log.stat().st_size
+        if size > output_limit:
+            with log.open("r+b") as output:
+                output.truncate(output_limit)
+            result["outputTruncated"] = True
+        result["observedBytes"] = size
+        result["retainedBytes"] = log.stat().st_size
+    except (OSError, subprocess.SubprocessError) as error:
+        result["error"] = str(error)
+    return result
+
+
+def linux_failure_diagnostics(junit: Path, destination: Path):
+    result = {"scope": "Linux loader diagnostics only, never acceptance evidence", "commands": []}
+    if platform.system() != "Linux":
+        result["reason"] = "ELF diagnostics are limited to Linux"
+        return result
+    try:
+        if not any(case.find("failure") is not None or case.find("error") is not None
+                   for case in ET.parse(junit).getroot().iter("testcase")):
+            result["reason"] = "The original CTest report contains no failed program"
+            return result
+        destination.mkdir(parents=True, exist_ok=True)
+        prefix = QT / "6.12.0/gcc_64"
+        # Match the developer runner's child environment. In particular, retain
+        # inherited LD_LIBRARY_PATH so the faulty loader search is not repaired
+        # accidentally by the diagnostics themselves.
+        environment = os.environ.copy()
+        environment["QCOPILOTS_SEARCH_BUILD_ROOT"] = str(ROOT)
+        environment["QCOPILOTS_SEARCH_QT_PREFIX"] = str(prefix)
+        environment["QCOPILOTS_SEARCH_MODEL_DIR"] = str(MODELS)
+        environment["PATH"] = os.pathsep.join(str(path) for path in (
+            ROOT / "release/bin", ROOT / "release/lib", prefix / "bin", ROOT / "bootstrap/nsis")) + os.pathsep + environment.get("PATH", "")
+        test_parent = ROOT / "test-runs"
+        test_parent.mkdir(parents=True, exist_ok=True)
+        test_root = Path(tempfile.mkdtemp(prefix=PRODUCT + "-loader-", dir=test_parent))
+        environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(test_root)
+        environment["QT_FORCE_STDERR_LOGGING"] = "1"
+        result["environment"] = {name: environment.get(name) for name in (
+            "PATH", "LD_LIBRARY_PATH", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM", "QT_QPA_PLATFORM_PLUGIN_PATH",
+            "QCOPILOTS_SEARCH_BUILD_ROOT", "QCOPILOTS_SEARCH_QT_PREFIX", "QCOPILOTS_SEARCH_TEST_ROOT")}
+        program = find_program(PRODUCT + "-tests-gui", installed=False)
+        targets = [program, prefix / "lib/libavutil.so.61", prefix / "plugins/platforms/libqxcb.so",
+                   prefix / "lib/libQt6XcbQpa.so.6"]
+        for name in ("ssl", "crypto"):
+            targets.extend(sorted((prefix / "lib").glob(f"libQt6FFmpegStub-{name}.so*")))
+        seen = set()
+        for target in targets:
+            if not target.is_file() or target.resolve() in seen:
+                continue
+            seen.add(target.resolve())
+            for arguments in (["ldd", "-r", target], ["readelf", "--dynamic", "--version-info", target]):
+                log = destination / f"{len(result['commands']) + 1:02d}-{arguments[0]}.log"
+                result["commands"].append(bounded_linux_diagnostic(arguments, log, environment))
+        environment["QT_DEBUG_PLUGINS"] = "1"
+        command = ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1600x1000x24",
+                   program, "-functions"]
+        result["commands"].append(bounded_linux_diagnostic(command, destination / "qt-plugin-loader.log",
+                                                           environment, timeout=20))
+    except (OSError, ET.ParseError, RuntimeError) as error:
+        result["error"] = str(error)
+    return result
+
+
+def linux_sdk_diagnostics(destination: Path):
+    """Inspect the installed SDK before any application binary exists."""
+    result = {"scope": "Linux SDK loader diagnostics only, never acceptance evidence", "commands": []}
+    if platform.system() != "Linux":
+        result["reason"] = "ELF diagnostics are limited to Linux"
+        return result
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        result["environment"] = {name: environment.get(name) for name in (
+            "PATH", "LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM",
+            "QT_QPA_PLATFORM_PLUGIN_PATH", "QT_LOGGING_RULES", "QT_LOGGING_CONF")}
+        prefix = QT / "6.12.0/gcc_64"
+        for target in (prefix / "plugins/platforms/libqxcb.so", prefix / "lib/libQt6XcbQpa.so.6"):
+            if not target.is_file():
+                result.setdefault("missingTargets", []).append(str(target))
+                continue
+            for arguments in (["ldd", "-r", target], ["readelf", "--dynamic", "--version-info", target]):
+                log = destination / f"{len(result['commands']) + 1:02d}-{arguments[0]}.log"
+                result["commands"].append(bounded_linux_diagnostic(arguments, log, environment))
+    except (OSError, RuntimeError) as error:
+        result["error"] = str(error)
+    return result
+
+
+def doctor():
+    try:
+        dev("doctor")
+    finally:
+        # Loader diagnostics must neither hide an original doctor failure nor
+        # turn a successful doctor invocation into an acceptance failure.
+        if platform.system() == "Linux":
+            try:
+                diagnostics = linux_sdk_diagnostics(REPORTS / "linux-sdk-loader")
+                (REPORTS / "linux-sdk-diagnostics.json").write_text(
+                    json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as error:
+                print(f"SDK loader diagnostics unavailable: {error}", file=sys.stderr)
+
+
 def report():
     case_evidence = test_evidence()
     signature = signature_evidence(ROOT / "stage")
@@ -383,7 +507,9 @@ def main():
         raise RuntimeError(f"Expected native architecture {expected}, got {actual}")
     if action == "configure":
         dev(action, "--cmake-arg=-DGGML_NATIVE=OFF", "--cmake-arg=-DGGML_CUDA=OFF", "--cmake-arg=-DGGML_METAL=OFF", "--cmake-arg=-DQCOPILOTS_SEARCH_REQUIRE_FULL_FEATURES=ON")
-    elif action in ("bootstrap", "doctor", "install"):
+    elif action == "doctor":
+        doctor()
+    elif action in ("bootstrap", "install"):
         dev(action)
     elif action == "build":
         build()
@@ -400,6 +526,9 @@ def main():
         except subprocess.CalledProcessError:
             diagnostics = gui_failure_diagnostics(REPORTS / "tests/ctest.xml", REPORTS / "mac-gui-debug")
             (REPORTS / "gui-failure-diagnostics.json").write_text(
+                json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+            diagnostics = linux_failure_diagnostics(REPORTS / "tests/ctest.xml", REPORTS / "linux-loader")
+            (REPORTS / "linux-loader-diagnostics.json").write_text(
                 json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
             raise
         test_evidence(require_complete=True)

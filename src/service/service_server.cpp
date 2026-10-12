@@ -618,6 +618,9 @@ public:
 
     void dispatchIndex() {
         if (!current || stopping || settings.indexingPaused || !pipelineReady) return;
+        // A paused job can outlive its source version. Reconcile now instead of
+        // sending a knowingly stale request and waiting for the periodic scan.
+        if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
         if (!ensureWorker(indexWorker, false)) { publishFailedCurrent(QStringLiteral("Cannot start index worker")); return; }
         currentWorkerId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         const QJsonObject request{{"id", currentWorkerId}, {"operation", "extract"}, {"path", current->file.path},
@@ -630,18 +633,21 @@ public:
     void receiveIndex(const QJsonObject &message) {
         if (!current || message.value("id").toString() != currentWorkerId) return;
         indexTimeout.stop(); currentWorkerId.clear();
-        if (!message.value("ok").toBool()) { publishFailedCurrent(message.value("error").toObject().value("message").toString("Worker failed")); return; }
+        if (!message.value("ok").toBool()) {
+            const auto error = message.value("error").toObject();
+            if (error.value("code").toString() == "stale_source" || !currentSourceMatches()) {
+                rescanStaleCurrent(); return;
+            }
+            publishFailedCurrent(error.value("message").toString("Worker failed")); return;
+        }
         const auto result = message.value("result").toObject();
         if (result.value("extractionFingerprint").toString() != extractionPipelineFingerprint()
             || (modelAvailable && result.value("modelFingerprint").toString() != embeddingPipelineFingerprint())) {
             failCurrent(QStringLiteral("Worker pipeline fingerprint differs from the service build")); return;
         }
-        FileRecord now;
-        QString error;
-        if (current->generation != generation || !FileCatalog::describe(current->file.path, &now, &error)
-            || now.fingerprint != current->file.fingerprint || sourceVersion(current->file.path) != current->workerVersion
+        if (!currentSourceMatches()
             || result.value("sourceVersion").toString() != current->workerVersion) {
-            current.reset(); pendingScan = true; scheduleNext(); return;
+            rescanStaleCurrent(); return;
         }
         const auto state = result.value("state").toString();
         if (state == "cancelled") { failCurrent(result.value("error").toString(state)); return; }
@@ -676,6 +682,10 @@ public:
             const auto error = watcher->result(); watcher->deleteLater(); publishing = false;
             if (stopping) return;
             if (!current || current->generation != generation) { current.reset(); scheduleNext(); return; }
+            // The source can change after decoding or while the writer waits
+            // to enter its publication gate. Such a rejection requires work
+            // for the new version, never a failed placeholder for the old one.
+            if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
             if (!error.isEmpty()) { failCurrent(error); return; }
             progress.segments += current->segments.size() - previousCount;
             event(QStringLiteral("indexChanged"), {{"path", job.file.path}});
@@ -709,6 +719,7 @@ public:
     void publishFailedCurrent(const QString &failure) {
         if (!current || publishing) return;
         indexTimeout.stop(); currentWorkerId.clear();
+        if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
         const Job job = *current;
         publishing = true;
         auto *watcher = new QFutureWatcher<QString>(q);
@@ -716,6 +727,7 @@ public:
             const QString error = watcher->result(); watcher->deleteLater(); publishing = false;
             if (stopping) return;
             if (!current || current->generation != generation) { current.reset(); scheduleNext(); return; }
+            if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
             if (error.isEmpty()) event(QStringLiteral("indexChanged"), {{"path", job.file.path}});
             failCurrent(error.isEmpty() ? failure : failure + QStringLiteral("\nCannot preserve filename index: ") + error);
         });
@@ -748,6 +760,25 @@ public:
                 segments, job.file.kind == "code", &error, gate);
             return error;
         }));
+    }
+
+    bool currentSourceMatches() const {
+        if (!current || current->generation != generation) return false;
+        FileRecord now;
+        return FileCatalog::describe(current->file.path, &now)
+            && now.fingerprint == current->file.fingerprint
+            && sourceVersion(current->file.path) == current->workerVersion;
+    }
+
+    void rescanStaleCurrent() {
+        indexTimeout.stop(); currentWorkerId.clear();
+        if (current) log(QStringLiteral("Source changed, rescheduling index: %1").arg(current->file.path));
+        current.reset();
+        // Let already queued files make progress before retrying this source.
+        // Re-sorting the whole queue here can starve every later path when the
+        // first file keeps changing. An empty queue triggers the pending scan.
+        pendingScan = true;
+        QTimer::singleShot(0, q, [this] { scheduleNext(); });
     }
 
     void failCurrent(const QString &error) {

@@ -43,7 +43,8 @@ function(qcopilots_search_add_doc_dependency)
     file(WRITE "${wv2_binary}/parserfactory.cpp" "${parser_content}")
 
     # wv2's sole iconv consumer converts legacy code pages to UCS-2. A private
-    # adapter uses the exact Qt SDK's Core5Compat tables across all platforms.
+    # adapter uses Qt's strict stateless decoder with Core5Compat fallback for
+    # Qt builds without named ICU codecs. It never links the host iconv ABI.
     configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcopilots-search-native-doc-iconv.h"
         "${wv2_binary}/private/iconv.h" COPYONLY)
     include(TestBigEndian)

@@ -379,6 +379,219 @@ class GuiDiagnosticsTests(unittest.TestCase):
         self.assertIn("cleanupUnknown", result["attempts"][0])
 
 
+class LinuxDiagnosticsTests(unittest.TestCase):
+    def diagnose(self, *, system="Linux", failed=True, present=True):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-linux-diagnostic-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+            root = Path(temporary)
+            qt = root / "qt"
+            prefix = qt / "6.12.0/gcc_64"
+            program = root / "release/bin/qcopilots-search-tests-gui"
+            targets = [program, prefix / "lib/libavutil.so.61",
+                       prefix / "plugins/platforms/libqxcb.so", prefix / "lib/libQt6XcbQpa.so.6",
+                       prefix / "lib/libQt6FFmpegStub-ssl.so.6",
+                       prefix / "lib/libQt6FFmpegStub-crypto.so.6.12.0"]
+            for target in targets:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"Synthetic loader diagnostic fixture, not an executable")
+            junit = root / "ctest.xml"
+            document = ET.Element("testsuite")
+            case = ET.SubElement(document, "testcase", name="qcopilots-search-tests-gui")
+            if failed:
+                ET.SubElement(case, "failure")
+            if present:
+                ET.ElementTree(document).write(junit, encoding="utf-8")
+            original = junit.read_bytes() if present else None
+            observed = []
+
+            def capture(command, log, environment, **limits):
+                entry = {"command": [str(item) for item in command], "log": log.name}
+                observed.append({**entry, "environment": environment.copy(), "limits": limits})
+                return entry
+
+            inherited = {"PATH": "original-tool-path", "LD_LIBRARY_PATH": "original-loader-path",
+                         "QT_QPA_PLATFORM": "xcb", "QT_PLUGIN_PATH": "original-plugin-path",
+                         "QCOPILOTS_SEARCH_TEST_ROOT": "original-test-root"}
+            with mock.patch.object(native.platform, "system", return_value=system), \
+                    mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "QT", qt, create=True), \
+                    mock.patch.object(native, "MODELS", root / "models", create=True), \
+                    mock.patch.object(native, "find_program", return_value=program), \
+                    mock.patch.dict(native.os.environ, inherited), \
+                    mock.patch.object(native, "bounded_linux_diagnostic", side_effect=capture), \
+                    mock.patch.object(native.subprocess, "Popen") as spawn:
+                result = native.linux_failure_diagnostics(junit, root / "reports/linux-loader")
+                spawn.assert_not_called()
+            self.assertEqual(junit.read_bytes() if present else None, original)
+            self.assertNotIn("passed", result)
+            self.assertTrue(all("passed" not in entry for entry in result["commands"]))
+            return result, observed, root, prefix, targets
+
+    def test_non_linux_or_absent_failed_junit_never_spawns_diagnostics(self):
+        for arguments in ({"system": "Windows"}, {"failed": False}, {"present": False}):
+            with self.subTest(arguments=arguments):
+                result, commands, *_ = self.diagnose(**arguments)
+                self.assertEqual(result["commands"], [])
+                self.assertEqual(commands, [])
+
+    def test_loader_environment_is_preserved_with_an_isolated_xvfb_probe(self):
+        result, commands, root, prefix, targets = self.diagnose()
+        expected_path = os.pathsep.join(str(path) for path in (
+            root / "release/bin", root / "release/lib", prefix / "bin", root / "bootstrap/nsis"))
+        expected_path += os.pathsep + "original-tool-path"
+        for command in commands:
+            environment = command["environment"]
+            self.assertEqual(environment["PATH"], expected_path)
+            self.assertEqual(environment["LD_LIBRARY_PATH"], "original-loader-path")
+            self.assertEqual(environment["QT_PLUGIN_PATH"], "original-plugin-path")
+            self.assertEqual(environment["QT_QPA_PLATFORM"], "xcb")
+            self.assertTrue(Path(environment["QCOPILOTS_SEARCH_TEST_ROOT"]).is_relative_to(root / "test-runs"))
+            self.assertNotIn("offscreen", command["command"])
+        probe = commands[-1]
+        self.assertEqual(probe["command"], ["xvfb-run", "--auto-servernum",
+            "--server-args=-screen 0 1600x1000x24", str(targets[0]), "-functions"])
+        self.assertEqual(probe["environment"]["QT_DEBUG_PLUGINS"], "1")
+        self.assertEqual(probe["limits"]["timeout"], 20)
+        self.assertEqual(result["environment"]["LD_LIBRARY_PATH"], "original-loader-path")
+
+    def test_elf_commands_cover_gui_qt_ffmpeg_and_discovered_tls_stubs(self):
+        _, commands, _, _, targets = self.diagnose()
+        self.assertEqual(len(commands), 2 * len(targets) + 1)
+        for target in targets:
+            self.assertIn(["ldd", "-r", str(target)], [entry["command"] for entry in commands])
+            self.assertIn(["readelf", "--dynamic", "--version-info", str(target)],
+                          [entry["command"] for entry in commands])
+
+    def bounded(self, *, oversized=False):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-linux-bounded-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+            root = Path(temporary)
+            log = root / "synthetic-diagnostic.log"
+            payload = b"x" * (128 if oversized else 16)
+            process = mock.Mock(pid=24680)
+            process.poll.return_value = None
+            process.wait.return_value = -9
+
+            def spawn(command, **arguments):
+                self.assertTrue(arguments["start_new_session"])
+                self.assertEqual(arguments["cwd"], root)
+                self.assertEqual(arguments["env"], {"PATH": "fixture-path"})
+                self.assertEqual(arguments["stderr"], native.subprocess.STDOUT)
+                arguments["stdout"].write(payload)
+                arguments["stdout"].flush()
+                return process
+
+            with mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native.subprocess, "Popen", side_effect=spawn), \
+                    mock.patch.object(native.time, "monotonic", side_effect=[100, 100.1 if oversized else 111]), \
+                    mock.patch.object(native.time, "sleep") as sleep, \
+                    mock.patch.object(native.os, "killpg", create=True) as kill_group, \
+                    mock.patch.object(native.signal, "SIGKILL", 9, create=True):
+                result = native.bounded_linux_diagnostic(["synthetic-fixture-tool", "--diagnose"],
+                    log, {"PATH": "fixture-path"}, timeout=10, output_limit=64)
+                kill_group.assert_called_once_with(process.pid, 9)
+                process.wait.assert_called_once_with(timeout=5)
+                sleep.assert_not_called()
+            self.assertNotIn("passed", result)
+            self.assertTrue(result["stoppedAtLimit"])
+            self.assertEqual(result["observedBytes"], len(payload))
+            self.assertEqual(result["retainedBytes"], log.stat().st_size)
+            self.assertLessEqual(log.stat().st_size, 64)
+            self.assertEqual(log.read_bytes(), payload[:64])
+            return result
+
+    def test_timeout_terminates_only_the_owned_process_group(self):
+        result = self.bounded()
+        self.assertEqual(result["exitCode"], -9)
+        self.assertFalse(result.get("outputTruncated", False))
+
+    def test_size_limit_terminates_owned_group_and_records_bounded_log(self):
+        result = self.bounded(oversized=True)
+        self.assertTrue(result["outputTruncated"])
+        self.assertEqual(result["retainedBytes"], 64)
+
+    def sdk(self, *, system="Linux", present=("qxcb", "xcbqpa")):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-sdk-diagnostic-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+            root = Path(temporary)
+            qt = root / "qt"
+            prefix = qt / "6.12.0/gcc_64"
+            targets = {"qxcb": prefix / "plugins/platforms/libqxcb.so",
+                       "xcbqpa": prefix / "lib/libQt6XcbQpa.so.6"}
+            for name in present:
+                targets[name].parent.mkdir(parents=True, exist_ok=True)
+                targets[name].write_bytes(b"Synthetic SDK target")
+            unrelated = prefix / "lib/libavutil.so.61"
+            unrelated.parent.mkdir(parents=True, exist_ok=True)
+            unrelated.write_bytes(b"SDK fixture outside this diagnostic scope")
+            observed = []
+
+            def capture(command, log, environment, **limits):
+                entry = {"command": [str(item) for item in command], "log": log.name}
+                observed.append({**entry, "environment": environment.copy()})
+                return entry
+
+            with mock.patch.object(native.platform, "system", return_value=system), \
+                    mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "QT", qt, create=True), \
+                    mock.patch.dict(native.os.environ, {"LD_LIBRARY_PATH": "inherited-sdk-loader-path"}), \
+                    mock.patch.object(native, "bounded_linux_diagnostic", side_effect=capture), \
+                    mock.patch.object(native, "find_program") as find_program, \
+                    mock.patch.object(native.subprocess, "Popen") as spawn:
+                result = native.linux_sdk_diagnostics(root / "reports/linux-sdk")
+                find_program.assert_not_called()
+                spawn.assert_not_called()
+            self.assertNotIn("passed", result)
+            return result, observed, targets
+
+    def test_sdk_diagnostic_uses_only_existing_qt_targets_without_gui_build(self):
+        for present in (("qxcb", "xcbqpa"), ("qxcb",), ()):
+            with self.subTest(present=present):
+                _, observed, targets = self.sdk(present=present)
+                self.assertEqual(len(observed), len(present) * 2)
+                commands = [entry["command"] for entry in observed]
+                for name in present:
+                    self.assertIn(["ldd", "-r", str(targets[name])], commands)
+                    self.assertIn(["readelf", "--dynamic", "--version-info", str(targets[name])], commands)
+
+    def test_sdk_diagnostic_preserves_original_loader_path(self):
+        _, observed, _ = self.sdk()
+        self.assertTrue(observed)
+        for entry in observed:
+            self.assertEqual(entry["environment"]["LD_LIBRARY_PATH"], "inherited-sdk-loader-path")
+
+    def test_non_linux_sdk_diagnostic_does_not_run_commands(self):
+        result, observed, _ = self.sdk(system="Windows")
+        self.assertEqual(result["commands"], [])
+        self.assertEqual(observed, [])
+
+    def doctor_with_diagnostic_error(self, dev_error=None):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-doctor-diagnostic-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+            reports = Path(temporary)
+            with mock.patch.object(native.platform, "system", return_value="Linux"), \
+                    mock.patch.object(native, "REPORTS", reports, create=True), \
+                    mock.patch.object(native, "dev", side_effect=dev_error) as dev, \
+                    mock.patch.object(native, "linux_sdk_diagnostics", side_effect=RuntimeError("Synthetic diagnostics failure")) as diagnose, \
+                    mock.patch.object(native, "print", create=True), \
+                    mock.patch.object(native.subprocess, "Popen") as spawn:
+                if dev_error is None:
+                    native.doctor()
+                else:
+                    with self.assertRaises(type(dev_error)) as caught:
+                        native.doctor()
+                    self.assertIs(caught.exception, dev_error)
+                dev.assert_called_once_with("doctor")
+                diagnose.assert_called_once()
+                spawn.assert_not_called()
+
+    def test_doctor_success_survives_sdk_diagnostic_exception(self):
+        self.doctor_with_diagnostic_error()
+
+    def test_doctor_rethrows_original_failure_after_sdk_diagnostic_exception(self):
+        self.doctor_with_diagnostic_error(native.subprocess.CalledProcessError(23, ["fixture-dev", "doctor"]))
+
+
 class SignatureEvidenceTests(unittest.TestCase):
     def inspect(self, *, verify_code=0, display_code=0, details="Signature=adhoc\n",
                 verify_error="", exists=True, system="Darwin", error=None):

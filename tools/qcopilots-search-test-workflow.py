@@ -92,6 +92,58 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("stale package failure", output.getvalue())
         self.assertTrue(current.is_file())
 
+    def test_cpack_matches_full_install_before_final_bundle_hook(self):
+        import zipfile
+        project = self.root / "package source"
+        project.mkdir()
+        for name in ("application.txt", "runtime.txt", "internal-export.cmake"):
+            (project / name).write_text(name, encoding="utf-8")
+        packaging = workflow.SOURCE / "cmake/QCopilotsSearchCPackConfig.cmake"
+        # DragNDrop installs components by default. Force that behavior for the
+        # portable ZIP fixture so the real project policy must suppress it.
+        (project / "CMakeLists.txt").write_text('''
+cmake_minimum_required(VERSION 3.28)
+project(qcopilots-search-package-layout VERSION 1.0 LANGUAGES NONE)
+set(bundle "qcopilots-search.app/Contents")
+install(FILES application.txt DESTINATION "${bundle}/MacOS")
+install(FILES runtime.txt DESTINATION "${bundle}/Resources"
+  COMPONENT qcopilots-search-runtime)
+install(FILES internal-export.cmake DESTINATION "${bundle}/Frameworks/cmake"
+  EXCLUDE_FROM_ALL)
+install(CODE [[
+  set(bundle "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/qcopilots-search.app/Contents")
+  foreach(resource MacOS/application.txt Resources/runtime.txt)
+    if(NOT EXISTS "${bundle}/${resource}")
+      message(FATAL_ERROR "Final bundle hook ran before runtime installation: ${resource}")
+    endif()
+  endforeach()
+  if(EXISTS "${bundle}/Frameworks/cmake/internal-export.cmake")
+    message(FATAL_ERROR "Internal developer metadata entered the runtime bundle")
+  endif()
+  file(WRITE "${bundle}/Resources/final-hook.txt" "all runtime resources installed")
+]])
+set(CPACK_GENERATOR ZIP)
+set(CPACK_PACKAGE_FILE_NAME qcopilots-search-layout)
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
+set(CPACK_PROJECT_CONFIG_FILE "''' + packaging.as_posix() + '''")
+include(CPack)
+''', encoding="utf-8")
+        build, stage = self.root / "package build", self.root / "package stage"
+        for command in (["cmake", "-S", str(project), "-B", str(build), "-G", "Ninja"],
+                        ["cmake", "--install", str(build), "--prefix", str(stage)],
+                        ["cpack", "--config", str(build / "CPackConfig.cmake"), "-G", "ZIP"]):
+            result = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((stage / "qcopilots-search.app/Contents/Resources/final-hook.txt").is_file())
+        self.assertFalse(list(stage.rglob("*.cmake")))
+        with zipfile.ZipFile(self.root / "qcopilots-search-layout.zip") as archive:
+            names = archive.namelist()
+            for suffix in ("MacOS/application.txt", "Resources/runtime.txt", "Resources/final-hook.txt"):
+                self.assertEqual(len([name for name in names if name.endswith(suffix)]), 1)
+            self.assertFalse(any(name.endswith(".cmake") for name in names))
+
     def test_distribution_archive_traversal_rejected_before_write(self):
         import zipfile
         package = self.root / "qcopilots-search-test.zip"

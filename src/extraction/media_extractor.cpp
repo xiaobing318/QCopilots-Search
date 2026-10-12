@@ -50,7 +50,10 @@ public:
 // Function pointer types come exclusively from the locked public FFmpeg headers.
 // Never substitute private struct declarations or resolve a library by PATH.
 struct FFmpeg {
-    QLibrary util, resample, scale, codec, format;
+    // Keep the root dependency group alive until the other handles are gone.
+    // On Linux its SSL stub also supplies symbols used by avutil.
+    QLibrary format;
+    QLibrary util, resample, scale, codec;
     QString error;
 #define API(name) decltype(&::name) name = nullptr
     API(avutil_version); API(swresample_version); API(swscale_version);
@@ -88,7 +91,13 @@ struct FFmpeg {
         const QString path = directory.absoluteFilePath(fileName(base, major));
         if (!QFileInfo(path).isFile()) throw MediaFailure(QStringLiteral("Missing locked FFmpeg library: %1").arg(path));
         library.setFileName(path);
+#if defined(Q_OS_LINUX)
+        // Qt's FFmpeg stubs must stay local to this dependency group instead
+        // of interposing on the application's OpenSSL and VAAPI symbols.
+        library.setLoadHints(QLibrary::ResolveAllSymbolsHint);
+#else
         library.setLoadHints(QLibrary::ResolveAllSymbolsHint | QLibrary::ExportExternalSymbolsHint);
+#endif
         if (!library.load()) throw MediaFailure(QStringLiteral("Cannot load %1: %2").arg(path, library.errorString()));
     }
 
@@ -113,11 +122,19 @@ struct FFmpeg {
                 }
             }
             if (!found) throw MediaFailure(QStringLiteral("Locked FFmpeg runtime was not found beside the application or in the configured Qt SDK"));
+#if defined(Q_OS_LINUX)
+            // Qt's avutil needs RAND_bytes, provided by the SSL stub in
+            // avformat's dependency group rather than its own crypto stub.
+            // Load that complete group before eagerly resolving avutil.
+            loadLibrary(format, directory, QStringLiteral("avformat"), LIBAVFORMAT_VERSION_MAJOR);
+#endif
             loadLibrary(util, directory, QStringLiteral("avutil"), LIBAVUTIL_VERSION_MAJOR);
             loadLibrary(resample, directory, QStringLiteral("swresample"), LIBSWRESAMPLE_VERSION_MAJOR);
             loadLibrary(scale, directory, QStringLiteral("swscale"), LIBSWSCALE_VERSION_MAJOR);
             loadLibrary(codec, directory, QStringLiteral("avcodec"), LIBAVCODEC_VERSION_MAJOR);
+#if !defined(Q_OS_LINUX)
             loadLibrary(format, directory, QStringLiteral("avformat"), LIBAVFORMAT_VERSION_MAJOR);
+#endif
 #define LOAD(library, name) resolve(library, name, #name)
             LOAD(util, avutil_version); LOAD(resample, swresample_version); LOAD(scale, swscale_version);
             LOAD(codec, avcodec_version); LOAD(format, avformat_version);

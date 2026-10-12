@@ -17,19 +17,22 @@
 #include <QProcess>
 #include <QSignalSpy>
 #include <QScopeGuard>
+#include <QStorageInfo>
 #include <QTest>
 #include <QTimer>
 #include <QtEndian>
 #ifndef Q_OS_WIN
 #include <sys/un.h>
 #endif
+#include <atomic>
+#include <mutex>
 #include <stdexcept>
 
 using namespace qcopilots_search;
 using namespace qcopilots_search::test;
 
 namespace {
-QJsonObject localCall(ServiceClient &client, const QString &method, const QJsonObject &params = {}) {
+QJsonObject localCall(ServiceClient &client, const QString &method, const QJsonObject &params = {}, int timeout = 9000) {
     QJsonObject reply;
     QEventLoop loop;
     QString requestId;
@@ -41,11 +44,22 @@ QJsonObject localCall(ServiceClient &client, const QString &method, const QJsonO
         if (id != requestId) return;
         reply = {{"ok", false}, {"error", QJsonObject{{"code", code}, {"message", message}}}}; loop.quit();
     });
-    QTimer::singleShot(10000, &loop, &QEventLoop::quit);
-    requestId = client.request(method, params, 9000);
+    QTimer::singleShot(timeout + 100, &loop, &QEventLoop::quit);
+    requestId = client.request(method, params, timeout);
     loop.exec();
     QObject::disconnect(response); QObject::disconnect(failure);
     return reply;
+}
+
+QString serviceDiagnostics(const RuntimePaths &paths, const QJsonObject &status) {
+    QFile log(QDir(paths.logDir).filePath(QStringLiteral("qcopilots-search-service.log")));
+    QString contents;
+    if (log.open(QIODevice::ReadOnly)) {
+        log.seek(qMax<qint64>(0, log.size() - 16384));
+        contents = QString::fromUtf8(log.readAll());
+    } else contents = log.errorString();
+    return QStringLiteral("Profile: %1\nStatus: %2\nService log: %3")
+        .arg(paths.profileDir, QString::fromUtf8(QJsonDocument(status).toJson(QJsonDocument::Compact)), contents);
 }
 
 class ServiceProcess {
@@ -95,16 +109,17 @@ public:
         }
         return {};
     }
-    QList<QJsonObject> search(const QString &query) {
+    QList<QJsonObject> search(const QString &query, int timeout = 5000) {
         QList<QJsonObject> result;
-        const auto response = call("search", {{"query", query}, {"semantic", false}});
+        const auto response = call("search", {{"query", query}, {"semantic", false}}, timeout);
         for (const auto &hit : response.value("result").toObject().value("hits").toArray()) result.append(hit.toObject());
         return result;
     }
     bool waitForHit(const QString &query, const QString &path, int timeout = 30000) {
         QElapsedTimer elapsed; elapsed.start();
         while (elapsed.elapsed() < timeout) {
-            for (const auto &hit : search(query)) if (QDir::cleanPath(hit.value("path").toString()) == QDir::cleanPath(path)) return true;
+            for (const auto &hit : search(query, qMax(1, timeout - int(elapsed.elapsed()))))
+                if (QDir::cleanPath(hit.value("path").toString()) == QDir::cleanPath(path)) return true;
             QTest::qWait(30);
         }
         return false;
@@ -444,10 +459,173 @@ private slots:
         QVERIFY(service.waitForHit("cappedfinalprefixneedle", file.path, 5000));
         QVERIFY(environment.writeFile("selected/long.txt", "changedsourceaftercapneedle"));
         QVERIFY(service.call("index.resume").value("ok").toBool());
-        QVERIFY(service.waitForHit("changedsourceaftercapneedle", file.path));
+        const bool changedSourceFound = service.waitForHit("changedsourceaftercapneedle", file.path, 5000);
+        QString diagnostics;
+        if (!changedSourceFound) diagnostics = serviceDiagnostics(paths, service.call("status"))
+            + QStringLiteral("\nService stderr: ") + QString::fromUtf8(service.process.readAllStandardError());
+        QVERIFY2(changedSourceFound, qPrintable(diagnostics));
         QTRY_COMPARE_WITH_TIMEOUT(status().value("progress").toObject().value("state").toString(), QStringLiteral("idle"), 10000);
         QCOMPARE(status().value("repository").toObject().value("segments").toInteger(), 1);
         QVERIFY(status().value("failures").toObject().isEmpty());
+    }
+
+    void sourceChangedDuringPublicationIsRescanned() {
+        TestEnvironment environment("service-publication-source-race");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/document.txt", "publicationoldsourcekeyword"));
+        const auto paths = environment.runtimePaths();
+        const QString source = environment.path("selected/document.txt");
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("selected")}; settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+
+        std::atomic_bool armed{false}, changed{false};
+        ServiceDependencies dependencies;
+        dependencies.storage.availableBytes = [&](const QString &directory) -> qint64 {
+            // This existing disk-space provider runs after PublicationGate has
+            // accepted the old source and before its SQLite transaction. The
+            // completion callback must detect the new source and schedule it.
+            if (armed.exchange(false)) {
+                QFile file(source);
+                const QByteArray replacement("publicationnewsourcekeyword with a changed file size");
+                if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                    || file.write(replacement) != replacement.size() || !file.flush())
+                    throw std::runtime_error("Could not inject source change during publication");
+                file.close();
+                changed.store(true);
+            }
+            const QStorageInfo volume(directory);
+            return volume.isValid() && volume.isReady() ? volume.bytesAvailable() : -1;
+        };
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        armed.store(true);
+        QVERIFY(localCall(client, "index.resume").value("ok").toBool());
+
+        bool found = false;
+        QJsonObject lastSearch;
+        QElapsedTimer elapsed; elapsed.start();
+        while (!found && elapsed.elapsed() < 5000) {
+            lastSearch = localCall(client, "search", {{"query", "publicationnewsourcekeyword"}, {"semantic", false}},
+                qMax(1, qMin(500, 5000 - int(elapsed.elapsed()))));
+            for (const auto &hit : lastSearch.value("result").toObject().value("hits").toArray())
+                if (QDir::cleanPath(hit.toObject().value("path").toString()) == QDir::cleanPath(source)) found = true;
+            if (!found) QTest::qWait(20);
+        }
+        QString diagnostics;
+        if (!found || !changed.load()) diagnostics = serviceDiagnostics(paths, localCall(client, "status"))
+            + QStringLiteral("\nSource mutation injected: %1\nLast search: %2").arg(changed.load())
+                .arg(QString::fromUtf8(QJsonDocument(lastSearch).toJson(QJsonDocument::Compact)));
+        QVERIFY2(changed.load(), qPrintable(diagnostics));
+        QVERIFY2(found, qPrintable(diagnostics));
+        const auto oldSearch = localCall(client, "search", {{"query", "publicationoldsourcekeyword"}, {"semantic", false}});
+        QVERIFY(oldSearch.value("ok").toBool());
+        QVERIFY(oldSearch.value("result").toObject().value("hits").toArray().isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+            .value("progress").toObject().value("state").toString(), QStringLiteral("idle"), 5000);
+        QVERIFY(localCall(client, "status").value("result").toObject().value("failures").toObject().isEmpty());
+        client.disconnectFromService(); service.stop();
+    }
+
+    void changingSourceDoesNotStarveStableQueuedFile() {
+        TestEnvironment environment("service-stale-source-fairness");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/a.txt", "fairnessoldsourcekeyword"));
+        const auto paths = environment.runtimePaths();
+        const QString changingSource = environment.path("selected/a.txt");
+        const QString stableSource = environment.path("selected/b.txt");
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("selected")}; settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+
+        std::mutex mutationMutex;
+        bool keepChanging = false;
+        std::atomic_int mutations{0};
+        ServiceDependencies dependencies;
+        dependencies.storage.availableBytes = [&](const QString &directory) -> qint64 {
+            const std::lock_guard guard(mutationMutex);
+            if (keepChanging) {
+                const int mutation = mutations.fetch_add(1) + 1;
+                QFile changingFile(changingSource);
+                const QByteArray replacement = QByteArray("fairnessintermediatesourcekeyword ") + QByteArray(mutation, 'x');
+                if (!changingFile.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                    || changingFile.write(replacement) != replacement.size() || !changingFile.flush())
+                    throw std::runtime_error("Could not inject continuously changing source");
+                changingFile.close();
+                // Until this point only a exists, so both initial mutations
+                // interrupt publication of a. Subsequent scans queue a then b.
+                if (mutation == 2) {
+                    QFile stableFile(stableSource);
+                    const QByteArray stableText("fairnessstablefilekeyword");
+                    if (!stableFile.open(QIODevice::WriteOnly | QIODevice::NewOnly)
+                        || stableFile.write(stableText) != stableText.size() || !stableFile.flush())
+                        throw std::runtime_error("Could not create stable file for fairness regression");
+                }
+            }
+            const QStorageInfo volume(directory);
+            return volume.isValid() && volume.isReady() ? volume.bytesAvailable() : -1;
+        };
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        {
+            const std::lock_guard guard(mutationMutex);
+            keepChanging = true;
+        }
+        QVERIFY(localCall(client, "index.resume").value("ok").toBool());
+        QJsonObject lastSearch;
+        auto waitForToken = [&](const QString &query, const QString &path) {
+            QElapsedTimer elapsed; elapsed.start();
+            while (elapsed.elapsed() < 5000) {
+                lastSearch = localCall(client, "search", {{"query", query}, {"semantic", false}},
+                    qMax(1, qMin(500, 5000 - int(elapsed.elapsed()))));
+                for (const auto &hit : lastSearch.value("result").toObject().value("hits").toArray())
+                    if (QDir::cleanPath(hit.toObject().value("path").toString()) == QDir::cleanPath(path))
+                        return elapsed.elapsed() <= 5000;
+                QTest::qWait(20);
+            }
+            return false;
+        };
+        const bool stableFound = waitForToken("fairnessstablefilekeyword", stableSource);
+        int mutationsBeforeStable;
+        {
+            // Stop only after observing b or exhausting the deadline. A fixed
+            // number of changes would let the queue-clearing bug pass eventually.
+            const std::lock_guard guard(mutationMutex);
+            keepChanging = false;
+            mutationsBeforeStable = mutations.load();
+        }
+        QString diagnostics;
+        if (!stableFound || mutationsBeforeStable < 3)
+            diagnostics = serviceDiagnostics(paths, localCall(client, "status"))
+                + QStringLiteral("\nSource mutations before stable result: %1\nLast search: %2")
+                    .arg(mutationsBeforeStable)
+                    .arg(QString::fromUtf8(QJsonDocument(lastSearch).toJson(QJsonDocument::Compact)));
+        QVERIFY2(mutationsBeforeStable >= 3, qPrintable(diagnostics));
+        QVERIFY2(stableFound, qPrintable(diagnostics));
+
+        // Taking the same mutex above has drained any in-flight mutation. The
+        // writer can now publish the final version without a concurrent rewrite.
+        QVERIFY(environment.writeFile("selected/a.txt", "fairnessfinalsourcekeyword"));
+        const bool changingFound = waitForToken("fairnessfinalsourcekeyword", changingSource);
+        if (!changingFound) diagnostics = serviceDiagnostics(paths, localCall(client, "status"));
+        QVERIFY2(changingFound, qPrintable(diagnostics));
+        for (const QString &oldToken : {QStringLiteral("fairnessoldsourcekeyword"), QStringLiteral("fairnessintermediatesourcekeyword")}) {
+            const auto result = localCall(client, "search", {{"query", oldToken}, {"semantic", false}});
+            QVERIFY(result.value("ok").toBool());
+            QVERIFY(result.value("result").toObject().value("hits").toArray().isEmpty());
+        }
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+            .value("progress").toObject().value("state").toString(), QStringLiteral("idle"), 5000);
+        QVERIFY(localCall(client, "status").value("result").toObject().value("failures").toObject().isEmpty());
+        client.disconnectFromService(); service.stop();
     }
 
     void authenticationAndProtocolLimits() {

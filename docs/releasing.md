@@ -15,7 +15,7 @@
 | 许可与源码材料 | 实际部署依赖的许可证、版本、源归档、补丁及重建说明 |
 | 签名状态 | macOS 对实际 staging APP 执行 `codesign --verify --deep --strict` 并读取身份，区分 ad-hoc、Developer ID、其他证书、未签名、无效与未知状态，公证单独记录 |
 
-任一必需证据缺失时，保持草稿或测试包状态。操作系统 runner 版本比产品最低版本新，因此原生 CI 通过不自动证明最低操作系统版本经过实机验收。
+任一必需证据缺失时，保持草稿或测试包状态。部分 runner 的系统版本高于最低发行目标，因此原生 CI 通过不自动证明所有最低操作系统版本已经过实机验收。
 
 发布检查同时读取 CTest 进程结果和 QtTest 用例明细。测试程序退出码为零不能替代内部用例执行证据。`reports/tests/qt-test-cases.json` 必须没有未执行的必需用例或缺失明细。唯一经过明确分类的平台不适用用例及其精确匹配规则见 [测试指南](testing.md)，这类用例保留单独计数，不计为通过。
 
@@ -118,7 +118,7 @@ $tool = Join-Path $source 'tools/qcopilots-search-release-evidence.py'
   --model-fingerprint $modelFingerprint --extraction-fingerprint $extractionFingerprint
 ```
 
-以新生成的 package candidate 初始化 Windows Computer Use 记录，再对这一个最终包完成十个场景。报告必须带相同候选身份、包哈希、四个程序哈希、模型和提取指纹，每个场景保留预期、实际操作、结果、时间、截图与操作日志。JSON 和其 `files` 清单位于同一个运行根，附件路径为相对 POSIX 路径。旧跨包报告保留历史价值，但缺少执行前来源链时属于 `unbound`，不能充当最终候选验收。
+以新生成的 package candidate 初始化 Windows Computer Use 记录，再对这一个最终包完成十个场景。报告必须带相同候选身份、包哈希、四个程序哈希、模型和提取指纹，每个场景保留预期、实际操作、结果、时间、截图与操作日志。原始 JSON 必须在顶层内嵌 `files` 清单，所有附件路径均相对于该 JSON 所在目录，使用 POSIX 路径。`--computer-use` 传入这份自包含原始报告，不能传入附加的 `-files.json`。完整字段与路径规则见 [Windows 用户操作验收](windows-user-acceptance.md#报告字段)。旧跨包报告保留历史价值，但缺少执行前来源链时属于 `unbound`，不能充当最终候选验收。
 
 将 `record-package`、两个 `run-local` 和 Computer Use 的原始 JSON 路径分别赋给下列变量。`collect-local` 只复制已列入哈希清单的证据，不导入整个数据库目录。四份 GitHub 原生 artifact 分别解压到 `$nativeArtifacts` 的四个子目录，保持各自 `reports` 和 `packages` 布局。
 
