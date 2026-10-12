@@ -426,6 +426,63 @@ private slots:
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
     }
 
+#ifdef Q_OS_WIN
+    void longUnicodeProfile_data()
+    {
+        QTest::addColumn<int>("minimumUtf16Units");
+        QTest::addColumn<int>("minimumUtf8Bytes");
+        QTest::newRow("beyond-win32-max-path") << 360 << 0;
+        // SQLite's Windows VFS byte limit is independent of Windows UTF-16
+        // path lengths. Other platforms, including macOS, have lower limits.
+        QTest::newRow("beyond-default-sqlite-byte-budget") << 360 << 1300;
+    }
+
+    void longUnicodeProfile()
+    {
+        QFETCH(int, minimumUtf16Units);
+        QFETCH(int, minimumUtf8Bytes);
+        TestEnvironment environment(QStringLiteral("storage-long-profile"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QString profile = environment.path(QStringLiteral("中文 空格 profile"));
+        // Every component remains below filesystem component limits. Grow the
+        // actual profile rather than assuming a particular developer root.
+        const QString component = QStringLiteral("中文 空格 ") + QString(36, u'a');
+        while (profile.size() < minimumUtf16Units || profile.toUtf8().size() < minimumUtf8Bytes)
+            profile = QDir(profile).filePath(component);
+        const auto paths = RuntimePaths::resolve(profile, environment.path(QStringLiteral("models")));
+        QVERIFY(paths.profileDir.size() >= minimumUtf16Units);
+        QVERIFY(paths.profileDir.toUtf8().size() >= minimumUtf8Bytes);
+        const QString source = environment.path(QStringLiteral("资料 中文.txt"));
+        QString error;
+        QVERIFY2(environment.writeFile(QStringLiteral("资料 中文.txt"), "longprofilecanary", &error),
+                 qPrintable(error));
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            QCOMPARE(repository.databasePath(), paths.databaseFile());
+            QVERIFY2(repository.replaceFile(source, QStringLiteral("revision"),
+                         {segment(QStringLiteral("长路径 longprofilecanary"), QStringLiteral("document"), basis(0))},
+                         false, &error), qPrintable(error));
+            QCOMPARE(repository.search(query(QStringLiteral("longprofilecanary")), &error).size(), qsizetype(1));
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY2(repository.flush(&error), qPrintable(error));
+            QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
+        }
+        IndexRepository reopened;
+        QVERIFY2(reopened.open(paths, &error), qPrintable(error));
+        QCOMPARE(reopened.fileVersion(source, false, &error), QStringLiteral("revision"));
+        QCOMPARE(reopened.search(query(QStringLiteral("longprofilecanary")), &error).size(), qsizetype(1));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        SearchOptions semantic;
+        semantic.queryEmbedding = basis(0);
+        const auto hits = reopened.search(semantic, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hits.size(), qsizetype(1));
+        QCOMPARE(hits.first().path, source);
+        QVERIFY2(reopened.checkIntegrity(&error), qPrintable(error));
+    }
+#endif
+
     void reopenPreservesIndexAndIntegrity()
     {
         TestEnvironment environment(QStringLiteral("storage-reopen"));

@@ -85,7 +85,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y build-essential ninja-build \
             libgl1-mesa-dev libxkbcommon-dev libfontconfig1-dev libfreetype6-dev \
             libglib2.0-dev libdbus-1-dev libx11-xcb-dev libxcb-cursor0 \
-            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-shape0 \
             libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxkbcommon-x11-0 \
             libpulse0 xvfb xauth dpkg-dev patchelf fonts-noto-cjk fonts-dejavu-core
       - name: Install macOS build tools

@@ -1,4 +1,5 @@
 #include "model_files.h"
+#include "native_lock_path.h"
 #include "pipeline_manifest.h"
 
 #include <QCryptographicHash>
@@ -111,7 +112,8 @@ bool ModelFiles::verify(QString* error) const
 bool ModelFiles::acquireLock(QString* error)
 {
     if (!QDir().mkpath(modelDir_)) return setError(error, tr("Cannot create model directory: %1").arg(modelDir_));
-    lock_ = std::make_unique<QLockFile>(QDir(modelDir_).filePath(QStringLiteral("qcopilots-search-models.lock")));
+    lock_ = std::make_unique<QLockFile>(nativeLockFilePath(
+        QDir(modelDir_).filePath(QStringLiteral("qcopilots-search-models.lock"))));
     lock_->setStaleLockTime(0);
     if (!lock_->tryLock()) {
         lock_.reset();

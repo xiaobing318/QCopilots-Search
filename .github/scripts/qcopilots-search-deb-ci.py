@@ -176,7 +176,7 @@ apt-get update
 apt-get install --yes --no-install-recommends python3 xvfb xauth ca-certificates passwd \\
   libgl1 libegl1 libopengl0 libfontconfig1 libfreetype6 libglib2.0-0 libdbus-1-3 \\
   libx11-xcb1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \\
-  libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxkbcommon-x11-0 \\
+  libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xfixes0 libxkbcommon-x11-0 \\
   libasound2 libpulse0 fonts-noto-cjk fonts-dejavu-core
 exec python3 /source/.github/scripts/qcopilots-search-deb-ci.py --inside-container
 """

@@ -1,3 +1,4 @@
+#include "core/native_lock_path.h"
 #include "support/test_environment.h"
 #include <QDir>
 #include <QElapsedTimer>
@@ -10,6 +11,8 @@
 #include <QStandardPaths>
 #include <QTest>
 
+using qcopilots_search::nativeLockFilePath;
+using qcopilots_search::RuntimePaths;
 using namespace qcopilots_search::test;
 
 namespace {
@@ -26,8 +29,12 @@ public:
     }
     bool start(const TestEnvironment &environment, const QString &mode = QStringLiteral("extract"))
     {
+        return start(environment, environment.runtimePaths(), mode);
+    }
+    bool start(const TestEnvironment &environment, const RuntimePaths &paths,
+               const QString &mode = QStringLiteral("extract"))
+    {
         process.setWorkingDirectory(environment.root());
-        const auto paths = environment.runtimePaths();
         process.start(QString::fromUtf8(QCOPILOTS_SEARCH_TEST_WORKER_PATH),
             {QStringLiteral("--mode"), mode, QStringLiteral("--profile-dir"), paths.profileDir,
              QStringLiteral("--model-dir"), paths.modelDir, QStringLiteral("--threads"), QStringLiteral("1")});
@@ -75,6 +82,16 @@ QString errorCode(const QJsonObject &reply)
 {
     return reply.value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString();
 }
+
+RuntimePaths workerLockPaths(const TestEnvironment &environment, bool longPath)
+{
+    const auto paths = environment.runtimePaths();
+    if (!longPath) return paths;
+    QString profile = environment.path(QStringLiteral("中文 worker profile with spaces"));
+    while (profile.size() < 320)
+        profile = QDir(profile).filePath(QStringLiteral("中文 nested worker directory with spaces"));
+    return RuntimePaths::resolve(profile, paths.modelDir);
+}
 }
 
 class WorkerTests final : public QObject {
@@ -113,15 +130,26 @@ private slots:
         worker.send({{QStringLiteral("operation"), QStringLiteral("query")}});
         QCOMPARE(errorCode(worker.receive()), QStringLiteral("invalid_request"));
     }
+    void unicodePathsAndKeywordOnlyWithoutModels_data()
+    {
+        QTest::addColumn<bool>("longPath");
+        QTest::newRow("normal") << false;
+#ifdef Q_OS_WIN
+        QTest::newRow("windows-long-unicode-path") << true;
+#endif
+    }
     void unicodePathsAndKeywordOnlyWithoutModels()
     {
+        QFETCH(bool, longPath);
         TestEnvironment environment(QStringLiteral("worker 可移植 路径"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto paths = workerLockPaths(environment, longPath);
+        if (longPath) QVERIFY(paths.profileDir.size() >= 320);
         const QString relative = QStringLiteral("source 文件/会议 记录.txt");
         const QByteArray content = QStringLiteral("中文搜索测试。The aurora expedition leaves on Friday.\n").toUtf8();
         QVERIFY(environment.writeFile(relative, content));
         WorkerProcess worker;
-        QVERIFY(worker.start(environment));
+        QVERIFY(worker.start(environment, paths));
         worker.send(extract(QStringLiteral("text"), environment.path(relative)));
         const auto reply = worker.receive();
         QVERIFY2(reply.value(QStringLiteral("ok")).toBool(), qPrintable(worker.errors() + QString::fromUtf8(QJsonDocument(reply).toJson())));
@@ -139,7 +167,7 @@ private slots:
         QFile original(environment.path(relative));
         QVERIFY(original.open(QIODevice::ReadOnly));
         QCOMPARE(original.readAll(), content);
-        QDir temporary(environment.runtimePaths().tempDir);
+        QDir temporary(paths.tempDir);
         QCOMPARE(temporary.entryList({QStringLiteral("qcopilots-search-worker-*")}, QDir::Dirs | QDir::NoDotAndDotDot).size(), 0);
     }
     void inputAndVersionErrors()
@@ -237,11 +265,21 @@ private slots:
         worker.send(extract(QStringLiteral("wrong"), environment.path(QStringLiteral("example.txt"))));
         QCOMPARE(errorCode(worker.receive()), QStringLiteral("wrong_mode"));
     }
+    void abandonedTemporaryJobsRespectOwnershipAndLocks_data()
+    {
+        QTest::addColumn<bool>("longPath");
+        QTest::newRow("normal") << false;
+#ifdef Q_OS_WIN
+        QTest::newRow("windows-long-unicode-path") << true;
+#endif
+    }
     void abandonedTemporaryJobsRespectOwnershipAndLocks()
     {
+        QFETCH(bool, longPath);
         TestEnvironment environment(QStringLiteral("worker recovery"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        const auto paths = environment.runtimePaths();
+        const auto paths = workerLockPaths(environment, longPath);
+        if (longPath) QVERIFY(paths.profileDir.size() >= 320);
         QString error;
         QVERIFY2(paths.ensure(&error), qPrintable(error));
         const QDir root(paths.tempDir);
@@ -264,11 +302,11 @@ private slots:
                 .toJson(QJsonDocument::Compact);
             QCOMPARE(marker.write(bytes), bytes.size());
         }
-        QLockFile activeLock(QDir(active).filePath(QStringLiteral("qcopilots-search-worker-lock")));
+        QLockFile activeLock(nativeLockFilePath(QDir(active).filePath(QStringLiteral("qcopilots-search-worker-lock"))));
         activeLock.setStaleLockTime(0);
         QVERIFY(activeLock.tryLock(0));
         WorkerProcess worker;
-        QVERIFY(worker.start(environment));
+        QVERIFY(worker.start(environment, paths));
         worker.send({{QStringLiteral("id"), QStringLiteral("ready")}, {QStringLiteral("operation"), QStringLiteral("cancel")}});
         QVERIFY(worker.receive().value(QStringLiteral("ok")).toBool());
         QVERIFY(!QFileInfo::exists(abandoned));

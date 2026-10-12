@@ -137,6 +137,12 @@ private slots:
             << QByteArray::fromHex("02ac") << QByteArray("UCS-2LE");
         QTest::newRow("Japanese-Windows-NEC-extension") << QByteArray("CP932") << QByteArray::fromHex("8740")
             << QByteArray::fromHex("6024") << QByteArray("UCS-2LE");
+        // Microsoft CP932.TXT: NEC, IBM, Windows fullwidth tilde, ASCII and
+        // fullwidth reverse solidus. Plain Shift_JIS has different mappings.
+        QTest::newRow("Japanese-Windows-extensions-and-punctuation") << QByteArray("CP932")
+            << QByteArray::fromHex("8740fa4081605c815f") << QByteArray::fromHex("602470215eff5c003cff") << QByteArray("UCS-2LE");
+        QTest::newRow("Japanese-lowercase-big-endian") << QByteArray("cp932")
+            << QByteArray::fromHex("8740fa4081605c815f") << QByteArray::fromHex("24602170ff5e005cff3c") << QByteArray("UCS-2BE");
         QTest::newRow("Windows-Latin") << QByteArray("CP1252") << QByteArray::fromHex("e9")
             << QByteArray::fromHex("e900") << QByteArray("UCS-2LE");
         QTest::newRow("big-endian") << QByteArray("CP936") << QByteArray::fromHex("d6d0cec4")
@@ -170,6 +176,9 @@ private slots:
         QTest::newRow("GBK-valid-prefix-truncated-tail") << QByteArray("CP936") << QByteArray::fromHex("d6d081");
         QTest::newRow("Big5-truncated") << QByteArray("CP950") << QByteArray::fromHex("a4");
         QTest::newRow("Big5-invalid") << QByteArray("CP950") << QByteArray::fromHex("a420");
+        QTest::newRow("CP932-truncated") << QByteArray("CP932") << QByteArray::fromHex("81");
+        QTest::newRow("CP932-invalid") << QByteArray("CP932") << QByteArray::fromHex("8120");
+        QTest::newRow("CP932-valid-prefix-truncated-tail") << QByteArray("CP932") << QByteArray::fromHex("874081");
         QTest::newRow("UTF8-truncated") << QByteArray("UTF-8") << QByteArray::fromHex("e4b8");
         QTest::newRow("UTF8-invalid") << QByteArray("UTF-8") << QByteArray::fromHex("e428a0");
     }
@@ -201,27 +210,35 @@ private slots:
             QCOMPARE(output.first(4), QByteArray::fromHex("41005a00"));
         }
     }
+    void codePageOutputBoundsPreserveInput_data() {
+        QTest::addColumn<QByteArray>("codePage");
+        QTest::addColumn<QByteArray>("encoded");
+        QTest::addColumn<QByteArray>("expected");
+        QTest::newRow("Chinese") << QByteArray("CP936") << QByteArray::fromHex("d6d0cec4") << QByteArray::fromHex("2d4e8765");
+        QTest::newRow("Japanese-Windows") << QByteArray("CP932") << QByteArray::fromHex("8740fa4081605c815f")
+            << QByteArray::fromHex("602470215eff5c003cff");
+    }
     void codePageOutputBoundsPreserveInput() {
+        QFETCH(QByteArray, codePage); QFETCH(QByteArray, encoded); QFETCH(QByteArray, expected);
         std::unique_ptr<qcopilots_search_wv2_converter, decltype(&iconv_close)> converter(
-            iconv_open("UCS-2LE", "CP936"), iconv_close);
+            iconv_open("UCS-2LE", codePage.constData()), iconv_close);
         QVERIFY(converter.get() != reinterpret_cast<iconv_t>(-1));
-        const QByteArray encoded = QByteArray::fromHex("d6d0cec4");
         const char *input = encoded.constData();
         size_t inputSize = size_t(encoded.size());
-        char output[2] = {};
-        char *target = output;
-        size_t targetSize = sizeof(output);
+        QByteArray output(expected.size() - 1, char(0x5a));
+        char *target = output.data();
+        size_t targetSize = size_t(output.size());
         QCOMPARE(iconv(converter.get(), &input, &inputSize, &target, &targetSize), size_t(-1));
         QCOMPARE(errno, E2BIG);
         QCOMPARE(input, encoded.constData());
         QCOMPARE(inputSize, size_t(encoded.size()));
-        QCOMPARE(target, output);
-        QCOMPARE(targetSize, sizeof(output));
-        QCOMPARE(QByteArray(output, 2), QByteArray(2, '\0'));
-        char sufficient[4] = {}; target = sufficient; targetSize = sizeof(sufficient);
+        QCOMPARE(target, output.data());
+        QCOMPARE(targetSize, size_t(output.size()));
+        QCOMPARE(output, QByteArray(expected.size() - 1, char(0x5a)));
+        QByteArray sufficient(expected.size(), '\0'); target = sufficient.data(); targetSize = size_t(sufficient.size());
         QCOMPARE(iconv(converter.get(), &input, &inputSize, &target, &targetSize), size_t(0));
         QCOMPARE(inputSize, size_t(0)); QCOMPARE(targetSize, size_t(0));
-        QCOMPARE(QByteArray(sufficient, 4), QByteArray::fromHex("2d4e8765"));
+        QCOMPARE(sufficient, expected);
         QCOMPARE(iconv(converter.get(), nullptr, nullptr, nullptr, nullptr), size_t(0));
     }
 };

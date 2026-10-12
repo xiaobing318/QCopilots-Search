@@ -13,6 +13,8 @@
 #include <string>
 
 #ifdef Q_OS_WIN
+#include <git2/sys/config.h>
+#include <git2/sys/repository.h>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -269,6 +271,44 @@ bool gitIgnored(const QString &repository, const QList<FileRecord> &files,
         return false;
     }
     std::unique_ptr<git_repository, decltype(&git_repository_free)> repo(rawRepository, git_repository_free);
+#ifdef Q_OS_WIN
+    // Scanning can read long working-tree paths even when the user's Git
+    // client keeps core.longpaths disabled. Overlay a readonly snapshot for
+    // this repository instance without writing either source or user config.
+    git_config *rawConfig = nullptr;
+    if (git_repository_config_snapshot(&rawConfig, repo.get()) < 0) {
+        error = QStringLiteral("Cannot read Git configuration for %1: %2").arg(repository, gitError());
+        return false;
+    }
+    std::unique_ptr<git_config, decltype(&git_config_free)> config(rawConfig, git_config_free);
+    static constexpr char longPaths[] = "[core]\nlongpaths = true\n";
+    git_config_backend *rawBackend = nullptr;
+    if (git_config_backend_from_string(&rawBackend, longPaths, sizeof(longPaths) - 1, nullptr) < 0) {
+        error = QStringLiteral("Cannot create Git path configuration for %1: %2").arg(repository, gitError());
+        return false;
+    }
+    const auto freeBackend = [](git_config_backend *backend) { if (backend) backend->free(backend); };
+    std::unique_ptr<git_config_backend, decltype(freeBackend)> backend(rawBackend, freeBackend);
+    if (git_config_add_backend(config.get(), backend.get(), GIT_CONFIG_LEVEL_APP, repo.get(), 0) < 0) {
+        error = QStringLiteral("Cannot apply Git path configuration for %1: %2").arg(repository, gitError());
+        return false;
+    }
+    backend.release(); // The config owns an added backend.
+    // libgit2 1.9.1's memory backend does not retain entries returned by get.
+    // Freeze via its deep-copy iterator before any lookup can release that
+    // backend's list. Only snapshot backends with safe entry ownership are
+    // exposed to repository config lookups and their later destruction.
+    git_config *rawSnapshot = nullptr;
+    if (git_config_snapshot(&rawSnapshot, config.get()) < 0) {
+        error = QStringLiteral("Cannot snapshot Git path configuration for %1: %2").arg(repository, gitError());
+        return false;
+    }
+    std::unique_ptr<git_config, decltype(&git_config_free)> snapshot(rawSnapshot, git_config_free);
+    if (git_repository_set_config(repo.get(), snapshot.get()) < 0) {
+        error = QStringLiteral("Cannot activate Git path configuration for %1: %2").arg(repository, gitError());
+        return false;
+    }
+#endif
     git_index *rawIndex = nullptr;
     if (git_repository_index(&rawIndex, repo.get()) < 0) {
         error = QStringLiteral("Cannot read Git index for %1: %2").arg(repository, gitError());

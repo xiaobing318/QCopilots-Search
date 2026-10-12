@@ -15,7 +15,7 @@
 
 Qt 6.12.0 和独立 Qt PDF 6.140.0 由 bootstrap 安装。官方 SDK 包按下载校验值锁定。其他依赖通过 CMake 下载到外置依赖目录，不修改系统包的源码，也不在仓库中展开第三方源码。
 
-Linux 主机还需要 Qt 使用的图形、字体、XCB、DBus 和多媒体运行依赖。Qt Multimedia 的 PulseAudio 客户端动态库由 `libpulse0` 提供，构建和运行都需要该库，不要求安装开发头文件或启动音频服务。无显示服务器的 CI 在 Xvfb 中执行 GUI 用例。平台依赖安装命令以 `.github/workflows/qcopilots-search-native.yml` 为可执行参考，`doctor` 输出用于检查当前主机。
+Linux 主机还需要 Qt 使用的图形、字体、XCB、DBus 和多媒体运行依赖。Qt 的 XCB 平台插件需要 `libxcb-shape0` 提供的 `libxcb-shape.so.0`。Qt Multimedia 的 PulseAudio 客户端动态库由 `libpulse0` 提供，构建和运行都需要该库，不要求安装开发头文件或启动音频服务。无显示服务器的 CI 在 Xvfb 中执行 GUI 用例。平台依赖安装命令以 `.github/workflows/qcopilots-search-native.yml` 为可执行参考，`doctor` 输出用于检查当前主机。
 
 ## 目录布局
 
@@ -38,6 +38,8 @@ QCopilots-search/                 源码，可以位于任意可读目录
 ```
 
 `stage` 供部署和打包使用。程序的真实用户数据通过平台标准应用目录解析，开发构建目录不会成为默认用户数据目录。使用 `--profile-dir` 可以让 GUI、服务和 CLI 连接独立实例，`--model-dir` 可以选择模型目录。
+
+Windows 的数据库打开使用扩展 NT 路径和 SQLite `win32-longpath` VFS，锁文件在 `QLockFile` 构造处统一转换绝对盘符或 UNC 路径，使创建和删除使用同一文件名。公开路径、持久化配置和 IPC 实例标识仍采用原有表示。这些适配不取消文件系统、单个路径段或第三方工具自身的长度限制。启动子进程时，Windows 工作目录仍受 `MAX_PATH` 限制。发布证据工具仅在确认指向同一目录后使用现有 8.3 短名称，也允许显式指定较短的 `--working-directory`，详见[发布指南](releasing.md)。
 
 ## 统一脚本入口
 

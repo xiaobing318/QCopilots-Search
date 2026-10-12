@@ -164,6 +164,10 @@ function(qcopilots_search_add_git_dependency)
     qcopilots_search_fetch(qcopilots_search_libgit2
         "https://codeload.github.com/libgit2/libgit2/tar.gz/refs/tags/v1.9.1"
         "14cab3014b2b7ad75970ff4548e83615f74d719afe00aa479b4a889c1e13fc00")
+    include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcopilots-search-native-git-patch.cmake")
+    qcopilots_search_prepare_git_source("${qcopilots_search_libgit2_SOURCE_DIR}"
+        "${qcopilots_search_libgit2_BINARY_DIR}" patched_git_source)
+    set(qcopilots_search_libgit2_SOURCE_DIR "${patched_git_source}")
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
     set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
     set(BUILD_SHARED_LIBS ON)

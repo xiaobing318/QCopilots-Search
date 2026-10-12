@@ -26,5 +26,18 @@ endif()
 target_sources(qcopilots-search-tests-extraction-legacy_doc PRIVATE legacy_doc_fixtures.qrc)
 set_target_properties(qcopilots-search-tests-extraction-legacy_doc PROPERTIES AUTORCC ON)
 target_link_libraries(qcopilots-search-tests-extraction-legacy_doc PRIVATE Qt6::Core5Compat)
+if(APPLE)
+    # This test exercises the private inline adapter as well as the wv2 DLL.
+    target_link_libraries(qcopilots-search-tests-extraction-legacy_doc PRIVATE "${QCOPILOTS_SEARCH_COREFOUNDATION_LIBRARY}")
+endif()
 target_sources(qcopilots-search-tests-extraction-image PRIVATE image_fixtures.qrc)
 set_target_properties(qcopilots-search-tests-extraction-image PROPERTIES AUTORCC ON)
+add_executable(qcopilots-search-tests-jpeg-probe jpeg_probe.cpp)
+target_link_libraries(qcopilots-search-tests-jpeg-probe PRIVATE
+    Qt6::Core qcopilots-search::raw JPEG::JPEG ${CMAKE_DL_LIBS})
+target_compile_features(qcopilots-search-tests-jpeg-probe PRIVATE cxx_std_20)
+target_compile_definitions(qcopilots-search-tests-extraction-image PRIVATE
+    QCOPILOTS_SEARCH_TEST_JPEG_PROBE_PATH="$<TARGET_FILE:qcopilots-search-tests-jpeg-probe>"
+    QCOPILOTS_SEARCH_TEST_IMAGE_WORKER_PATH="$<TARGET_FILE:qcopilots-search-worker>")
+add_dependencies(qcopilots-search-tests-extraction-image
+    qcopilots-search-tests-jpeg-probe qcopilots-search-worker)

@@ -89,6 +89,8 @@ $tool = Join-Path $source 'tools/qcopilots-search-release-evidence.py'
 
 命令输出新的 `build-record.json` 路径。将它保存为 `$buildRecord`，后续 `run-local` 在实际启动前核对 clean source 和 producer 的 SHA-256，在进程结束后再次核对。`{program}`、`{evidence}`、`{report}` 由工具展开，分别表示已经核验的程序、本次唯一目录和报告路径。不要将旧报告复制到新目录冒充新执行。
 
+Windows 的 `CreateProcessW` 对工作目录仍有 `MAX_PATH` 限制，即使证据文件本身支持长路径。工具默认在本次证据目录执行，路径过长时仅采用经文件身份核验、指向同一目录的现有 8.3 短名称，并记录 `requestedWorkingDirectory` 和 `actualWorkingDirectory`。文件系统未提供可用短名称时会明确失败。此时可以在 `record-build` 或 `run-local` 的 `--` 之前显式指定 `--working-directory <已有的较短目录>`。只有这个选项会改变命令中相对路径的基准，证据和报告继续写入原来的绝对路径。建议命令的输入文件使用绝对路径。该限制见 [Microsoft 的工作目录文档](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setcurrentdirectory)。
+
 ```powershell
 & $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot `
   --kind physical --program-name qcopilots-search-tests-file-capacity `

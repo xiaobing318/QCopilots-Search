@@ -3,6 +3,7 @@
 #include "core/ipc_directory.h"
 #include "core/pipeline_manifest.h"
 #include "core/model_files.h"
+#include "core/native_lock_path.h"
 #include "core/types.h"
 #include "support/test_environment.h"
 
@@ -27,6 +28,7 @@ class CoreTest : public QObject {
     Q_OBJECT
 private slots:
     void explicitRuntimePaths();
+    void nativeLockPaths();
     void runtimePathIdentity();
     void ipcIgnoresLongTemporaryDirectory();
 #ifdef Q_OS_UNIX
@@ -53,6 +55,29 @@ private slots:
     void progressSerialization();
     void pipelineContracts();
 };
+
+void CoreTest::nativeLockPaths()
+{
+    QCOMPARE(nativeLockFilePath({}), QString{});
+#ifdef Q_OS_WIN
+    QCOMPARE(nativeLockFilePath(QStringLiteral("C:/中文 folder/qcopilots-search.lock")),
+             QStringLiteral("\\\\?\\C:\\中文 folder\\qcopilots-search.lock"));
+    QCOMPARE(nativeLockFilePath(QStringLiteral("//server/share/中文 folder/qcopilots-search.lock")),
+             QStringLiteral("\\\\?\\UNC\\server\\share\\中文 folder\\qcopilots-search.lock"));
+    for (const QString &extended : {QStringLiteral("\\\\?\\C:\\目录\\lock"),
+                                   QStringLiteral("\\\\?\\UNC\\server\\share\\目录\\lock"),
+                                   QStringLiteral("\\\\.\\C:\\目录\\lock")}) {
+        QCOMPARE(nativeLockFilePath(extended), extended);
+        QCOMPARE(nativeLockFilePath(nativeLockFilePath(extended)), extended);
+    }
+    QCOMPARE(nativeLockFilePath(QStringLiteral("C:/folder/../folder/lock")),
+             QStringLiteral("\\\\?\\C:\\folder\\lock"));
+#else
+    for (const QString &path : {QStringLiteral("/tmp/中文 folder/lock"), QStringLiteral("relative/lock"),
+                               QStringLiteral("C:/literal-Windows-path/lock")})
+        QCOMPARE(nativeLockFilePath(path), path);
+#endif
+}
 
 void CoreTest::explicitRuntimePaths()
 {

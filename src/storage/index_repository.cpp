@@ -43,12 +43,28 @@ struct Connection {
       sqlite3_close_v2(db);
       db = nullptr;
     }
-    const auto path = file.toUtf8();
+    QString nativeFile = file;
+    const char *vfs = nullptr;
+#ifdef Q_OS_WIN
+    // The longpath VFS raises SQLite's UTF-8 path budget, but does not add
+    // the Win32 extended prefix. Supply both without requiring machine-wide
+    // LongPathsEnabled policy or changing the public profile/IPC identity.
+    nativeFile = QDir::toNativeSeparators(QFileInfo(file).absoluteFilePath());
+    if (!nativeFile.startsWith(QStringLiteral("\\\\?\\"))) {
+      nativeFile = nativeFile.startsWith(QStringLiteral("\\\\"))
+          ? QStringLiteral("\\\\?\\UNC\\") + nativeFile.mid(2)
+          : QStringLiteral("\\\\?\\") + nativeFile;
+    }
+    vfs = "win32-longpath";
+    if (!sqlite3_vfs_find(vfs))
+      throw std::runtime_error("Required SQLite win32-longpath VFS is unavailable");
+#endif
+    const auto path = nativeFile.toUtf8();
     if (sqlite3_open_v2(path.constData(), &db,
                         writable ? SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
                                        SQLITE_OPEN_NOMUTEX
                                  : SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
-                        nullptr) != SQLITE_OK)
+                        vfs) != SQLITE_OK)
       fail(db, "Open database");
     sqlite3_busy_timeout(db, sqliteBusyTimeoutMs);
     execute(db, "PRAGMA foreign_keys=ON");

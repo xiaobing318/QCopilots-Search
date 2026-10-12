@@ -522,7 +522,7 @@ def main():
         os.environ["QCOPILOTS_SEARCH_SEMANTIC_REPORT"] = str(REPORTS / "semantic-quality.json")
         os.environ["QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT"] = str(REPORTS / "physical-files-ci.json")
         try:
-            dev(action, "--keep-failed-tests", "--report-dir", str(REPORTS / "tests"), display=True)
+            dev(action, "--fail-fast", "--keep-failed-tests", "--report-dir", str(REPORTS / "tests"), display=True)
         except subprocess.CalledProcessError:
             diagnostics = gui_failure_diagnostics(REPORTS / "tests/ctest.xml", REPORTS / "mac-gui-debug")
             (REPORTS / "gui-failure-diagnostics.json").write_text(

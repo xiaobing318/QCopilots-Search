@@ -1,3 +1,4 @@
+#include "core/native_lock_path.h"
 #include "core/runtime_paths.h"
 #include "core/types.h"
 #include "extraction/extractor.h"
@@ -68,7 +69,7 @@ void reclaimAbandonedJobs(const RuntimePaths &paths)
         if (owner.value(QStringLiteral("version")).toInt() != 1
             || owner.value(QStringLiteral("kind")).toString() != QStringLiteral("qcopilots-search-worker-temporary")
             || owner.value(QStringLiteral("profile")).toString() != paths.profileDir) continue;
-        QLockFile lock(directory.filePath(QString::fromLatin1(temporaryLock)));
+        QLockFile lock(nativeLockFilePath(directory.filePath(QString::fromLatin1(temporaryLock))));
         lock.setStaleLockTime(0);
         if (!lock.tryLock(0)) continue;
         lock.unlock();
@@ -347,7 +348,7 @@ private:
         QTemporaryDir temporary(QDir(paths_.tempDir).filePath(QStringLiteral("qcopilots-search-worker-XXXXXX")));
         if (!temporary.isValid())
             return failure(id, QStringLiteral("temporary_directory"), QStringLiteral("Cannot create isolated worker temporary directory: %1").arg(temporary.errorString()));
-        QLockFile jobLock(QDir(temporary.path()).filePath(QString::fromLatin1(temporaryLock)));
+        QLockFile jobLock(nativeLockFilePath(QDir(temporary.path()).filePath(QString::fromLatin1(temporaryLock))));
         jobLock.setStaleLockTime(0);
         if (!jobLock.tryLock(0))
             return failure(id, QStringLiteral("temporary_directory"), QStringLiteral("Cannot lock worker temporary directory"));

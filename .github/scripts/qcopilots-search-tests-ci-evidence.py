@@ -273,6 +273,53 @@ class PythonSigningEvidenceTests(unittest.TestCase):
             self.assertFalse(self.inspect(signing_verbose(rows, footer=footer))["releaseComplete"])
 
 
+class NativeTestFlowTests(unittest.TestCase):
+    def run_test_action(self, failure=None):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-ci-test-flow-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+            root = Path(temporary)
+            reports = root / "reports"
+            inventory = json.dumps({"kind": "ctestInfo", "tests": [{"name": "qcopilots-search-tests-core"}]})
+            with mock.patch.object(native.sys, "argv", ["synthetic-native-ci", "test"]), \
+                    mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "REPORTS", reports, create=True), \
+                    mock.patch.object(native.platform, "machine", return_value="x86_64"), \
+                    mock.patch.dict(native.os.environ, {"QCOPILOTS_SEARCH_CI_ARCH": "x86_64"}), \
+                    mock.patch.object(native, "run", return_value=native.subprocess.CompletedProcess([], 0, stdout=inventory)), \
+                    mock.patch.object(native, "dev", side_effect=failure) as dev, \
+                    mock.patch.object(native, "test_evidence") as acceptance, \
+                    mock.patch.object(native, "gui_failure_diagnostics", return_value={"attempts": []}) as gui_diagnostics, \
+                    mock.patch.object(native, "linux_failure_diagnostics", return_value={"commands": []}) as linux_diagnostics, \
+                    mock.patch.object(native.subprocess, "Popen") as spawn:
+                if failure is None:
+                    native.main()
+                    acceptance.assert_called_once_with(require_complete=True)
+                    gui_diagnostics.assert_not_called()
+                    linux_diagnostics.assert_not_called()
+                else:
+                    with self.assertRaises(native.subprocess.CalledProcessError) as caught:
+                        native.main()
+                    self.assertIs(caught.exception, failure)
+                    acceptance.assert_not_called()
+                    gui_diagnostics.assert_called_once_with(reports / "tests/ctest.xml", reports / "mac-gui-debug")
+                    linux_diagnostics.assert_called_once_with(reports / "tests/ctest.xml", reports / "linux-loader")
+                dev.assert_called_once()
+                arguments = dev.call_args.args
+                self.assertEqual(arguments[0], "test")
+                self.assertEqual(arguments.count("--fail-fast"), 1)
+                self.assertIn("--keep-failed-tests", arguments)
+                self.assertEqual(arguments[arguments.index("--report-dir") + 1], str(reports / "tests"))
+                self.assertTrue(dev.call_args.kwargs["display"])
+                spawn.assert_not_called()
+            self.assertEqual((reports / "tests/ctest-inventory.json").read_text(encoding="utf-8"), inventory)
+
+    def test_fail_fast_invocation_still_requires_complete_evidence_after_success(self):
+        self.run_test_action()
+
+    def test_fail_fast_failure_preserves_original_error_without_acceptance_success(self):
+        self.run_test_action(native.subprocess.CalledProcessError(17, ["synthetic-dev", "test"]))
+
+
 class NativeIdentityTests(unittest.TestCase):
     def test_pr_candidate_head_is_distinct_from_merge_checkout(self):
         with tempfile.TemporaryDirectory(prefix="qcopilots-search-event-") as directory:

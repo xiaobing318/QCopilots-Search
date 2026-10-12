@@ -203,6 +203,47 @@ include(CPack)
         with self.assertRaises(RuntimeError):
             workflow.disk_guard(self.root, 1e12)
 
+    def test_fail_fast_stops_ctest_without_hiding_failure(self):
+        import shutil
+        import xml.etree.ElementTree as ET
+        checkout = self.root / "测试源码 source"
+        tools = checkout / "tools"
+        tools.mkdir(parents=True)
+        shutil.copy2(SCRIPT, tools / SCRIPT.name)
+        (checkout / "CMakeLists.txt").write_text('''
+cmake_minimum_required(VERSION 3.28)
+project(qcopilots-search-fail-fast-test LANGUAGES NONE)
+enable_testing()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fail.cmake"
+  "message(FATAL_ERROR \\\"intentional fixture failure\\\")\\n")
+add_test(NAME qcopilots-search-tests-first-failure
+  COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_BINARY_DIR}/fail.cmake")
+add_test(NAME qcopilots-search-tests-second-marker
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/second-ran.txt")
+''', encoding="utf-8")
+        build = self.root / "test build"
+        command = [sys.executable, str(tools / SCRIPT.name)]
+        result = subprocess.run([*command, "configure", "--build-root", str(build)],
+                                cwd=self.root, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        marker = build / "release/second-ran.txt"
+        for fail_fast in (False, True):
+            with self.subTest(fail_fast=fail_fast):
+                marker.unlink(missing_ok=True)
+                report = self.root / ("fail-fast" if fail_fast else "complete-tests")
+                result = subprocess.run(
+                    [*command, "test", "--build-root", str(build), "--jobs", "1",
+                     "--report-dir", str(report), *(["--fail-fast"] if fail_fast else [])],
+                    cwd=self.root, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("intentional fixture failure", result.stdout + result.stderr)
+                self.assertEqual(marker.exists(), not fail_fast)
+                cases = ET.parse(report / "ctest.xml").findall("testcase")
+                self.assertEqual(len(cases), 1 if fail_fast else 2)
+                self.assertEqual(len([case for case in cases if case.find("failure") is not None]), 1)
+
     def test_qt_sdk_relocation_with_unicode(self):
         sdk = self.root / "SDK 中文 空格"
         kit = {"Windows": "msvc2022_64", "Darwin": "macos", "Linux": "gcc_64"}[workflow.platform.system()]

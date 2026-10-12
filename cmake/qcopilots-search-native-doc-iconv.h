@@ -13,11 +13,16 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#ifdef Q_OS_MACOS
+#include <CoreFoundation/CoreFoundation.h>
+#include <QtCore/qscopeguard.h>
+#endif
 
 struct qcopilots_search_wv2_converter {
     QByteArray name;
     QTextCodec *codec;
     bool bigEndian;
+    bool nativeCp932;
 };
 using iconv_t = qcopilots_search_wv2_converter *;
 
@@ -36,16 +41,26 @@ inline iconv_t iconv_open(const char *destination, const char *source)
     else if (name.compare("CP949", Qt::CaseInsensitive) == 0) canonical = "windows-949";
     else if (name.compare("CP932", Qt::CaseInsensitive) == 0) canonical = "windows-932";
     QStringDecoder decoder(canonical, QStringConverter::Flag::Stateless);
+    bool nativeCp932 = false;
+#ifdef Q_OS_MACOS
+    if (!decoder.isValid() && canonical == "windows-932") {
+        // Qt's built-in Shift_JIS codec does not enable the Windows NEC/IBM
+        // extensions by default. CoreFoundation exposes the actual Windows
+        // code page, without changing global UNICODEMAP_JP or codec state.
+        const auto encoding = CFStringConvertWindowsCodepageToEncoding(932);
+        nativeCp932 = encoding != kCFStringEncodingInvalidId && CFStringIsEncodingAvailable(encoding);
+    }
+#endif
     QTextCodec *codec = nullptr;
-    if (!decoder.isValid() && !canonical.isEmpty()) {
+    if (!decoder.isValid() && !nativeCp932 && !canonical.isEmpty()) {
         codec = QTextCodec::codecForName(canonical);
         if (!codec && canonical != name) codec = QTextCodec::codecForName(name);
     }
-    if ((!little && !big) || canonical.isEmpty() || (!decoder.isValid() && !codec)) {
+    if ((!little && !big) || canonical.isEmpty() || (!decoder.isValid() && !nativeCp932 && !codec)) {
         errno = EINVAL;
         return reinterpret_cast<iconv_t>(-1);
     }
-    auto *converter = new (std::nothrow) qcopilots_search_wv2_converter{canonical, codec, big};
+    auto *converter = new (std::nothrow) qcopilots_search_wv2_converter{canonical, codec, big, nativeCp932};
     if (!converter) {
         errno = ENOMEM;
         return reinterpret_cast<iconv_t>(-1);
@@ -81,6 +96,19 @@ inline std::size_t iconv(iconv_t converter, const char **input,
         return failure;
     }
     QString text;
+#ifdef Q_OS_MACOS
+    if (converter->nativeCp932) {
+        // CreateWithBytes consumes the complete run with lossless conversion.
+        // Invalid bytes or an incomplete trailing sequence return null. Keep
+        // the caller's input and output untouched until every check succeeds.
+        const auto decoded = CFStringCreateWithBytes(kCFAllocatorDefault,
+            reinterpret_cast<const UInt8 *>(*input), static_cast<CFIndex>(*inputBytes),
+            CFStringConvertWindowsCodepageToEncoding(932), false);
+        if (!decoded) { errno = EILSEQ; return failure; }
+        const auto release = qScopeGuard([decoded] { CFRelease(decoded); });
+        text = QString::fromCFString(decoded);
+    } else
+#endif
     if (!converter->codec) {
         // A fresh decoder per complete run also clears Qt's error counter.
         // Qt 6.12's ICU resetState() only resets the ICU conversion state.

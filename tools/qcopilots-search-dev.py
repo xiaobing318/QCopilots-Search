@@ -105,6 +105,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 2))
     parser.add_argument("--model-dir", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_MODEL_DIR"))
     parser.add_argument("--test-label")
+    parser.add_argument("--fail-fast", action="store_true",
+                        help="Stop scheduling further tests after the first failure")
     parser.add_argument("--generator", help="CPack generator, for example ZIP, NSIS, TGZ, DEB or DragNDrop")
     parser.add_argument("--package-file", type=Path, help="Specific distribution archive to verify")
     parser.add_argument("--report-dir", type=Path, help="Explicit unique report directory for this test or package verification run")
@@ -171,6 +173,8 @@ def main():
                    "--output-junit", run_report / "ctest.xml"]
         if args.test_label:
             command.extend(["-L", args.test_label])
+        if args.fail_fast:
+            command.append("--stop-on-failure")
         run(command, cwd=root, env=environment)
     elif args.action == "run":
         run([executable(build, PRODUCT), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=environment)

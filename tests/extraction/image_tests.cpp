@@ -6,6 +6,7 @@
 #include <QFontDatabase>
 #include <QFontMetrics>
 #include <QImage>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPainter>
@@ -21,6 +22,7 @@
 #include <QtTest>
 
 using namespace qcopilots_search;
+
 
 class ImageExtractionTests : public QObject {
     Q_OBJECT
@@ -115,6 +117,99 @@ private slots:
         QTest::newRow("DNG-uncompressed") << QStringLiteral("generated-uncompressed.dng") << QSize(32,32);
         QTest::newRow("DNG-float-deflate") << QStringLiteral("generated-deflate.dng") << QSize(32,32);
         QTest::newRow("DNG-lossy-jpeg") << QStringLiteral("generated-jpeg.dng") << QSize(64,64);
+    }
+    void jpegDngCodecContract()
+    {
+        qcopilots_search::test::ExtractionDirectory temporary(testTemplate()); QVERIFY(temporary.isValid());
+        const auto path = QDir(temporary.path()).filePath(QStringLiteral("中文 diagnostic generated-jpeg.dng"));
+        QVERIFY(QFile::copy(QStringLiteral(":/images/generated-jpeg.dng"), path));
+        QProcess helper;
+        helper.setWorkingDirectory(temporary.path());
+        helper.start(QString::fromUtf8(QCOPILOTS_SEARCH_TEST_JPEG_PROBE_PATH), {path});
+        const bool started = helper.waitForStarted(10'000);
+        if (!started) { helper.kill(); helper.waitForFinished(5'000); }
+        QVERIFY2(started, qPrintable(helper.errorString()));
+        const bool finished = helper.waitForFinished(30'000);
+        if (!finished) { helper.kill(); helper.waitForFinished(5'000); }
+        const auto json = helper.readAllStandardOutput();
+        const auto errors = helper.readAllStandardError();
+        QFile evidence(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-jpeg-dng-codec.json")));
+        QVERIFY(evidence.open(QIODevice::WriteOnly)); QCOMPARE(evidence.write(json), qint64(json.size())); evidence.close();
+        QFile stderrFile(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-jpeg-dng-codec.stderr.txt")));
+        QVERIFY(stderrFile.open(QIODevice::WriteOnly)); QCOMPARE(stderrFile.write(errors), qint64(errors.size())); stderrFile.close();
+        qInfo().noquote() << json << errors;
+        QVERIFY2(finished, "JPEG codec probe timed out");
+        QVERIFY2(helper.exitStatus() == QProcess::NormalExit, errors.constData());
+        QJsonParseError parse;
+        const auto document = QJsonDocument::fromJson(json, &parse);
+        QVERIFY2(parse.error == QJsonParseError::NoError && document.isObject(), json.constData());
+        const auto report = document.object();
+        QCOMPARE(report.value("fixtureSha256").toString(), QStringLiteral("65eb7a5050b3f87172b9a424cfa9b7652adc0c30a260b1d4b971e14c2a1fb28b"));
+        const auto jpeg = report.value("jpeg").toObject();
+        const auto buffer = report.value("rawBuffer").toObject();
+        const auto traced = report.value("rawTracedBuffer").toObject();
+        QVERIFY2(jpeg.value("complete").toBool(), json.constData());
+        QVERIFY2(buffer.value("complete").toBool(), json.constData());
+        QVERIFY2(traced.value("complete").toBool(), json.constData());
+        QCOMPARE(buffer.value("width").toInt(), 64); QCOMPARE(buffer.value("height").toInt(), 64);
+        QCOMPARE(traced.value("width").toInt(), 64); QCOMPARE(traced.value("height").toInt(), 64);
+        QCOMPARE(helper.exitCode(), 0);
+    }
+    void jpegDngWorkerContract()
+    {
+        qcopilots_search::test::ExtractionDirectory temporary(testTemplate()); QVERIFY(temporary.isValid());
+        const auto path = QDir(temporary.path()).filePath(QStringLiteral("中文 worker generated-jpeg.dng"));
+        QVERIFY(QFile::copy(QStringLiteral(":/images/generated-jpeg.dng"), path));
+        QProcess worker;
+        worker.setWorkingDirectory(temporary.path());
+        worker.start(QString::fromUtf8(QCOPILOTS_SEARCH_TEST_IMAGE_WORKER_PATH),
+            {QStringLiteral("--mode"), QStringLiteral("extract"), QStringLiteral("--profile-dir"),
+             QDir(temporary.path()).filePath(QStringLiteral("独立 worker profile")), QStringLiteral("--model-dir"),
+             QDir(temporary.path()).filePath(QStringLiteral("unused models")), QStringLiteral("--threads"), QStringLiteral("1")});
+        const bool started = worker.waitForStarted(10'000);
+        if (!started) { worker.kill(); worker.waitForFinished(5'000); }
+        QVERIFY2(started, qPrintable(worker.errorString()));
+        const QJsonObject request{{"id", "jpeg-dng"}, {"operation", "extract"}, {"path", path},
+            {"embed", false}, {"enableOcr", false}};
+        const auto frame = QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n';
+        const auto accepted = worker.write(frame);
+        // Closing stdin drains this single real extraction before worker exit.
+        worker.closeWriteChannel();
+        const bool finished = worker.waitForFinished(30'000);
+        if (!finished) { worker.kill(); worker.waitForFinished(5'000); }
+        const auto json = worker.readAllStandardOutput();
+        const auto errors = worker.readAllStandardError();
+        QFile evidence(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-jpeg-dng-worker.json")));
+        QVERIFY(evidence.open(QIODevice::WriteOnly)); QCOMPARE(evidence.write(json), qint64(json.size())); evidence.close();
+        QFile stderrFile(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-jpeg-dng-worker.stderr.txt")));
+        QVERIFY(stderrFile.open(QIODevice::WriteOnly)); QCOMPARE(stderrFile.write(errors), qint64(errors.size())); stderrFile.close();
+        qInfo().noquote() << json << errors;
+        QCOMPARE(accepted, qint64(frame.size()));
+        QVERIFY2(finished, "DNG extraction worker timed out");
+        QVERIFY2(worker.exitStatus() == QProcess::NormalExit, errors.constData());
+        QCOMPARE(worker.exitCode(), 0);
+        QJsonParseError parse;
+        const auto document = QJsonDocument::fromJson(json, &parse);
+        QVERIFY2(parse.error == QJsonParseError::NoError && document.isObject(), json.constData());
+        const auto reply = document.object();
+        QCOMPARE(reply.value("id").toString(), QStringLiteral("jpeg-dng"));
+        QVERIFY2(reply.value("ok").toBool(), json.constData());
+        const auto result = reply.value("result").toObject();
+        QVERIFY2(result.value("error").toString().isEmpty(), json.constData());
+        QCOMPARE(result.value("state").toString(), QStringLiteral("complete"));
+        QVERIFY(result.value("complete").toBool()); QVERIFY(!result.value("embedded").toBool());
+        QCOMPARE(result.value("next").toInt(), 1);
+        QCOMPARE(result.value("sourceVersion").toString(), Extractor::sourceVersion(path));
+        const auto segments = result.value("segments").toArray(); QCOMPARE(segments.size(), 1);
+        const auto segment = segments.first().toObject();
+        QCOMPARE(segment.value("path").toString(), path);
+        QCOMPARE(segment.value("kind").toString(), QStringLiteral("image"));
+        QCOMPARE(segment.value("modality").toString(), QStringLiteral("image"));
+        QCOMPARE(segment.value("imageBudget").toInt(), 140);
+        QVERIFY(segment.value("embedding").toArray().isEmpty());
+        // Worker deliberately removes its transient media before replying, so
+        // 64 x 64 pixel dimensions remain asserted by realCameraFormats.
+        QVERIFY(segment.value("mediaPath").toString().isEmpty());
     }
     void realCameraFormats()
     {

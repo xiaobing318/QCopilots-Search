@@ -37,10 +37,10 @@ inline QJsonObject embeddingPipelineContract()
 inline QJsonObject extractionPipelineContract()
 {
     return {
-        {QStringLiteral("revision"), 5},
+        {QStringLiteral("revision"), 6},
         {QStringLiteral("qt"), QStringLiteral("6.12.0,QtPDF-6.140.0")},
         {QStringLiteral("documents"), QStringLiteral("UTF-grapheme-chunks=1800,overlap=200,HTML-no-network,ZIP-XML-miniz-3.1.0,RTF-native-v1")},
-        {QStringLiteral("legacyDoc"), QStringLiteral("wv2+POLE-Calligra-88bde0ce71a5c12fb50786017b2e2e07c5ce13e4-port-v2,QStringDecoder-Stateless-fresh-per-call,Core5Compat-fallback,CP950=Big5,CP949=windows-949,CP932=windows-932,atomic-UCS2-output")},
+        {QStringLiteral("legacyDoc"), QStringLiteral("wv2+POLE-Calligra-88bde0ce71a5c12fb50786017b2e2e07c5ce13e4-port-v3,QStringDecoder-Stateless-fresh-per-call,Core5Compat-fallback,CP950=Big5,CP949=windows-949,CP932=windows-932-or-macOS-CoreFoundation-codepage932-strict-full-input,atomic-UCS2-output")},
         {QStringLiteral("code"), QStringLiteral("whole-line-chunks=1800,overlap=2-lines,single-line-crop=4000-graphemes,input=1MiB")},
         {QStringLiteral("notebook"), QStringLiteral("nbformat=3/4,input=20MiB,output=1MiB,cell-position=1-based")},
         {QStringLiteral("pdf"), QStringLiteral("native-text-NFKC-before-classification-and-encoding,>=200-UTF16-or>=24-Unicode-letters-or>=8-Han/Hiragana/Katakana/Hangul-letters,otherwise-render-longest=2000,alpha-composite-white-RGB-before-OCR-and-model,cap=5000-pages,image-budget=280,page=1-based")},
@@ -70,6 +70,6 @@ inline QString embeddingPipelineFingerprint()
 
 inline QString extractionPipelineFingerprint()
 {
-    return pipelineContractFingerprint(QStringLiteral("qcopilots-search-extraction-v5"), extractionPipelineContract());
+    return pipelineContractFingerprint(QStringLiteral("qcopilots-search-extraction-v6"), extractionPipelineContract());
 }
 } // namespace qcopilots_search

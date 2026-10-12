@@ -88,6 +88,10 @@ function(qcopilots_search_add_doc_dependency)
         "$<BUILD_INTERFACE:${wv2_source}>" "$<BUILD_INTERFACE:${wv2_binary}/include>")
     target_include_directories(qcopilots-search-native-wv2 PRIVATE "${pole_source}" "${wv2_binary}/private")
     target_link_libraries(qcopilots-search-native-wv2 PUBLIC Qt6::Core PRIVATE Qt6::Core5Compat)
+    if(APPLE)
+        find_library(QCOPILOTS_SEARCH_COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+        target_link_libraries(qcopilots-search-native-wv2 PRIVATE "${QCOPILOTS_SEARCH_COREFOUNDATION_LIBRARY}")
+    endif()
     target_compile_features(qcopilots-search-native-wv2 PRIVATE cxx_std_20)
     target_compile_definitions(qcopilots-search-native-wv2 PRIVATE
         HAVE_CONFIG_H MAKE_WV2_LIB UNICODE _UNICODE NOMINMAX

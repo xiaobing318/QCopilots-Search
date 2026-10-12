@@ -588,16 +588,61 @@ def fresh_directory(parent: Path, prefix: str):
     return root
 
 
-def execute_record(command, root: Path, *, environment=None):
+def windows_short_directory(directory: Path):
+    """Ask the filesystem for an existing alias, without creating a link."""
+    import ctypes
+    function = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+    function.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    function.restype = ctypes.c_uint32
+    size = function(str(directory), None, 0)
+    if not size:
+        return None
+    buffer = ctypes.create_unicode_buffer(size)
+    written = function(str(directory), buffer, size)
+    return Path(buffer.value) if 0 < written < size else None
+
+
+def fits_windows_cwd(path: Path | str):
+    # Reserve the trailing separator and NUL in CreateProcessW's MAX_PATH buffer.
+    return len(str(path).encode("utf-16-le")) // 2 <= 258
+
+
+def execution_working_directory(root: Path, working_directory: Path | None = None):
+    requested = (working_directory if working_directory is not None else root).expanduser().resolve()
+    if not requested.is_dir():
+        raise ValueError(f"Execution working directory does not exist: {requested}")
+    actual = requested
+    # CreateProcessW still limits cwd even when ordinary file operations allow long paths.
+    if sys.platform == "win32" and not fits_windows_cwd(requested):
+        candidate = windows_short_directory(requested)
+        try:
+            verified = candidate is not None and fits_windows_cwd(candidate) and os.path.samefile(requested, candidate)
+        except OSError:
+            verified = False
+        if not verified:
+            raise ValueError(
+                f"Windows cannot launch a process with this working directory "
+                f"({len(str(requested).encode('utf-16-le')) // 2} UTF-16 characters): {requested}. "
+                "No verified short representation is available. Choose an existing shorter directory "
+                "with --working-directory. This explicitly changes the base for relative command paths, "
+                "while evidence and report paths remain absolute.")
+        actual = candidate
+    return requested, actual
+
+
+def execute_record(command, root: Path, *, environment=None, working_directory: Path | None = None):
+    requested, actual = execution_working_directory(root, working_directory)
     started = datetime.now(timezone.utc).isoformat()
     with (root / "stdout.log").open("wb") as stdout, (root / "stderr.log").open("wb") as stderr:
-        completed = subprocess.run(command, cwd=root, env=environment, stdout=stdout, stderr=stderr, check=False)
+        completed = subprocess.run(command, cwd=actual, env=environment, stdout=stdout, stderr=stderr, check=False)
     return {"command": [str(item) for item in command], "startedAt": started,
             "finishedAt": datetime.now(timezone.utc).isoformat(), "exitCode": completed.returncode,
+            "requestedWorkingDirectory": str(requested), "actualWorkingDirectory": str(actual),
             "stdout": "stdout.log", "stderr": "stderr.log"}
 
 
-def record_build(source: Path, parent: Path, programs: dict[str, Path], command: list[str]):
+def record_build(source: Path, parent: Path, programs: dict[str, Path], command: list[str], *,
+                 working_directory: Path | None = None):
     if not command or not programs:
         raise ValueError("A build command and explicit output programs are required")
     root = fresh_directory(parent, "build-evidence")
@@ -605,7 +650,7 @@ def record_build(source: Path, parent: Path, programs: dict[str, Path], command:
     if valid_identity(before):
         raise ValueError("Build evidence requires a clean immutable source checkout")
     write_json(root / "begin.json", {"identity": before, "programs": {name: str(path) for name, path in programs.items()}, "command": command})
-    execution = execute_record(command, root)
+    execution = execute_record(command, root, working_directory=working_directory)
     after = source_identity(source)
     entries = {}
     if execution["exitCode"] == 0 and before == after:
@@ -625,7 +670,8 @@ def record_build(source: Path, parent: Path, programs: dict[str, Path], command:
 
 
 def run_local(build_record: Path, parent: Path, kind: str, program_name: str, report_relative: str,
-              command: list[str], extra_environment: dict[str, str], inputs: list[Path] | None = None):
+              command: list[str], extra_environment: dict[str, str], inputs: list[Path] | None = None, *,
+              working_directory: Path | None = None):
     build = read_json(build_record)
     errors = verified_build(build_record.parent, build)
     if errors or build.get("kind") != "build-execution" or build.get("passed") is not True:
@@ -660,7 +706,7 @@ def run_local(build_record: Path, parent: Path, kind: str, program_name: str, re
         input_hashes[str(path.resolve())] = digest(path)
     begin["inputHashes"] = input_hashes
     write_json(root / "begin.json", begin)
-    execution = execute_record(expanded, root, environment=environment)
+    execution = execute_record(expanded, root, environment=environment, working_directory=working_directory)
     unchanged = source_identity(source) == identity and digest(producer) == program["sha256"]
     unchanged = unchanged and all(digest(Path(path)) == value for path, value in input_hashes.items())
     matches = list(root.glob(report_relative))
@@ -936,6 +982,8 @@ def main(argv=None):
     build.add_argument("--source", type=Path, default=SOURCE)
     build.add_argument("--output-root", type=Path, required=True)
     build.add_argument("--program", action="append", required=True, help="NAME=absolute executable path, repeat for every producer")
+    build.add_argument("--working-directory", type=Path,
+                       help="Explicit existing cwd for relative command paths, separate from the evidence directory")
     build.add_argument("command", nargs=argparse.REMAINDER)
     local = commands.add_parser("run-local")
     local.add_argument("--build-record", type=Path, required=True)
@@ -945,6 +993,8 @@ def main(argv=None):
     local.add_argument("--report", required=True, help="Fresh relative output path or a glob with exactly one report")
     local.add_argument("--env", action="append", default=[])
     local.add_argument("--input", type=Path, action="append", default=[], help="Capture an external runner script before execution")
+    local.add_argument("--working-directory", type=Path,
+                       help="Explicit existing cwd for relative command paths, separate from the evidence directory")
     local.add_argument("command", nargs=argparse.REMAINDER)
     package = commands.add_parser("record-package")
     for name in ("build-record", "package", "verification", "output-root"):
@@ -975,10 +1025,12 @@ def main(argv=None):
                 raise ValueError("An actual command after -- is required")
         if args.action == "record-build":
             path, result = record_build(args.source.resolve(), args.output_root,
-                                        {name: Path(value).resolve() for name, value in pairs(args.program).items()}, command)
+                                        {name: Path(value).resolve() for name, value in pairs(args.program).items()}, command,
+                                        working_directory=args.working_directory)
         elif args.action == "run-local":
             path, result = run_local(args.build_record.resolve(), args.output_root, args.kind, args.program_name,
-                                     args.report, command, pairs(args.env), [path.resolve() for path in args.input])
+                                     args.report, command, pairs(args.env), [path.resolve() for path in args.input],
+                                     working_directory=args.working_directory)
         elif args.action == "record-package":
             path, result = record_package(args.build_record.resolve(), args.package.resolve(), args.verification.resolve(),
                                           args.output_root, args.model_fingerprint, args.extraction_fingerprint)

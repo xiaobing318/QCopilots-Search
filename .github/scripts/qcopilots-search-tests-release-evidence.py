@@ -859,6 +859,197 @@ class NativeAggregateEvidenceTests(unittest.TestCase):
             self.assertFalse(self.inspect()["passed"])
 
 
+def accessible_short_ancestor(directory):
+    """Choose only a cwd, never a destination for files outside a test root."""
+    requested = directory.resolve()
+    for candidate in (requested, *requested.parents):
+        if evidence.fits_windows_cwd(candidate) and candidate.is_dir() and os.access(candidate, os.R_OK | os.X_OK):
+            return candidate
+    raise unittest.SkipTest("Environment has no accessible short cwd for launching an absolute-output fixture")
+
+
+class ExecutionWorkingDirectoryTests(unittest.TestCase):
+    """Launch actual tiny processes while evidence remains under long paths."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="qcopilots-search-cwd-evidence-中文 ",
+            dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT"))
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        # The explicit launcher is independently temporary. Evidence can live
+        # beneath an arbitrarily deep configured test root on volumes without 8.3.
+        launcher = tempfile.TemporaryDirectory(prefix="qcopilots-search-cwd-")
+        self.addCleanup(launcher.cleanup)
+        self.launcher = Path(launcher.name).resolve()
+        self.absolute_output_cwd = accessible_short_ancestor(self.launcher)
+        self.long_root = self.root / "long evidence"
+        while len(str(self.long_root).encode("utf-16-le")) // 2 < 310:
+            self.long_root /= "long evidence 中文 " + "segment" * 7
+        self.long_root.mkdir(parents=True)
+
+    def run_child(self, root, *, working_directory=None, relative_files=True):
+        expected_cwd = working_directory or root
+        input_path = (expected_cwd / "relative input 中文.txt") if relative_files else (root / "absolute input 中文.txt")
+        output_path = (expected_cwd / "relative output.txt") if relative_files else (root / "absolute output.txt")
+        input_path.write_text("relative fixture", encoding="utf-8")
+        command = [sys.executable, "-c",
+            "import json,os,pathlib,sys\n"
+            "assert pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')=='relative fixture'\n"
+            "pathlib.Path(sys.argv[3]).write_text('child output',encoding='utf-8')\n"
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps({'cwd':os.getcwd(),'environment':"
+            "os.environ['QCOPILOTS_SEARCH_CWD_TEST']}),encoding='utf-8')\n"
+            "print('actual child stdout')\nprint('actual child stderr',file=sys.stderr)\n",
+            str(root / "child.json"), input_path.name if relative_files else str(input_path),
+            output_path.name if relative_files else str(output_path)]
+        environment = {**os.environ, "QCOPILOTS_SEARCH_CWD_TEST": "unchanged relative/value 中文"}
+        snapshot = environment.copy()
+        receipt = evidence.execute_record(command, root, environment=environment,
+                                          working_directory=working_directory)
+        self.assertEqual(receipt["exitCode"], 0, (root / "stderr.log").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["command"], command)
+        self.assertEqual(environment, snapshot)
+        observed = json.loads((root / "child.json").read_text(encoding="utf-8"))
+        self.assertTrue(os.path.samefile(observed["cwd"], expected_cwd))
+        self.assertEqual(observed["environment"], environment["QCOPILOTS_SEARCH_CWD_TEST"])
+        self.assertEqual(output_path.read_text(), "child output")
+        self.assertIn("actual child stdout", (root / "stdout.log").read_text())
+        self.assertIn("actual child stderr", (root / "stderr.log").read_text())
+        return receipt
+
+    def test_default_cwd_keeps_relative_arguments_in_same_directory(self):
+        try:
+            evidence.execution_working_directory(self.launcher)
+        except ValueError as error:
+            self.skipTest(f"Isolated system temporary cwd cannot launch a relative-file fixture: {error}")
+        receipt = self.run_child(self.launcher)
+        self.assertEqual(receipt["requestedWorkingDirectory"], str(self.launcher))
+        self.assertTrue(os.path.samefile(receipt["actualWorkingDirectory"], self.launcher))
+
+    def test_long_default_uses_real_alias_or_reports_filesystem_limitation(self):
+        try:
+            requested, actual = evidence.execution_working_directory(self.long_root)
+        except ValueError as error:
+            # A real no-8.3 filesystem is supported through the explicit choice,
+            # not reported as a skipped automatic-alias process test.
+            self.assertEqual(sys.platform, "win32")
+            self.assertIn("--working-directory", str(error))
+            receipt = self.run_child(self.long_root, working_directory=self.absolute_output_cwd, relative_files=False)
+            self.assertEqual(receipt["requestedWorkingDirectory"], str(self.absolute_output_cwd))
+        else:
+            receipt = self.run_child(self.long_root)
+            self.assertEqual(requested, self.long_root)
+            self.assertTrue(os.path.samefile(actual, requested))
+            self.assertEqual(receipt["requestedWorkingDirectory"], str(requested))
+            self.assertEqual(receipt["actualWorkingDirectory"], str(actual))
+            if sys.platform == "win32":
+                self.assertLessEqual(len(str(actual).encode("utf-16-le")) // 2, 258)
+
+    def test_explicit_cwd_keeps_long_evidence_and_changes_relative_base_only(self):
+        owned_cwd = os.path.samefile(self.absolute_output_cwd, self.launcher)
+        receipt = self.run_child(self.long_root, working_directory=self.absolute_output_cwd, relative_files=owned_cwd)
+        self.assertEqual(receipt["requestedWorkingDirectory"], str(self.absolute_output_cwd))
+        self.assertFalse((self.long_root / "relative output.txt").exists())
+        self.assertTrue((self.long_root / "child.json").is_file())
+
+    def test_exact_windows_cwd_boundary_with_real_processes(self):
+        prefix_units = len(str(self.launcher).encode("utf-16-le")) // 2 + 1
+        if prefix_units >= 258:
+            reason = "Controlled temporary root is too long to construct a canonical 258-unit cwd without writing outside it"
+            print(json.dumps({"case": "actual-process-cwd-boundary", "status": "capability-unavailable", "reason": reason}))
+            self.skipTest(reason)
+        for units in (258, 259):
+            with self.subTest(utf16_units=units):
+                directory = self.launcher / ("b" * (units - prefix_units))
+                directory.mkdir()
+                self.assertEqual(len(str(directory).encode("utf-16-le")) // 2, units)
+                try:
+                    requested, actual = evidence.execution_working_directory(directory)
+                except ValueError as error:
+                    self.assertEqual((sys.platform, units), ("win32", 259))
+                    self.assertIn("--working-directory", str(error))
+                    self.run_child(directory, working_directory=self.absolute_output_cwd, relative_files=False)
+                else:
+                    receipt = self.run_child(directory)
+                    if sys.platform == "win32":
+                        self.assertLessEqual(len(str(actual).encode("utf-16-le")) // 2, 258)
+                        if units == 258:
+                            self.assertEqual(actual, requested)
+                    print(json.dumps({"case": "actual-process-cwd-boundary", "requestedUtf16Units": units,
+                        "actualUtf16Units": len(str(actual).encode("utf-16-le")) // 2,
+                        "exitCode": receipt["exitCode"]}))
+
+    def test_explicit_cwd_launches_real_process_when_alias_lookup_is_unavailable(self):
+        # Only the API failure is simulated. The explicit-cwd child really runs,
+        # and writes its report into the same long evidence directory.
+        with mock.patch.object(evidence.sys, "platform", "win32"), \
+                mock.patch.object(evidence, "windows_short_directory", return_value=None):
+            with self.assertRaisesRegex(ValueError, "--working-directory"):
+                evidence.execution_working_directory(self.long_root)
+            self.run_child(self.long_root, working_directory=self.absolute_output_cwd, relative_files=False)
+
+    def test_unusable_aliases_fail_before_launch_with_explicit_cwd_guidance(self):
+        # These are failure-branch simulations, separate from the real API and
+        # process execution above. They do not claim that this volume lacks 8.3.
+        missing = Path(self.absolute_output_cwd.anchor) / ("qcopilots-search-missing-" + self.root.name[-8:])
+        for candidate in (None, self.absolute_output_cwd, missing, self.long_root):
+            with self.subTest(candidate=candidate), mock.patch.object(evidence.sys, "platform", "win32"), \
+                    mock.patch.object(evidence, "windows_short_directory", return_value=candidate), \
+                    mock.patch.object(evidence.subprocess, "run") as spawn:
+                with self.assertRaisesRegex(ValueError, "--working-directory"):
+                    evidence.execute_record([sys.executable, "-c", "pass"], self.long_root)
+                spawn.assert_not_called()
+
+    def test_utf16_units_not_python_character_count_control_windows_limit(self):
+        # Pure Windows path data, independent of the host filesystem and TEMP.
+        boundary = "C:/" + "x" * 255
+        non_bmp = "C:/" + "🚀" * 128
+        self.assertTrue(evidence.fits_windows_cwd(boundary))
+        self.assertFalse(evidence.fits_windows_cwd(boundary + "x"))
+        self.assertLess(len(non_bmp), 258)
+        self.assertFalse(evidence.fits_windows_cwd(non_bmp))
+
+    def test_missing_explicit_directory_is_rejected_before_launch(self):
+        with mock.patch.object(evidence.subprocess, "run") as spawn:
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                evidence.execute_record([sys.executable, "-c", "pass"], self.root,
+                                        working_directory=self.root / "not created")
+            spawn.assert_not_called()
+
+    def test_long_temp_root_keeps_core_executions_and_reports_boundary_limit(self):
+        cases = [
+            "ExecutionWorkingDirectoryTests.test_explicit_cwd_keeps_long_evidence_and_changes_relative_base_only",
+            "ExecutionWorkingDirectoryTests.test_explicit_cwd_launches_real_process_when_alias_lookup_is_unavailable",
+            "ExecutionWorkingDirectoryTests.test_utf16_units_not_python_character_count_control_windows_limit",
+            "ExecutionWorkingDirectoryTests.test_exact_windows_cwd_boundary_with_real_processes",
+            "ExecutionProvenanceTests.test_cli_working_directory_records_actual_build_and_local_processes"]
+        command = [sys.executable, "-c",
+            "import pathlib,runpy,sys,tempfile\n"
+            # Override the Python-selected root after interpreter startup. This
+            # exercises real TemporaryDirectory paths without changing the host
+            # interpreter launcher's own OS temporary-directory requirements.
+            "tempfile.tempdir=sys.argv.pop(1)\n"
+            "assert len(str(pathlib.Path(tempfile.gettempdir()).resolve()).encode('utf-16-le'))//2>300\n"
+            "sys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name='__main__')",
+            str(self.long_root), str(Path(__file__).resolve())]
+        for both_roots_long in (False, True):
+            # The second run directly covers an already-long configured root.
+            # It needs no synthetic Git checkout or external Git cwd support.
+            selected = cases[:-1] if both_roots_long else cases
+            environment = os.environ.copy()
+            if both_roots_long:
+                environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(self.long_root)
+            result = subprocess.run([*command, *selected, "-v"], cwd=self.absolute_output_cwd,
+                env=environment, capture_output=True, text=True, encoding="utf-8", timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('"status": "capability-unavailable"', result.stdout)
+            self.assertIn(f"Ran {len(selected)} tests", result.stderr)
+            self.assertIn("OK (skipped=1)", result.stderr)
+            print(json.dumps({"case": "actual-process-long-python-temp-root", "exitCode": result.returncode,
+                "coreTestsPassed": len(selected) - 1, "physicalBoundaryCapabilityUnavailable": 1,
+                "configuredRootAlsoLong": both_roots_long,
+                "temporaryRootUtf16Units": len(str(self.long_root).encode("utf-16-le")) // 2}))
+
+
 class ExecutionProvenanceTests(unittest.TestCase):
     """Run tiny fixture commands in a fresh Git repository, never the application."""
 
@@ -867,6 +1058,10 @@ class ExecutionProvenanceTests(unittest.TestCase):
             dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT"))
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        launcher = tempfile.TemporaryDirectory(prefix="qcopilots-search-cwd-")
+        self.addCleanup(launcher.cleanup)
+        self.launcher = Path(launcher.name).resolve()
+        self.working_directory = accessible_short_ancestor(self.launcher)
         self.source = self.root / "synthetic source 中文"
         self.source.mkdir()
         self.hooks = self.root / "empty-git-hooks"
@@ -898,7 +1093,8 @@ class ExecutionProvenanceTests(unittest.TestCase):
 
     def build(self):
         return evidence.record_build(self.source, self.root / "recorded builds",
-                                     self.programs, self.build_command)
+                                     self.programs, self.build_command,
+                                     working_directory=self.working_directory)
 
     def candidate(self):
         build_path, build = self.build()
@@ -925,7 +1121,50 @@ class ExecutionProvenanceTests(unittest.TestCase):
 
     def run_local(self, build_path, command=None):
         return evidence.run_local(build_path, self.root / "recorded executions", "physical",
-            "qcopilots-search-cli", "synthetic-physical-validator.json", command or self.local_command(), {})
+            "qcopilots-search-cli", "synthetic-physical-validator.json", command or self.local_command(), {},
+            working_directory=self.working_directory)
+
+    def test_cli_working_directory_records_actual_build_and_local_processes(self):
+        parent = self.root / "recorded cli executions"
+        while len(str(parent).encode("utf-16-le")) // 2 < 300:
+            parent /= "evidence 中文 " + "segment" * 7
+        parent.mkdir(parents=True)
+        input_path = self.launcher / "relative input.txt"
+        input_path.write_text("explicit cwd", encoding="utf-8")
+        input_argument = input_path.name if self.working_directory == self.launcher else str(input_path)
+        build_command = self.build_command.copy()
+        build_command[2] += f"\nassert pathlib.Path({input_argument!r}).read_text()=='explicit cwd'"
+        command = [sys.executable, str(Path(evidence.__file__)), "record-build",
+            "--source", str(self.source), "--output-root", str(parent),
+            "--working-directory", str(self.working_directory)]
+        for name, path in self.programs.items():
+            command += ["--program", f"{name}={path}"]
+        result = subprocess.run(command + ["--", *build_command], cwd=self.working_directory,
+            capture_output=True, text=True, encoding="utf-8", env=self.environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build_path = Path(json.loads(result.stdout)["record"])
+        build = evidence.read_json(build_path)
+        self.assertTrue(build["passed"])
+        self.assertTrue(build_path.is_relative_to(parent))
+        self.assertEqual(evidence.verified_build(build_path.parent, build), [])
+        local_command = self.local_command(
+            f"assert pathlib.Path({input_argument!r}).read_text()=='explicit cwd'\n")
+        result = subprocess.run([sys.executable, str(Path(evidence.__file__)), "run-local",
+            "--build-record", str(build_path), "--output-root", str(parent),
+            "--kind", "physical", "--program-name", "qcopilots-search-cli",
+            "--report", "physical.json", "--working-directory", str(self.working_directory),
+            "--", *local_command], cwd=self.working_directory, capture_output=True,
+            text=True, encoding="utf-8", env=self.environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        local_path = Path(json.loads(result.stdout)["record"])
+        local = evidence.read_json(local_path)
+        self.assertTrue(local["passed"])
+        self.assertTrue(local_path.is_relative_to(parent))
+        self.assertEqual(evidence.inspect_local_run(local_path.parent, local, "physical", build["identity"]), [])
+        for receipt in (build, local):
+            execution = receipt["execution"]
+            self.assertEqual(execution["requestedWorkingDirectory"], str(self.working_directory))
+            self.assertTrue(os.path.samefile(execution["actualWorkingDirectory"], self.working_directory))
 
     def test_clean_fixture_build_and_package_provenance_are_inspectable(self):
         path, candidate = self.candidate()
@@ -999,7 +1238,7 @@ class ExecutionProvenanceTests(unittest.TestCase):
         output = self.root / "cli-failure.json"
         result = subprocess.run([sys.executable, str(Path(evidence.__file__)), "aggregate-native",
             "--candidate-commit", "1" * 40, "--native-artifacts-dir", str(self.root / "absent artifacts"),
-            "--output", str(output)], cwd=self.root, capture_output=True, text=True, encoding="utf-8")
+            "--output", str(output)], cwd=self.working_directory, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 1, result.stderr)
         report = json.loads(output.read_text(encoding="utf-8"))
         self.assertFalse(report["passed"])

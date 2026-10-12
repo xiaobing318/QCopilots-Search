@@ -314,19 +314,36 @@ private slots:
         QVERIFY(!models.isBusy());
     }
 
+    void cancelKeepsPartialAndUnlocks_data()
+    {
+        QTest::addColumn<bool>("longPath");
+        QTest::newRow("normal") << false;
+#ifdef Q_OS_WIN
+        QTest::newRow("windows-long-unicode-path") << true;
+#endif
+    }
+
     void cancelKeepsPartialAndUnlocks()
     {
+        QFETCH(bool, longPath);
         TestEnvironment root(QStringLiteral("model-files"));
         QVERIFY2(root.isValid(), qPrintable(root.error()));
+        QString modelDir = root.root();
+        if (longPath) {
+            modelDir = root.path(QStringLiteral("中文 models with spaces"));
+            while (modelDir.size() < 320)
+                modelDir = QDir(modelDir).filePath(QStringLiteral("中文 nested model directory with spaces"));
+            QVERIFY(modelDir.size() >= 320);
+        }
         ModelServer server;
         server.mode = ModelServer::Slow;
         QVERIFY(server.listen(QHostAddress::LocalHost, 0));
-        ModelFiles models(root.root(), {server.artifact()});
+        ModelFiles models(modelDir, {server.artifact()});
         QSignalSpy completed(&models, &ModelFiles::finished);
         QSignalSpy progress(&models, &ModelFiles::progress);
         models.downloadMissing();
         QTRY_VERIFY_WITH_TIMEOUT(!progress.isEmpty() && progress.last().at(0).toLongLong() == 7, 5000);
-        ModelFiles contender(root.root(), {server.artifact()});
+        ModelFiles contender(modelDir, {server.artifact()});
         QSignalSpy blocked(&contender, &ModelFiles::finished);
         contender.downloadMissing();
         QCOMPARE(blocked.size(), 1);
@@ -334,7 +351,8 @@ private slots:
         models.cancel();
         QCOMPARE(completed.size(), 1);
         QVERIFY(!completed.at(0).at(0).toBool());
-        QCOMPARE(readFile(root.path(QStringLiteral("test-model.gguf.download"))), server.body.left(7));
+        QVERIFY(!QFileInfo::exists(QDir(modelDir).filePath(QStringLiteral("qcopilots-search-models.lock"))));
+        QCOMPARE(readFile(QDir(modelDir).filePath(QStringLiteral("test-model.gguf.download"))), server.body.left(7));
         server.mode = ModelServer::Normal;
         contender.downloadMissing();
         QTRY_COMPARE_WITH_TIMEOUT(blocked.size(), 2, 5000);

@@ -4,6 +4,7 @@
 #include "core/app_settings.h"
 #include "core/file_catalog.h"
 #include "core/model_files.h"
+#include "core/native_lock_path.h"
 #include "core/pipeline_manifest.h"
 #include "storage/index_repository.h"
 #include <QCoreApplication>
@@ -91,7 +92,7 @@ class ServiceServer::Private {
 public:
     explicit Private(ServiceServer *owner, RuntimePaths value, ServiceDependencies dependencies) : q(owner), paths(std::move(value)),
         repository(std::move(dependencies.storage)), modelVerifier(std::move(dependencies.verifyModels)),
-        lock(paths.lockFile), server(owner), monitor(owner), reconcile(owner), debounce(owner),
+        lock(nativeLockFilePath(paths.lockFile)), server(owner), monitor(owner), reconcile(owner), debounce(owner),
         indexWorker(owner), queryWorker(owner), indexTimeout(owner), queryTimeout(owner) {
         scanPool.setMaxThreadCount(1);
         writePool.setMaxThreadCount(1);

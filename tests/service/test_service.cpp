@@ -25,6 +25,7 @@
 #include <sys/un.h>
 #endif
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <stdexcept>
 
@@ -391,11 +392,27 @@ private slots:
         QCOMPARE(service.call("status").value("result").toObject().value("repository").toObject().value("files").toInt(), 2);
     }
 
+    void singletonAndExplicitProfile_data() {
+        QTest::addColumn<bool>("longProfile");
+        QTest::newRow("ordinary-profile") << false;
+#ifdef Q_OS_WIN
+        QTest::newRow("long-unicode-profile") << true;
+#endif
+    }
+
     void singletonAndExplicitProfile() {
+        QFETCH(bool, longProfile);
         TestEnvironment environment("service-singleton");
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        ServiceProcess service(environment.runtimePaths());
+        QString profile = environment.path("profile");
+        if (longProfile) while (profile.size() < 350)
+            profile += QStringLiteral("/中文 空格 configuration");
+        const auto paths = RuntimePaths::resolve(profile, environment.path("models"));
+        ServiceProcess service(paths);
         QVERIFY2(service.start(), qPrintable(service.error));
+        QVERIFY(QFileInfo::exists(paths.lockFile));
+        QCOMPARE(RuntimePaths::resolve(paths.profileDir, paths.modelDir).ipcName, paths.ipcName);
+        QCOMPARE(paths.lockFile, QDir(paths.profileDir).filePath(QStringLiteral("qcopilots-search-service.lock")));
         const auto status = service.call("status");
         QVERIFY(status.value("ok").toBool());
         QVERIFY(!status.value("result").toObject().value("modelAvailable").toBool());
@@ -407,6 +424,22 @@ private slots:
         QVERIFY(duplicate.readAllStandardError().contains("already_running:"));
         QCOMPARE(service.process.state(), QProcess::Running);
         QVERIFY(service.call("status").value("ok").toBool());
+        QVERIFY(service.call("shutdown").value("ok").toBool());
+        QVERIFY(service.process.state() == QProcess::NotRunning || service.process.waitForFinished(5000));
+        QCOMPARE(service.process.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(service.process.exitCode(), 0);
+        QVERIFY2(!QFileInfo::exists(paths.lockFile), qPrintable(paths.lockFile));
+        QVERIFY2(!service.process.readAllStandardError().contains("Could not remove our own lock file"),
+                 qPrintable(serviceDiagnostics(paths, status)));
+        ServiceProcess restarted(paths);
+        QVERIFY2(restarted.start(), qPrintable(restarted.error));
+        QVERIFY(QFileInfo::exists(paths.lockFile));
+        QVERIFY(restarted.call("status").value("ok").toBool());
+        QVERIFY(restarted.call("shutdown").value("ok").toBool());
+        QVERIFY(restarted.process.state() == QProcess::NotRunning || restarted.process.waitForFinished(5000));
+        QCOMPARE(restarted.process.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(restarted.process.exitCode(), 0);
+        QVERIFY2(!QFileInfo::exists(paths.lockFile), qPrintable(paths.lockFile));
     }
 
     void cappedPrefixSurvivesReconcileAndExplicitRetry() {
@@ -684,64 +717,164 @@ private slots:
     void cancellationRejectsLateCompletion() {
         TestEnvironment environment("service-cancel");
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        ServiceProcess service(environment.runtimePaths());
-        QVERIFY2(service.start(), qPrintable(service.error));
-        QLocalSocket socket;
-        socket.connectToServer(service.paths.ipcName);
-        QVERIFY(socket.waitForConnected(3000));
-        const QString token = QString::fromLatin1(service.token);
-        const auto search = encodeIpcFrame({{"protocol", 1}, {"id", "pending-search"}, {"token", token},
-            {"method", "search"}, {"params", QJsonObject{{"query", "anything"}, {"semantic", false}}}});
-        const auto cancel = encodeIpcFrame({{"protocol", 1}, {"id", "cancel-command"}, {"token", token},
-            {"method", "cancel"}, {"params", QJsonObject{{"id", "pending-search"}}}});
-        socket.write(search + cancel);
-        QByteArray buffer;
-        QList<QJsonObject> replies;
-        QElapsedTimer timer; timer.start();
-        while (timer.elapsed() < 5000 && replies.size() < 2) {
-            if (!socket.bytesAvailable()) socket.waitForReadyRead(100);
-            buffer += socket.readAll();
-            QVERIFY(takeIpcFrames(buffer, replies));
-        }
-        bool cancelled = false, acknowledged = false;
-        for (const auto &reply : replies) {
-            if (reply.value("id").toString() == "pending-search") {
-                QCOMPARE(reply.value("error").toObject().value("code").toString(), QStringLiteral("cancelled"));
-                cancelled = true;
+        QVERIFY(environment.writeFile("selected/document.txt", "boundedcancel source document"));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("selected")}; settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        FileRecord file;
+        QVERIFY(FileCatalog::describe(environment.path("selected/document.txt"), &file));
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            QVector<Segment> segments;
+            for (int index = 0; index < 512; ++index) {
+                Segment segment;
+                segment.path = file.path; segment.kind = "text"; segment.title = "document";
+                segment.text = QStringLiteral("boundedcancel SQLite progress fixture %1").arg(index);
+                segments.append(std::move(segment));
             }
-            if (reply.value("id").toString() == "cancel-command") acknowledged = reply.value("result").toObject().value("cancelled").toBool();
+            QVERIFY2(repository.replaceFile(file.path, file.fingerprint + "|cancel-fixture", segments, false, &error), qPrintable(error));
         }
-        QVERIFY(cancelled); QVERIFY(acknowledged);
-        socket.waitForReadyRead(200);
-        buffer += socket.readAll();
-        QList<QJsonObject> late;
-        QVERIFY(takeIpcFrames(buffer, late));
-        for (const auto &reply : late) QVERIFY(reply.value("id").toString() != "pending-search");
-        QTRY_COMPARE_WITH_TIMEOUT(service.call("status").value("result").toObject().value("activeSearches").toInt(), 0, 5000);
-        QVERIFY(service.call("search", {{"query", "aftercancel"}, {"semantic", false}}).value("ok").toBool());
 
-        QByteArray flood;
-        for (int index = 0; index < 80; ++index) {
-            const QString searchId = QStringLiteral("flood-%1").arg(index);
-            flood += encodeIpcFrame({{"protocol", 1}, {"id", searchId}, {"token", token}, {"method", "search"},
-                {"params", QJsonObject{{"query", "boundedcancel"}, {"semantic", false}}}});
-            flood += encodeIpcFrame({{"protocol", 1}, {"id", QStringLiteral("stop-%1").arg(index)}, {"token", token},
-                {"method", "cancel"}, {"params", QJsonObject{{"id", searchId}}}});
-        }
-        socket.write(flood);
-        QList<QJsonObject> floodReplies;
-        timer.restart();
-        while (timer.elapsed() < 5000 && floodReplies.size() < 160) {
-            if (!socket.bytesAvailable()) socket.waitForReadyRead(100);
+        std::mutex barrierMutex;
+        std::condition_variable barrierChanged;
+        bool released = false;
+        std::atomic_int entered{0};
+        ServiceDependencies dependencies;
+        dependencies.storage.faultHook = [&](const QString &phase) {
+            if (phase != "sqlite-search-progress") return;
+            std::unique_lock lock(barrierMutex);
+            if (released) return;
+            entered.fetch_add(1);
+            // The hook is inside SQLite, after its publication lock is released.
+            // Every running query waits, irrespective of search-pool size.
+            barrierChanged.wait(lock, [&] { return released; });
+        };
+        ServiceServer service(paths, dependencies);
+        auto releaseBarrier = [&] {
+            {
+                const std::lock_guard guard(barrierMutex);
+                released = true;
+            }
+            barrierChanged.notify_all();
+        };
+        // On every assertion failure release SQLite readers before service.stop()
+        // waits for the search pool during destruction.
+        const auto releaseGuard = qScopeGuard(releaseBarrier);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        QFile tokenFile(QDir(paths.profileDir).filePath("qcopilots-search-ipc-token"));
+        QVERIFY(tokenFile.open(QIODevice::ReadOnly));
+        const QString token = QString::fromLatin1(tokenFile.readAll());
+        tokenFile.close();
+
+        QByteArray buffer;
+        QString protocolError;
+        QHash<QString, QList<QJsonObject>> replies;
+        QLocalSocket socket;
+        QObject::connect(&socket, &QLocalSocket::readyRead, &socket, [&] {
+            if (!protocolError.isEmpty()) return;
             buffer += socket.readAll();
-            QVERIFY(takeIpcFrames(buffer, floodReplies));
-        }
-        bool backpressure = false;
-        for (const auto &reply : floodReplies)
-            if (reply.value("error").toObject().value("code").toString() == "busy") backpressure = true;
-        QVERIFY(backpressure);
-        QTRY_COMPARE_WITH_TIMEOUT(service.call("status").value("result").toObject().value("activeSearches").toInt(), 0, 5000);
-        QVERIFY(service.call("search", {{"query", "responsiveafterflood"}, {"semantic", false}}).value("ok").toBool());
+            QList<QJsonObject> frames;
+            if (!takeIpcFrames(buffer, frames, &protocolError)) return;
+            for (const auto &frame : frames) {
+                const QString id = frame.value("id").toString();
+                if (!id.isEmpty()) replies[id].append(frame);
+            }
+        });
+        socket.connectToServer(paths.ipcName);
+        QTRY_COMPARE_WITH_TIMEOUT(socket.state(), QLocalSocket::ConnectedState, 5000);
+        auto frame = [&](const QString &id, const QString &method, const QJsonObject &params = {}) {
+            return encodeIpcFrame({{"protocol", 1}, {"id", id}, {"token", token}, {"method", method}, {"params", params}});
+        };
+        auto call = [&](const QString &id, const QString &method, const QJsonObject &params = {}) {
+            QEventLoop loop;
+            QTimer deadline;
+            deadline.setSingleShot(true);
+            QObject::connect(&deadline, &QTimer::timeout, &loop, &QEventLoop::quit);
+            const auto ready = QObject::connect(&socket, &QLocalSocket::readyRead, &loop, [&] {
+                if (replies.contains(id) || !protocolError.isEmpty()) loop.quit();
+            });
+            socket.write(frame(id, method, params)); socket.flush();
+            deadline.start(5000);
+            if (!replies.contains(id)) loop.exec();
+            QObject::disconnect(ready);
+            return replies.value(id).value(0);
+        };
+        const QJsonObject searchParams{{"query", "boundedcancel"}, {"semantic", false}};
+        socket.write(frame("pending-search", "search", searchParams)); socket.flush();
+        QTRY_VERIFY_WITH_TIMEOUT(entered.load() >= 1, 5000);
+        QVERIFY(!replies.contains("pending-search"));
+        const auto cancelled = call("cancel-command", "cancel", {{"id", "pending-search"}});
+        QVERIFY(cancelled.value("ok").toBool());
+        QVERIFY(cancelled.value("result").toObject().value("cancelled").toBool());
+        QCOMPARE(replies.value("pending-search").size(), 1);
+        QCOMPARE(replies.value("pending-search").first().value("error").toObject().value("code").toString(), QStringLiteral("cancelled"));
+        const auto held = call("held-status", "status");
+        QVERIFY(held.value("ok").toBool());
+        QCOMPARE(held.value("result").toObject().value("activeSearches").toInt(), 1);
+
+        // Leave these queries uncancelled until backpressure is observed. Every
+        // running query is held in SQLite and queued queries cannot complete, so
+        // socket fragmentation and search-thread count cannot hide saturation.
+        QByteArray flood;
+        for (int index = 0; index < 80; ++index)
+            flood += frame(QStringLiteral("flood-%1").arg(index), "search", searchParams);
+        socket.write(flood); socket.flush();
+        auto hasBackpressure = [&] {
+            for (int index = 0; index < 80; ++index)
+                for (const auto &reply : replies.value(QStringLiteral("flood-%1").arg(index)))
+                    if (reply.value("error").toObject().value("code").toString() == "busy") return true;
+            return false;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(hasBackpressure(), 5000);
+        // This response on the same socket follows dispatch of all 80 searches.
+        const auto saturated = call("saturated-status", "status");
+        QVERIFY(saturated.value("ok").toBool());
+        const int active = saturated.value("result").toObject().value("activeSearches").toInt();
+        QVERIFY(active > 1); QVERIFY(active <= 64);
+
+        QByteArray cancellations;
+        for (int index = 0; index < 80; ++index)
+            cancellations += frame(QStringLiteral("stop-%1").arg(index), "cancel", {{"id", QStringLiteral("flood-%1").arg(index)}});
+        socket.write(cancellations); socket.flush();
+        const auto cancelledStatus = call("cancelled-status", "status");
+        QVERIFY(cancelledStatus.value("ok").toBool());
+        QVERIFY(cancelledStatus.value("result").toObject().value("activeSearches").toInt() >= 1);
+        auto verifyTerminals = [&] {
+            if (replies.value("pending-search").size() != 1
+                || replies.value("pending-search").first().value("error").toObject().value("code").toString() != "cancelled") return false;
+            for (int index = 0; index < 80; ++index) {
+                const auto searches = replies.value(QStringLiteral("flood-%1").arg(index));
+                const auto stops = replies.value(QStringLiteral("stop-%1").arg(index));
+                if (searches.size() != 1 || stops.size() != 1 || !stops.first().value("ok").toBool()) return false;
+                const QString code = searches.first().value("error").toObject().value("code").toString();
+                if (code != "cancelled" && code != "busy") return false;
+                if (stops.first().value("result").toObject().value("cancelled").toBool() != (code == "cancelled")) return false;
+            }
+            return true;
+        };
+        QVERIFY2(protocolError.isEmpty(), qPrintable(protocolError));
+        QVERIFY(verifyTerminals());
+
+        releaseBarrier();
+        int statusSequence = 0;
+        auto drained = [&] {
+            const auto status = call(QStringLiteral("drained-status-%1").arg(++statusSequence), "status");
+            return status.value("ok").toBool() && status.value("result").toObject().value("activeSearches").toInt() == 0;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(drained(), 5000);
+        // A successful query on the original socket is also a reply-order
+        // barrier. Any erroneous late terminal would already be in replies.
+        const auto recovered = call("responsive-after-flood", "search", searchParams);
+        QVERIFY(recovered.value("ok").toBool());
+        QCOMPARE(recovered.value("result").toObject().value("hits").toArray().size(), 1);
+        QCOMPARE(recovered.value("result").toObject().value("hits").toArray().first().toObject().value("path").toString(), file.path);
+        QVERIFY2(protocolError.isEmpty(), qPrintable(protocolError));
+        QVERIFY(verifyTerminals());
+        socket.disconnectFromServer(); service.stop();
     }
 
     void pipelineChangePreservesKeywordWhilePaused() {
@@ -855,31 +988,64 @@ private slots:
         }
     }
 
+    void codeClassificationToggle_data() {
+        QTest::addColumn<bool>("longPath");
+        QTest::newRow("ordinary-path") << false;
+        QTest::newRow("long-unicode-path") << true;
+    }
+
     void codeClassificationToggle() {
+        QFETCH(bool, longPath);
         TestEnvironment environment("service-code-toggle");
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QString relativeRoot = QStringLiteral("repository");
+        if (longPath) while (environment.path(relativeRoot).size() < 320)
+            relativeRoot += QStringLiteral("/中文 空格 nested");
+        const QString repository = environment.path(relativeRoot);
+        const QString excludesPath = repository + "/.git/qcopilots-search-empty-excludes";
+        QString escapedExcludesPath = QDir::fromNativeSeparators(excludesPath);
+        escapedExcludesPath.replace('\\', "\\\\").replace('"', "\\\"");
+        const QByteArray config = QByteArray("[core]\nrepositoryformatversion = 0\nbare = false\nlongpaths = false\nexcludesfile = \"")
+            + escapedExcludesPath.toUtf8() + "\"\n";
         // A valid empty repository fixture needs no installed Git executable.
-        QVERIFY(environment.writeFile("repository/.git/HEAD", "ref: refs/heads/main\n"));
-        QVERIFY(environment.writeFile("repository/.git/config", "[core]\nrepositoryformatversion = 0\nbare = false\n"));
-        QVERIFY(QDir().mkpath(environment.path("repository/.git/objects")));
-        QVERIFY(QDir().mkpath(environment.path("repository/.git/refs/heads")));
-        QVERIFY(environment.writeFile("repository/README.md", "classificationtoggleword documentation"));
-        const QString path = environment.path("repository/README.md");
+        QVERIFY(environment.writeFile(relativeRoot + "/.git/HEAD", "ref: refs/heads/main\n"));
+        // User-level ignore patterns must not hide this fixture's untracked source.
+        QVERIFY(environment.writeFile(relativeRoot + "/.git/qcopilots-search-empty-excludes", {}));
+        QVERIFY(environment.writeFile(relativeRoot + "/.git/config", config));
+        QVERIFY(QDir().mkpath(repository + "/.git/objects"));
+        QVERIFY(QDir().mkpath(repository + "/.git/refs/heads"));
+        QVERIFY(environment.writeFile(relativeRoot + "/README.md", "classificationtoggleword documentation"));
+        QVERIFY(environment.writeFile(relativeRoot + "/untracked.cpp", "int untrackedcodetoken = 1;\n"));
+        QVERIFY(environment.writeFile(relativeRoot + "/.gitignore", "ignored.cpp\n"));
+        QVERIFY(environment.writeFile(relativeRoot + "/ignored.cpp", "int ignoredcodetoken = 1;\n"));
+        const QString path = repository + "/README.md";
         ServiceProcess service(environment.runtimePaths());
         QVERIFY2(service.start(), qPrintable(service.error));
-        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("repository")}}, {"includeCode", false}}).value("ok").toBool());
-        QVERIFY(service.waitForHit("classificationtoggleword", path));
+        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{repository}}, {"includeCode", false}}).value("ok").toBool());
+        QVERIFY2(service.waitForHit("classificationtoggleword", path), qPrintable(serviceDiagnostics(service.paths, service.call("status"))));
         QVERIFY(service.call("settings.set", {{"includeCode", true}}).value("ok").toBool());
         auto codeHits = [&] {
             return service.call("search", {{"query", "classificationtoggleword"}, {"code", true}, {"semantic", false}})
                 .value("result").toObject().value("hits").toArray();
         };
-        QTRY_COMPARE_WITH_TIMEOUT(codeHits().size(), 1, 30000);
+        QTRY_VERIFY2_WITH_TIMEOUT(codeHits().size() == 1,
+            qPrintable(serviceDiagnostics(service.paths, service.call("status"))), 30000);
         QCOMPARE(service.search("classificationtoggleword").size(), 0);
+        auto sourceHits = [&] (const QString &query) {
+            return service.call("search", {{"query", query}, {"code", true}, {"semantic", false}})
+                .value("result").toObject().value("hits").toArray();
+        };
+        QTRY_VERIFY2_WITH_TIMEOUT(sourceHits("untrackedcodetoken").size() == 1,
+            qPrintable(serviceDiagnostics(service.paths, service.call("status"))), 30000);
+        QVERIFY(sourceHits("ignoredcodetoken").isEmpty());
         QVERIFY(service.call("settings.set", {{"includeCode", false}}).value("ok").toBool());
-        QVERIFY(service.waitForHit("classificationtoggleword", path));
+        QVERIFY2(service.waitForHit("classificationtoggleword", path), qPrintable(serviceDiagnostics(service.paths, service.call("status"))));
         const auto disabled = service.call("search", {{"query", "classificationtoggleword"}, {"code", true}});
         QCOMPARE(disabled.value("error").toObject().value("code").toString(), QStringLiteral("code_search_disabled"));
+        QFile configFile(repository + "/.git/config");
+        QVERIFY(configFile.open(QIODevice::ReadOnly));
+        QCOMPARE(configFile.readAll(), config);
+        QVERIFY(!QFileInfo::exists(repository + "/.git/index"));
     }
 
     void continuationSurvivesMissingJournal() {
