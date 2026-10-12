@@ -178,7 +178,26 @@ function(qcopilots_search_add_git_dependency)
     set(REGEX_BACKEND builtin CACHE STRING "Pinned libgit2 builtin regex" FORCE)
     set(USE_BUNDLED_ZLIB ON)
     set(STATIC_CRT OFF)
+    set(USE_NSEC ON)
+    if(UNIX)
+        # libgit2 1.9.1 probes struct stat before DefaultCFlags adds _GNU_SOURCE
+        # to its real compilation. Match that feature-test environment, so
+        # strict C90 does not hide glibc's nanosecond fields from the probes.
+        list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+        # Recheck older build trees that cached results without the macro.
+        foreach(stat_probe IN ITEMS HAVE_STRUCT_STAT_ST_MTIM
+                HAVE_STRUCT_STAT_ST_MTIMESPEC HAVE_STRUCT_STAT_MTIME_NSEC
+                HAVE_STRUCT_STAT_NSEC)
+            unset(${stat_probe})
+            unset(${stat_probe} CACHE)
+        endforeach()
+    endif()
     add_subdirectory("${qcopilots_search_libgit2_SOURCE_DIR}" "${qcopilots_search_libgit2_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    if(UNIX AND NOT (HAVE_STRUCT_STAT_MTIME_NSEC OR
+            ((HAVE_STRUCT_STAT_ST_MTIM OR HAVE_STRUCT_STAT_ST_MTIMESPEC)
+            AND HAVE_STRUCT_STAT_NSEC)))
+        message(FATAL_ERROR "libgit2 requires a detected struct stat nanosecond field on this platform")
+    endif()
     target_include_directories(libgit2package SYSTEM PUBLIC
         "$<BUILD_INTERFACE:${qcopilots_search_libgit2_SOURCE_DIR}/include>"
         "$<BUILD_INTERFACE:${qcopilots_search_libgit2_BINARY_DIR}/include>")

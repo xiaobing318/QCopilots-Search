@@ -16,6 +16,7 @@
 #include <QJsonDocument>
 #include <QProcess>
 #include <QSaveFile>
+#include <QScopeGuard>
 #include <QSet>
 #include <QStorageInfo>
 #include <QTemporaryDir>
@@ -480,10 +481,14 @@ bool exerciseMutationsAndRebuild(IndexRepository &repository, const RuntimePaths
     QString rebuildError;
     QElapsedTimer rebuildTimer;
     rebuildTimer.start();
-    std::jthread rebuilding([&] {
+    std::thread rebuilding([&] {
         started.store(true, std::memory_order_release);
         rebuildSucceeded = repository.flushOneShard(&rebuildError);
         finished.store(true, std::memory_order_release);
+    });
+    const auto joinRebuilding = qScopeGuard([&] {
+        if (rebuilding.joinable())
+            rebuilding.join();
     });
     while (!started.load(std::memory_order_acquire))
         std::this_thread::yield();

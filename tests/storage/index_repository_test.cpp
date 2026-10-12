@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QScopeGuard>
 #include <QtTest>
 #include <sqlite3.h>
 
@@ -1043,10 +1044,9 @@ private slots:
         std::atomic<int> completedReads{0};
         std::mutex failureMutex;
         QString readerFailure;
-        // jthread joins before repository or TestEnvironment are destroyed,
-        // including when a writer-side QVERIFY exits this test early.
-        std::jthread reader([&](std::stop_token stop) {
-            while (!stop.stop_requested()) {
+        std::atomic_bool stopReader{false};
+        std::thread reader([&] {
+            while (!stopReader.load(std::memory_order_relaxed)) {
                 QString readError;
                 const auto hits = repository.search(query(QStringLiteral("generation")), &readError);
                 if (!readError.isEmpty() || hits.size() != 1 || hits.first().path != path
@@ -1058,6 +1058,14 @@ private slots:
                 completedReads.fetch_add(1, std::memory_order_relaxed);
                 std::this_thread::yield();
             }
+        });
+        // Join before repository or TestEnvironment are destroyed, including
+        // when a writer-side QVERIFY exits this test early. std::thread also
+        // supports Apple libc++ versions that do not provide std::jthread.
+        const auto joinReader = qScopeGuard([&] {
+            stopReader.store(true, std::memory_order_relaxed);
+            if (reader.joinable())
+                reader.join();
         });
         QTRY_VERIFY_WITH_TIMEOUT(completedReads.load(std::memory_order_relaxed) > 0, 10000);
         for (int generation = 1; generation <= 40; ++generation) {
@@ -1073,7 +1081,7 @@ private slots:
             if (generation % 10 == 0)
                 QVERIFY2(repository.flush(&error), qPrintable(error));
         }
-        reader.request_stop();
+        stopReader.store(true, std::memory_order_relaxed);
         reader.join();
         QVERIFY2(readerFailure.isEmpty(), qPrintable(readerFailure));
         QVERIFY(completedReads.load(std::memory_order_relaxed) > 0);

@@ -307,19 +307,51 @@ QString recognizeText(const QImage &source, const ExtractionOptions &options, QS
         ? source.scaled(6000, 6000, Qt::KeepAspectRatio, Qt::SmoothTransformation) : source;
     const QImage image = opaqueOnWhite(bounded).convertToFormat(QImage::Format_Grayscale8);
     if (image.isNull()) { *error = QStringLiteral("Cannot allocate OCR image"); return {}; }
-    api.SetPageSegMode(tesseract::PSM_AUTO);
-    api.SetImage(image.constBits(), image.width(), image.height(), 1, int(image.bytesPerLine()));
     tesseract::ETEXT_DESC monitor;
     monitor.set_deadline_msecs(120'000);
     monitor.cancel = [](void *context, int) { return cancelled(*static_cast<const ExtractionOptions *>(context)); };
     monitor.cancel_this = const_cast<ExtractionOptions *>(&options);
-    if (api.Recognize(&monitor) != 0) {
-        *error = cancelled(options) ? QStringLiteral("OCR cancelled") : QStringLiteral("OCR failed or exceeded its deadline");
-        return {};
+    const auto recognize = [&](const QImage &input, tesseract::PageSegMode mode, QString *text, int *confidence) {
+        if (cancelled(options) || monitor.deadline_exceeded()) {
+            *error = cancelled(options) ? QStringLiteral("OCR cancelled") : QStringLiteral("OCR exceeded its deadline");
+            return false;
+        }
+        api.SetPageSegMode(mode);
+        api.SetImage(input.constBits(), input.width(), input.height(), 1, int(input.bytesPerLine()));
+        if (api.Recognize(&monitor) != 0 || cancelled(options) || monitor.deadline_exceeded()) {
+            *error = cancelled(options) ? QStringLiteral("OCR cancelled") : QStringLiteral("OCR failed or exceeded its deadline");
+            return false;
+        }
+        std::unique_ptr<char[]> buffer(api.GetUTF8Text());
+        if (!buffer) { *error = QStringLiteral("OCR produced no text buffer"); return false; }
+        *text = QString::fromUtf8(buffer.get()).trimmed();
+        *confidence = api.MeanTextConf();
+        return true;
+    };
+    QString text;
+    int confidence = 0;
+    if (!recognize(image, tesseract::PSM_AUTO, &text, &confidence)) return {};
+    // Automatic page layout can mistake a short CJK sign for Latin fragments
+    // or discard it entirely. A bounded block-layout retry recovers those
+    // images without changing confident recognition of multi-column pages.
+    if (text.isEmpty() || confidence < 70) {
+        QString alternative;
+        int alternativeConfidence = 0;
+        if (!recognize(image, tesseract::PSM_SINGLE_BLOCK, &alternative, &alternativeConfidence)) return {};
+        if (!alternative.isEmpty() && (text.isEmpty() || alternativeConfidence > confidence)) {
+            text = alternative; confidence = alternativeConfidence;
+        }
+        // Large glyphs can still normalize poorly in the LSTM recognizer.
+        // Try one smaller scale only while the best result remains uncertain.
+        if ((text.isEmpty() || confidence < 70) && qMin(image.width(), image.height()) >= 64) {
+            const QImage smaller = image.scaled(qMax(1, image.width() / 2), qMax(1, image.height() / 2),
+                Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            if (smaller.isNull()) { *error = QStringLiteral("Cannot allocate OCR retry image"); return {}; }
+            if (!recognize(smaller, tesseract::PSM_SINGLE_BLOCK, &alternative, &alternativeConfidence)) return {};
+            if (!alternative.isEmpty() && (text.isEmpty() || alternativeConfidence > confidence)) text = alternative;
+        }
     }
-    std::unique_ptr<char[]> text(api.GetUTF8Text());
-    if (!text) { *error = QStringLiteral("OCR produced no text buffer"); return {}; }
-    return QString::fromUtf8(text.get()).trimmed();
+    return text;
 }
 
 ExtractionResult extractImage(const QString &path, const ExtractionOptions &options)

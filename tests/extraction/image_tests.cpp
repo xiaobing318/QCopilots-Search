@@ -2,9 +2,12 @@
 #include "extraction/image_extractor.h"
 #include <QDir>
 #include <QFile>
+#include <QFontDatabase>
+#include <QFontMetrics>
 #include <QImage>
 #include <QPainter>
 #include <QPdfWriter>
+#include <QRawFont>
 #include <QStandardPaths>
 #include "test_directory.h"
 #include <QtTest>
@@ -272,6 +275,90 @@ private slots:
         ExtractionOptions options; options.tessdataDir = data; QString error;
         const QString text = recognizeText(image, options, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error)); QVERIFY2(text.contains(QStringLiteral("4815162342")), qPrintable(text));
+    }
+    void realChineseOcr_data()
+    {
+        QTest::addColumn<QString>("phrase");
+        QTest::addColumn<QString>("expected");
+        QTest::addColumn<int>("writingSystem");
+        QTest::addColumn<int>("pixelSize");
+        for (const int size : {40, 80}) {
+            QTest::newRow(qPrintable(QStringLiteral("simplified-%1px").arg(size))) << QStringLiteral("安全出口 禁止吸烟")
+                << QStringLiteral("安全出口禁止吸烟") << int(QFontDatabase::SimplifiedChinese) << size;
+            QTest::newRow(qPrintable(QStringLiteral("traditional-%1px").arg(size))) << QStringLiteral("社區會議 歡迎參加")
+                << QStringLiteral("社區會議歡迎參加") << int(QFontDatabase::TraditionalChinese) << size;
+        }
+    }
+    void ocrKeepsBlankImagesEmptyAndHonorsCancellation()
+    {
+        QImage image(64, 64, QImage::Format_RGB32); image.fill(Qt::white);
+        ExtractionOptions options; options.tessdataDir = qEnvironmentVariable("QCOPILOTS_SEARCH_TESSDATA_DIR");
+        QVERIFY2(!options.tessdataDir.isEmpty(), "The pinned OCR data directory is required");
+        QString error;
+        QVERIFY(recognizeText(image, options, &error).isEmpty()); QVERIFY2(error.isEmpty(), qPrintable(error));
+        bool initialCheck = true;
+        options.cancelled = [&] { if (initialCheck) { initialCheck = false; return false; } return true; };
+        QVERIFY(recognizeText(image, options, &error).isEmpty()); QCOMPARE(error, QStringLiteral("OCR cancelled"));
+    }
+    void ocrPreservesEnglishColumns()
+    {
+        QImage image(1800, 750, QImage::Format_RGB32); image.fill(Qt::white);
+        const QStringList left{QStringLiteral("Alpha planning report"), QStringLiteral("Volunteers repair wooden chairs"),
+            QStringLiteral("The workshop opens on Monday"), QStringLiteral("Tools are stored on the shelf")};
+        const QStringList right{QStringLiteral("Omega delivery schedule"), QStringLiteral("Fresh apples arrive on Tuesday"),
+            QStringLiteral("The market serves local families"), QStringLiteral("Drivers return before sunset")};
+        { QPainter painter(&image); QFont font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+          font.setPixelSize(38); painter.setFont(font); painter.setPen(Qt::black);
+          for (int line = 0; line < left.size(); ++line) {
+              painter.drawText(50, 100 + 100 * line, left[line]); painter.drawText(950, 100 + 100 * line, right[line]);
+          } }
+        ExtractionOptions options; options.tessdataDir = qEnvironmentVariable("QCOPILOTS_SEARCH_TESSDATA_DIR");
+        QVERIFY2(!options.tessdataDir.isEmpty(), "The pinned OCR data directory is required");
+        QString error; const QString text = recognizeText(image, options, &error).simplified();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        for (const QString &line : left + right) QVERIFY2(text.contains(line), qPrintable(text));
+    }
+    void realChineseOcr()
+    {
+        QFETCH(QString, phrase); QFETCH(QString, expected); QFETCH(int, writingSystem); QFETCH(int, pixelSize);
+        qcopilots_search::test::ExtractionDirectory temporary(testTemplate()); QVERIFY(temporary.isValid());
+        const auto script = QFontDatabase::WritingSystem(writingSystem);
+        const QStringList installed = QFontDatabase::families(script);
+        QStringList families{QStringLiteral("Noto Sans CJK SC"), QStringLiteral("Noto Sans CJK TC"),
+            QStringLiteral("Microsoft YaHei"), QStringLiteral("Microsoft JhengHei"),
+            QStringLiteral("PingFang SC"), QStringLiteral("PingFang TC"), QStringLiteral("DengXian")};
+        families.append(installed); families.removeDuplicates();
+        QFont font;
+        bool supportsPhrase = false;
+        for (const QString &family : families) {
+            if (!installed.contains(family, Qt::CaseInsensitive)) continue;
+            QFont candidate(family); candidate.setPixelSize(pixelSize); candidate.setWeight(QFont::Normal);
+            const QRawFont raw = QRawFont::fromFont(candidate);
+            if (!raw.isValid()) continue;
+            bool complete = true;
+            for (const char32_t character : expected.toUcs4())
+                if (!raw.supportsCharacter(character)) { complete = false; break; }
+            if (complete) { font = candidate; supportsPhrase = true; break; }
+        }
+        QVERIFY2(supportsPhrase, qPrintable(QStringLiteral("No installed CJK font covers every glyph in '%1'. "
+            "Install the platform Chinese fonts, such as fonts-noto-cjk on Linux. This OCR requirement cannot be skipped.").arg(expected)));
+        const QFontMetrics metrics(font);
+        const int margin = 60;
+        QImage image(metrics.horizontalAdvance(phrase) + 2 * margin, metrics.height() + 2 * margin, QImage::Format_RGB32);
+        image.fill(Qt::white);
+        { QPainter painter(&image); painter.setFont(font); painter.setPen(Qt::black);
+          painter.drawText(margin, margin + metrics.ascent(), phrase); }
+        QVERIFY(image.save(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-chinese-ocr.png"))));
+        ExtractionOptions options; options.tessdataDir = qEnvironmentVariable("QCOPILOTS_SEARCH_TESSDATA_DIR");
+        QVERIFY2(!options.tessdataDir.isEmpty(), "The pinned English, Simplified Chinese and Traditional Chinese OCR data is required");
+        QString error;
+        const QString text = recognizeText(image, options, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QString normalized;
+        for (const QChar character : text) if (!character.isSpace()) normalized += character;
+        qInfo().noquote() << QStringLiteral("Direct OCR font=%1 expected=%2 actual=%3").arg(font.family(), expected, normalized);
+        QVERIFY2(normalized.contains(expected), qPrintable(QStringLiteral("Direct OCR failed for %1: '%2' (font %3)")
+            .arg(expected, text, font.family())));
     }
 private:
     static QString testTemplate()
