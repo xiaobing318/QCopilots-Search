@@ -5,7 +5,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+import weakref
+from unittest.mock import Mock, patch
 
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('qcopilots_search_sources', Path(__file__).resolve().parents[1] / 'qcs-source-bundle.py')
@@ -80,6 +81,116 @@ class ChecksumRegression(unittest.TestCase):
     def test_checksum_file_cannot_include_itself(self):
         with self.assertRaisesRegex(RuntimeError, 'Invalid source checksum entry'):
             module.refresh_package_checksums(self.root, [self.checksums])
+
+
+class FFmpegMetadataRegression(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='qcs-ffmeta-',
+            dir=os.environ.get('QCOPILOTS_SEARCH_TEST_ROOT') or None)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.sdk = self.root / 'SDK with spaces \u6d4b\u8bd5'
+        self.handle = Mock()
+        dll_directories = patch.object(module.os, 'add_dll_directory', return_value=self.handle, create=True)
+        dll_directories.start()
+        self.addCleanup(dll_directories.stop)
+
+    def kit(self, system='Linux', format_present=True):
+        relative = {'Linux': 'gcc_64/lib/libavcodec.so.63',
+                    'Darwin': 'macos/lib/libavcodec.63.dylib',
+                    'Windows': 'msvc2022_64/bin/avcodec-63.dll'}[system]
+        codec = self.sdk / '6.12.0' / relative
+        codec.parent.mkdir(parents=True)
+        codec.write_bytes(b'SYNTHETIC codec fixture, never loaded')
+        if system == 'Linux' and format_present:
+            (codec.parent / 'libavformat.so.63').write_bytes(b'SYNTHETIC format fixture, never loaded')
+        return codec
+
+    def codec(self, configuration=b'--disable-gpl --disable-nonfree'):
+        library = Mock()
+        library.avcodec_configuration.return_value = configuration
+        library.avcodec_license.return_value = b'LGPL version 2.1 or later'
+        library.avcodec_version.return_value = 63 << 16
+        return library
+
+    def test_linux_loads_local_format_group_first_and_retains_it_for_metadata(self):
+        path = self.kit()
+        library = self.codec()
+        group = []
+        calls = []
+        class Group:
+            pass
+        def load(filename, **options):
+            calls.append((filename, options))
+            self.assertEqual(options, {'mode': module.ctypes.RTLD_LOCAL})
+            if len(calls) == 1:
+                self.assertEqual(Path(filename), path.parent / 'libavformat.so.63')
+                dependency = Group()
+                group.append(weakref.ref(dependency))
+                return dependency
+            self.assertEqual(Path(filename), path)
+            self.assertIsNotNone(group[0](), 'Format dependency group must survive codec loading')
+            return library
+        def value(result):
+            def read():
+                self.assertIsNotNone(group[0](), 'Format dependency group must survive metadata reads')
+                return result
+            return read
+        library.avcodec_configuration.side_effect = value(b'--disable-gpl')
+        library.avcodec_license.side_effect = value(b'LGPL version 2.1 or later')
+        library.avcodec_version.side_effect = value(63 << 16)
+        with patch.object(module.platform, 'system', return_value='Linux'), patch.object(module.ctypes, 'CDLL', side_effect=load):
+            result = module.ffmpeg_metadata(self.sdk)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result, {'binary': path.name, 'sha256': module.digest(path),
+            'versionInteger': 63 << 16, 'configuration': '--disable-gpl', 'license': 'LGPL version 2.1 or later'})
+
+    def test_linux_missing_same_kit_format_does_not_search_another_kit(self):
+        self.kit(format_present=False)
+        other = self.sdk / '6.12.0/unrelated/lib/libavformat.so.63'
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b'SYNTHETIC unrelated kit')
+        with patch.object(module.platform, 'system', return_value='Linux'), patch.object(module.ctypes, 'CDLL') as load:
+            with self.assertRaisesRegex(RuntimeError, 'selected Qt FFmpeg directory lacks'):
+                module.ffmpeg_metadata(self.sdk)
+        load.assert_not_called()
+
+    def test_linux_dependency_failure_prevents_codec_load_and_propagates(self):
+        self.kit()
+        failure = OSError('SYNTHETIC dependency load failure')
+        with patch.object(module.platform, 'system', return_value='Linux'), patch.object(module.ctypes, 'CDLL', side_effect=failure) as load:
+            with self.assertRaises(OSError) as caught:
+                module.ffmpeg_metadata(self.sdk)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(load.call_count, 1)
+
+    def test_non_linux_keeps_existing_codec_only_loading_and_metadata(self):
+        for system in ('Windows', 'Darwin'):
+            with self.subTest(system=system):
+                path = self.kit(system)
+                with patch.object(module.platform, 'system', return_value=system), patch.object(module.ctypes, 'CDLL', return_value=self.codec()) as load:
+                    result = module.ffmpeg_metadata(self.sdk)
+                load.assert_called_once_with(str(path))
+                self.assertEqual(result['sha256'], module.digest(path))
+
+    def test_linux_still_rejects_gpl_and_nonfree_configuration(self):
+        self.kit()
+        for flag in (b'--enable-gpl', b'--enable-nonfree'):
+            with self.subTest(flag=flag), patch.object(module.platform, 'system', return_value='Linux'), patch.object(module.ctypes, 'CDLL', side_effect=[Mock(), self.codec(flag)]):
+                with self.assertRaisesRegex(RuntimeError, 'incompatible GPL/nonfree'):
+                    module.ffmpeg_metadata(self.sdk)
+
+    def test_metadata_symbol_failure_propagates_and_closes_windows_directory(self):
+        self.kit('Windows')
+        library = self.codec()
+        failure = OSError('SYNTHETIC metadata read failure')
+        library.avcodec_configuration.side_effect = failure
+        with patch.object(module.platform, 'system', return_value='Windows'), patch.object(module.ctypes, 'CDLL', return_value=library):
+            with self.assertRaises(OSError) as caught:
+                module.ffmpeg_metadata(self.sdk)
+        self.assertIs(caught.exception, failure)
+        if os.name == 'nt':
+            self.handle.close.assert_called_once_with()
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

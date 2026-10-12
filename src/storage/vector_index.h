@@ -72,8 +72,12 @@ public:
 
     SnapshotPtr snapshot() const;
 
-    // The filter participates in ANN traversal. Small allowed sets use an exact
-    // path. nullptr allows every ID, whereas an empty set allows none.
+    // Small allowed sets use an exact path. Larger sets are partitioned by
+    // shard, counting only present, non-excluded IDs. For N graph nodes, A
+    // accepted IDs and E=min(N,max(k,searchEf)), A*A <= E*N selects exact graph
+    // scoring, otherwise the filter participates in ANN traversal. Each shard
+    // retains up to the global k candidates before the distance/ID merge.
+    // nullptr allows every ID, whereas an empty set allows none.
     QVector<VectorNeighbor> search(const SnapshotPtr &snapshot,
                                    const QVector<float> &query, int k,
                                    const QSet<qint64> *allowedIds = nullptr,

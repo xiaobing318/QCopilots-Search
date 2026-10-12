@@ -223,7 +223,8 @@ include(CPack)
         report = self.root / "missing-model-report"
         output = io.StringIO()
         with patch.object(package_verifier.subprocess, "Popen") as launch, \
-                patch.object(package_verifier.shutil, "which", return_value=None), \
+                patch.object(package_verifier, "package_source_identity", return_value={
+                    "commit": None, "workingTreeModified": None, "sourceIdentityStatus": "unavailable"}), \
                 contextlib.redirect_stdout(output):
             with self.assertRaisesRegex(RuntimeError, "requires --model-dir"):
                 package_verifier.verify(None, self.root / "build", report, self.root / "installed")
@@ -234,6 +235,137 @@ include(CPack)
         self.assertFalse(evidence["releaseComplete"])
         self.assertTrue(evidence["realModelRequired"])
         self.assertEqual(evidence["verificationScope"], "release")
+
+    def package_git_fixture(self):
+        git_config = self.root / "isolated.gitconfig"
+        git_config.write_text("", encoding="utf-8")
+        template = self.root / "empty-git-template"
+        template.mkdir()
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=str(git_config), GIT_CONFIG_NOSYSTEM="1",
+                           GIT_TEMPLATE_DIR=str(template), GIT_TERMINAL_PROMPT="0")
+        isolated_environment = patch.dict(os.environ, environment, clear=True)
+        isolated_environment.start()
+        self.addCleanup(isolated_environment.stop)
+        source = self.root / "真实源码 中文"
+        source.mkdir()
+        git = shutil.which("git")
+        self.assertIsNotNone(git, "Git is required for real package provenance regression")
+        def run(*arguments):
+            result = subprocess.run([git, *arguments], cwd=source, capture_output=True,
+                                    text=True, encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+        run("init", "--quiet")
+        run("config", "core.hooksPath", str(template))
+        run("config", "core.fsmonitor", "false")
+        (source / "source.txt").write_text("immutable test source\n", encoding="utf-8")
+        run("add", "source.txt")
+        run("-c", "user.name=QCS Test", "-c", "user.email=qcs-test@example.invalid",
+            "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Isolated package identity fixture")
+        return source, run("rev-parse", "HEAD")
+
+    def test_package_identity_git_fixture_ignores_user_config_templates_and_overrides(self):
+        global_config = self.root / "unusable-global.gitconfig"
+        global_config.write_text("not valid Git configuration\n", encoding="utf-8")
+        inherited = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config),
+            "GIT_DIR": str(self.root / "not-a-git-dir"), "GIT_WORK_TREE": str(self.root / "not-a-worktree"),
+            "GIT_INDEX_FILE": str(self.root / "not-an-index"), "GIT_TEMPLATE_DIR": str(self.root / "not-a-template"),
+            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.worktree", "GIT_CONFIG_VALUE_0": "missing"})
+        inherited.start()
+        self.addCleanup(inherited.stop)
+        source, head = self.package_git_fixture()
+        self.assertEqual(package_verifier.package_source_identity(source, {})["commit"], head)
+        self.assertEqual(os.environ["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(Path(os.environ["GIT_CONFIG_GLOBAL"]).read_bytes(), b"")
+        self.assertEqual(list(Path(os.environ["GIT_TEMPLATE_DIR"]).iterdir()), [])
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0"):
+            self.assertNotIn(name, os.environ)
+
+    def test_package_identity_supports_actual_linked_worktree_git_file(self):
+        source, head = self.package_git_fixture()
+        worktree = self.root / "linked worktree 中文"
+        result = subprocess.run([shutil.which("git"), "worktree", "add", "--detach", str(worktree), head],
+                                cwd=source, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((worktree / ".git").is_file())
+        identity = package_verifier.package_source_identity(worktree, {"QCOPILOTS_SEARCH_SOURCE_COMMIT": head})
+        self.assertEqual(identity["commit"], head)
+        self.assertFalse(identity["workingTreeModified"])
+
+    def test_package_identity_uses_actual_git_head_without_ci_variables(self):
+        source, head = self.package_git_fixture()
+        result = package_verifier.package_source_identity(source, {})
+        self.assertEqual(result, {"commit": head, "workingTreeModified": False,
+                                  "sourceIdentityStatus": "git-checkout"})
+
+    def test_package_identity_ignores_pr_merge_sha_and_accepts_phase1_head(self):
+        source, head = self.package_git_fixture()
+        result = package_verifier.package_source_identity(source, {"GITHUB_SHA": "b" * 40,
+            "QCOPILOTS_SEARCH_CANDIDATE_HEAD": head, "QCOPILOTS_SEARCH_SOURCE_COMMIT": head})
+        self.assertEqual(result["commit"], head)
+        self.assertFalse(result["workingTreeModified"])
+
+    def test_package_identity_rejects_mismatched_or_malformed_declarations(self):
+        source, head = self.package_git_fixture()
+        for name in ("QCOPILOTS_SEARCH_SOURCE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD"):
+            for value in ("b" * 40, head[:12], "", "not-a-sha"):
+                with self.subTest(name=name, value=value), self.assertRaises(RuntimeError):
+                    package_verifier.package_source_identity(source, {name: value})
+
+    def test_package_identity_preserves_dirty_checkout_status(self):
+        source, head = self.package_git_fixture()
+        (source / "source.txt").write_text("modified\n", encoding="utf-8")
+        result = package_verifier.package_source_identity(source, {})
+        self.assertEqual(result["commit"], head)
+        self.assertTrue(result["workingTreeModified"])
+
+    def test_package_identity_copied_archive_does_not_inherit_enclosing_git(self):
+        source, head = self.package_git_fixture()
+        archive = source / "unpacked source"
+        archive.mkdir()
+        result = package_verifier.package_source_identity(archive, {"GITHUB_SHA": head})
+        self.assertEqual(result, {"commit": None, "workingTreeModified": None,
+                                  "sourceIdentityStatus": "unavailable"})
+
+    def test_package_identity_non_git_archive_rejects_declared_provenance(self):
+        for name in ("QCOPILOTS_SEARCH_SOURCE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD"):
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "Cannot verify declared"):
+                package_verifier.package_source_identity(self.root, {name: "a" * 40})
+
+    def test_package_identity_missing_git_remains_unbound_for_deb_smoke(self):
+        source, _ = self.package_git_fixture()
+        with patch.object(package_verifier.shutil, "which", return_value=None):
+            result = package_verifier.package_source_identity(source, {"GITHUB_SHA": "b" * 40,
+                "QCOPILOTS_SEARCH_CI_COMMIT": "a" * 40})
+            self.assertIsNone(result["commit"])
+            self.assertIsNone(result["workingTreeModified"])
+            self.assertEqual(result["sourceIdentityStatus"], "unavailable")
+            with self.assertRaisesRegex(RuntimeError, "Cannot verify declared"):
+                package_verifier.package_source_identity(source, {"QCOPILOTS_SEARCH_SOURCE_COMMIT": "a" * 40})
+
+    def test_package_identity_git_failure_is_not_downgraded_to_unknown(self):
+        source, _ = self.package_git_fixture()
+        with patch.object(package_verifier.subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["git"], 128, "", "synthetic permission failure")), self.assertRaisesRegex(RuntimeError, "permission failure"):
+            package_verifier.package_source_identity(source, {})
+
+    def test_package_identity_wrong_checkout_fails_before_creating_reports_or_launching(self):
+        source, _ = self.package_git_fixture()
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in {"QCOPILOTS_SEARCH_SOURCE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD"}}
+        environment["QCOPILOTS_SEARCH_SOURCE_COMMIT"] = "b" * 40
+        report = self.root / "should-not-exist"
+        build = self.root / "build-should-not-exist"
+        with patch.object(package_verifier, "SOURCE", source), patch.dict(os.environ, environment, clear=True), \
+                patch.object(package_verifier.subprocess, "Popen", wraps=subprocess.Popen) as launch:
+            with self.assertRaisesRegex(RuntimeError, "differs from the actual"):
+                package_verifier.verify(None, build, report, self.root / "installed")
+        self.assertFalse(report.exists())
+        self.assertFalse(build.exists())
+        self.assertEqual(len(launch.call_args_list), 2, "Only the two Git identity probes may run")
+        self.assertTrue(all(Path(call.args[0][0]).name.lower() in {"git", "git.exe"}
+                            for call in launch.call_args_list))
 
     def test_jpeg_contract_uses_consumer_build_directory_and_header_order(self):
         project = self.root / "源码 source"

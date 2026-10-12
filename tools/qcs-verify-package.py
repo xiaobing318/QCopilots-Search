@@ -518,8 +518,52 @@ def create_fixtures(directory):
     (directory / "package.avi").write_bytes(chunk(b"RIFF",b"AVI "+headers+chunk(b"LIST",b"movi"+frames)))
 
 
+def package_source_identity(source=None, environment=None):
+    """Report this checkout, never a PR workflow's synthetic merge commit.
+
+    Standalone/archive verification remains usable without Git. Its provenance
+    is explicitly unavailable and cannot satisfy the native release gate.
+    A declared source or candidate commit always requires real Git validation.
+    """
+    source = (Path(source) if source is not None else SOURCE).resolve()
+    environment = os.environ if environment is None else environment
+    declarations = {name: environment[name] for name in
+                    ("QCOPILOTS_SEARCH_SOURCE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD")
+                    if name in environment}
+    for name, value in declarations.items():
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise RuntimeError(f"{name} must be a complete Git commit SHA")
+    git = shutil.which("git")
+    # Do not infer provenance from an unrelated repository enclosing a copied
+    # source archive. Both normal checkouts and linked worktrees have .git.
+    if git is None or not (source / ".git").exists():
+        if declarations:
+            raise RuntimeError("Cannot verify declared source commit without this checkout's Git metadata and Git executable")
+        return {"commit": None, "workingTreeModified": None,
+                "sourceIdentityStatus": "unavailable"}
+
+    def checked(*arguments):
+        completed = subprocess.run([git, *arguments], cwd=source, capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", timeout=30)
+        if completed.returncode:
+            raise RuntimeError("Cannot inspect package verifier checkout: " + completed.stderr.strip())
+        return completed.stdout.strip()
+
+    if Path(checked("rev-parse", "--show-toplevel")).resolve() != source:
+        raise RuntimeError("Git checkout root differs from the package verifier source directory")
+    commit = checked("rev-parse", "--verify", "HEAD")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError("Package verifier checkout has no complete HEAD commit")
+    for name, declared in declarations.items():
+        if declared != commit:
+            raise RuntimeError(f"{name} differs from the actual package verifier checkout HEAD")
+    return {"commit": commit, "workingTreeModified": bool(checked("status", "--porcelain")),
+            "sourceIdentityStatus": "git-checkout"}
+
+
 def verify(package, build_root, explicit_report=None, installed_root=None, explicit_profile=None, installed_manifest=None,
            model_dir=None, keyword_only=False, model_timeout=600):
+    source_identity = package_source_identity()
     run_id = str(uuid.uuid4())
     if explicit_report:
         report_dir = explicit_report
@@ -535,13 +579,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
               "runId":run_id, "workingDirectory":str(work), "checks":[], "passed":False,
               "verificationScope": "keyword-only" if keyword_only else "release",
               "realModelRequired": not keyword_only, "releaseComplete": False}
-    report["commit"] = os.environ.get("QCOPILOTS_SEARCH_SOURCE_COMMIT") or os.environ.get("GITHUB_SHA")
-    report["workingTreeModified"] = None
-    if shutil.which("git"):
-        checkout_status = subprocess.run(["git", "status", "--porcelain"], cwd=Path(__file__).resolve().parent.parent,
-                                         capture_output=True, text=True, encoding="utf-8", timeout=30)
-        if checkout_status.returncode == 0:
-            report["workingTreeModified"] = bool(checkout_status.stdout.strip())
+    report.update(source_identity)
     if package:
         package_hash = hashlib.sha256()
         with package.open("rb") as package_stream:

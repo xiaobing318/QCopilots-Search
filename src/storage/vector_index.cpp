@@ -690,6 +690,9 @@ QVector<VectorNeighbor> VectorIndex::search(const SnapshotPtr &state,
         const auto unitQuery = normalized(query, d_->dimensions);
         if (k == 0 || state->size_ == 0 || (allowedIds && allowedIds->isEmpty()))
             return result;
+        const auto neighborLess = [](const VectorNeighbor &left, const VectorNeighbor &right) {
+            return left.distance < right.distance || (left.distance == right.distance && left.id < right.id);
+        };
         if (allowedIds && allowedIds->size() <= exactFilterLimit) {
             result.reserve(allowedIds->size());
             qsizetype visited = 0;
@@ -712,11 +715,81 @@ QVector<VectorNeighbor> VectorIndex::search(const SnapshotPtr &state,
                 result.append({id, std::clamp(distance, 0.0f, 2.0f)});
             }
         } else {
-            for (const auto &shard : state->shards_) {
+            const auto checkpoint = [&](const QString &point) {
+                if (!d_->faultHook)
+                    return;
+                try {
+                    d_->faultHook(point);
+                } catch (const std::exception &) {
+                    throw;
+                } catch (...) {
+                    throw std::runtime_error("ANN search checkpoint failed with a non-standard exception");
+                }
+            };
+            std::array<QVector<hnswlib::tableint>, shardCount> allowedByShard;
+            if (allowedIds) {
+                qsizetype visited = 0;
+                for (const auto id : *allowedIds) {
+                    const int shardNumber = shardForId(id);
+                    if (shardNumber >= 0 && (!excludedIds || !excludedIds->contains(id))) {
+                        const auto &shard = state->shards_[shardNumber];
+                        if (shard) {
+                            const auto found = shard->graph.label_lookup_.find(hnswlib::labeltype(id));
+                            if (found != shard->graph.label_lookup_.end())
+                                allowedByShard[shardNumber].append(found->second);
+                        }
+                    }
+                    if ((++visited % 128) == 0) {
+                        checkpoint(QStringLiteral("ann-search-filter-progress"));
+                        if (wasCancelled())
+                            return {};
+                    }
+                }
+            }
+            for (int shardNumber = 0; shardNumber < shardCount; ++shardNumber) {
                 if (wasCancelled())
                     return {};
-                if (!shard)
+                const auto &shard = state->shards_[shardNumber];
+                if (!shard || (allowedIds && allowedByShard[shardNumber].isEmpty()))
                     continue;
+                const quint64 nodes = shard->graph.cur_element_count.load();
+                const auto &allowed = allowedByShard[shardNumber];
+                const quint64 accepted = quint64(allowed.size());
+                const quint64 breadth = std::min(nodes, std::max(quint64(k), quint64(queryEf)));
+                // A <= N <= maximumShardElements (validated on build/load),
+                // so both products fit in quint64. Sparse filters can cost
+                // more graph visits than scoring their accepted vectors.
+                if (allowedIds && accepted * accepted <= breadth * nodes) {
+                    checkpoint(QStringLiteral("ann-search-exact-started"));
+                    if (wasCancelled())
+                        return {};
+                    QVector<VectorNeighbor> exact;
+                    exact.reserve(allowed.size());
+                    qsizetype scored = 0;
+                    for (const auto internalId : allowed) {
+                        const float distance = shard->graph.fstdistfunc_(unitQuery.constData(),
+                            shard->graph.getDataByInternalId(internalId), shard->graph.dist_func_param_);
+                        exact.append({qint64(shard->graph.getExternalLabel(internalId)),
+                                      std::clamp(distance, 0.0f, 2.0f)});
+                        if ((++scored % 128) == 0) {
+                            checkpoint(QStringLiteral("ann-search-exact-progress"));
+                            if (wasCancelled())
+                                return {};
+                        }
+                    }
+                    if (wasCancelled())
+                        return {};
+                    if (exact.size() > k) {
+                        // Any shard can supply all global k neighbors. Use
+                        // the final distance/ID order when resolving ties.
+                        std::nth_element(exact.begin(), exact.begin() + k, exact.end(), neighborLess);
+                        exact.resize(k);
+                    }
+                    if (wasCancelled())
+                        return {};
+                    result += exact;
+                    continue;
+                }
                 std::unique_ptr<AllowedFilter> filter;
                 if (allowedIds || (excludedIds && !excludedIds->isEmpty()))
                     filter = std::make_unique<AllowedFilter>(allowedIds, excludedIds);
@@ -746,9 +819,7 @@ QVector<VectorNeighbor> VectorIndex::search(const SnapshotPtr &state,
         }
         if (wasCancelled())
             return {};
-        std::sort(result.begin(), result.end(), [](const VectorNeighbor &left, const VectorNeighbor &right) {
-            return left.distance < right.distance || (left.distance == right.distance && left.id < right.id);
-        });
+        std::sort(result.begin(), result.end(), neighborLess);
         if (result.size() > k)
             result.resize(k);
         if (wasCancelled())

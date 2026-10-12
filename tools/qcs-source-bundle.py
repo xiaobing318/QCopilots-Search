@@ -216,7 +216,16 @@ def ffmpeg_metadata(qt_root: Path):
     path = candidates[0].resolve()
     directory_handle = os.add_dll_directory(str(path.parent)) if os.name == "nt" else None
     try:
-        library = ctypes.CDLL(str(path))
+        if platform.system() == "Linux":
+            # Qt's avutil needs RAND_bytes from avformat's SSL stub dependency
+            # group. Keep that group alive and local, matching media_extractor.
+            dependency_path = path.parent / "libavformat.so.63"
+            if not dependency_path.is_file():
+                raise RuntimeError("The selected Qt FFmpeg directory lacks libavformat.so.63")
+            dependency_group = ctypes.CDLL(str(dependency_path.resolve()), mode=ctypes.RTLD_LOCAL)
+            library = ctypes.CDLL(str(path), mode=ctypes.RTLD_LOCAL)
+        else:
+            library = ctypes.CDLL(str(path))
         library.avcodec_configuration.restype = ctypes.c_char_p
         library.avcodec_license.restype = ctypes.c_char_p
         library.avcodec_version.restype = ctypes.c_uint

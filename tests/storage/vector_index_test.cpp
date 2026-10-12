@@ -78,6 +78,84 @@ QVector<VectorRecord> sphericalRecords(int count, quint32 seed = 20261011)
     return records;
 }
 
+QVector<VectorRecord> filterRecords(int count, int shard, quint32 seed)
+{
+    auto records = sphericalRecords(count, seed);
+    for (auto &record : records)
+        record.id += shard;
+    return records;
+}
+
+QSet<qint64> prefixIds(const QVector<VectorRecord> &records, int count)
+{
+    QSet<qint64> allowed;
+    for (int i = 0; i < count; ++i)
+        allowed.insert(records.at(i).id);
+    return allowed;
+}
+
+QVector<qint64> neighborIds(const QVector<VectorNeighbor> &neighbors)
+{
+    QVector<qint64> ids;
+    for (const auto &neighbor : neighbors)
+        ids.append(neighbor.id);
+    return ids;
+}
+
+// Deliberately does not call VectorIndex normalization, graph distance, or
+// branch-selection code. There are no tied spherical distances in these cases.
+QVector<qint64> filteredOracle(const QVector<VectorRecord> &records,
+                               const QVector<float> &query,
+                               const QSet<qint64> &allowed,
+                               const QSet<qint64> &excluded, int limit)
+{
+    double queryNorm = 0;
+    for (float value : query)
+        queryNorm += double(value) * value;
+    QVector<QPair<qint64, double>> scored;
+    for (const auto &record : records) {
+        if (!allowed.contains(record.id) || excluded.contains(record.id))
+            continue;
+        double dot = 0, norm = 0;
+        for (qsizetype i = 0; i < query.size(); ++i) {
+            dot += double(query.at(i)) * record.vector.at(i);
+            norm += double(record.vector.at(i)) * record.vector.at(i);
+        }
+        scored.append({record.id, 1.0 - dot / std::sqrt(queryNorm * norm)});
+    }
+    std::sort(scored.begin(), scored.end(), [](const auto &a, const auto &b) {
+        return a.second == b.second ? a.first < b.first : a.second < b.second;
+    });
+    QVector<qint64> result;
+    for (qsizetype i = 0; i < std::min(qsizetype(limit), scored.size()); ++i)
+        result.append(scored.at(i).first);
+    return result;
+}
+
+int intersectionSize(const QVector<qint64> &actual, const QVector<qint64> &expected)
+{
+    const QSet<qint64> unique(actual.cbegin(), actual.cend());
+    int matches = 0;
+    for (qint64 id : expected)
+        matches += unique.contains(id);
+    return matches;
+}
+
+bool eligibleUniqueNeighbors(const QVector<VectorNeighbor> &actual,
+                             const QSet<qint64> &allowed,
+                             const QSet<qint64> &excluded = {})
+{
+    QSet<qint64> seen;
+    for (const auto &neighbor : actual) {
+        if (seen.contains(neighbor.id) || !allowed.contains(neighbor.id)
+                || excluded.contains(neighbor.id))
+            return false;
+        seen.insert(neighbor.id);
+    }
+    return true;
+}
+
+
 } // namespace
 
 class VectorIndexTest : public QObject
@@ -132,6 +210,320 @@ private slots:
         QVERIFY(matches.at(0).distance <= matches.at(1).distance);
         QVERIFY(matches.at(1).distance <= matches.at(2).distance);
         QCOMPARE(index.search(snapshot, basis(0), 1).size(), qsizetype(1));
+    }
+
+    void adaptiveFilteredSearchUsesRealIdsOnBothSidesOfBoundary()
+    {
+        test::TestTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        QStringList checkpoints;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) { checkpoints.append(point); });
+        const auto records = filterRecords(20000, 0, 20261013);
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, records, &error), qPrintable(error));
+        const auto snapshot = index.snapshot();
+        std::atomic_bool cancelled{false};
+        // E=4096, N=20000 gives the integer transition at 9050/9051.
+        // All collections contain exclusively real graph labels. The 9000
+        // case also proves this is the new path beyond the previous 8192 limit.
+        for (const auto [count, expectExact] : std::array<std::pair<int, bool>, 5>{{
+                 {9000, true}, {9050, true}, {9051, false}, {10000, false}, {20000, false}}}) {
+            const auto allowed = prefixIds(records, count);
+            checkpoints.clear();
+            const auto actual = index.search(snapshot, basis(0), 20, &allowed, &error, nullptr, &cancelled);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(actual.size(), qsizetype(20));
+            QVERIFY(eligibleUniqueNeighbors(actual, allowed));
+            QCOMPARE(checkpoints.count(QStringLiteral("ann-search-exact-started")), expectExact ? 1 : 0);
+            QCOMPARE(checkpoints.count(QStringLiteral("ann-search-traversal-started")), expectExact ? 0 : 1);
+            const auto expected = filteredOracle(records, basis(0), allowed, {}, 20);
+            if (expectExact)
+                QCOMPARE(neighborIds(actual), expected);
+            else
+                QVERIFY(intersectionSize(neighborIds(actual), expected) >= 19);
+            const auto noToken = index.search(snapshot, basis(0), 20, &allowed, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(neighborIds(noToken), neighborIds(actual));
+            for (qsizetype i = 0; i < actual.size(); ++i)
+                QCOMPARE(noToken.at(i).distance, actual.at(i).distance);
+        }
+        // k also contributes to E. The same 10000 valid IDs now lie exactly on
+        // the boundary when k=5000, so the strategy must change to exact.
+        const auto broadAllowed = prefixIds(records, 10000);
+        checkpoints.clear();
+        const auto broad = index.search(snapshot, basis(0), 5000, &broadAllowed, &error, nullptr, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-exact-started")), 1);
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-traversal-started")), 0);
+        const auto broadIds = neighborIds(broad);
+        const auto broadOracle = filteredOracle(records, basis(0), broadAllowed, {}, 5000);
+        QCOMPARE(QSet<qint64>(broadIds.cbegin(), broadIds.cend()), QSet<qint64>(broadOracle.cbegin(), broadOracle.cend()));
+        QCOMPARE(broad.size(), qsizetype(5000));
+        QVERIFY(eligibleUniqueNeighbors(broad, broadAllowed));
+        QCOMPARE(snapshot->size(), qsizetype(20000));
+        QCOMPARE(snapshot->generation(), quint64(1));
+    }
+
+    void adaptiveFilterCountsOnlyPresentNonTombstonedLabels()
+    {
+        test::TestTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        QStringList checkpoints;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) { checkpoints.append(point); });
+        const auto records = filterRecords(20000, 0, 20261014);
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, records, &error), qPrintable(error));
+        auto allowed = prefixIds(records, 10000);
+        QSet<qint64> excluded;
+        for (int i = 0; i < 1200; ++i)
+            excluded.insert(records.at(i).id);
+        // Missing labels, missing shards and invalid IDs must not inflate A.
+        for (qint64 i = 100000; i < 130000; ++i)
+            allowed.insert(i * 16);
+        allowed.insert(999999);
+        allowed.insert(0);
+        allowed.insert(-16);
+        std::atomic_bool cancelled{false};
+        const auto snapshot = index.snapshot();
+        checkpoints.clear();
+        const auto exact = index.search(snapshot, basis(0), 20, &allowed, &error, &excluded, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(eligibleUniqueNeighbors(exact, allowed, excluded));
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-exact-started")), 1);
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-traversal-started")), 0);
+        QCOMPARE(neighborIds(exact), filteredOracle(records, basis(0), allowed, excluded, 20));
+        for (const auto &hit : exact)
+            QVERIFY(!excluded.contains(hit.id));
+        // Same allowed set, but 10000 true live IDs now cross the ANN boundary.
+        checkpoints.clear();
+        const auto ann = index.search(snapshot, basis(0), 20, &allowed, &error, nullptr, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(ann.size(), qsizetype(20));
+        QVERIFY(eligibleUniqueNeighbors(ann, allowed));
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-exact-started")), 0);
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-traversal-started")), 1);
+        QVERIFY(intersectionSize(neighborIds(ann), filteredOracle(records, basis(0), allowed, {}, 20)) >= 19);
+        // Keep a nonempty tombstone set while remaining on the genuine ANN side.
+        excluded = {filteredOracle(records, basis(0), allowed, {}, 20).first()};
+        checkpoints.clear();
+        const auto liveAnn = index.search(snapshot, basis(0), 20, &allowed, &error, &excluded, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(liveAnn.size(), qsizetype(20));
+        QVERIFY(eligibleUniqueNeighbors(liveAnn, allowed, excluded));
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-exact-started")), 0);
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-traversal-started")), 1);
+        QVERIFY(intersectionSize(neighborIds(liveAnn), filteredOracle(records, basis(0), allowed, excluded, 20)) >= 19);
+        excluded = prefixIds(records, 20000);
+        QVERIFY(index.search(snapshot, basis(0), 20, &allowed, &error, &excluded, &cancelled).isEmpty());
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
+    void adaptiveFilteredSearchMergesSkewedShardStrategies()
+    {
+        test::TestTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        QStringList checkpoints;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) { checkpoints.append(point); });
+        const auto first = filterRecords(20000, 0, 20261015);
+        const auto second = filterRecords(20000, 1, 20261016);
+        const auto all = first + second;
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, first, &error), qPrintable(error));
+        QVERIFY2(index.rebuildShard(1, 2, second, &error), qPrintable(error));
+        auto allowed = prefixIds(first, 9000);
+        allowed.unite(prefixIds(second, 10000));
+        std::atomic_bool cancelled{false};
+        for (int coordinate = 0; coordinate < 3; ++coordinate) {
+            checkpoints.clear();
+            const auto actual = index.search(index.snapshot(), basis(coordinate), 20, &allowed, &error, nullptr, &cancelled);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(actual.size(), qsizetype(20));
+            QVERIFY(eligibleUniqueNeighbors(actual, allowed));
+            QCOMPARE(checkpoints.count(QStringLiteral("ann-search-exact-started")), 1);
+            QCOMPARE(checkpoints.count(QStringLiteral("ann-search-traversal-started")), 1);
+            const auto ids = neighborIds(actual);
+            QCOMPARE(QSet<qint64>(ids.cbegin(), ids.cend()).size(), ids.size());
+            QVERIFY(intersectionSize(ids, filteredOracle(all, basis(coordinate), allowed, {}, 20)) >= 19);
+            const auto noToken = index.search(index.snapshot(), basis(coordinate), 20, &allowed, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(neighborIds(noToken), ids);
+        }
+        // Keeping the same total A but concentrating it on one shard must not
+        // reuse the earlier 9000/10000 per-shard plan.
+        allowed = prefixIds(second, 19000);
+        checkpoints.clear();
+        const auto skewed = index.search(index.snapshot(), basis(0), 20, &allowed, &error, nullptr, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(skewed.size(), qsizetype(20));
+        QVERIFY(eligibleUniqueNeighbors(skewed, allowed));
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-exact-started")), 0);
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-traversal-started")), 1);
+        QVERIFY(intersectionSize(neighborIds(skewed), filteredOracle(all, basis(0), allowed, {}, 20)) >= 19);
+    }
+
+    void adaptiveExactScanCanBeCancelledAfterScoringStarts()
+    {
+        test::TestTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        std::atomic_bool cancelled{false};
+        bool cancelOnProgress = true;
+        int starts = 0, progress = 0;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) {
+            if (point == QStringLiteral("ann-search-exact-started"))
+                ++starts;
+            if (point == QStringLiteral("ann-search-exact-progress")) {
+                ++progress;
+                if (cancelOnProgress)
+                    cancelled.store(true, std::memory_order_relaxed);
+            }
+        });
+        const auto records = filterRecords(20000, 0, 20261017);
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, records, &error), qPrintable(error));
+        const auto snapshot = index.snapshot();
+        const auto allowed = prefixIds(records, 9000);
+        const auto files = filesBelow(temporary.path());
+        QVERIFY(!cancelled.load());
+        QVERIFY(index.search(snapshot, basis(0), 20, &allowed, &error, nullptr, &cancelled).isEmpty());
+        QCOMPARE(error, QStringLiteral("Search cancelled"));
+        QCOMPARE(starts, 1);
+        QCOMPARE(progress, 1);
+        cancelOnProgress = false;
+        cancelled.store(false);
+        const auto retry = index.search(snapshot, basis(0), 20, &allowed, &error, nullptr, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(neighborIds(retry), filteredOracle(records, basis(0), allowed, {}, 20));
+        QCOMPARE(snapshot->generation(), quint64(1));
+        QCOMPARE(snapshot->size(), qsizetype(20000));
+        QCOMPARE(filesBelow(temporary.path()), files);
+    }
+
+    void adaptiveFilteredReadsKeepTheirCapturedSnapshot()
+    {
+        test::TestTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        VectorIndex index(temporary.path(), 4);
+        const auto records = filterRecords(20000, 0, 20261018);
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, records, &error), qPrintable(error));
+        const auto old = index.snapshot();
+        const auto replacement = filterRecords(128, 0, 20261019);
+        QVERIFY2(index.rebuildShard(0, 2, replacement, &error), qPrintable(error));
+        const auto fresh = index.snapshot();
+        std::atomic_bool cancelled{false};
+        for (int count : {9000, 10000}) {
+            const auto allowed = prefixIds(records, count);
+            const auto before = index.search(old, basis(0), 20, &allowed, &error, nullptr, &cancelled);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            const auto after = index.search(fresh, basis(0), 20, &allowed, &error, nullptr, &cancelled);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            const auto expectedOld = filteredOracle(records, basis(0), allowed, {}, 20);
+            if (count == 9000)
+                QCOMPARE(neighborIds(before), expectedOld);
+            else
+                QVERIFY(intersectionSize(neighborIds(before), expectedOld) >= 19);
+            QCOMPARE(neighborIds(after), filteredOracle(replacement, basis(0), allowed, {}, 20));
+            QVERIFY(neighborIds(before) != neighborIds(after));
+        }
+        QCOMPARE(old->size(), qsizetype(20000));
+        QCOMPARE(old->generation(), quint64(1));
+        QCOMPARE(fresh->size(), qsizetype(128));
+        QCOMPARE(fresh->generation(), quint64(2));
+    }
+
+    void adaptiveFilterPartitionCancellationAndCheckpointErrors()
+    {
+        test::TestTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        std::atomic_bool cancelled{false};
+        QString failPoint;
+        int action = 0, observations = 0, exactStarts = 0;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) {
+            if (point == QStringLiteral("ann-search-exact-started"))
+                ++exactStarts;
+            if (point != failPoint || action == 0)
+                return;
+            ++observations;
+            if (action == 1)
+                cancelled.store(true, std::memory_order_relaxed);
+            else if (action == 2)
+                throw std::runtime_error("Injected filter checkpoint failure");
+            else if (action == 3)
+                throw 42;
+        });
+        const auto records = filterRecords(20000, 0, 20261020);
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, records, &error), qPrintable(error));
+        const auto snapshot = index.snapshot();
+        const auto allowed = prefixIds(records, 9000);
+        const auto expected = filteredOracle(records, basis(0), allowed, {}, 20);
+        failPoint = QStringLiteral("ann-search-filter-progress");
+        action = 1;
+        QVERIFY(index.search(snapshot, basis(0), 20, &allowed, &error, nullptr, &cancelled).isEmpty());
+        QCOMPARE(error, QStringLiteral("Search cancelled"));
+        QCOMPARE(observations, 1);
+        QCOMPARE(exactStarts, 0);
+        action = 0;
+        cancelled.store(false);
+        auto retry = index.search(snapshot, basis(0), 20, &allowed, &error, nullptr, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(neighborIds(retry), expected);
+        for (const auto &point : {QStringLiteral("ann-search-filter-progress"),
+                                  QStringLiteral("ann-search-exact-started"),
+                                  QStringLiteral("ann-search-exact-progress")}) {
+            for (int failure : {2, 3}) {
+                failPoint = point;
+                action = failure;
+                observations = 0;
+                QVERIFY(index.search(snapshot, basis(0), 20, &allowed, &error, nullptr, &cancelled).isEmpty());
+                QCOMPARE(observations, 1);
+                QVERIFY2(error.contains(failure == 2 ? QStringLiteral("Injected filter checkpoint failure")
+                                                    : QStringLiteral("non-standard exception")), qPrintable(error));
+                action = 0;
+                retry = index.search(snapshot, basis(0), 20, &allowed, &error, nullptr, &cancelled);
+                QVERIFY2(error.isEmpty(), qPrintable(error));
+                QCOMPARE(neighborIds(retry), expected);
+            }
+        }
+        QCOMPARE(index.snapshot()->generation(), quint64(1));
+        QCOMPARE(index.snapshot()->size(), qsizetype(20000));
+    }
+
+    void adaptiveExactSelectionKeepsGlobalKAndDistanceIdTies()
+    {
+        test::TestTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        QStringList checkpoints;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) { checkpoints.append(point); });
+        auto first = filterRecords(10000, 0, 20261021);
+        auto second = filterRecords(10000, 1, 20261022);
+        for (int i = 0; i < 40; ++i) {
+            first[i].vector = basis(0);
+            second[i].vector = basis(0);
+        }
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, first, &error), qPrintable(error));
+        QVERIFY2(index.rebuildShard(1, 2, second, &error), qPrintable(error));
+        auto allowed = prefixIds(first, 5000);
+        allowed.unite(prefixIds(second, 5000));
+        std::atomic_bool cancelled{false};
+        checkpoints.clear();
+        const auto tied = index.search(index.snapshot(), basis(0), 20, &allowed, &error, nullptr, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-exact-started")), 2);
+        QCOMPARE(checkpoints.count(QStringLiteral("ann-search-traversal-started")), 0);
+        QCOMPARE(neighborIds(tied), filteredOracle(first + second, basis(0), allowed, {}, 20));
+        // Make every best hit belong to one shard. Per-shard trimming must keep
+        // global k, not k divided by the number of nonempty shards.
+        QSet<qint64> excluded;
+        for (int i = 0; i < 40; ++i)
+            excluded.insert(first.at(i).id);
+        const auto concentrated = index.search(index.snapshot(), basis(0), 20, &allowed, &error, &excluded, &cancelled);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(concentrated.size(), qsizetype(20));
+        QCOMPARE(neighborIds(concentrated), filteredOracle(first + second, basis(0), allowed, excluded, 20));
+        for (const auto &hit : concentrated)
+            QCOMPARE(VectorIndex::shardForId(hit.id), 1);
     }
 
     void allowedIdsRestrictCandidates()
@@ -200,13 +592,8 @@ private slots:
         QCOMPARE(exact.size(), qsizetype(2));
         QCOMPARE(exact.first().id, qint64(514 * 16));
         QCOMPARE(exact.last().id, qint64(515 * 16));
-        QSet<qint64> largeAllowed = allowed;
-        for (qint64 id = 100000; id < 109000; ++id)
-            largeAllowed.insert(id);
-        const auto filteredAnn = index.search(snapshot, basis(0), 10, &largeAllowed, &error, &excluded);
-        QVERIFY2(error.isEmpty(), qPrintable(error));
-        QCOMPARE(filteredAnn.size(), qsizetype(2));
-        QCOMPARE(filteredAnn.first().id, qint64(514 * 16));
+        // Real populated filtered ANN and adaptive-exact strategies are
+        // observed independently in adaptiveFilteredSearchUsesRealIdsOnBothSidesOfBoundary.
         for (const auto &record : records)
             excluded.insert(record.id);
         QVERIFY(index.search(snapshot, basis(0), 10, nullptr, &error, &excluded).isEmpty());

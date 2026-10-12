@@ -39,6 +39,10 @@ Windows NSIS 生成器需要安装 NSIS。macOS 使用 `DragNDrop`，分架构�
 
 自动部署检查和用户操作验收分别报告。只运行 `--version` 可以证明一部分动态库加载，不能替代 GUI 插件加载、后台索引或多媒体预览。`verify-package` 的实际执行范围需要在报告中注明，缺少的完整流程由包级测试补齐。
 
+`verify-package` 从验证器源码目录的真实 Git checkout 读取 `HEAD` 和工作树状态，正常 checkout 与 linked worktree 均可使用。报告记录 `commit`、`workingTreeModified` 和 `sourceIdentityStatus`，不从 `GITHUB_SHA` 推断来源。若设置 `QCOPILOTS_SEARCH_SOURCE_COMMIT` 或 `QCOPILOTS_SEARCH_CANDIDATE_HEAD`，每项必须是完整的 40 位小写十六进制 SHA，且与实际 `HEAD` 相同。声明失配、Git 查询失败或 checkout 根不符时，在创建报告和启动产品前明确失败。
+
+源码归档或没有 Git 程序的环境仍可在未声明候选身份时执行功能验收，此时报告中的 `commit` 和 `workingTreeModified` 为 `null`，`sourceIdentityStatus` 为 `unavailable`，不能独立满足发布来源门槛。复制的源码归档不会继承上层其他 Git 仓库的身份。DEB 容器内层报告同样遵循此规则，外层安装与卸载报告的候选及包哈希绑定仍由原生证据流程核验。
+
 默认包级验收必须读取已校验的模型目录，执行 `query`、`screen-280` 和 `speech` 三条原始黄金输入，并保存全部 768 维结果和 worker 原始回复。发布门禁独立重算归一化长度和 cosine，要求 cosine ≥ 0.999，并核对安装目录内推理库的来源、实际字节哈希及服务语义检索结果。Windows 和 x64 Unix 包验证实际加载的共享 CPU 后端，Apple Silicon 验证静态 CPU 实现。本步骤不替代单独的九条黄金向量和强制基线后端测试。`--keyword-only` 只生成开发阶段的部分验收报告，发布门禁会拒绝它。
 
 包中 Qt SDK 的许可清单、对应许可文本和 llama/ggml 许可会完整复制到验收报告目录。`record-package` 同时保留这些材料和三份原始 worker 回复，检查清单哈希、模块覆盖及每份附件的实际字节。DEB 验收容器以只读方式挂载模型目录，不把模型写入安装包。
@@ -71,7 +75,7 @@ Linux CI 在固定 Ubuntu 22.04 容器中使用 `dpkg --install` 安装最终 DE
 
 CI 的 `required` job 下载当前运行的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `qcs-native-aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。这个结果只代表四个原生组合，最终 Windows 百万规模和 Computer Use 由下面的本机门禁单独核验。
 
-PR 的候选提交使用事件中的 `pull_request.head.sha`。实际 CI checkout 通常是 GitHub 生成的 merge commit，两者分别记录。四个原生 job 必须执行同一 checkout，最终本机候选必须与其候选 head、Git tree 和依赖锁哈希一致。不能把 merge commit 与 head 字符串不同误判为构建失败，也不能将旧报告事后绑定到新的 HEAD。
+PR 的候选提交使用事件中的 `pull_request.head.sha`，其他事件使用 `github.sha`。四个原生 job 和汇总 job 都显式检出该候选，分别记录候选 head 与实际 checkout commit，并核对 Git tree 和依赖锁哈希。PR 事件的 `GITHUB_SHA` 可能是 GitHub 生成的临时合并提交，不能替代实际 checkout 身份写入包报告。最终本机候选必须与原生证据一致，不能将旧报告事后绑定到新的 HEAD。
 
 ## 本机最终证据流程
 

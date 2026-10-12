@@ -11,6 +11,15 @@
 
 #include <sqlite3.h>
 #include <cmath>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <stdexcept>
+#include <utility>
 #include <memory>
 #include <numbers>
 
@@ -78,6 +87,235 @@ qint64 testFileCount(sqlite3 *database)
     return rc == SQLITE_OK && sqlite3_step(statement.get()) == SQLITE_ROW
         ? sqlite3_column_int64(statement.get(), 0) : -1;
 }
+
+
+QStringList hitPaths(const QList<SearchHit> &hits)
+{
+    QStringList paths;
+    for (const auto &hit : hits)
+        paths.append(hit.path);
+    return paths;
+}
+
+QJsonArray hitIdentities(const QList<SearchHit> &hits)
+{
+    QJsonArray identities;
+    for (const auto &hit : hits)
+        identities.append(QJsonObject{{QStringLiteral("id"), hit.segmentId},
+                                     {QStringLiteral("path"), hit.path},
+                                     {QStringLiteral("version"), hit.sourceVersion}});
+    return identities;
+}
+
+QVector<float> sentinelVector(float score)
+{
+    QVector<float> vector(embeddingDimensions, 0.0f);
+    vector[0] = score;
+    vector[1] = std::sqrt(1.0f - score * score);
+    return vector;
+}
+
+qint64 pendingEventsForShard(const QString &path, int shard, QString *error)
+{
+    auto database = openTestDatabase(path, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, error);
+    if (!database)
+        return -1;
+    sqlite3_stmt *raw = nullptr;
+    const int prepared = sqlite3_prepare_v2(database.get(),
+        "SELECT count(*) FROM ann_events WHERE shard=?", -1, &raw, nullptr);
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(raw, sqlite3_finalize);
+    if (prepared != SQLITE_OK || sqlite3_bind_int(raw, 1, shard) != SQLITE_OK
+            || sqlite3_step(raw) != SQLITE_ROW) {
+        *error = QString::fromUtf8(sqlite3_errmsg(database.get()));
+        return -1;
+    }
+    error->clear();
+    return sqlite3_column_int64(raw, 0);
+}
+
+
+class PairedSnapshotProbe {
+public:
+    struct State {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::atomic_bool armed{false};
+        bool entered = false;
+        bool released = false;
+        bool timedOut = false;
+    };
+
+    struct Result {
+        QList<SearchHit> hits;
+        QString error;
+    };
+
+    static std::function<void(const QString &)> observer(const std::shared_ptr<State> &state)
+    {
+        return [state](const QString &point) {
+            if (point != QStringLiteral("sqlite-search-progress") ||
+                !state->armed.exchange(false, std::memory_order_acq_rel))
+                return;
+            std::unique_lock lock(state->mutex);
+            state->entered = true;
+            state->changed.notify_all();
+            // This is a fail-safe, never a successful automatic release.
+            // One flushOneShard checkpoint may wait SQLite's 5-second busy
+            // timeout while this reader pins WAL. Do not use full flush here.
+            if (!state->changed.wait_for(lock, std::chrono::seconds(60),
+                                         [&] { return state->released; }))
+                state->timedOut = true;
+        };
+    }
+
+    explicit PairedSnapshotProbe(std::shared_ptr<State> state)
+        : state_(std::move(state)), cancelled_(std::make_shared<std::atomic_bool>(false))
+    {
+    }
+
+    PairedSnapshotProbe(std::shared_ptr<State> state, const IndexRepository &repository,
+                        SearchOptions options)
+        : PairedSnapshotProbe(std::move(state))
+    {
+        start(repository, std::move(options));
+    }
+
+    PairedSnapshotProbe(const PairedSnapshotProbe &) = delete;
+    PairedSnapshotProbe &operator=(const PairedSnapshotProbe &) = delete;
+
+    ~PairedSnapshotProbe()
+    {
+        // QVERIFY/QCOMPARE may return from the enclosing test at any point.
+        // The only thread owned here is this query. Never leave its barrier
+        // waiting on a fixture or repository whose lifetime has already ended.
+        state_->armed.store(false, std::memory_order_release);
+        cancelled_->store(true, std::memory_order_relaxed);
+        release();
+        if (future_.valid())
+            future_.wait();
+    }
+
+    void start(const IndexRepository &repository, SearchOptions options)
+    {
+        if (started_)
+            throw std::logic_error("A paired snapshot probe is single-use");
+        started_ = true;
+        // Query options are captured by value. Cleanup owns its cancellation
+        // token and never changes a caller's options or shared token.
+        options.cancelled = cancelled_;
+        state_->armed.store(true, std::memory_order_release);
+        future_ = std::async(std::launch::async, [&repository, options = std::move(options)] {
+            Result result;
+            result.hits = repository.search(options, &result.error);
+            return result;
+        });
+    }
+
+    bool waitEntered(std::chrono::seconds timeout = std::chrono::seconds(10))
+    {
+        std::unique_lock lock(state_->mutex);
+        return state_->changed.wait_for(lock, timeout, [&] { return state_->entered; });
+    }
+
+    bool waitUntilEntered() { return waitEntered(); }
+
+    bool remainsBlocked() const
+    {
+        std::lock_guard lock(state_->mutex);
+        return state_->entered && !state_->released && !state_->timedOut;
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard lock(state_->mutex);
+            state_->released = true;
+        }
+        state_->changed.notify_all();
+    }
+
+    bool releaseAndJoin(std::chrono::seconds timeout = std::chrono::seconds(10))
+    {
+        release();
+        if (!future_.valid() || future_.wait_for(timeout) != std::future_status::ready)
+            return false;
+        try {
+            result_ = future_.get();
+        } catch (const std::exception &exception) {
+            result_.error = QStringLiteral("Snapshot query worker exception: %1")
+                                .arg(QString::fromUtf8(exception.what()));
+        } catch (...) {
+            result_.error = QStringLiteral("Unknown snapshot query worker exception");
+        }
+        joined_ = true;
+        return true;
+    }
+
+    bool hookTimedOut() const
+    {
+        std::lock_guard lock(state_->mutex);
+        return state_->timedOut;
+    }
+
+    bool finish()
+    {
+        const bool writerFinishedWhilePinned = remainsBlocked();
+        if (!releaseAndJoin()) {
+            result_.error = QStringLiteral("Snapshot query did not finish within 10 seconds after explicit release");
+            return false;
+        }
+        if (hookTimedOut()) {
+            result_.error = QStringLiteral("Snapshot barrier expired after 60 seconds while writer was still active");
+            return false;
+        }
+        if (!writerFinishedWhilePinned) {
+            result_.error = QStringLiteral("Snapshot reader was not pinned when writer completed");
+            return false;
+        }
+        return result_.error.isEmpty();
+    }
+
+    const QString &error() const { return result_.error; }
+    const QList<SearchHit> &hits() const { return result().hits; }
+
+    const Result &result() const
+    {
+        if (!joined_)
+            throw std::logic_error("Snapshot query result requires successful join");
+        return result_;
+    }
+
+private:
+    std::shared_ptr<State> state_;
+    std::shared_ptr<std::atomic_bool> cancelled_;
+    std::future<Result> future_;
+    Result result_;
+    bool started_ = false;
+    bool joined_ = false;
+};
+
+// The barrier/state precedes IndexRepository. The returned paused query is
+// declared after IndexRepository, and therefore is torn down before it.
+class SnapshotBarrier {
+public:
+    SnapshotBarrier()
+        : state_(std::make_shared<PairedSnapshotProbe::State>()),
+          observer_(PairedSnapshotProbe::observer(state_))
+    {
+    }
+
+    void observe(const QString &point) { observer_(point); }
+
+    PairedSnapshotProbe start(const IndexRepository &repository, SearchOptions options)
+    {
+        return PairedSnapshotProbe(state_, repository, std::move(options));
+    }
+
+private:
+    std::shared_ptr<PairedSnapshotProbe::State> state_;
+    std::function<void(const QString &)> observer_;
+};
+
 
 } // namespace
 
@@ -592,7 +830,10 @@ private slots:
     {
         TestEnvironment environment(QStringLiteral("ann-regression"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        IndexRepository repository;
+        auto snapshotState = std::make_shared<PairedSnapshotProbe::State>();
+        StorageOptions storage;
+        storage.faultHook = PairedSnapshotProbe::observer(snapshotState);
+        IndexRepository repository(storage);
         QString error;
         QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
         QElapsedTimer elapsed;
@@ -600,7 +841,8 @@ private slots:
 
         constexpr int dominantSegments = 300;
         // Keep this strictly above the repository's 20,000-vector exact cutoff
-        // after deleting the dominant file, so both assertions exercise ANN.
+        // after deleting the dominant file, so all filtered and unfiltered
+        // queries with the live root still use the repository's index path.
         constexpr int liveFiles = 20001;
         constexpr int codebookSize = 257;
         constexpr int batchSize = 512;
@@ -618,8 +860,21 @@ private slots:
         }
         const QString dominant = environment.path(QStringLiteral("a"));
         const QString liveRoot = environment.path(QStringLiteral("v"));
+        const QString sentinelA = QDir(liveRoot).filePath(QStringLiteral("sentinel-a"));
+        const QString sentinelB = QDir(liveRoot).filePath(QStringLiteral("sentinel-b"));
+        const QString sentinelD = QDir(liveRoot).filePath(QStringLiteral("sentinel-d"));
+        constexpr int sentinelFiles = 3;
         QVector<IndexedFile> batch;
         batch.reserve(batchSize);
+        // Place sentinels before the dominant file so old and replacement A
+        // share a shard. The paired-snapshot assertions below also verify the
+        // actual labels and outbox state instead of assuming particular IDs.
+        batch.append({sentinelA, QStringLiteral("one"), false,
+                      {makeSegment(QStringLiteral("old-a-token"), sentinelVector(0.995f))}});
+        batch.append({sentinelB, QStringLiteral("one"), false,
+                      {makeSegment(QStringLiteral("old-b-token"), sentinelVector(0.99f))}});
+        batch.append({sentinelD, QStringLiteral("one"), false,
+                      {makeSegment(QStringLiteral("stable-d-token"), sentinelVector(0.97f))}});
         batch.append({dominant, QStringLiteral("one"), false,
                       QVector<Segment>(dominantSegments, makeSegment({}, queryVector))});
         for (int index = 0; index < liveFiles; ++index) {
@@ -640,10 +895,11 @@ private slots:
         QVERIFY2(repository.flush(&error), qPrintable(error));
         const auto ready = repository.status(&error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
-        QCOMPARE(ready.value(QStringLiteral("files")).toInteger(), qint64(liveFiles + 1));
-        QCOMPARE(ready.value(QStringLiteral("vectors")).toInteger(), qint64(liveFiles + dominantSegments));
-        QCOMPARE(ready.value(QStringLiteral("annVectors")).toInteger(), qint64(liveFiles + dominantSegments));
+        QCOMPARE(ready.value(QStringLiteral("files")).toInteger(), qint64(liveFiles + sentinelFiles + 1));
+        QCOMPARE(ready.value(QStringLiteral("vectors")).toInteger(), qint64(liveFiles + sentinelFiles + dominantSegments));
+        QCOMPARE(ready.value(QStringLiteral("annVectors")).toInteger(), qint64(liveFiles + sentinelFiles + dominantSegments));
         QVERIFY(!ready.value(QStringLiteral("deferredMaintenance")).toBool());
+        QCOMPARE(ready.value(QStringLiteral("pendingShards")).toInteger(), qint64(0));
 
         SearchOptions options;
         options.queryEmbedding = queryVector;
@@ -657,7 +913,7 @@ private slots:
         QCOMPARE(beforeDeletion.first().path, dominant);
         QVERIFY(beforeDeletion.last().path.startsWith(liveRoot + u'/'));
 
-        // Excluding the dominant file still leaves 20,001 vectors, so folder
+        // Excluding the dominant file still leaves >20,000 vectors, so folder
         // enforcement must build the ANN allow-list instead of dropping the
         // original top result after its limit or falling into the exact path.
         SearchOptions folderFiltered = options;
@@ -682,10 +938,10 @@ private slots:
         QVERIFY2(repository.removeFile(dominant, &error), qPrintable(error));
         const auto afterRemoval = repository.status(&error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
-        QCOMPARE(afterRemoval.value(QStringLiteral("vectors")).toInteger(), qint64(liveFiles));
+        QCOMPARE(afterRemoval.value(QStringLiteral("vectors")).toInteger(), qint64(liveFiles + sentinelFiles));
         // Do not flush or reopen here. The original near-neighbor IDs must still
         // exist in the immutable ANN graph and be excluded during traversal.
-        QCOMPARE(afterRemoval.value(QStringLiteral("annVectors")).toInteger(), qint64(liveFiles + dominantSegments));
+        QCOMPARE(afterRemoval.value(QStringLiteral("annVectors")).toInteger(), qint64(liveFiles + sentinelFiles + dominantSegments));
         const auto afterDeletion = repository.search(options, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(afterDeletion.size(), qsizetype(2));
@@ -698,8 +954,150 @@ private slots:
             QVERIFY2(error.isEmpty(), qPrintable(error));
         }
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
-        qInfo().noquote() << "ANN aggregation/tombstone fixture:" << liveFiles
-                          << "live vectors," << dominantSegments << "pending deletions,"
+        // Reuse the same >20,000-vector published fixture. The sentinels have
+        // wide cosine margins above the existing background codebook, so this
+        // checks file identity/version rather than approximate score rounding.
+        SearchOptions liveOptions = options;
+        liveOptions.limit = 3;
+        liveOptions.enforceFolderRules = true;
+        liveOptions.allowedRoots = {liveRoot};
+        const QString hiddenRoot = QDir(liveRoot).filePath(QStringLiteral("hidden"));
+        const QString hiddenPath = QDir(hiddenRoot).filePath(QStringLiteral("image"));
+        const QString outsideRoot = environment.path(QStringLiteral("outside"));
+        const QString outsidePath = QDir(outsideRoot).filePath(QStringLiteral("best"));
+        const QString newPath = QDir(liveRoot).filePath(QStringLiteral("sentinel-c"));
+        const QString codePath = QDir(liveRoot).filePath(QStringLiteral("source.py"));
+        liveOptions.excludedRoots = {hiddenRoot};
+        const auto oldLive = repository.search(liveOptions, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hitPaths(oldLive), (QStringList{sentinelA, sentinelB, sentinelD}));
+        for (const auto &hit : oldLive)
+            QCOMPARE(hit.sourceVersion, QStringLiteral("one"));
+        QVERIFY(oldLive.at(0).segmentId % 16 != oldLive.at(1).segmentId % 16);
+
+        // The old reader captures SQL and ANN under the publication lock and
+        // pauses at the first actual SQLite VM progress callback after capture.
+        // The guard is declared after the repository, so every Qt early return
+        // releases and joins the reader before the repository is destroyed.
+        PairedSnapshotProbe pausedRead(snapshotState);
+        pausedRead.start(repository, liveOptions);
+        QVERIFY2(pausedRead.waitEntered(), "Paired-snapshot reader did not reach SQLite progress");
+        auto hiddenSegment = makeSegment(QStringLiteral("hidden-token"), queryVector);
+        hiddenSegment.kind = QStringLiteral("image");
+        const QVector<IndexedFile> changes{
+            {sentinelA, QStringLiteral("two"), false,
+             {makeSegment(QStringLiteral("new-a-token"), sentinelVector(0.985f))}},
+            {newPath, QStringLiteral("new-c"), false,
+             {makeSegment(QStringLiteral("new-c-token"), queryVector)}},
+            {hiddenPath, QStringLiteral("hidden"), false, {hiddenSegment}},
+            {outsidePath, QStringLiteral("outside"), false,
+             {makeSegment(QStringLiteral("outside-token"), queryVector)}},
+            {codePath, QStringLiteral("code"), true,
+             {makeSegment(QStringLiteral("code-token"), queryVector)}}};
+        QVERIFY2(repository.replaceFiles(changes, &error), qPrintable(error));
+        QVERIFY2(repository.removeFile(sentinelB, &error), qPrintable(error));
+        const auto pending = repository.status(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(pending.value(QStringLiteral("generation")).toInteger()
+                > afterRemoval.value(QStringLiteral("generation")).toInteger());
+        QCOMPARE(pending.value(QStringLiteral("annVectors")), ready.value(QStringLiteral("annVectors")));
+        QCOMPARE(pending.value(QStringLiteral("annGeneration")), ready.value(QStringLiteral("annGeneration")));
+        QVERIFY(!pending.value(QStringLiteral("deferredMaintenance")).toBool());
+        QVERIFY(pending.value(QStringLiteral("pendingShards")).toInteger() >= 2);
+
+        // Check pending-only delta/tombstone merge before any shard is rebuilt.
+        // The barrier is one-shot, so this independent new reader must proceed.
+        const auto pendingLive = repository.search(liveOptions, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hitPaths(pendingLive), (QStringList{newPath, sentinelA, sentinelD}));
+        QCOMPARE(pendingLive.at(0).sourceVersion, QStringLiteral("new-c"));
+        QCOMPARE(pendingLive.at(1).sourceVersion, QStringLiteral("two"));
+        QCOMPARE(pendingLive.at(2).sourceVersion, QStringLiteral("one"));
+        QVERIFY(pendingLive.at(1).segmentId != oldLive.at(0).segmentId);
+        const int replacedShard = int(oldLive.at(0).segmentId % 16);
+        QCOMPARE(int(pendingLive.at(1).segmentId % 16), replacedShard);
+        const auto replacedShardPending = pendingEventsForShard(repository.databasePath(), replacedShard, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(replacedShardPending > 0);
+        for (const auto &hit : pendingLive) {
+            QVERIFY(hit.segmentId != oldLive.at(0).segmentId);
+            QVERIFY(hit.segmentId != oldLive.at(1).segmentId);
+        }
+
+        // Only one publication is performed while the old SQLite reader is
+        // pinned. Its checkpoint may wait for busy_timeout, so the barrier's
+        // held-reader timeout is separate from its entry/completion timeouts.
+        QVERIFY2(repository.flushOneShard(&error), qPrintable(error));
+        const auto mixed = repository.status(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(mixed.value(QStringLiteral("pendingShards")).toInteger() > 0);
+        QCOMPARE(mixed.value(QStringLiteral("pendingShards")).toInteger(),
+                 pending.value(QStringLiteral("pendingShards")).toInteger() - 1);
+        // Prove this publication rebuilt the shard containing old A. A buggy
+        // old-SQL/new-ANN pairing would now miss that old label and fail the
+        // old-reader identity assertion, rather than pass on unchanged shards.
+        QCOMPARE(pendingEventsForShard(repository.databasePath(), replacedShard, &error), qint64(0));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        const bool writerFinishedWhilePinned = pausedRead.remainsBlocked();
+        const bool readerJoined = pausedRead.releaseAndJoin();
+        QVERIFY(writerFinishedWhilePinned);
+        QVERIFY(readerJoined);
+        QVERIFY2(!pausedRead.hookTimedOut(), "Snapshot hook expired before explicit release");
+        QVERIFY2(pausedRead.result().error.isEmpty(), qPrintable(pausedRead.result().error));
+        QCOMPARE(hitIdentities(pausedRead.result().hits), hitIdentities(oldLive));
+        const auto mixedLive = repository.search(liveOptions, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hitIdentities(mixedLive), hitIdentities(pendingLive));
+
+        QVERIFY2(repository.flush(&error), qPrintable(error));
+        const auto published = repository.status(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(published.value(QStringLiteral("pendingShards")).toInteger(), qint64(0));
+        QCOMPARE(published.value(QStringLiteral("annVectors")), published.value(QStringLiteral("vectors")));
+        const auto publishedLive = repository.search(liveOptions, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hitIdentities(publishedLive), hitIdentities(pendingLive));
+
+        // Alternate independent options without changing the data generation.
+        // A future allow-list cache must not reuse another request's folder,
+        // code, or kind permissions. Small kind/code subsets also verify their
+        // SQL path but are not claimed as ANN branch coverage.
+        auto changedRules = liveOptions;
+        changedRules.excludedRoots.clear();
+        QVERIFY(distinctPaths(repository.search(changedRules, &error)).contains(hiddenPath));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        changedRules = liveOptions;
+        changedRules.allowedRoots = {outsideRoot};
+        QCOMPARE(hitPaths(repository.search(changedRules, &error)), (QStringList{outsidePath}));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        changedRules = liveOptions;
+        changedRules.allowedRoots.clear();
+        QVERIFY(repository.search(changedRules, &error).isEmpty());
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        changedRules = liveOptions;
+        changedRules.allowedRoots = {liveRoot, hiddenRoot};
+        QVERIFY(distinctPaths(repository.search(changedRules, &error)).contains(hiddenPath));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        changedRules = liveOptions;
+        changedRules.kind = QStringLiteral("text");
+        QCOMPARE(hitIdentities(repository.search(changedRules, &error)), hitIdentities(pendingLive));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        changedRules.kind = QStringLiteral("image");
+        QVERIFY(repository.search(changedRules, &error).isEmpty());
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        changedRules = liveOptions;
+        changedRules.code = true;
+        QCOMPARE(hitPaths(repository.search(changedRules, &error)), (QStringList{codePath}));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hitIdentities(repository.search(liveOptions, &error)), hitIdentities(pendingLive));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        const auto unchanged = repository.status(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(unchanged.value(QStringLiteral("generation")), published.value(QStringLiteral("generation")));
+        QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
+
+        qInfo().noquote() << "ANN aggregation/filter/snapshot fixture:" << liveFiles + sentinelFiles
+                          << "initial live vectors," << dominantSegments << "deleted graph labels,"
                           << elapsed.elapsed() << "ms, observed logical file bytes"
                           << directoryBytes(environment.root());
     }

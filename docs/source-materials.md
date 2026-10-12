@@ -23,6 +23,8 @@ python tools/qcs-source-bundle.py `
 
 FFmpeg 使用固定 9.0.1 源码，清单记录当前 SDK 的真实 `avcodec_configuration()`、许可证及运行库 SHA-256。Windows 配套 FFmpeg 使用的 zlib 1.3.1 源码与应用自身使用的 zlib 1.3.2 分开保留。第三方源归档内部包含其原始许可证和版权声明。
 
+Linux 读取 Qt SDK 的 FFmpeg 元数据时，先从选中的 `libavcodec.so.63` 所在目录以 `RTLD_LOCAL` 加载 `libavformat.so.63` 及其依赖组，再以相同方式加载 avcodec，并在元数据读取期间保留依赖组句柄。缺少同目录的 avformat、动态加载失败或元数据符号读取失败都会明确失败，不跨 SDK 寻找替代库。Windows 和 macOS 保留原有加载路径，FFmpeg ABI 及 GPL / nonfree 配置拒绝规则保持不变。
+
 项目源码放入 `project/`，其中 `cmake/` 是原生依赖构建适配，`third_party/patches/` 保存 llama.cpp 补丁，`tools/` 保存 SDK、部署及材料生成流程。源文件清单逐项记录哈希。若打包期间文件发生变化，脚本拒绝继续发布该材料包。
 
 指定 `--qt-root` 时，`sdk-metadata/` 同时保留该 SDK 的公共构建配置和原始 SPDX JSON，包含第三方版权及自定义许可全文。运行包中的 `qcs-runtime` 许可目录由 `tools/qcs-license-materials.py` 自动生成。它使用上述源码锁和外置许可证源码缓存，默认位于 `deps/licenses`，收集 Qt base、SVG、Image Formats、Multimedia 的原始许可和 attribution 引用文件，并按实际 SDK SPDX 检查标准许可全文是否齐全。对应源码材料工具的默认归档缓存位于 `deps/sources`。PDF / Chromium 的自定义许可来自实际 SDK SPDX 的原始 `extractedText`。任何平台新增未覆盖的许可 ID 都会明确阻止配置。

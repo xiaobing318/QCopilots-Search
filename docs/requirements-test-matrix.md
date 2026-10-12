@@ -36,6 +36,8 @@
 | 无模型关键词搜索 | worker、storage | unicodePathsAndKeywordOnlyWithoutModels | 已建立用例 |
 | 文件增删改与模型版本 | IndexRepository | replacementAndRemovalRetireOldSegments、pipelineChangeInvalidatesVectorsButPreservesKeywordSearch | 已建立用例 |
 | 过滤参与召回 | IndexRepository、VectorIndex | semanticSearchAppliesFiltersBeforeLimit、allowedIdsRestrictCandidates | 已建立用例 |
+| 过滤分片策略与取消恢复 | VectorIndex | `qcs-tests-vector_index`，真实允许集合的选择边界、缺失 ID 与墓碑、混合分片、实际打分途中取消、异常、旧快照及全局 k 并列排序 | 已建立回归，正确性与性能结果待新冻结候选报告 |
+| 并发发布时的 SQL/ANN 配对快照 | IndexRepository | `qcs-tests-index_repository_regression` 的 `annFileAggregationAndPendingTombstones`，待发布增删改、目录规则变化、旧读者与单分片发布交错 | 已建立回归，原生执行结果待新冻结候选报告 |
 | ANN 快照、损坏恢复 | VectorIndex | oldSnapshotSurvivesRebuild、corruptManifestPreservesLiveSnapshot、corruptShardChecksumPreservesLiveSnapshot | 已建立用例 |
 | 并发读取与分片重建 | storage | concurrentReadersSeeCommittedReplacements、concurrentReadersKeepOldSnapshotDuringRebuild | 已建立用例 |
 | IPC 分帧、版本、超时和取消 | service、client、worker | service client 用例、worker invalidFramesDoNotPoisonNextRequest、oversizedFrameIsTerminal | 已建立用例，服务整体集成待报告 |
@@ -50,8 +52,10 @@
 | 真实语义质量 | 独立语义数据集与评估器 | ≥ 1,000 真实片段、≥ 200 中英查询和无答案集 | 待数据集与执行报告 |
 | 磁盘不足、提交中断与失效版本零返回 | storage、service | 故障注入及恢复检查 | 部分存储用例已建立，全流程待报告 |
 | 安装布局与依赖部署 | install、CPack、verify-package | 原生 CI 与重定位包级启动 | 已建立流程，包级结果待报告 |
+| 包报告绑定实际源码 checkout | `tools/qcs-verify-package.py` | `qcs-tests-workflow`，真实 Git HEAD、linked worktree、候选声明失配、dirty 状态、无 Git 归档与错误提前失败 | 已建立回归，真实包级结果待新冻结候选报告 |
 | 验收运行器入库后契约 | `tools/acceptance` | qcs-tests-acceptance-runners，候选身份、fixture 拷贝、容量守卫、来源清单和可移植性运行器检查 | 已建立回归，实际专项验收仍单独执行 |
 | 许可证、源码材料与签名状态 | packaging、依赖锁、第三方声明 | 包清单、源码材料清单、unsigned/signed 字段 | 待最终包审查 |
+| Linux Qt FFmpeg 源码元数据加载 | `tools/qcs-source-bundle.py` | `qcs-tests-acceptance-runners` 中的 `qcs-test-source-checksums.py`，同目录 avformat 先加载、局部符号范围、句柄生命周期、错误传播及许可拒绝的模拟回归 | 已建立回归，真实 Linux SDK 与源码材料结果待原生 CI |
 | QtTest 内部跳过和平台不适用分类 | CI CTest 证据解析器 | qcs-tests-ci-evidence.py，注册程序集合、逐用例与汇总核对、精确平台分类及日志截断拦截 | 已建立回归，短名候选结果以本轮报告为准 |
 | 本地完整自动化门槛 | CTest、QtTest、工具与包验证 | 全量注册清单、逐用例明细、真实模型及安装报告，缺失不放行 | 同一冻结候选的独立门槛 |
 | 四组合远端 Actions 门槛 | qcs-native.yml、required 汇总 | 四组合 configure/build/test/真实模型/package/verify 全部 success，记录实际 run URL | 同一冻结候选的独立门槛 |
