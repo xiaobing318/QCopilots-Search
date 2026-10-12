@@ -74,6 +74,34 @@ def executable_snapshot(bin_dir, git_dll):
     return {str(path.resolve()): {"bytes": path.stat().st_size, "sha256": sha(path)} for path in files}
 
 
+def clone_executable_snapshot(build):
+    # The subset build does not run the ALL deployment target that copies
+    # native runtimes into bin. Use this checkout's explicitly configured nd.
+    build = Path(build)
+    deployed_dll = build / "bin/git2.dll"
+    require(not deployed_dll.exists() and not deployed_dll.is_symlink(),
+            "Unexpected bin/git2.dll would override the isolated native runtime")
+    git_dll = build / "nd/libgit2/git2.dll"
+    return git_dll, executable_snapshot(build / "bin", git_dll)
+
+
+def command_env(base, build, git_dll, *, main_build, qt_prefix, nsis_root):
+    env = dict(base)
+    exclude = {str(main_build / "release/bin").casefold(), str(main_build / "release/lib").casefold()}
+    rest = [piece for piece in env.get("PATH", "").split(os.pathsep) if piece and piece.casefold() not in exclude]
+    env["PATH"] = os.pathsep.join([str(build / "bin"), str(Path(git_dll).parent), str(qt_prefix / "bin"), str(nsis_root), *rest])
+    env["NSISDIR"] = str(nsis_root)
+    env["QT_PLUGIN_PATH"] = str(qt_prefix / "plugins")
+    env["QCOPILOTS_SEARCH_PYTHON"] = sys.executable
+    env["PATH"] = os.pathsep.join((str(nsis_root), env.get("PATH", "")))
+    env["NSISDIR"] = str(nsis_root)
+    require(Path(shutil.which("makensis", path=env["PATH"])).resolve() == (nsis_root / "makensis.exe").resolve(),
+            "Locked NSIS compiler is not first on the prepared PATH")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
 def validate_test_command(command, name, source, build, test_root):
     """Bind the isolation wrapper and its inner command to this checkout."""
     command = list(command)
@@ -606,22 +634,6 @@ def main():
             "script": str(checkout / "qcs-dev.ps1"), "arguments": list(map(str, arguments))}
         return command
 
-    def command_env(base, build, git_dll):
-        env = dict(base)
-        exclude = {str(main_build / "release/bin").casefold(), str(main_build / "release/lib").casefold()}
-        rest = [piece for piece in env.get("PATH", "").split(os.pathsep) if piece and piece.casefold() not in exclude]
-        env["PATH"] = os.pathsep.join([str(build / "bin"), str(Path(git_dll).parent), str(args.qt_prefix / "bin"), str(nsis_root), *rest])
-        env["NSISDIR"] = str(nsis_root)
-        env["QT_PLUGIN_PATH"] = str(args.qt_prefix / "plugins")
-        env["QCOPILOTS_SEARCH_PYTHON"] = sys.executable
-        env["PATH"] = os.pathsep.join((str(nsis_root), env.get("PATH", "")))
-        env["NSISDIR"] = str(nsis_root)
-        require(Path(shutil.which("makensis", path=env["PATH"])).resolve() == (nsis_root / "makensis.exe").resolve(),
-                "Locked NSIS compiler is not first on the prepared PATH")
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        env["GIT_OPTIONAL_LOCKS"] = "0"
-        return env
-
     try:
         before_original = executable_snapshot(main_build / "release/bin", main_build / "release/bin/git2.dll")
         before_original_source = snapshot(source)
@@ -664,12 +676,13 @@ def main():
                      "--cmake-arg=-DQCOPILOTS_SEARCH_LLAMA_BINARY_DIR=" + str(clone_build / "nd/llama")]
         run(developer_command(clone, "configure", configure), "configure", env, caller)
         run(["cmake", "--build", clone_build, "--config", "Release", "--parallel", args.jobs, "--target", *TARGETS], "subset-build", env, caller)
-        clone_dll = clone_build / "bin/git2.dll"
+        clone_dll, clone_binaries = clone_executable_snapshot(clone_build)
         main_dll = main_build / "release/bin/git2.dll"
-        clone_binaries = executable_snapshot(clone_build / "bin", clone_dll)
         record["originalBinariesBefore"], record["cloneBinariesBefore"] = before_original, clone_binaries
-        clone_env = command_env(env, clone_build, clone_dll)
-        main_env = command_env(env, main_build / "release", main_dll)
+        clone_env = command_env(env, clone_build, clone_dll, main_build=main_build, qt_prefix=args.qt_prefix, nsis_root=nsis_root)
+        main_env = command_env(env, main_build / "release", main_dll, main_build=main_build, qt_prefix=args.qt_prefix, nsis_root=nsis_root)
+        record["cloneRuntime"] = {"gitDll": str(clone_dll.resolve()), "sha256": sha(clone_dll),
+                                  "searchPath": clone_env["PATH"].split(os.pathsep)}
         inv_args = [("clone", clone_build, "^(core|workflow)$", clone_env, TARGETS + ["qcs-tests-workflow"]),
                     ("original", main_build / "release", "^core$", main_env, TARGETS)]
         for label, build, regex, used_env, names in inv_args:
@@ -748,7 +761,7 @@ def main():
         require(roots[0] != roots[1], "Two checkout runs unexpectedly shared a writable root")
         record["testRoots"] = roots
         record["readonlyProbesAfter"] = write_probes(clone)
-        record["cloneBinariesAfter"] = executable_snapshot(clone_build / "bin", clone_dll)
+        _, record["cloneBinariesAfter"] = clone_executable_snapshot(clone_build)
         require(record["cloneBinariesAfter"] == clone_binaries, "Clone binary bytes changed during tests")
         record["testExecutionPassed"] = True
     except BaseException as error:

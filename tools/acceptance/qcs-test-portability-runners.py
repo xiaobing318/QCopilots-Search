@@ -197,6 +197,100 @@ class PortabilityContracts(unittest.TestCase):
                    "--root", str(tests), "--", *inner]
         return command, name, source, build, tests
 
+    def native_build_fixture(self):
+        clone = self.root / "克隆 构建/release"
+        main = self.root / "主构建"
+        qt, nsis, global_dlls = (self.root / name for name in ("Qt SDK", "私有 NSIS", "全局 DLL"))
+        for directory in (clone / "bin", clone / "nd/libgit2", main / "release/bin",
+                          main / "release/lib", qt / "bin", qt / "plugins", nsis, global_dlls):
+            directory.mkdir(parents=True, exist_ok=True)
+        for name in runner.TARGETS:
+            (clone / "bin" / (name + ".exe")).write_bytes(("independent " + name).encode())
+        native = clone / "nd/libgit2/git2.dll"
+        native.write_bytes(b"independently built native DLL")
+        for directory in (main / "release/bin", global_dlls):
+            (directory / "git2.dll").write_bytes(("decoy " + str(directory)).encode("utf-8"))
+        (nsis / "makensis.exe").write_bytes(b"locked NSIS lookup fixture, never executed")
+        return clone, native, main, qt, nsis, global_dlls
+
+    def test_clone_snapshot_records_exact_native_dll_and_independent_executables(self):
+        clone, native, *_ = self.native_build_fixture()
+        selected, actual = runner.clone_executable_snapshot(clone)
+        self.assertEqual(selected, native)
+        expected = [clone / "bin" / (name + ".exe") for name in runner.TARGETS] + [native]
+        self.assertEqual(set(actual), {str(path.resolve()) for path in expected})
+        for path in expected:
+            with self.subTest(file=path.name):
+                self.assertEqual(actual[str(path.resolve())],
+                                 {"bytes": path.stat().st_size, "sha256": runner.sha(path)})
+        native.write_bytes(b"different native DLL bytes")
+        _, changed = runner.clone_executable_snapshot(clone)
+        self.assertNotEqual(actual[str(native.resolve())], changed[str(native.resolve())])
+
+    def test_clone_snapshot_missing_native_dll_rejects_bin_main_and_path_decoys(self):
+        clone, native, main, _, _, global_dlls = self.native_build_fixture()
+        native.unlink()
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join(map(str, (
+                clone / "bin", main / "release/bin", global_dlls)))}):
+            for with_bin in (False, True):
+                with self.subTest(binDecoy=with_bin):
+                    if with_bin:
+                        (clone / "bin/git2.dll").write_bytes(b"deployed decoy cannot replace the missing native DLL")
+                    before = runner.snapshot(self.root)
+                    with self.assertRaisesRegex(RuntimeError, "git2.dll"):
+                        runner.clone_executable_snapshot(clone)
+                    self.assertFalse(native.exists())
+                    self.assertEqual(before, runner.snapshot(self.root))
+
+    def test_clone_snapshot_rejects_bin_dll_that_shadows_native(self):
+        clone, native, *_ = self.native_build_fixture()
+        deployed = clone / "bin/git2.dll"
+        for content in (b"different DLL that Windows would load first", native.read_bytes()):
+            with self.subTest(identical=content == native.read_bytes()):
+                deployed.write_bytes(content)
+                before = runner.snapshot(self.root)
+                with self.assertRaisesRegex(RuntimeError, "bin/git2.dll.*override"):
+                    runner.clone_executable_snapshot(clone)
+                self.assertEqual(before, runner.snapshot(self.root))
+        deployed.unlink()
+        selected, _ = runner.clone_executable_snapshot(clone)
+        self.assertEqual(selected, native)
+
+    def test_clone_snapshot_requires_every_independently_built_executable(self):
+        clone, _, *_ = self.native_build_fixture()
+        for name in runner.TARGETS:
+            path = clone / "bin" / (name + ".exe")
+            content = path.read_bytes()
+            path.unlink()
+            try:
+                with self.subTest(target=name), self.assertRaisesRegex(RuntimeError, "Missing independently built"):
+                    runner.clone_executable_snapshot(clone)
+            finally:
+                path.write_bytes(content)
+
+    def test_clone_command_environment_uses_selected_native_dll_directory(self):
+        clone, native, main, qt, nsis, global_dlls = self.native_build_fixture()
+        selected, _ = runner.clone_executable_snapshot(clone)
+        base = {"PATH": os.pathsep.join(map(str, (main / "release/bin", main / "release/lib", global_dlls))),
+                "UNCHANGED_VALUE": "preserve"}
+        before = dict(base)
+        # Only the unrelated Windows NSIS command lookup is stubbed. DLL
+        # selection, native/decoy files, hashes and PATH construction are real.
+        with mock.patch.object(runner.shutil, "which", return_value=str(nsis / "makensis.exe")) as lookup:
+            actual = runner.command_env(base, clone, selected, main_build=main, qt_prefix=qt, nsis_root=nsis)
+        paths = actual["PATH"].split(os.pathsep)
+        self.assertIn(str(native.parent), paths)
+        self.assertLess(paths.index(str(native.parent)), paths.index(str(global_dlls)))
+        self.assertNotIn(str(main / "release/bin"), paths)
+        self.assertNotIn(str(main / "release/lib"), paths)
+        self.assertIn(str(clone / "bin"), paths)
+        self.assertEqual(actual["QT_PLUGIN_PATH"], str(qt / "plugins"))
+        self.assertEqual(actual["NSISDIR"], str(nsis))
+        self.assertEqual(actual["QCOPILOTS_SEARCH_PYTHON"], sys.executable)
+        self.assertEqual(actual["UNCHANGED_VALUE"], "preserve")
+        self.assertEqual(base, before)
+        lookup.assert_called_once_with("makensis", path=actual["PATH"])
+
     def test_owned_wrapper_and_binary_are_bound(self):
         values = self.wrapper()
         identity = runner.validate_test_command(*values)
