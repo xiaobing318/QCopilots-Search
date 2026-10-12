@@ -105,15 +105,16 @@ Windows 的 `CreateProcessW` 对工作目录仍有 `MAX_PATH` 限制，即使证
   --env 'QT_FORCE_STDERR_LOGGING=1' -- '{program}' -o -,txt
 ```
 
-物理测试需要由运行环境提供构建依赖的位置，且 `QCOPILOTS_SEARCH_TEST_ROOT` 的父目录必须可写。百万向量测试使用独立监控器，通过 `--input` 保留监控脚本原文和执行前后哈希。监控器的 `ExternalRoot` 必须使用 `{evidence}`，让原始 benchmark JSON、采样 JSONL 和输出日志都保留在本次根内。下面的 `$millionRunner` 指向当前源码中的 `tools/acceptance/qcs-run-million.ps1`，由 `$source` 派生，不是假定另一台电脑存在的固定路径。
+物理测试需要由运行环境提供构建依赖的位置，且 `QCOPILOTS_SEARCH_TEST_ROOT` 的父目录必须可写。百万向量测试使用独立监控器，通过 `--input` 保留监控脚本原文和执行前后哈希。监控器的 `ExternalRoot` 指向六个 producer 所属的真实构建根，`ReportRoot` 使用 `{evidence}`，让原始 benchmark JSON、采样 JSONL 和输出日志从运行开始就保存在本次证据目录。百万运行的 `$evidenceRoot` 必须位于 `$buildRoot/reports` 内。下面的 `$millionRunner` 由当前源码目录派生，完整示例见 [候选验收运行器](../tools/acceptance/README.md#百万验收的完整执行记录)。
 
 ```powershell
 $millionRunner = Join-Path $source 'tools/acceptance/qcs-run-million.ps1'
-& $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot `
+$millionPreflight = Join-Path $source 'tools/acceptance/qcs-physical-preflight.py'
+& $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot --working-directory $buildRoot `
   --kind million --program-name qcs-benchmark `
-  --report 'reports/*.monitor.json' --input $millionRunner `
+  --report '*.monitor.json' --input $millionRunner --input $millionPreflight `
   -- pwsh -NoProfile -File $millionRunner -BenchmarkExe '{program}' `
-       -ExternalRoot '{evidence}' -QtBin $qtBin -Source $source `
+       -ExternalRoot $buildRoot -ReportRoot '{evidence}' -QtBin $qtBin -Source $source `
        -ExpectedCommit $candidateHead -BuildRecord $buildRecord -Python $python -Mode Run
 ```
 
