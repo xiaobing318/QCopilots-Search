@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, namedtuple
 import json
 import os
 from pathlib import Path
@@ -16,6 +16,7 @@ import sys
 
 OBJECT_BUDGET = 200
 GENERATED_BUDGET = 240
+NinjaTarget = namedtuple("NinjaTarget", ("name", "path"))
 SKIP_DIRECTORIES = frozenset({
     ".git", "models", "deps", "dependencies", "source-cache", "sources",
     "runs", "test-runs", "capacity-runs", "profiles", "reports", "Testing",
@@ -48,7 +49,7 @@ def classify(path: Path, context: str = "build") -> str:
     return context
 
 
-def parse_ninja_targets(output: str, build: Path) -> list[Path]:
+def parse_ninja_targets(output: str, build: Path) -> list[NinjaTarget]:
     """Ninja prints decoded paths followed by ': rule', including drive colons."""
     result = []
     for line in output.splitlines():
@@ -63,7 +64,10 @@ def parse_ninja_targets(output: str, build: Path) -> list[Path]:
         if rule == "phony":
             continue
         path = Path(name.replace("\\", "/"))
-        result.append((path if path.is_absolute() else build / path).resolve())
+        # Ninja graph keys retain their own spelling. An absolute CMake dyndep
+        # output and a relative output can resolve to the same filesystem path,
+        # but are distinct command-query keys. Canonicalize only for reporting.
+        result.append(NinjaTarget(name, (path if path.is_absolute() else build / path).resolve()))
     return result
 
 
@@ -86,7 +90,7 @@ def find_ninja(build: Path, explicit: str | None = None) -> str:
     return found
 
 
-def ninja_outputs(build: Path, executable: str | None = None) -> tuple[list[Path], str]:
+def ninja_outputs(build: Path, executable: str | None = None) -> tuple[list[NinjaTarget], str]:
     if not (build / "build.ninja").is_file():
         raise RuntimeError(f"Configured Ninja build is required: {build / 'build.ninja'}")
     ninja = find_ninja(build, executable)
@@ -112,7 +116,7 @@ def response_arguments(command: str, platform: str) -> list[str]:
             for match in re.finditer(pattern, command)]
 
 
-def ninja_responses(build: Path, ninja: str, platform: str, targets: list[Path]) -> list[Path]:
+def ninja_responses(build: Path, ninja: str, platform: str, targets: list[NinjaTarget]) -> list[Path]:
     # Ninja expands variables and subninja scopes for us. RSP files are not targets
     # and normally disappear after compilation, so a filesystem scan is insufficient.
     # `compdb` omits edges with no inputs, and plain `commands` follows only the
@@ -120,8 +124,7 @@ def ninja_responses(build: Path, ninja: str, platform: str, targets: list[Path])
     batches = []
     batch = []
     size = 0
-    for target in dict.fromkeys(targets):
-        argument = target.relative_to(build).as_posix() if build in target.parents else target.as_posix()
+    for argument in dict.fromkeys(target.name for target in targets):
         length = path_length(argument, "windows") + 3
         if batch and size + length > 12000:
             batches.append(batch)
@@ -247,8 +250,8 @@ def inspect_paths(args: argparse.Namespace) -> dict:
             generated, ninja = ninja_outputs(roots["build"], getattr(args, "ninja", None))
             report["ninja"] = ninja
             report["configured"] = True
-            for path in generated:
-                add(path, "build", "ninja")
+            for target in generated:
+                add(target.path, "build", "ninja")
             for path in ninja_responses(roots["build"], ninja, platform, generated):
                 add(path, "build", "ninja-command")
             for path in scan_generated(roots["build"]):

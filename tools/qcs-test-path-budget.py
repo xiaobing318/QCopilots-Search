@@ -82,9 +82,41 @@ class PathBudgetTests(unittest.TestCase):
     def test_ninja_decoded_paths_preserve_spaces_and_colons(self):
         parsed = budget.parse_ninja_targets(
             "folder with spaces/文件.cpp.obj: compile\nphony name: phony\n", self.root)
-        self.assertEqual(parsed, [(self.root / "folder with spaces/文件.cpp.obj").resolve()])
+        self.assertEqual(parsed, [budget.NinjaTarget("folder with spaces/文件.cpp.obj",
+                                                   (self.root / "folder with spaces/文件.cpp.obj").resolve())])
         with self.assertRaisesRegex(RuntimeError, "Unexpected Ninja target"):
             budget.parse_ninja_targets("not a valid target listing", self.root)
+
+    def test_real_ninja_preserves_absolute_and_relative_output_spellings(self):
+        build = self.graph()
+        # CMake's C++ dyndep graph emits absolute CXXModules.json outputs among
+        # otherwise relative targets. Ninja does not substitute one spelling
+        # for the other, even when both refer to the same filesystem location.
+        absolute = (build / "CMakeFiles/绝对 目标/CXXModules.json").as_posix()
+        relative = "CMakeFiles/相对 目标/CXXModules.json"
+        shared_relative = "same-output.json"
+        shared_absolute = (build / shared_relative).as_posix()
+        def escape(value):
+            return value.replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
+        with (build / "build.ninja").open("a", encoding="utf-8") as stream:
+            stream.write("rule spelling\n  command = unused-generator @\"$response\"\n")
+            for name, response in ((absolute, "absolute.rsp"), (relative, "relative.rsp"),
+                                   (shared_relative, "same-relative.rsp"), (shared_absolute, "same-absolute.rsp")):
+                stream.write(f"build {escape(name)}: spelling\n  response = {response}\n")
+            stream.write("default all\n")
+        targets, _ = budget.ninja_outputs(build, self.ninja())
+        self.assertIn(absolute, [target.name for target in targets])
+        self.assertIn(relative, [target.name for target in targets])
+        same = [target for target in targets if target.path == (build / shared_relative).resolve()]
+        self.assertEqual({target.name for target in same}, {shared_relative, shared_absolute})
+        report = budget.inspect_paths(self.args(build=build, ninja=self.ninja()))
+        self.assertEqual(report["errors"], [])
+        self.assertTrue(report["configured"])
+        self.assertEqual(report["passed"], not report["offenders"])
+        responses = {row["path"] for row in report["paths"] if row["category"] == "response"}
+        self.assertEqual(responses, {str((build / name).resolve()) for name in
+                                   ("absolute.rsp", "relative.rsp", "same-relative.rsp", "same-absolute.rsp")})
+        self.assertFalse(Path(absolute).exists(), "Inspection must not execute a build command")
 
     def test_response_arguments_preserve_shell_quoting(self):
         command = 'tool @plain.rsp @"folder with spaces/中文.rsp" "@whole quoted.rsp"'
@@ -195,7 +227,8 @@ class PathBudgetTests(unittest.TestCase):
         desired = max(201, budget.path_length(prefix, "windows") + 8)
         obj = Path(prefix + "a" * (desired - budget.path_length(prefix, "windows") - 4) + ".obj")
         other = obj.with_suffix(".txt")
-        with patch.object(budget, "ninja_outputs", return_value=([obj, other], "fixture")), \
+        with patch.object(budget, "ninja_outputs", return_value=(
+                [budget.NinjaTarget(str(path), path) for path in (obj, other)], "fixture")), \
                 patch.object(budget, "ninja_responses", return_value=[]), \
                 patch.object(budget, "scan_generated", return_value=[]):
             report = budget.inspect_paths(self.args(build=self.root))
