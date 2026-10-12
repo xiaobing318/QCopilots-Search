@@ -48,9 +48,6 @@ jobs:
         shell: bash
         working-directory: 'QCopilots 源码'
     env:
-      QCOPILOTS_SEARCH_BUILD_ROOT: ${{ runner.temp }}/qcopilots-search-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
-      QCOPILOTS_SEARCH_QT_ROOT: ${{ runner.temp }}/qcopilots-search-qt-${{ matrix.id }}
-      QCOPILOTS_SEARCH_MODEL_DIR: ${{ runner.temp }}/qcopilots-search-models
       QCOPILOTS_SEARCH_CI_ARCH: ${{ matrix.arch }}
       QCOPILOTS_SEARCH_CI_GENERATORS: ${{ matrix.generators }}
       QCOPILOTS_SEARCH_KEEP_FAILED_TESTS: '1'
@@ -65,6 +62,24 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+      - name: Initialize isolated runner directories
+        env:
+          QCOPILOTS_SEARCH_CI_ID: ${{ matrix.id }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          identifier = os.environ["QCOPILOTS_SEARCH_CI_ID"]
+          directories = {
+              "QCOPILOTS_SEARCH_BUILD_ROOT": temporary / f"qcopilots-search-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{identifier}",
+              "QCOPILOTS_SEARCH_QT_ROOT": temporary / f"qcopilots-search-qt-{identifier}",
+              "QCOPILOTS_SEARCH_MODEL_DIR": temporary / "qcopilots-search-models",
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              for name, path in directories.items():
+                  print(f"{name}={path}", file=output)
+          PY
       - name: Verify case-level release evidence parser
         run: python .github/scripts/qcopilots-search-tests-ci-evidence.py
       - name: Install Linux host libraries and test display
