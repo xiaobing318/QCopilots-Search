@@ -535,7 +535,8 @@ class ManifestEvidenceTests(unittest.TestCase):
     def test_symlinks_are_rejected_without_requiring_host_privilege(self):
         # Simulate the filesystem type observation, not the checker or its result.
         original = Path.is_symlink
-        with mock.patch.object(Path, "is_symlink", lambda path: path == self.path or original(path)):
+        target = self.path.resolve()
+        with mock.patch.object(Path, "is_symlink", lambda path: path == target or original(path)):
             with self.assertRaises(ValueError):
                 evidence.safe_file(self.root, self.path.relative_to(self.root).as_posix())
             self.assertTrue(self.inspect())
