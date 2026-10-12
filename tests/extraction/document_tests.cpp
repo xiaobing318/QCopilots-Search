@@ -1,4 +1,5 @@
 #include "extraction/document_extractor.h"
+#include "../support/test_environment.h"
 
 #include <QDir>
 #include <QFile>
@@ -6,7 +7,6 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QStandardPaths>
-#include <QTemporaryDir>
 #include <QTextBoundaryFinder>
 #include <QUrl>
 #include <QtEndian>
@@ -63,7 +63,7 @@ QString allText(const ExtractionResult &result) {
 
 class DocumentTests final : public QObject {
     Q_OBJECT
-    std::unique_ptr<QTemporaryDir> directory;
+    std::unique_ptr<test::TestTemporaryDir> directory;
     QString write(const QString &name, const QByteArray &bytes) {
         const auto path = directory->filePath(name);
         QFile file(path);
@@ -73,19 +73,30 @@ class DocumentTests final : public QObject {
 private slots:
     void initTestCase() {
         QStandardPaths::setTestModeEnabled(true);
+    }
+    void init() {
         auto root = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT");
         if (root.isEmpty()) root = QDir::tempPath();
         QVERIFY2(QDir().mkpath(root), qPrintable(root));
-        directory = std::make_unique<QTemporaryDir>(QDir(root).filePath(QStringLiteral("qcopilots-search-document-tests-XXXXXX")));
+        directory = std::make_unique<test::TestTemporaryDir>(QDir(root).filePath(QStringLiteral("qcs-document-XXXXXX")));
         QVERIFY2(directory->isValid(), qPrintable(directory->errorString()));
         if (qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS") == 1) directory->setAutoRemove(false);
         qInfo().noquote() << "Document test root:" << directory->path();
     }
     void cleanup() {
-        if (QTest::currentTestFailed()) {
-            directory->setAutoRemove(false);
-            qWarning().noquote() << "Preserved failed document test artifacts:" << directory->path();
+        QString cleanupError;
+        if (directory && directory->isValid()) {
+            if (QTest::currentTestFailed()
+                || qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS") == 1) {
+                directory->setAutoRemove(false);
+                qInfo().noquote() << "Preserved document test artifacts:" << directory->path();
+            } else {
+                if (!directory->remove(&cleanupError)) directory->setAutoRemove(false);
+            }
         }
+        directory.reset();
+        cleanupError += test::takeCleanupErrors();
+        QVERIFY2(cleanupError.isEmpty(), qPrintable(cleanupError));
     }
     void textUnicodePathsAndEncodings() {
         const auto path = write(QStringLiteral("中文 sample.txt"), QStringLiteral("中文检索\r\nSecond paragraph").toUtf8());
@@ -100,6 +111,39 @@ private slots:
         QVERIFY(allText(result).contains(QStringLiteral("中文\nA")));
         result = extractDocument(write(QStringLiteral("latin.txt"), QByteArray::fromHex("436166e9208094")), {});
         QVERIFY(allText(result).contains(QStringLiteral("Café €”")));
+    }
+    void longUnicodePaths_data() {
+        QTest::addColumn<int>("requestedLength");
+        QTest::newRow("258") << 258;
+        QTest::newRow("259") << 259;
+        QTest::newRow("260") << 260;
+        QTest::newRow("300") << 300;
+    }
+    void longUnicodePaths() {
+        QFETCH(int, requestedLength);
+        // Account for the caller's temporary root instead of assuming a drive,
+        // username or checkout length. Keep individual components portable.
+        const QString basename = QStringLiteral("中文 文档.txt");
+        const auto targetLength = qMax(qsizetype(258), directory->path().size() + 48)
+            + requestedLength - 258;
+        QString parent = directory->path();
+        while (targetLength - parent.size() - 1 - basename.size() > 60)
+            parent = QDir(parent).filePath(QString(32, QLatin1Char('d')));
+        QVERIFY2(QDir().mkpath(parent), qPrintable(parent));
+        const QString filename = QString(targetLength - parent.size() - 1 - basename.size(), QLatin1Char('p')) + basename;
+        const QString path = QDir(parent).filePath(filename);
+        QCOMPARE(path.size(), targetLength);
+        const QByteArray body = QStringLiteral("中文长路径检索\nportable document extraction").toUtf8();
+        {
+            QFile file(path);
+            QVERIFY2(file.open(QIODevice::WriteOnly), qPrintable(file.errorString()));
+            QCOMPARE(file.write(body), body.size());
+        }
+        const auto result = extractDocument(path, {});
+        QCOMPARE(result.state, QStringLiteral("complete"));
+        QVERIFY2(result.error.isEmpty(), qPrintable(result.error));
+        QVERIFY(allText(result).contains(QStringLiteral("中文长路径检索")));
+        QCOMPARE(result.segments.first().path, path);
     }
     void limitsAndCancellation() {
         auto options = ExtractionOptions{};

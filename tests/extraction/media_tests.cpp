@@ -19,9 +19,11 @@ using namespace qcopilots_search;
 namespace {
 
 QString testTemplate() {
-    const QString root = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT", QDir::tempPath());
-    if (!QDir().mkpath(root)) return root + QStringLiteral("/missing/qcopilots-search-media-XXXXXX");
-    return QDir(root).filePath(QStringLiteral("qcopilots-search-media-XXXXXX"));
+    QString root = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT");
+    if (root.isEmpty()) root = QDir::tempPath();
+    if (!QDir().mkpath(root))
+        test::recordCleanupFailure(QStringLiteral("Cannot create explicit media test root: %1").arg(root));
+    return QDir(root).filePath(QStringLiteral("qcs-media-XXXXXX"));
 }
 
 bool writeWave(const QString &path, int seconds, bool silent = false, int rate = 16000, int channels = 1) {
@@ -160,6 +162,10 @@ bool writeDiscontinuousAudio(const QString &path) {
 class MediaTests final : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup() {
+        const auto cleanupError = test::takeCleanupErrors();
+        QVERIFY2(cleanupError.isEmpty(), qPrintable(cleanupError));
+    }
     void initTestCase() {
         QStandardPaths::setTestModeEnabled(true);
 #if defined(Q_OS_LINUX)

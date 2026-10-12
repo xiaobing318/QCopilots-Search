@@ -7,7 +7,7 @@ int main(int argc, char **argv)
 {
     qputenv("QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES", "1");
     QCoreApplication app(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("qcopilots-search-service"));
+    QCoreApplication::setApplicationName(QStringLiteral("qcs-service"));
     QCoreApplication::setOrganizationName(QStringLiteral("qcopilots-search"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
     QCommandLineParser parser;

@@ -6,6 +6,7 @@
 
 | 门槛 | 必需证据 |
 | --- | --- |
+| 本地 Windows | 同一候选的完整 CTest、QtTest、工具测试、真实模型、路径与清理回归及安装报告 |
 | Windows x64、Linux x64、macOS arm64 / x86_64 | 四个原生 CI job 的构建、CTest、真实模型和包级结果 |
 | 推理兼容性 | 九条固定黄金向量 cosine ≥ 0.999，CPU 基线与当前分发路径 |
 | 语义质量 | 真实片段与查询集来源、逐查询及分组 Recall@10、无答案结果 |
@@ -15,7 +16,7 @@
 | 许可与源码材料 | 实际部署依赖的许可证、版本、源归档、补丁及重建说明 |
 | 签名状态 | macOS 对实际 staging APP 执行 `codesign --verify --deep --strict` 并读取身份，区分 ad-hoc、Developer ID、其他证书、未签名、无效与未知状态，公证单独记录 |
 
-任一必需证据缺失时，保持草稿或测试包状态。部分 runner 的系统版本高于最低发行目标，因此原生 CI 通过不自动证明所有最低操作系统版本已经过实机验收。
+本地自动化、四组合 Actions 和当前 Windows Computer Use 必须分别完成。每个必需 CI job 和汇总 job 必须实际结束为 success，并提供对应 run 链接。任一必需证据缺失时，保持草稿或测试包状态。部分 runner 的系统版本高于最低发行目标，因此原生 CI 通过不自动证明所有最低操作系统版本已经过实机验收。
 
 发布检查同时读取 CTest 进程结果和 QtTest 用例明细。测试程序退出码为零不能替代内部用例执行证据。`reports/tests/qt-test-cases.json` 必须没有未执行的必需用例或缺失明细。唯一经过明确分类的平台不适用用例及其精确匹配规则见 [测试指南](testing.md)，这类用例保留单独计数，不计为通过。
 
@@ -24,13 +25,13 @@
 先执行开发脚本的 `configure`、`build` 和 `test`。`install` 调用 `cmake --install`，将程序及依赖放入 `<build-root>/stage`。安装布局是后续部署和打包的依据，不手动复制开发目录里的 DLL 来补包。
 
 ```powershell
-./qcopilots-search-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
-./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator NSIS
-./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
+./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator NSIS
+./qcs-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ```
 
-Windows NSIS 生成器需要安装 NSIS。macOS 使用 `DragNDrop`，分架构生成 `.app` 和 `.dmg`。Linux 分别使用 `TGZ` 和 `DEB`。包位于 `<build-root>/packages`，文件统一采用 `qcopilots-search` 前缀，校验和写入 `SHA256SUMS`。
+Windows NSIS 生成器需要安装 NSIS。macOS 使用 `DragNDrop`，分架构生成 `.app` 和 `.dmg`。Linux 分别使用 `TGZ` 和 `DEB`。包位于 `<build-root>/pkg`，文件统一采用 `qcs` 前缀，校验和写入 `SHA256SUMS`。
 
 ## 包级验收
 
@@ -62,32 +63,32 @@ Linux CI 在固定 Ubuntu 22.04 容器中使用 `dpkg --install` 安装最终 DE
 
 模型由下载或离线导入获得，不放进安装包。OCR 数据和中文分词字典是正常运行资源，需要随包部署并保留归属。
 
-运行 `tools/qcopilots-search-source-bundle.py --build-root <root> --qt-root <sdk> --download` 生成实际对应源码包及校验清单，详见 [对应源码材料](source-materials.md)。生成最终材料时要求使用干净的发行提交，开发阶段的 `workingTreeModified` 标记不能被删除来伪装不可变来源。
+运行 `tools/qcs-source-bundle.py --build-root <root> --qt-root <sdk> --download` 生成实际对应源码包及校验清单，详见 [对应源码材料](source-materials.md)。生成最终材料时要求使用干净的发行提交，开发阶段的 `workingTreeModified` 标记不能被删除来伪装不可变来源。
 
 ## CI 和人工发布
 
-`.github/workflows/qcopilots-search-native.yml` 在 PR 创建或同步、main 推送时运行四个原生组合，也支持手动触发。每个 job 使用独立外置根，执行校验过的模型下载、测试、小规模容量和平台打包，并上传报告与测试包。
+`.github/workflows/qcs-native.yml` 在 PR 创建或同步、main 推送时运行四个原生组合，也支持手动触发。每个 job 使用独立外置根，执行校验过的模型下载、测试、小规模容量和平台打包，并上传报告与测试包。
 
-CI 的 `required` job 下载当前运行的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `qcopilots-search-native-aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。这个结果只代表四个原生组合，最终 Windows 百万规模和 Computer Use 由下面的本机门禁单独核验。
+CI 的 `required` job 下载当前运行的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `qcs-native-aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。这个结果只代表四个原生组合，最终 Windows 百万规模和 Computer Use 由下面的本机门禁单独核验。
 
 PR 的候选提交使用事件中的 `pull_request.head.sha`。实际 CI checkout 通常是 GitHub 生成的 merge commit，两者分别记录。四个原生 job 必须执行同一 checkout，最终本机候选必须与其候选 head、Git tree 和依赖锁哈希一致。不能把 merge commit 与 head 字符串不同误判为构建失败，也不能将旧报告事后绑定到新的 HEAD。
 
 ## 本机最终证据流程
 
-使用 `tools/qcopilots-search-release-evidence.py` 记录构建与验收。它使用 Python 标准库，所有运行创建外置唯一目录，保留执行前来源、实际命令、退出码、原始 stdout / stderr、执行时间和产物 SHA-256。聚合器不执行发布，也不根据报告中的单个 `passed` 字段放行。
+使用 `tools/qcs-release-evidence.py` 记录构建与验收。它使用 Python 标准库，所有运行创建外置唯一目录，保留执行前来源、实际命令、退出码、原始 stdout / stderr、执行时间和产物 SHA-256。聚合器不执行发布，也不根据报告中的单个 `passed` 字段放行。
 
 先提交并冻结候选，然后在干净 checkout 下记录一次实际完整构建。路径均由调用者提供，下面的 `$source`、`$buildRoot`、`$qtRoot`、`$evidenceRoot` 和 `$python` 分别指向当前源码、外置构建根、SDK、证据根及 Python。`--program` 至少记录四个应用程序、百万容量程序和物理文件测试程序，程序的实际生成路径以当前构建为准。
 
 ```powershell
-$tool = Join-Path $source 'tools/qcopilots-search-release-evidence.py'
+$tool = Join-Path $source 'tools/qcs-release-evidence.py'
 & $python $tool record-build --source $source --output-root $evidenceRoot `
-  --program "qcopilots-search=$buildRoot/release/bin/qcopilots-search.exe" `
-  --program "qcopilots-search-service=$buildRoot/release/bin/qcopilots-search-service.exe" `
-  --program "qcopilots-search-worker=$buildRoot/release/bin/qcopilots-search-worker.exe" `
-  --program "qcopilots-search-cli=$buildRoot/release/bin/qcopilots-search-cli.exe" `
-  --program "qcopilots-search-benchmark=$buildRoot/release/bin/qcopilots-search-benchmark.exe" `
-  --program "qcopilots-search-tests-file-capacity=$physicalTest" `
-  -- pwsh -NoProfile -File "$source/qcopilots-search-dev.ps1" build `
+  --program "qcs=$buildRoot/release/bin/qcs.exe" `
+  --program "qcs-service=$buildRoot/release/bin/qcs-service.exe" `
+  --program "qcs-worker=$buildRoot/release/bin/qcs-worker.exe" `
+  --program "qcs-cli=$buildRoot/release/bin/qcs-cli.exe" `
+  --program "qcs-benchmark=$buildRoot/release/bin/qcs-benchmark.exe" `
+  --program "qcs-tests-file-capacity=$physicalTest" `
+  -- pwsh -NoProfile -File "$source/qcs-dev.ps1" build `
        --build-root $buildRoot --qt-root $qtRoot
 ```
 
@@ -97,21 +98,23 @@ Windows 的 `CreateProcessW` 对工作目录仍有 `MAX_PATH` 限制，即使证
 
 ```powershell
 & $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot `
-  --kind physical --program-name qcopilots-search-tests-file-capacity `
+  --kind physical --program-name qcs-tests-file-capacity `
   --report physical.json --env 'QCOPILOTS_SEARCH_PHYSICAL_FILE_COUNT=100000' `
   --env 'QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT={report}' `
   --env 'QCOPILOTS_SEARCH_TEST_ROOT={evidence}/temporary' `
   --env 'QT_FORCE_STDERR_LOGGING=1' -- '{program}' -o -,txt
 ```
 
-物理测试需要由运行环境提供构建依赖的位置，且 `QCOPILOTS_SEARCH_TEST_ROOT` 的父目录必须可写。百万向量测试使用独立监控器，通过 `--input` 保留监控脚本原文和执行前后哈希。监控器的 `ExternalRoot` 必须使用 `{evidence}`，让原始 benchmark JSON、采样 JSONL 和输出日志都保留在本次根内。下面的 `$millionRunner` 是维护者选择并审查的实际监控脚本路径，不是假定另一台电脑存在的固定路径。
+物理测试需要由运行环境提供构建依赖的位置，且 `QCOPILOTS_SEARCH_TEST_ROOT` 的父目录必须可写。百万向量测试使用独立监控器，通过 `--input` 保留监控脚本原文和执行前后哈希。监控器的 `ExternalRoot` 必须使用 `{evidence}`，让原始 benchmark JSON、采样 JSONL 和输出日志都保留在本次根内。下面的 `$millionRunner` 指向当前源码中的 `tools/acceptance/qcs-run-million.ps1`，由 `$source` 派生，不是假定另一台电脑存在的固定路径。
 
 ```powershell
+$millionRunner = Join-Path $source 'tools/acceptance/qcs-run-million.ps1'
 & $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot `
-  --kind million --program-name qcopilots-search-benchmark `
+  --kind million --program-name qcs-benchmark `
   --report 'reports/*.monitor.json' --input $millionRunner `
   -- pwsh -NoProfile -File $millionRunner -BenchmarkExe '{program}' `
-       -ExternalRoot '{evidence}' -QtBin $qtBin -Mode Run
+       -ExternalRoot '{evidence}' -QtBin $qtBin -Source $source `
+       -ExpectedCommit $candidateHead -BuildRecord $buildRecord -Python $python -Mode Run
 ```
 
 百万验收要求实际写入和重载至少 1,000,000 个 768 维向量、至少 100 条不同 oracle 查询和 500 次预热后计时，同时验证过滤、CRUD、后台重建、四个崩溃恢复边界及独立磁盘采样。原始报告和监控报告均保留，绝对路径只作为原始记录，由附件映射对应到可移植相对路径。采样峰值不冒充连续测量峰值。
@@ -124,9 +127,9 @@ Windows 的 `CreateProcessW` 对工作目录仍有 `MAX_PATH` 限制，即使证
   --model-fingerprint $modelFingerprint --extraction-fingerprint $extractionFingerprint
 ```
 
-以新生成的 package candidate 初始化 Windows Computer Use 记录，再对这一个最终包完成十个场景。报告必须带相同候选身份、包哈希、四个程序哈希、模型和提取指纹，每个场景保留预期、实际操作、结果、时间、截图与操作日志。原始 JSON 必须在顶层内嵌 `files` 清单，所有附件路径均相对于该 JSON 所在目录，使用 POSIX 路径。`--computer-use` 传入这份自包含原始报告，不能传入附加的 `-files.json`。完整字段与路径规则见 [Windows 用户操作验收](windows-user-acceptance.md#报告字段)。旧跨包报告保留历史价值，但缺少执行前来源链时属于 `unbound`，不能充当最终候选验收。
+以新生成的 package candidate 初始化 Windows Computer Use 记录，再对这一个最终包完成十个场景。报告必须带相同候选身份、包哈希、四个程序哈希、模型和提取指纹，每个场景保留预期、实际操作、结果、时间、截图与操作日志。原始 JSON 必须在顶层内嵌 `files` 清单，所有附件路径均相对于该 JSON 所在目录，使用 POSIX 路径。`--computer-use` 传入这份自包含原始报告，不能传入附加的 `-files.json`。完整字段与路径规则见 [Windows 用户操作验收](windows-user-acceptance.md#报告字段)。旧长命名候选及跨包报告已退出本轮验收范围，不能通过改名或补写来源充当新候选的实际操作证据。
 
-将 `record-package`、两个 `run-local` 和 Computer Use 的原始 JSON 路径分别赋给下列变量。`collect-local` 只复制已列入哈希清单的证据，不导入整个数据库目录。四份 GitHub 原生 artifact 分别解压到 `$nativeArtifacts` 的四个子目录，保持各自 `reports` 和 `packages` 布局。
+将 `record-package`、两个 `run-local` 和 Computer Use 的原始 JSON 路径分别赋给下列变量。`collect-local` 只复制已列入哈希清单的证据，不导入整个数据库目录。四份 GitHub 原生 artifact 分别解压到 `$nativeArtifacts` 的四个子目录，保持各自 `reports` 和 `pkg` 布局。
 
 ```powershell
 & $python $tool collect-local --candidate $candidateRecord --million $millionRecord `
@@ -138,8 +141,8 @@ Windows 的 `CreateProcessW` 对工作目录仍有 `MAX_PATH` 限制，即使证
 
 最终命令只有在四组合原生证据及全部本机门槛满足时返回 0。其失败报告逐项保留缺失、规模不足、原始结果不一致或来源失配的原因。纯粹整理旧报告、合成验证器 fixture 通过、部分平台测试通过，都不会成为最终发布完成证明。
 
-macOS 部署默认使用 ad-hoc 签名。Qt 先通过 `-no-codesign` 完成依赖复制、路径修改和 strip，然后项目签名工具扫描整个 APP 中的实际 Mach-O 文件，包括无链接引用的完整版本 dylib、动态加载模块和 universal binary。独立代码文件和嵌套 framework、APP 从内到外签名，最外层 APP 最后签。工具逐个验证代码文件和 bundle，再执行 `codesign --verify --deep --strict`。签名不使用 `--deep`，也不允许签名后再次修改 APP 内容。签名清单和命令记录写到 APP 外部的 `reports/qcopilots-search-macos-signing-<配置>.json`。
+macOS 部署默认使用 ad-hoc 签名。Qt 先通过 `-no-codesign` 完成依赖复制、路径修改和 strip，然后项目签名工具扫描整个 APP 中的实际 Mach-O 文件，包括无链接引用的完整版本 dylib、动态加载模块和 universal binary。独立代码文件和嵌套 framework、APP 从内到外签名，最外层 APP 最后签。工具逐个验证代码文件和 bundle，再执行 `codesign --verify --deep --strict`。签名不使用 `--deep`，也不允许签名后再次修改 APP 内容。签名清单和命令记录写到 APP 外部的 `reports/qcs-macos-signing-<配置>.json`。
 
-`QCOPILOTS_SEARCH_MACOS_CODESIGN_IDENTITY` 默认为 `-`，可以显式指定受控钥匙串中的证书身份。指定证书但不可用时构建失败，不回退到 ad-hoc。证书模式启用 secure timestamp，并为 executable 启用 Hardened Runtime。可选 `QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP` 指向 JSON 文件，键为 APP 内 executable 的相对路径，例如 `Contents/MacOS/qcopilots-search`，值为相对于该 JSON 文件的 entitlement plist 路径。只有映射中明确列出的 executable 会附加这些权限，库和 framework 不接受 entitlement 映射。未配置时不自动继承第三方代码的旧 entitlements，已有权限需求必须在该映射中明确列出。私钥和签名凭据不能写入仓库、日志或普通测试产物。
+`QCOPILOTS_SEARCH_MACOS_CODESIGN_IDENTITY` 默认为 `-`，可以显式指定受控钥匙串中的证书身份。指定证书但不可用时构建失败，不回退到 ad-hoc。证书模式启用 secure timestamp，并为 executable 启用 Hardened Runtime。可选 `QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP` 指向 JSON 文件，键为 APP 内 executable 的相对路径，例如 `Contents/MacOS/qcs`，值为相对于该 JSON 文件的 entitlement plist 路径。只有映射中明确列出的 executable 会附加这些权限，库和 framework 不接受 entitlement 映射。未配置时不自动继承第三方代码的旧 entitlements，已有权限需求必须在该映射中明确列出。私钥和签名凭据不能写入仓库、日志或普通测试产物。
 
 验收报告以实际 `codesign` 命令及退出码为依据。ad-hoc 不等于 Developer ID 分发签名，签名验证也不证明已公证。报告中的签名范围是 staging APP，未生成 APP、命令不可用或身份无法识别时记为未知，其他平台尚未配置签名验证时同样记为未知。当前仓库默认验收的是 ad-hoc 包，配置证书的分发与公证仍须在受控发布环境单独验证。签名后重新计算包校验和，并验证签名后的最终包。维护者确认全部验收和许可材料后再决定公开发布。

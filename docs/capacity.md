@@ -4,12 +4,12 @@
 
 ## 合成向量基准
 
-`qcopilots-search-benchmark` 使用固定种子流式生成 768 维向量，实际写入 SQLite、构建 ANN、关闭并重新打开，然后与精确 top-20 对照。程序创建唯一的测试子目录，生成物不写入源码树。
+`qcs-benchmark` 使用固定种子流式生成 768 维向量，实际写入 SQLite、构建 ANN、关闭并重新打开，然后与精确 top-20 对照。程序创建唯一的测试子目录，生成物不写入源码树。
 
 CI 使用较小规模执行相同存储路径：
 
 ```bash
-qcopilots-search-benchmark \
+qcs-benchmark \
   --profile-dir "$build_root/ci-capacity" \
   --files 3000 --segments-per-file 10 \
   --queries 10 --timings 20 \
@@ -19,7 +19,7 @@ qcopilots-search-benchmark \
 当前 Windows 的百万规模命令：
 
 ```powershell
-$benchmark = Join-Path $buildRoot 'release/bin/qcopilots-search-benchmark.exe'
+$benchmark = Join-Path $buildRoot 'release/bin/qcs-benchmark.exe'
 & $benchmark --profile-dir (Join-Path $buildRoot 'benchmark') `
   --files 100000 --segments-per-file 10 --queries 100 --timings 500 `
   --seed 20261011 --min-free-gib 3 --budget-gib 7 `
@@ -34,15 +34,15 @@ $benchmark = Join-Path $buildRoot 'release/bin/qcopilots-search-benchmark.exe'
 
 后台重建的时间区间由真正插入图节点的循环内部记录，不包含等待线程启动、序列化或发布。报告保留建图区间和每条查询的起止时间，只使用与实际建图区间相交的查询计算后台 P95。没有实际重叠时，结果不能记为通过，也不会人为等待以延长建图。完整流程在初始建库后还会因增删改多次重建各分片，另有后台重建及故障恢复，因此初始建库耗时不能代表总验收时间。
 
-ANN 使用 16 个分片，图结构参数为 `M=24`、`efConstruction=200`。默认查询预算 `efSearch=4096`，标准检索和可取消检索使用相同值。最初的 512 预算在百万规模首轮实测中得到总体 Recall@20 0.932，未达到门槛。保留图上的只读对照中，4096 是 512、1024、2048、4096 四档里唯一在原 100 条查询与独立固定种子的 40 条查询中均达到 0.95 的预算，两组结果分别为 0.9625 和 0.965。预算选择没有修改向量、查询答案、构建参数或召回门槛。该对照只用于选择通用参数，正式通过仍以完整百万流程及过滤、恢复、500 次计时结果为准。
+ANN 使用 16 个分片，图结构参数为 `M=24`、`efConstruction=200`。默认查询预算 `efSearch=4096`，标准检索和可取消检索使用相同值。该预算用于修复先前较低预算暴露的召回问题，未修改向量、查询答案、构建参数或召回门槛。旧候选参数探针已退出本轮证据范围，正式通过以短名候选的完整百万流程及过滤、恢复、500 次计时结果为准。
 
-查询预算不改变持久图结构。旧版本以 512 保存的图可以由新版本读取，并使用当前查询预算，不需要因为该参数变化重建图。
+查询预算不改变持久图结构。同一布局中的图使用当前查询预算，不需要仅因该参数变化重建图。这是图格式的性质，不构成对旧长命名配置布局的迁移或回退支持。
 
 JSON 报告记录 `passed`、`error`、`annEfSearch`、`recallAt20`、聚类/均匀分布召回、`latencyMilliseconds`、构建与重开状态、每条查询和磁盘采样。服务状态同样报告实际 `annEfSearch`。`sampledDirectoryPeakBytes` 是采样峰值，不是连续监测的严格上界。
 
 ## 物理文件遍历
 
-`qcopilots-search-tests-file-capacity` 在动态创建的测试根生成真实小文件，验证遍历、修改对账、取消和排除。完整验收需实际生成十万个文件。CI 可运行较小规模，但必须在报告中写明文件数，不能沿用“十万”结论。
+`qcs-tests-file-capacity` 在动态创建的测试根生成真实小文件，验证遍历、修改对账、取消和排除。完整验收需实际生成十万个文件。CI 可运行较小规模，但必须在报告中写明文件数，不能沿用“十万”结论。
 
 通过 `QCOPILOTS_SEARCH_PHYSICAL_FILE_COUNT=100000` 选择完整规模，`QCOPILOTS_SEARCH_DISK_RESERVE_BYTES` 指定磁盘空闲保留量。默认运行生成 1,000 个物理文件，不应把默认结果记为十万规模。
 

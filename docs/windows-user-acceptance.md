@@ -6,7 +6,7 @@
 
 创建唯一的验收根、profile 和样本目录。根目录由系统临时目录或显式外置测试根派生，路径应包含中文或空格。把相同 profile 传给应用及其服务，只读取专用样本，不连接正式实例。记录安装包文件名、SHA-256、源码提交、模型指纹、Windows 版本、显示缩放和输入法。
 
-Computer Use 应通过当前安装版本技能初始化 `@oai/sky`，实际枚举应用，选择唯一目标窗口，并获取最新窗口状态。浏览器入口没有原生应用能力不代表 Windows 插件不可用。每次操作依据最新窗口状态，错误后按技能执行有界恢复，不复用失效控件索引。
+Computer Use 应先读取当前安装版本的 Windows Computer Use 技能及其 guidance、api 和 confirmations 文档，通过实际可用的 `mcp__node_repl__js` 初始化 `@oai/sky`。调用 `sky.list_apps()` 实际枚举应用，选择唯一目标窗口，再调用 `sky.get_window_state` 获取最新状态。浏览器入口没有原生应用能力不代表 Windows 插件不可用。每次操作依据最新窗口状态，错误后按技能执行有界恢复，不复用失效控件索引。
 
 ## 场景记录
 
@@ -25,11 +25,13 @@ Computer Use 应通过当前安装版本技能初始化 `@oai/sky`，实际枚�
 
 实际报告逐项记录“通过、失败、未运行或平台能力不可用”，附预期、操作、实际结果和必要截图路径。失败后修复并重新运行相关场景，保留修复前后的证据。不要把未运行项改成通过。
 
+所有场景使用同一最终安装包及其独立动态 profile，不能拼接不同候选的截图作为一次通过。工具无法操作、用户协助和工具随后核验的部分分别写入操作记录。必需场景没有实际完成时，本轮验收保持未通过。QtTest 自动化和 Computer Use 各自提供证据，并与本地完整自动化、四组合原生 Actions 及容量门槛一起判定交付。
+
 外部 Notebook 单元格定位只在明确支持该能力的编辑器配置下单独验收。编辑器命令中的 `{cell}` 只是参数替换，通用的文件与行号打开方式不保证跳到 Notebook 单元格，不能用应用内定位截图代替外部编辑器证据。
 
 ## 报告字段
 
-机器可读原始报告保存在本次运行根，例如 `windows-computer-use-<UTC>.json`。以下字段与 `tools/qcopilots-search-release-evidence.py` 的 `verify_manifest`、`validate_cu` 和最终 `preflight` 契约一致：
+机器可读原始报告保存在本次运行根，例如 `windows-computer-use-<UTC>.json`。以下字段与 `tools/qcs-release-evidence.py` 的 `verify_manifest`、`validate_cu` 和最终 `preflight` 契约一致：
 
 | 范围 | 必需内容 |
 | --- | --- |

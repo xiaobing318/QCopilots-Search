@@ -1,37 +1,39 @@
 # 实施进度
 
-当前阶段是最终候选冻结前的集成修复与发行验收。工程、推理和提取、服务和检索、Qt桌面应用、开发脚本及四组合CI已实现，完整交付门槛尚未全部通过。
+当前正在完成 `qcs` 短命名、生成路径优化、旧产物清理及新的发行候选验收。工程、推理和提取、服务和检索、Qt 桌面应用、开发脚本及四组合 CI 已有实现，完整交付门槛尚未全部通过。
 
-本文件说明实现边界与已归档的历史基线，不追记每次运行的最新计数。最终结论以绑定不可变源码提交、实际程序和安装包哈希的外置报告、CI artifact及 [草稿PR #1](https://github.com/xiaobing318/QCopilots-search/pull/1) 中的证据为准。测试完成后不通过反复修改本文件来改变候选提交，也不把后来取得的HEAD追认成旧报告的执行来源。
+本文件描述实现边界，不追记每次运行的通过计数。实际结论以绑定不可变源码提交、程序和安装包 SHA-256 的新报告、CI artifact 及 [草稿 PR #1](https://github.com/xiaobing318/QCopilots-search/pull/1) 中的证据为准。不能将取得报告后的 HEAD 追认为执行来源，也不能通过修改报告名称把旧执行归入新候选。
 
-下表路径相对于运行时选定的外置构建根，默认以 reports/ 保存报告。实际文件位置与SHA-256由各次证据清单记录，不要求其他电脑使用相同盘符或目录。以下均是已经执行的历史结果，不代表下一冻结候选已经重新通过。
+## 短命名与清理范围
 
-| 已归档验证范围 | 实际结果与适用边界 | 主要证据路径 |
+自有程序、真实 CMake target、脚本、安装资源和生成目录采用 `qcs` 短名称。只提供新命令和新布局，不保留旧命令别名。产品显示名称、仓库 URL、C++ 命名空间 `qcopilots_search` 和 `QCOPILOTS_SEARCH_*` 配置接口保持不变。模型指纹、协议和二进制格式中的非路径标识继续保持稳定。
+
+旧长命名候选的日志、截图、报告、构建树、缓存和安装包已退出本轮验收范围，并属于经授权清理的对象。清理操作是否完成以本轮清理记录为准，本文不提前声明已经删除。模型经锁定大小与 SHA-256 校验后保留，Qt 和外部工具链不属于清理范围。仍需维护的外置运行器应先整理入仓库，再删除旧副本。
+
+新候选使用全新的外置构建目录和独立运行配置，不复用旧 CMake 二进制缓存，不自动迁移旧用户配置或索引。说明中的路径相对于调用者指定的外置根，不要求其他电脑使用相同盘符、用户名或源码位置。
+
+## 已纳入实现的修复
+
+以下内容说明继续保留的修复原因，不代表短命名候选已经复测通过：
+
+- 检索采用更高的 ANN 查询预算、可索引的目录字面范围条件及按文件聚合的最近结果，回应先前容量测试暴露的召回与过滤问题。完整百万规模流程仍须重跑。
+- 平台部署修复包括 Linux PNG/ZLIB 链接、macOS 依赖与 CPU 模块布局、模型目录容量查询及 NSIS UTF-8 参数。每个平台仍须取得本轮原生构建和最终包验证。
+- 工具链修复保留 MSVC Unicode response file 与 JPEG 消费者目录直接生成源文件的方式。缩短名称不能替代字符编码、头文件顺序或 ABI 检查。
+
+语义语料属于受控实施验收集，不是独立人工盲评。自然照片、声音和视频样本的覆盖有边界，不能推广为所有题材或口音的质量保证。无答案查询需要单独报告，当前没有经过校准的无答案拒绝承诺。
+
+## 完成门槛
+
+所有必需证据必须对应同一冻结候选。本地 Windows 完整自动化测试、远端四组合原生 CI 和最终 Windows 包的 Computer Use 是三个独立门槛，不能相互替代。
+
+| 门槛 | 本轮必需证据 | 当前发布判断 |
 | --- | --- | --- |
-| Windows普通集成，9b0e0d4阶段 | 23/23个CTest程序通过，46.83秒，368个QtTest PASS、0 FAIL、1个Windows不适用案例。所选标签为unit、storage、process、gui、portable，登记清单与输出一致。真实模型及完整语义测试单独执行 | reports/integration-cu-fixes/ctest.xml、case-evidence.json、inventory.json |
-| Windows原生CI，9b0e0d4 PR head | 26/26 CTest通过，1126.10秒，398个QtTest PASS、0 FAIL、1个Windows不适用案例。实际PR合并checkout为ed9260840db6eaf782698ab64b7f5d50794b7e2b。随后NSIS打包失败，作业整体仍为failure，不能用测试通过代替完整CI通过 | reports/ci-38207590784/windows-native-test-evidence.json、windows-x64.log与windows-artifact-reports/reports/ |
-| 默认CPU与强制baseline数值回归 | 9条参考向量分别执行，两组cosine均≥0.999。两个reference程序共30个QtTest PASS，包含初始化、清理与其他契约检查，不是30条黄金向量。仅属于已执行的Windows环境 | reports/runtime-current/ctest.xml与case-evidence.json中的两个reference程序 |
-| OCR v3与真实语义质量 | 图片回归32项通过，包含简体、繁体中文的两种字号及有界低置信重试。semantic v3实际完成138文件、1,310个编码片段、222条有答案查询，生产检索与精确对照均为221/222，Recall@10为0.9954955。英文111/111、中文110/111，各主要语言和模态分组达到门槛，环境声音仍有1条漏召回 | reports/image-junit.xml、image-tests.txt、semantic-quality.json与semantic-v3/ctest.xml |
-| 十万个物理文件 | 实际创建100,000个文件，验证遍历、排除、运行中取消、修改100、删除100、新增100。失效结果为0，清理确认成功，CTest案例耗时184.10秒。该项与向量容量验收分开计算 | reports/physical-files-100k.json与physical-files-100k/ctest.xml |
-| 可移植路径与只读源码子集 | 中文空格路径、任意工作目录、独立外置构建根和真实NTFS拒绝写入的源码树下完成configure、所选目标build、4/4 CTest。198个源码文件前后哈希一致。该历史子集绑定fc813ef63fe2c06148fbe617e21dfd96b9deb7c9，不代表最终完整应用或其他系统已验证 | test-runs/portable-0c00ba22/reports/qcopilots-search-portability-report.json |
-| Windows 9b0e0d4历史安装包 | ZIP的9项、NSIS的11项检查通过，覆盖迁移安装位置、四个程序、实际格式提取、服务索引查询、GUI启动及依赖来源。NSIS安装与卸载保留独立profile。此包未签名，对应源码材料仍须随最终候选重新生成 | reports/package-final-manifest-9b0e0d4.json、package-zip-9b0e0d4/report.json、package-nsis-9b0e0d4/report.json |
-| Windows Computer Use历史完整覆盖 | CU01–CU10均取得场景证据，共74张截图，覆盖来自7615552与9b0e0d4两个包。CU08欢迎页关闭、CU10托盘暂停与打开由用户协助，工具随后核实实际状态。scenarioCoveragePassed=true，但混合版本历史的releaseEligible=false、顶层passed=false，不能声称单一最终包全流程通过 | reports/windows-computer-use-history-9b0e0d4.json与.md |
-| 第一轮百万向量实测 | 实际写入、建图、关闭并重载1,000,000个768维向量，100条精确对照Recall@20为0.932，低于0.95。500次计时的未过滤P95为74.3349ms，1%与0.1%过滤P95分别为569.9402ms和525.4593ms，超过500ms。确认失败后停止，CRUD、并发单分片重建及4种进程丢失恢复尚未完成，不能记为通过 | reports/capacity-million-first-run-summary.json、capacity-million-first-run-stop.json及其引用的原始benchmark、monitor、采样和日志 |
-| 百万失败后的检索修复 | ANN查询预算调整至efSearch=4096，目录范围改用可索引的字面范围条件，并修复最近文件按片段提前截断的问题。定向存储回归与独立探针已有证据，但没有以这些小规模或停止快照结果替代新的完整百万验收 | reports/storage-4096-*.xml、storage-filter-range-regressions.txt、qcopilots-search-ann-budget-20261012.json |
-| 平台部署与工具链修复 | Linux PNG/ZLIB版本符号、macOS依赖与CPU模块部署路径、macOS模型目录容量查询及NSIS UTF-8编译参数已作修正。模块配置、布局或Windows回归已有证据，其中模型管理24项通过，NSIS小工程实际编译成功。布局夹具和Windows执行不能充当macOS签名、模型加载或Linux最终链接通过 | reports/runtime-install-layout.json、runtime-backend-layout.xml、model-files-apfs-fix-windows.txt、nsis-encoding-probe-path.txt及其指向的原始探针日志 |
+| 本地自动化 | 完整 CTest、QtTest 和工具测试，真实模型、路径及清理回归、安装验证，注册清单与逐用例明细一致 | 以新候选报告判定，未取得完整证据前不通过 |
+| 四组合原生 CI | Windows x64、Linux x64、macOS arm64 和 x64 的构建、测试、真实模型、包验证与汇总 job 全部实际 success | 触发工作流不等于通过 |
+| Windows Computer Use | 同一最终包的 CU-01 至 CU-10，独立 profile、实际操作、截图及逐场景包和程序哈希 | 未运行或工具无法覆盖的必需场景阻断完成 |
+| 容量与恢复 | 十万物理文件、百万 768 维向量写入与重载、精确对照、过滤、500 次计时、后台单分片重建、增删改及故障恢复 | 不能用小规模 CI 或历史参数探针替代 |
+| 发布材料 | ZIP/NSIS、分架构 DMG、TGZ/DEB、对应源码、许可证、符号、校验和及签名状态 | 与实际包和提交绑定后验收 |
 
-普通集成与Windows CI中唯一的不适用案例是IndexRepositoryRegressionTest::rootFilterRespectsCaseSensitivePlatformKeys()，专门验证非Windows平台的大小写敏感路径规则。Windows采用明确的大小写折叠规则，该项没有计入368或398个PASS。其他缺能力、缺模型或缺材料的跳过不能沿用这一豁免。
+通过、不适用、失败和未运行分别记录。Windows 的大小写敏感路径专用用例可以按严格匹配规则记为不适用，但缺模型、权限或材料不能沿用这一分类。来源失配、必需用例缺失、清理失败和残留进程都需要明确失败。
 
-语义语料的目标资料与标签在观察模型结果前共同编写，属于受控实施验收集，不是独立人工盲评。真实自然照片、声音和视频样本仍然较少，不能推广为所有环境、口音或题材的质量保证。另20条无答案查询分为calibration和holdout各10条，全部仍返回10个候选，当前没有校准的无答案拒绝承诺，不能写成“无答案检测通过”。第一轮失败语义证据继续保留。
-
-四组合历史CI的完整流程尚未通过。[run 38207590784](https://github.com/xiaobing318/QCopilots-search/actions/runs/38207590784) 中Windows在测试通过后NSIS打包失败，Linux worker链接缺少PNG/ZLIB版本符号，macOS暴露依赖解析和嵌套CPU模块签名问题。修复后的原生执行结果必须另行取得。取消的旧运行不视为新提交的失败，也不能作为新提交成功的证据。
-
-最终不可变候选仍需完成以下门槛：
-
-- 同一候选的Windows x64、Linux x64、macOS arm64与x64原生CI，包括完整测试、真实模型、语义验收和对应平台包验证。
-- 修复后的完整百万规模建图与重载、精确对照、过滤、500次预热计时、后台单分片重建、增删改和故障恢复，保留磁盘预算与监控证据。
-- 对同一最终Windows包重新完整执行CU01–CU10，使用新的独立profile、实际截图和逐场景包及程序哈希。历史混合版本报告只能保留为历史记录。
-- 将物理文件、可移植性、安装包、源码完整性等必需证据绑定到真实执行时的构建记录，不能从当前HEAD反推旧报告来源。包内程序、模型和提取指纹、依赖锁与报告附件须能够重新校验。
-- 最终ZIP/NSIS、各架构DMG、TGZ/DEB及对应源码材料、许可文件、校验和、调试符号和签名状态记录。公开发布与合并仍由用户决定。
-
-外置不可变报告、CI artifact和PR中的来源清单是最终判据。本文件的历史成功计数、模块修复说明或安装包启动记录均不能单独解除上述门槛。
+每轮执行先保存来源清单，再运行测试或用户操作，结束后校验附件。原生 CI 分别记录 PR head 和实际 checkout，最终本机包与其候选、源码树和依赖锁对应。只有全部必需门槛满足后才能标记实施完成，合并和公开发布仍由用户决定。

@@ -39,10 +39,10 @@ def check_macos_deployment(options, source, repo, root):
         # on either the original staging directory or the fixture build tree.
         relocated = fixture_root / f"{label} 已迁移 中文 空格"
         stage.rename(relocated)
-        bundle = relocated / "qcopilots-search-deploy-fixture.app"
+        bundle = relocated / "qcs-deploy-fixture.app"
         frameworks = bundle / "Contents/Frameworks"
-        binary = bundle / "Contents/MacOS/qcopilots-search-deploy-fixture"
-        evidence = bundle / "Contents/Resources/qcopilots-search-before-runtime-finalization.txt"
+        binary = bundle / "Contents/MacOS/qcs-deploy-fixture"
+        evidence = bundle / "Contents/Resources/qcs-before-runtime-finalization.txt"
         if str(build) not in evidence.read_text(encoding="utf-8"):
             raise RuntimeError("Missing evidence that development installation overwrote the library")
         aliases = []
@@ -78,7 +78,7 @@ def check_macos_deployment(options, source, repo, root):
                                 "dependencies": dependencies})
         # macdeployqt deliberately leaves signing to the final production pass.
         # Apple Silicon requires valid ad-hoc seals after install_name_tool edits.
-        run([sys.executable, "-B", repo / "tools/qcopilots-search-sign-macos.py", "--bundle", bundle,
+        run([sys.executable, "-B", repo / "tools/qcs-sign-macos.py", "--bundle", bundle,
              "--identity=-", "--report", logs / f"{label}-signing.json"])
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith(("DYLD_", "LD_", "QT_", "QML"))}
@@ -98,7 +98,7 @@ def check_macos_deployment(options, source, repo, root):
     try:
         command = [options.cmake, "-S", source / "macos_deploy", "-B", build,
                    "-G", options.generator, "-DCMAKE_BUILD_TYPE=Release",
-                   f"-DQCOPILOTS_SEARCH_MACOS_DEPLOY_CMAKE={repo / 'cmake/QCopilotsSearchMacOSDeploy.cmake'}"]
+                   f"-DQCOPILOTS_SEARCH_MACOS_DEPLOY_CMAKE={repo / 'cmake/qcs-macos-deploy.cmake'}"]
         if options.compiler:
             command.append(f"-DCMAKE_C_COMPILER={options.compiler}")
         if options.qt_cmake_dir:
@@ -125,18 +125,18 @@ def check_macos_deployment(options, source, repo, root):
             raise RuntimeError("The macOS deploy regression requires CPack beside CMake")
         run([cpack, "--config", build / "CPackConfig.cmake", "-C", "Release", "-G", "TGZ",
              "-B", build / "packages"])
-        archive = build / "packages/qcopilots-search-macos-deploy-fixture.tar.gz"
+        archive = build / "packages/qcs-macos-deploy-fixture.tar.gz"
         unpack = fixture_root / "package 原始 空格"
         unpack.mkdir()
         with tarfile.open(archive) as package:
             package.extractall(unpack, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
-        verify(unpack / "qcopilots-search-macos-deploy-fixture", "macos-cpack-tgz-strip", names)
+        verify(unpack / "qcs-macos-deploy-fixture", "macos-cpack-tgz-strip", names)
         return records
     except Exception:
         # The parent runner owns and removes its temporary directory. Keep only
         # bounded diagnostic logs outside it when native CI requests retention.
         if os.environ.get("QCOPILOTS_SEARCH_KEEP_FAILED_TESTS") == "1":
-            retained = Path(tempfile.mkdtemp(prefix="qcopilots-search-macos-deploy-failed-", dir=root.parent))
+            retained = Path(tempfile.mkdtemp(prefix="qcs-macos-deploy-failed-", dir=root.parent))
             shutil.copytree(logs, retained / "logs")
             print(f"Preserved macOS deployment diagnostics: {retained}", file=sys.stderr, flush=True)
         raise

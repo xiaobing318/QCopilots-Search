@@ -28,6 +28,10 @@ class ImageExtractionTests : public QObject {
     Q_OBJECT
 private slots:
     void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
+    void cleanup() {
+        const auto cleanupError = test::takeCleanupErrors();
+        QVERIFY2(cleanupError.isEmpty(), qPrintable(cleanupError));
+    }
     void classification_data()
     {
         QTest::addColumn<QString>("suffix"); QTest::addColumn<bool>("image");
@@ -133,9 +137,9 @@ private slots:
         if (!finished) { helper.kill(); helper.waitForFinished(5'000); }
         const auto json = helper.readAllStandardOutput();
         const auto errors = helper.readAllStandardError();
-        QFile evidence(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-jpeg-dng-codec.json")));
+        QFile evidence(QDir(temporary.path()).filePath(QStringLiteral("qcs-jpeg-dng-codec.json")));
         QVERIFY(evidence.open(QIODevice::WriteOnly)); QCOMPARE(evidence.write(json), qint64(json.size())); evidence.close();
-        QFile stderrFile(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-jpeg-dng-codec.stderr.txt")));
+        QFile stderrFile(QDir(temporary.path()).filePath(QStringLiteral("qcs-jpeg-dng-codec.stderr.txt")));
         QVERIFY(stderrFile.open(QIODevice::WriteOnly)); QCOMPARE(stderrFile.write(errors), qint64(errors.size())); stderrFile.close();
         qInfo().noquote() << json << errors;
         QVERIFY2(finished, "JPEG codec probe timed out");
@@ -179,9 +183,9 @@ private slots:
         if (!finished) { worker.kill(); worker.waitForFinished(5'000); }
         const auto json = worker.readAllStandardOutput();
         const auto errors = worker.readAllStandardError();
-        QFile evidence(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-jpeg-dng-worker.json")));
+        QFile evidence(QDir(temporary.path()).filePath(QStringLiteral("qcs-jpeg-dng-worker.json")));
         QVERIFY(evidence.open(QIODevice::WriteOnly)); QCOMPARE(evidence.write(json), qint64(json.size())); evidence.close();
-        QFile stderrFile(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-jpeg-dng-worker.stderr.txt")));
+        QFile stderrFile(QDir(temporary.path()).filePath(QStringLiteral("qcs-jpeg-dng-worker.stderr.txt")));
         QVERIFY(stderrFile.open(QIODevice::WriteOnly)); QCOMPARE(stderrFile.write(errors), qint64(errors.size())); stderrFile.close();
         qInfo().noquote() << json << errors;
         QCOMPARE(accepted, qint64(frame.size()));
@@ -246,7 +250,7 @@ private slots:
         }
         qcopilots_search::test::ExtractionDirectory temporary(testTemplate()); QVERIFY(temporary.isValid());
         QStringList paths;
-        for (const QString &name : {QStringLiteral("qcopilots-search-ocr-simplified-40px.png"),
+        for (const QString &name : {QStringLiteral("qcs-ocr-simplified-40px.png"),
                 QStringLiteral("generated-uncompressed.dng"), QStringLiteral("generated-deflate.dng"),
                 QStringLiteral("generated-jpeg.dng")}) {
             const auto path = QDir(temporary.path()).filePath(name);
@@ -464,13 +468,13 @@ private slots:
         QTest::addColumn<QString>("fixture");
         QTest::addColumn<QString>("expected");
         QTest::addColumn<QByteArray>("sha256");
-        QTest::newRow("simplified-40px") << QStringLiteral("qcopilots-search-ocr-simplified-40px.png") << QStringLiteral("安全出口禁止吸烟")
+        QTest::newRow("simplified-40px") << QStringLiteral("qcs-ocr-simplified-40px.png") << QStringLiteral("安全出口禁止吸烟")
             << QByteArray("ae4b3d8ee1005c86284094fb4ff35e819b1e0b56dc19954b67d6e36e25bfb020");
-        QTest::newRow("traditional-40px") << QStringLiteral("qcopilots-search-ocr-traditional-40px.png") << QStringLiteral("社區會議歡迎參加")
+        QTest::newRow("traditional-40px") << QStringLiteral("qcs-ocr-traditional-40px.png") << QStringLiteral("社區會議歡迎參加")
             << QByteArray("d27525c909c530515762aa4d2261c7b4aef7aeb8c43205151a2a27bb1e4e73b4");
-        QTest::newRow("simplified-80px") << QStringLiteral("qcopilots-search-ocr-simplified-80px.png") << QStringLiteral("安全出口禁止吸烟")
+        QTest::newRow("simplified-80px") << QStringLiteral("qcs-ocr-simplified-80px.png") << QStringLiteral("安全出口禁止吸烟")
             << QByteArray("ded33620494a47bb0222bf0400cdd5bd38bbcaf1cee9c7256fc6cf928d06b299");
-        QTest::newRow("traditional-80px") << QStringLiteral("qcopilots-search-ocr-traditional-80px.png") << QStringLiteral("社區會議歡迎參加")
+        QTest::newRow("traditional-80px") << QStringLiteral("qcs-ocr-traditional-80px.png") << QStringLiteral("社區會議歡迎參加")
             << QByteArray("3fe4e737f53fd2e9766971f137b163b3d9c8d49cba4f506045b6dd475fdef25f");
     }
     void ocrKeepsBlankImagesEmptyAndHonorsCancellation()
@@ -518,7 +522,7 @@ private slots:
         const QString text = recognizeText(image, options, &error);
         QString normalized;
         for (const QChar character : text) if (!character.isSpace()) normalized += character;
-        QFile diagnostic(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-ocr-result.json")));
+        QFile diagnostic(QDir(temporary.path()).filePath(QStringLiteral("qcs-ocr-result.json")));
         QVERIFY(diagnostic.open(QIODevice::WriteOnly));
         const QJsonObject record{{"fixture", fixture}, {"sha256", QString::fromLatin1(sha256)},
             {"expected", expected}, {"actual", text}, {"whitespaceRemoved", normalized}, {"error", error}};
@@ -549,8 +553,9 @@ private:
     {
         QString root = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT");
         if (root.isEmpty()) root = QDir::tempPath();
-        if (!QDir().mkpath(root)) return QDir(root).filePath("invalid/qcopilots-search-image-XXXXXX");
-        return QDir(root).filePath("qcopilots-search-image-XXXXXX");
+        if (!QDir().mkpath(root))
+            test::recordCleanupFailure(QStringLiteral("Cannot create explicit image test root: %1").arg(root));
+        return QDir(root).filePath("qcs-image-XXXXXX");
     }
 };
 

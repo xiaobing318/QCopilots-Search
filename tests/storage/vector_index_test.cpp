@@ -1,4 +1,5 @@
 #include "storage/vector_index.h"
+#include "support/test_environment.h"
 
 #include <QCryptographicHash>
 #include <QDataStream>
@@ -9,7 +10,6 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QStandardPaths>
-#include <QTemporaryDir>
 #include <QtTest>
 
 #include <algorithm>
@@ -36,8 +36,8 @@ QString temporaryTemplate()
     const QString configured = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT");
     const QString parent = configured.isEmpty() ? QDir::tempPath() : configured;
     if (!QDir().mkpath(parent))
-        return QDir(parent).filePath("unavailable-parent/qcopilots-search-vector-tests-XXXXXX");
-    return QDir(parent).filePath(QString::fromUtf8("qcopilots-search-vector-tests 中文 空格-XXXXXX"));
+        test::recordCleanupFailure(QStringLiteral("Cannot create explicit vector test root: %1").arg(parent));
+    return QDir(parent).filePath(QString::fromUtf8("qcs-vector-tests 中文 空格-XXXXXX"));
 }
 
 QVector<float> basis(int coordinate)
@@ -85,6 +85,12 @@ class VectorIndexTest : public QObject
     Q_OBJECT
 
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void initTestCase()
     {
         QStandardPaths::setTestModeEnabled(true);
@@ -92,7 +98,7 @@ private slots:
 
     void emptyIndex()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
@@ -106,7 +112,7 @@ private slots:
 
     void shardsMergeInDistanceOrder()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
@@ -130,7 +136,7 @@ private slots:
 
     void allowedIdsRestrictCandidates()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
@@ -149,7 +155,7 @@ private slots:
 
     void reloadFromUnicodeAndSpacePath()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         const QString root = QDir(temporary.path()).filePath(QString::fromUtf8("索引 文件夹"));
         QString error;
@@ -171,7 +177,7 @@ private slots:
 
     void tombstonesParticipateInTraversalAndExactFiltering()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QVector<VectorRecord> records;
@@ -209,7 +215,7 @@ private slots:
 
     void cancellationDoesNotChangeSnapshotOrUncancelledResults()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QVector<VectorRecord> records;
@@ -253,7 +259,7 @@ private slots:
 
     void runningTraversalCanBeCancelledDeterministically()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         std::mutex gateMutex;
         std::condition_variable gate;
@@ -318,7 +324,7 @@ private slots:
 
     void traversalCheckpointExceptionsReturnAfterHnswCleanup()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         int failureKind = 0;
         VectorIndex index(temporary.path(), 4, [&](const QString &point) {
@@ -346,7 +352,7 @@ private slots:
 
     void legacy512SearchBudgetLoadsWithoutRewritingStoredGraph()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         QString error;
         QVector<VectorNeighbor> expected;
@@ -360,7 +366,7 @@ private slots:
             QCOMPARE(expected.size(), qsizetype(3));
         }
 
-        QFile manifest(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-ann-manifest.json")));
+        QFile manifest(QDir(temporary.path()).filePath(QStringLiteral("qcs-ann-manifest.json")));
         QVERIFY2(manifest.open(QIODevice::ReadOnly), qPrintable(manifest.errorString()));
         QJsonParseError parseError;
         auto document = QJsonDocument::fromJson(manifest.readAll(), &parseError);
@@ -448,7 +454,7 @@ private slots:
 
     void oldSnapshotSurvivesRebuild()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
@@ -470,7 +476,7 @@ private slots:
 
     void retiredFilesWaitForLastSnapshot()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         QString error;
         QSet<QString> currentFiles;
@@ -484,7 +490,7 @@ private slots:
             const auto secondFiles = filesBelow(temporary.path());
             QSet<QString> oldShardFiles;
             for (const QString &path : firstFiles) {
-                if (QFileInfo(path).fileName().startsWith(QStringLiteral("qcopilots-search-ann-shard-"))
+                if (QFileInfo(path).fileName().startsWith(QStringLiteral("qcs-ann-shard-"))
                     && path.endsWith(QStringLiteral(".bin")))
                     oldShardFiles.insert(path);
             }
@@ -512,7 +518,7 @@ private slots:
 
     void emptyRebuildRemovesOnlyChosenShard()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
@@ -533,19 +539,19 @@ private slots:
 
     void validLoadCollectsOnlyUnreferencedOwnedFiles()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
         QVERIFY2(index.rebuildShard(0, 1, {{16, basis(0)}}, &error), qPrintable(error));
         auto oldSnapshot = index.snapshot();
         const QDir directory(temporary.path());
-        const auto oldNames = directory.entryList({QStringLiteral("qcopilots-search-ann-shard-*.bin")}, QDir::Files);
+        const auto oldNames = directory.entryList({QStringLiteral("qcs-ann-shard-*.bin")}, QDir::Files);
         QCOMPARE(oldNames.size(), qsizetype(1));
         const QString oldFile = directory.filePath(oldNames.first());
         const QString orphan = directory.filePath(QStringLiteral(
-            "qcopilots-search-ann-shard-0-1-12345678-1234-1234-1234-123456789abc.bin"));
-        const QString unrelated = directory.filePath(QStringLiteral("qcopilots-search-ann-shard-personal.bin"));
+            "qcs-ann-shard-0-1-12345678-1234-1234-1234-123456789abc.bin"));
+        const QString unrelated = directory.filePath(QStringLiteral("qcs-ann-shard-personal.bin"));
         QVERIFY(QFile::copy(oldFile, orphan));
         QVERIFY(QFile::copy(oldFile, unrelated));
         QVERIFY2(index.rebuildShard(0, 2, {{32, basis(1)}}, &error), qPrintable(error));
@@ -560,7 +566,7 @@ private slots:
 
     void buildObserversDescribeOnlyActualGraphConstruction()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         QStringList observed;
         VectorIndex index(temporary.path(), 4, [&](const QString &point) {
@@ -589,7 +595,7 @@ private slots:
 
     void failedBuildDoesNotEmitCompletion()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         QStringList observed;
         VectorIndex index(temporary.path(), 4, [&](const QString &point) {
@@ -609,7 +615,7 @@ private slots:
 
     void buildObserverExceptionsDoNotPublishOrLeak()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         QString failurePoint;
         QStringList observed;
@@ -641,7 +647,7 @@ private slots:
 
     void exceptionBeforeManifestDoesNotPublishOrLeak()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         bool inject = false;
         QString faultPoint;
@@ -668,13 +674,13 @@ private slots:
 
     void corruptManifestPreservesLiveSnapshot()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
         QVERIFY2(index.rebuildShard(0, 7, {{16, basis(0)}}, &error), qPrintable(error));
         const auto previous = index.snapshot();
-        QFile manifest(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-ann-manifest.json")));
+        QFile manifest(QDir(temporary.path()).filePath(QStringLiteral("qcs-ann-manifest.json")));
         QVERIFY2(manifest.open(QIODevice::WriteOnly | QIODevice::Truncate), qPrintable(manifest.errorString()));
         QCOMPARE(manifest.write("{ invalid manifest"), qint64(18));
         manifest.close();
@@ -695,7 +701,7 @@ private slots:
 
     void multilevelGraphReloadPreservesNearestNeighbors()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         const auto records = sphericalRecords(2048);
         QVector<QVector<VectorNeighbor>> expected;
@@ -727,14 +733,14 @@ private slots:
 
     void corruptShardChecksumPreservesLiveSnapshot()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
         QVERIFY2(index.rebuildShard(0, 3, {{16, basis(0)}}, &error), qPrintable(error));
         const auto previous = index.snapshot();
         const QDir directory(temporary.path());
-        const auto shardFiles = directory.entryList({QStringLiteral("qcopilots-search-ann-shard-*.bin")}, QDir::Files);
+        const auto shardFiles = directory.entryList({QStringLiteral("qcs-ann-shard-*.bin")}, QDir::Files);
         QCOMPARE(shardFiles.size(), qsizetype(1));
         QFile shard(directory.filePath(shardFiles.first()));
         QVERIFY2(shard.open(QIODevice::ReadWrite), qPrintable(shard.errorString()));
@@ -764,10 +770,10 @@ private slots:
 
     void manifestPublicationFailureRemovesUnpublishedGraph()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         const QDir directory(temporary.path());
-        const QString name = QStringLiteral("qcopilots-search-ann-manifest.json");
+        const QString name = QStringLiteral("qcs-ann-manifest.json");
         QVERIFY(directory.mkdir(name));
         VectorIndex index(temporary.path(), 4);
         const auto before = filesBelow(temporary.path());
@@ -786,7 +792,7 @@ private slots:
 
     void staleGenerationCannotReplacePublishedShard()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
@@ -807,7 +813,7 @@ private slots:
 
     void concurrentReadersKeepOldSnapshotDuringRebuild()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         const auto records = sphericalRecords(1024);
@@ -880,7 +886,7 @@ private slots:
     void invalidRecords()
     {
         QFETCH(QVector<VectorRecord>, records);
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
@@ -911,7 +917,7 @@ private slots:
     void invalidQueries()
     {
         QFETCH(QVector<float>, query);
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;
@@ -922,7 +928,7 @@ private slots:
 
     void dimensions768()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path());
         QVector<float> vector(768, 0.0f);
@@ -938,7 +944,7 @@ private slots:
 
     void invalidShardDoesNotPublish()
     {
-        QTemporaryDir temporary(temporaryTemplate());
+        test::TestTemporaryDir temporary(temporaryTemplate());
         QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
         VectorIndex index(temporary.path(), 4);
         QString error;

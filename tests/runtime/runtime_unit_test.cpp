@@ -2,6 +2,7 @@
 #include "runtime_test_paths.h"
 
 #include <QFile>
+#include <QFileInfo>
 #include <QtTest>
 
 using namespace qcopilots_search;
@@ -12,6 +13,12 @@ private slots:
     void initTestCase()
     {
         QStandardPaths::setTestModeEnabled(true);
+    }
+
+    void cleanup()
+    {
+        const auto error = test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
     }
 
     void promptContracts_data()
@@ -109,9 +116,43 @@ private slots:
         QVERIFY(QDir(first->path()).exists());
         QVERIFY(QDir(second->path()).exists());
         const auto firstPath = first->path();
+        QVERIFY(first->remove());
         first.reset();
         QVERIFY(!QDir(firstPath).exists());
         QVERIFY(QDir(second->path()).exists());
+    }
+
+    void temporaryDirectoryUsesConfiguredRoot()
+    {
+        QString error;
+        auto parent = test::temporaryDirectory(&error);
+        QVERIFY2(parent != nullptr, qPrintable(error));
+        const auto customRoot = parent->filePath(QStringLiteral("中文 临时根"));
+        const test::ScopedEnvironment overrideRoot("QCOPILOTS_SEARCH_TEST_ROOT", customRoot.toUtf8());
+        auto child = test::temporaryDirectory(&error);
+        QVERIFY2(child != nullptr, qPrintable(error));
+        QCOMPARE(QFileInfo(child->path()).absolutePath(), QDir(customRoot).absolutePath());
+        const auto childPath = child->path();
+        QVERIFY(child->remove());
+        child.reset();
+        QVERIFY(!QFileInfo::exists(childPath));
+        QVERIFY(QFileInfo::exists(customRoot));
+    }
+
+    void temporaryDirectoryRejectsFileAsRoot()
+    {
+        QString error;
+        auto parent = test::temporaryDirectory(&error);
+        QVERIFY2(parent != nullptr, qPrintable(error));
+        const auto occupiedRoot = parent->filePath(QStringLiteral("not a directory"));
+        QFile file(occupiedRoot);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.close();
+        const test::ScopedEnvironment overrideRoot("QCOPILOTS_SEARCH_TEST_ROOT", occupiedRoot.toUtf8());
+        auto rejected = test::temporaryDirectory(&error);
+        QVERIFY(rejected == nullptr);
+        QVERIFY2(error.contains(occupiedRoot), qPrintable(error));
+        QVERIFY(QFileInfo(occupiedRoot).isFile());
     }
 };
 

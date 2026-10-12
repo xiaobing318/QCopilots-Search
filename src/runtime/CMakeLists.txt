@@ -34,45 +34,52 @@ set(LLAMA_SUBPROCESS OFF CACHE BOOL "Use application's controlled media extracti
 set(MTMD_VIDEO OFF CACHE BOOL "No external ffmpeg subprocess lookup" FORCE)
 
 set(QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR "" CACHE PATH "Existing checkout or verified source archive of the pinned llama.cpp commit")
-set(QCOPILOTS_SEARCH_LLAMA_BINARY_DIR "${CMAKE_BINARY_DIR}/native-dependencies/llama" CACHE PATH "Configuration-specific inference build directory")
+set(QCOPILOTS_SEARCH_LLAMA_BINARY_DIR "${CMAKE_BINARY_DIR}/nd/llama" CACHE PATH "Configuration-specific inference build directory")
 if(QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR)
-  set(FETCHCONTENT_SOURCE_DIR_QCOPILOTS_SEARCH_LLAMA "${QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR}")
+  set(FETCHCONTENT_SOURCE_DIR_QCS_LLAMA "${QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR}")
 endif()
-if(FETCHCONTENT_SOURCE_DIR_QCOPILOTS_SEARCH_LLAMA)
-  set(_qcopilots_llama_lock "${FETCHCONTENT_SOURCE_DIR_QCOPILOTS_SEARCH_LLAMA}.qcopilots-search.lock")
+if(FETCHCONTENT_SOURCE_DIR_QCS_LLAMA)
+  set(_qcopilots_llama_lock "${FETCHCONTENT_SOURCE_DIR_QCS_LLAMA}.qcs.lock")
 else()
   file(MAKE_DIRECTORY "${FETCHCONTENT_BASE_DIR}")
-  set(_qcopilots_llama_lock "${FETCHCONTENT_BASE_DIR}/qcopilots-search-llama.lock")
+  set(_qcopilots_llama_lock "${FETCHCONTENT_BASE_DIR}/qcs-llama.lock")
 endif()
 file(LOCK "${_qcopilots_llama_lock}" GUARD FILE TIMEOUT 300 RESULT_VARIABLE _qcopilots_llama_lock_result)
 if(NOT _qcopilots_llama_lock_result STREQUAL "0")
   message(FATAL_ERROR "Cannot lock shared llama.cpp dependency: ${_qcopilots_llama_lock_result}")
 endif()
-FetchContent_Declare(qcopilots_search_llama
+FetchContent_Declare(qcs_llama
   GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
   GIT_TAG b11461
   GIT_SHALLOW TRUE
   GIT_PROGRESS TRUE
   UPDATE_DISCONNECTED TRUE
   BINARY_DIR "${QCOPILOTS_SEARCH_LLAMA_BINARY_DIR}"
-  SUBBUILD_DIR "${CMAKE_BINARY_DIR}/native-dependencies/llama-subbuild")
-FetchContent_GetProperties(qcopilots_search_llama)
-if(NOT qcopilots_search_llama_POPULATED)
-  FetchContent_Populate(qcopilots_search_llama)
+  SUBBUILD_DIR "${CMAKE_BINARY_DIR}/sb/llama")
+FetchContent_GetProperties(qcs_llama)
+if(NOT qcs_llama_POPULATED)
+  FetchContent_Populate(qcs_llama)
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/verify_llama_source.cmake")
-qcopilots_search_prepare_llama_source("${qcopilots_search_llama_SOURCE_DIR}"
+qcopilots_search_prepare_llama_source("${qcs_llama_SOURCE_DIR}"
   "${PROJECT_SOURCE_DIR}/third_party/patches")
 file(LOCK "${_qcopilots_llama_lock}" RELEASE)
 # EXCLUDE_FROM_ALL prevents upstream developer headers/tools from entering application packages.
-add_subdirectory("${qcopilots_search_llama_SOURCE_DIR}" "${qcopilots_search_llama_BINARY_DIR}" EXCLUDE_FROM_ALL)
+# Inference has no Qt sources. Keep this scope local so our runtime below still
+# gets Qt autogen, without generating *_autogen trees for every CPU variant.
+block(SCOPE_FOR VARIABLES)
+  set(CMAKE_AUTOMOC OFF)
+  set(CMAKE_AUTORCC OFF)
+  set(CMAKE_AUTOUIC OFF)
+  add_subdirectory("${qcs_llama_SOURCE_DIR}" "${qcs_llama_BINARY_DIR}" EXCLUDE_FROM_ALL)
+endblock()
 
-add_library(qcopilots-search-runtime STATIC EmbeddingRuntime.cpp EmbeddingRuntime.h ImageSizing.cpp ImageSizing.h BackendPaths.h)
-target_compile_features(qcopilots-search-runtime PUBLIC cxx_std_20)
-target_include_directories(qcopilots-search-runtime PUBLIC "${PROJECT_SOURCE_DIR}/src")
-target_link_libraries(qcopilots-search-runtime PUBLIC Qt6::Core Qt6::Gui PRIVATE llama mtmd)
+add_library(qcs-runtime STATIC EmbeddingRuntime.cpp EmbeddingRuntime.h ImageSizing.cpp ImageSizing.h BackendPaths.h)
+target_compile_features(qcs-runtime PUBLIC cxx_std_20)
+target_include_directories(qcs-runtime PUBLIC "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(qcs-runtime PUBLIC Qt6::Core Qt6::Gui PRIVATE llama mtmd)
 if(_qcopilots_cpu_dispatch)
-  target_compile_definitions(qcopilots-search-runtime PRIVATE QCOPILOTS_SEARCH_CPU_DISPATCH=1)
+  target_compile_definitions(qcs-runtime PRIVATE QCOPILOTS_SEARCH_CPU_DISPATCH=1)
   set(_qcopilots_runtime_libraries llama mtmd ggml ggml-base)
   set(_qcopilots_cpu_libraries)
   foreach(_variant x64 sse42 sandybridge ivybridge piledriver haswell skylakex cannonlake cascadelake icelake cooperlake zen4 alderlake sapphirerapids)

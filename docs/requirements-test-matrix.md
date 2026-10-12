@@ -7,11 +7,19 @@
 | 自有组件统一前缀 | 根 CMake、各模块、开发脚本 | CMake 测试名称检查、安装布局清单 | 已建立检查，待集成结果 |
 | 外置构建与任意源码路径 | 开发脚本、CMake presets | CI 中文空格 checkout、CMake 拒绝源码内构建 | 已建立流程，待原生 CI |
 | 显式 profile 与 model 路径 | `core/runtime_paths.*` | `tests-core`: explicitRuntimePaths、environmentOverrides | 已建立用例 |
-| 中文、空格、长路径 | core、提取、runtime | longAndUnicodePaths、unicodeAndSpacedImagePathMatchesReference | 已建立用例 |
+| 中文、空格、长路径 | core、提取、runtime | longAndUnicodePaths、longUnicodePaths 的动态 258/259/260/300 长度数据行、unicodeAndSpacedImagePathMatchesReference | 已建立用例 |
 | 不依赖工作目录 | RuntimePaths、脚本自定位 | workingDirectoryIndependence、CI 独立工作目录 | 已建立用例 |
-| 唯一临时根与失败不回退 | 测试支持库 | temporaryRootsUnique、customTemporaryRoot、temporaryFailureDoesNotFallback | 已建立用例 |
-| 清理边界与句柄释放 | 测试支持库、子进程封装 | cleanupBoundaries、cleanupRejectsMovedRoot、进程退出测试 | 已建立用例 |
+| 每次 CTest 调用使用独立 cwd | `tools/qcs-test-runner.py`、测试支持库 | `qcs-tests-runner`，同一构建树并发执行同一测试，核对 cwd 和可写配置不共享 | 已建立回归，以本轮逐用例报告为准 |
+| 真实只读源码与双 checkout | `tools/acceptance/qcs-two-checkout-portability.py`、开发脚本 | 实际只读权限下 configure/build/test，源码哈希不变，两个独立 checkout 并行构建 | 必需验收，不能用只读夹具替代 |
+| 正式应用同时运行时隔离 | RuntimePaths、服务锁和 IPC | 启动受控正式实例并运行独立测试，核对其 PID、状态和数据未变 | 必需回归，以本轮进程报告为准 |
+| 唯一临时根与失败不回退 | 测试支持库、runtime 夹具 | temporaryRootsUnique、customTemporaryRoot、temporaryFailureDoesNotFallback、temporaryDirectoryUsesConfiguredRoot、temporaryDirectoryRejectsFileAsRoot | 已建立用例 |
+| Python 临时根空值与失败边界 | `tests/support/temp_paths.py` | `qcs-tests-temp-paths`，未设置或空值不写 cwd，中文目录隔离，阻塞路径明确失败 | 已建立回归，以本轮逐用例报告为准 |
+| 清理边界与句柄释放 | 测试支持库、子进程封装 | cleanupBoundaries、cleanupRejectsMovedRoot、cleanupRejectsReplacedRoot、cleanupRequiresClosedWindowsHandles 及进程退出测试 | 已建立用例 |
+| 清理失败不可只警告 | 显式测试收尾、开发脚本 clean | temporaryWriteFailure、destructorCleanupFailuresAreObservable、qcs-tests-runner 的 cleanup error、replaced root 和 interruption 回归 | 已建立回归，以本轮逐用例报告为准 |
+| 生成物清理保留用户资源 | clean 范围及归属检查 | dry-run 无修改，generated 清理排除模型、SDK、源码和正式配置，归属不符拒绝 | 必需回归，以本轮工具测试报告为准 |
+| 实际生成路径预算 | `tools/qcs-path-budget.py` 与 CMake | `qcs-tests-path-budget`，Windows UTF-16 长度、对象 200 字符、其他受控路径 240 字符，超长根诊断及动态长路径压力用例 | 已建立回归，以本轮路径报告为准 |
 | 配置读取与原子保存 | `core/app_settings.*` | settingsRoundTrip、settingsRejectCorruption、settingsAtomicFailure | 已建立用例 |
+| 旧持久布局拒绝且不修改 | RuntimePaths、ServiceClient | legacyProfileRejected、legacyProfileIsRejectedBeforeConnectingToExistingEndpoint | 已建立回归，以本轮进程报告为准 |
 | 模型固定版本与校验 | `core/model_files.*` | pinnedManifest、corruptedModelCannotPublish、CLI models verify | 已建立用例 |
 | 下载续传、取消和重试 | 模型下载器 | resumesRanges、cancelKeepsPartialAndUnlocks、invalidCompletePartialRestarts | 已建立用例 |
 | 文本、HTML、RTF、Office | `extraction/document_extractor.*` | extraction-document 全套 | 已建立用例 |
@@ -38,11 +46,15 @@
 | 暂停、恢复与文件变化 | service、app | CU-09、服务变化对账测试 | 待集成与用户操作结果 |
 | 托盘、全局快捷键与重启 | 平台适配 | CU-10 和平台能力报告 | 待各平台执行结果 |
 | 十万个物理文件 | file_catalog 容量入口 | tests-file-capacity，独立全规模运行 | 已建立入口，规模结果待报告 |
-| 百万 768 维向量 | qcopilots-search-benchmark | 写入、ANN、重开、精确 top-20 对照及 500 次计时 | 已建立入口，本机实测待报告 |
+| 百万 768 维向量 | qcs-benchmark | 写入、ANN、重开、精确 top-20 对照及 500 次计时 | 已建立入口，本机实测待报告 |
 | 真实语义质量 | 独立语义数据集与评估器 | ≥ 1,000 真实片段、≥ 200 中英查询和无答案集 | 待数据集与执行报告 |
 | 磁盘不足、提交中断与失效版本零返回 | storage、service | 故障注入及恢复检查 | 部分存储用例已建立，全流程待报告 |
 | 安装布局与依赖部署 | install、CPack、verify-package | 原生 CI 与重定位包级启动 | 已建立流程，包级结果待报告 |
+| 验收运行器入库后契约 | `tools/acceptance` | qcs-tests-acceptance-runners，候选身份、fixture 拷贝、容量守卫、来源清单和可移植性运行器检查 | 已建立回归，实际专项验收仍单独执行 |
 | 许可证、源码材料与签名状态 | packaging、依赖锁、第三方声明 | 包清单、源码材料清单、unsigned/signed 字段 | 待最终包审查 |
-| QtTest 内部跳过和平台不适用分类 | CI CTest 证据解析器 | qcopilots-search-tests-ci-evidence.py，注册程序集合、逐用例与汇总核对、精确平台分类及日志截断拦截 | 18 个解析器回归测试已在本机通过，实际全量明细以运行报告为准 |
+| QtTest 内部跳过和平台不适用分类 | CI CTest 证据解析器 | qcs-tests-ci-evidence.py，注册程序集合、逐用例与汇总核对、精确平台分类及日志截断拦截 | 已建立回归，短名候选结果以本轮报告为准 |
+| 本地完整自动化门槛 | CTest、QtTest、工具与包验证 | 全量注册清单、逐用例明细、真实模型及安装报告，缺失不放行 | 同一冻结候选的独立门槛 |
+| 四组合远端 Actions 门槛 | qcs-native.yml、required 汇总 | 四组合 configure/build/test/真实模型/package/verify 全部 success，记录实际 run URL | 同一冻结候选的独立门槛 |
+| Windows Computer Use 门槛 | 最终 Windows 包、@oai/sky | CU-01 至 CU-10，真实枚举与窗口操作，包及程序哈希、截图和结果 | 同一最终包的独立门槛 |
 
-完整验收还需要只读源码树、并发测试实例、不同安装目录以及正式应用同时运行的隔离证据。没有对应报告时，这些要求保持待验证，不由相近的单元测试替代。
+完整验收需要本地自动化、四组合原生 CI、当前 Windows Computer Use 和必需容量测试分别完成。源码中存在入口、触发 Actions 或执行相近用例均不能替代实际证据，失败、未运行和平台不适用必须分别记录。所有报告绑定执行时的同一候选，不复用旧长命名候选的报告。

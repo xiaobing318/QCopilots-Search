@@ -87,6 +87,12 @@ private:
 class CliTests final : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void initTestCase()
     {
         QStandardPaths::setTestModeEnabled(true);
@@ -100,7 +106,7 @@ private slots:
         const auto result = invoke(environment, {QStringLiteral("--help")});
         QVERIFY2(result.started && result.finished, result.errors.constData());
         QCOMPARE(result.exitCode, 0);
-        QVERIFY(result.output.contains("qcopilots-search-cli"));
+        QVERIFY(result.output.contains("qcs-cli"));
         QVERIFY(result.output.contains("model"));
         QVERIFY(result.output.contains("--profile-dir"));
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile"))));
@@ -131,7 +137,7 @@ private slots:
         QCOMPARE(result.exitCode, 2);
         QCOMPARE(result.json().value(QStringLiteral("ok")).toBool(true), false);
         QCOMPARE(result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString(), QStringLiteral("usage"));
-        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcopilots-search-ipc-token"))));
+        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcs-ipc-token"))));
     }
 
     void manifestIsOfflineAndDoesNotCreateProfile()
@@ -164,7 +170,7 @@ private slots:
         QCOMPARE(model.value(QStringLiteral("valid")).toBool(true), false);
         QCOMPARE(QDir::cleanPath(model.value(QStringLiteral("directory")).toString()),
                  QDir::cleanPath(environment.path(QStringLiteral("模型 cache"))));
-        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcopilots-search-ipc-token"))));
+        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcs-ipc-token"))));
     }
 
     void incompleteModelVerificationFails()
@@ -212,7 +218,7 @@ private slots:
         QCOMPARE(result.json().value(QStringLiteral("ok")).toBool(true), false);
         QVERIFY(result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString()
                 != QStringLiteral("service_start_failed"));
-        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcopilots-search-ipc-token"))));
+        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcs-ipc-token"))));
     }
 
     void indexWaitReportsRealCorruptFileAsPartialFailure()

@@ -10,6 +10,8 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "support"))
+from temp_paths import temporary_root
 
 
 def main():
@@ -24,9 +26,7 @@ def main():
         parser.error("CMake is required")
     source = Path(__file__).resolve().parent
     repo = source.parents[1]
-    temporary_root = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
-    if temporary_root:
-        Path(temporary_root).mkdir(parents=True, exist_ok=True)
+    fixture_root = temporary_root()
     records = []
 
     def run(arguments):
@@ -35,7 +35,7 @@ def main():
         if result.returncode:
             raise RuntimeError(f"{arguments!r}\n{result.stdout}\n{result.stderr}")
 
-    with tempfile.TemporaryDirectory(prefix="qcopilots-search-install-layout-", dir=temporary_root) as root:
+    with tempfile.TemporaryDirectory(prefix="qcs-install-layout-", dir=fixture_root) as root:
         for apple in (False, True):
             name = "mac-bundle" if apple else "non-bundle"
             build = Path(root) / name / "build"
@@ -51,11 +51,11 @@ def main():
             run([options.cmake, "--install", str(build), "--config", "Release", "--prefix", str(stage)])
             base, cpu = (build / "files.txt").read_text(encoding="utf-8").splitlines()
             if apple:
-                base_dir = Path("qcopilots-search.app/Contents/Frameworks")
-                cpu_dir = Path("qcopilots-search.app/Contents/PlugIns/ggml")
+                base_dir = Path("qcs.app/Contents/Frameworks")
+                cpu_dir = Path("qcs.app/Contents/PlugIns/ggml")
                 assert (build / "cpu-rpath.txt").read_text() == "@loader_path/../../Frameworks"
                 assert not (stage / base_dir / cpu).exists(), "CPU module remained in Frameworks"
-                assert not (stage / "qcopilots-search.app/Contents/MacOS" / cpu).exists()
+                assert not (stage / "qcs.app/Contents/MacOS" / cpu).exists()
             else:
                 base_dir = Path("bin" if os.name == "nt" else "lib")
                 cpu_dir = Path("lib")

@@ -1,6 +1,6 @@
 # 固定中文 OCR 图像的生成
 
-普通测试读取 `../images/qcopilots-search-ocr-*.png` 的已提交字节并校验 SHA-256，不需要安装字体、生成工具或联网。四张图分别使用简体、繁体的 40 px 与 80 px 正常字重，原句始终为「安全出口 禁止吸烟」和「社區會議 歡迎參加」。断言只去除空白，必须识别完整原句。
+普通测试读取 `../images/qcs-ocr-*.png` 的已提交字节并校验 SHA-256，不需要安装字体、生成工具或联网。四张图分别使用简体、繁体的 40 px 与 80 px 正常字重，原句始终为「安全出口 禁止吸烟」和「社區會議 歡迎參加」。断言只去除空白，必须识别完整原句。
 
 图像由本目录的 C++ Qt QPainter 工具生成。字体为 [Noto Sans CJK 2.004](https://github.com/notofonts/noto-cjk/releases/tag/Sans2.004)，固定提交 `523d033d6cb47f4a80c58a35753646f5c3608a78`，遵循相邻 `NotoSansCJK-LICENSE.txt` 中的 SIL Open Font License 1.1。仓库不分发字体文件，字体只作为开发者生成夹具时的外置输入。
 
@@ -16,7 +16,7 @@
 ```text
 cmake -S <source>/tests/extraction/fixtures/generator -B <external>/ocr-fixture-generator -DCMAKE_PREFIX_PATH=<qt-prefix>
 cmake --build <external>/ocr-fixture-generator --config Release
-<generator-executable> <font-cache> <external>/generated-ocr <external>/qcopilots-search-ocr-fixtures.json
+<generator-executable> <font-cache> <external>/generated-ocr <external>/qcs-ocr-fixtures.json
 ```
 
 生成器记录 Qt 版本、操作系统、字体版本及 SHA、像素尺寸、原句、边距和每张 PNG 的 SHA。已提交的基准来自 Qt 6.12.0 / Windows 11。字体栅格化和 PNG 编码可能随平台变化，因此不要在测试运行时重新生成输入，也不要无审查地更新图片及期待值。重新生成后的图片需要核对可见文字、所有识别断言与差异，再由开发者复制到夹具目录。没有将本机路径写入生成材料。

@@ -86,6 +86,12 @@ class IndexRepositoryRegressionTest : public QObject
     Q_OBJECT
 
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void initTestCase()
     {
         QStandardPaths::setTestModeEnabled(true);

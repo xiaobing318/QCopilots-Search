@@ -34,7 +34,7 @@ namespace {
 Q_LOGGING_CATEGORY(vectorIndexLog, "qcopilots-search.storage.vector-index")
 
 constexpr char graphMagic[] = "qcopilots-search-hnsw-v1";
-constexpr auto manifestName = "qcopilots-search-ann-manifest.json";
+constexpr auto manifestName = "qcs-ann-manifest.json";
 constexpr int graphM = 24;
 constexpr int constructionEf = 200;
 constexpr int queryEf = VectorIndex::searchEf;
@@ -470,11 +470,11 @@ public:
                 retained.insert(shard->path);
         }
         static const QRegularExpression ownedName(QStringLiteral(
-            "^qcopilots-search-ann-shard-(?:[0-9]|1[0-5])-[0-9]+-"
+            "^qcs-ann-shard-(?:[0-9]|1[0-5])-[0-9]+-"
             "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.bin$"));
         const QDir directory(root);
         const auto entries = directory.entryInfoList(
-            {QStringLiteral("qcopilots-search-ann-shard-*.bin")}, QDir::Files | QDir::NoSymLinks);
+            {QStringLiteral("qcs-ann-shard-*.bin")}, QDir::Files | QDir::NoSymLinks);
         for (const auto &entry : entries) {
             if (ownedName.match(entry.fileName()).hasMatch() && !retained.contains(entry.absoluteFilePath()) &&
                 !QFile::remove(entry.absoluteFilePath()))
@@ -555,7 +555,7 @@ bool VectorIndex::loadManifest(QString *error)
             }
             quint64 bytes;
             const auto filename = entry.value(QStringLiteral("file")).toString();
-            const auto expectedPrefix = QStringLiteral("qcopilots-search-ann-shard-%1-%2-").arg(index).arg(shardGeneration);
+            const auto expectedPrefix = QStringLiteral("qcs-ann-shard-%1-%2-").arg(index).arg(shardGeneration);
             const auto sha256 = entry.value(QStringLiteral("sha256")).toString().toLatin1();
             if (!filename.startsWith(expectedPrefix) || !filename.endsWith(QStringLiteral(".bin")) ||
                 filename.contains(QLatin1Char('/')) || filename.contains(QLatin1Char('\\')) ||
@@ -636,7 +636,7 @@ bool VectorIndex::rebuildShard(int shardNumber, quint64 generation,
             }
             if (d_->faultHook)
                 d_->faultHook(QStringLiteral("ann-build-completed"));
-            built->filename = QStringLiteral("qcopilots-search-ann-shard-%1-%2-%3.bin")
+            built->filename = QStringLiteral("qcs-ann-shard-%1-%2-%3.bin")
                                   .arg(shardNumber).arg(generation).arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
             built->path = QDir(d_->root).filePath(built->filename);
             built->removeWhenUnused = true;

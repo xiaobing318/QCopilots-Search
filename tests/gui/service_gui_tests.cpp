@@ -46,6 +46,12 @@ struct ScopedService {
 class ServiceGuiTests final : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
     void actualServiceIndexesAndSearchesInIsolatedProfile() {
         TestEnvironment env("gui-service-中文");
@@ -73,7 +79,7 @@ private slots:
         service.process.setWorkingDirectory(env.root());
         service.process.start();
         QVERIFY2(service.process.waitForStarted(10000), qPrintable(service.process.errorString()));
-        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(QDir(paths.profileDir).filePath("qcopilots-search-ipc-token")), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(QDir(paths.profileDir).filePath("qcs-ipc-token")), 10000);
         ServiceClient probe(paths);
         probe.setAutoStart(false);
         QTRY_VERIFY_WITH_TIMEOUT(([&] { if (!probe.isConnected()) probe.connectToService(); return probe.isConnected(); })(), 10000);

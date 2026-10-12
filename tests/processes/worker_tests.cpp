@@ -97,6 +97,12 @@ RuntimePaths workerLockPaths(const TestEnvironment &environment, bool longPath)
 class WorkerTests final : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
     void commandLineValidation()
     {
@@ -107,7 +113,7 @@ private slots:
         process.start(QString::fromUtf8(QCOPILOTS_SEARCH_TEST_WORKER_PATH), {QStringLiteral("--help")});
         QVERIFY(process.waitForFinished(10000));
         QCOMPARE(process.exitCode(), 0);
-        QVERIFY(process.readAllStandardOutput().contains("qcopilots-search-worker"));
+        QVERIFY(process.readAllStandardOutput().contains("qcs-worker"));
         process.start(QString::fromUtf8(QCOPILOTS_SEARCH_TEST_WORKER_PATH), {QStringLiteral("--threads"), QStringLiteral("0")});
         QVERIFY(process.waitForFinished(10000));
         QCOMPARE(process.exitCode(), 2);
@@ -168,7 +174,7 @@ private slots:
         QVERIFY(original.open(QIODevice::ReadOnly));
         QCOMPARE(original.readAll(), content);
         QDir temporary(paths.tempDir);
-        QCOMPARE(temporary.entryList({QStringLiteral("qcopilots-search-worker-*")}, QDir::Dirs | QDir::NoDotAndDotDot).size(), 0);
+        QCOMPARE(temporary.entryList({QStringLiteral("qcs-worker-*")}, QDir::Dirs | QDir::NoDotAndDotDot).size(), 0);
     }
     void inputAndVersionErrors()
     {
@@ -283,10 +289,10 @@ private slots:
         QString error;
         QVERIFY2(paths.ensure(&error), qPrintable(error));
         const QDir root(paths.tempDir);
-        const QString abandoned = root.filePath(QStringLiteral("qcopilots-search-worker-abandoned"));
-        const QString active = root.filePath(QStringLiteral("qcopilots-search-worker-active"));
-        const QString other = root.filePath(QStringLiteral("qcopilots-search-worker-other"));
-        const QString unknown = root.filePath(QStringLiteral("qcopilots-search-worker-unmarked"));
+        const QString abandoned = root.filePath(QStringLiteral("qcs-worker-abandoned"));
+        const QString active = root.filePath(QStringLiteral("qcs-worker-active"));
+        const QString other = root.filePath(QStringLiteral("qcs-worker-other"));
+        const QString unknown = root.filePath(QStringLiteral("qcs-worker-unmarked"));
         for (const auto &directory : {abandoned, active, other, unknown}) {
             QVERIFY(QDir().mkpath(directory));
             QFile content(QDir(directory).filePath(QStringLiteral("content.txt")));
@@ -294,7 +300,7 @@ private slots:
             QCOMPARE(content.write("fixture"), 7);
             content.close();
             if (directory == unknown) continue;
-            QFile marker(QDir(directory).filePath(QStringLiteral("qcopilots-search-worker-owner.json")));
+            QFile marker(QDir(directory).filePath(QStringLiteral("qcs-worker-owner.json")));
             QVERIFY(marker.open(QIODevice::WriteOnly));
             const auto bytes = QJsonDocument(QJsonObject{{QStringLiteral("version"), 1},
                 {QStringLiteral("kind"), QStringLiteral("qcopilots-search-worker-temporary")},
@@ -302,7 +308,7 @@ private slots:
                 .toJson(QJsonDocument::Compact);
             QCOMPARE(marker.write(bytes), bytes.size());
         }
-        QLockFile activeLock(nativeLockFilePath(QDir(active).filePath(QStringLiteral("qcopilots-search-worker-lock"))));
+        QLockFile activeLock(nativeLockFilePath(QDir(active).filePath(QStringLiteral("qcs-worker-lock"))));
         activeLock.setStaleLockTime(0);
         QVERIFY(activeLock.tryLock(0));
         WorkerProcess worker;

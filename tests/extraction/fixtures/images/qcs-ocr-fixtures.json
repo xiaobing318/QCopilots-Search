@@ -1,0 +1,50 @@
+{
+    "fixtures": [
+        {
+            "file": "qcs-ocr-simplified-40px.png",
+            "font": "NotoSansCJKsc-Regular.otf",
+            "fontSha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+            "height": 178,
+            "phrase": "安全出口 禁止吸烟",
+            "pixelSize": 40,
+            "sha256": "ae4b3d8ee1005c86284094fb4ff35e819b1e0b56dc19954b67d6e36e25bfb020",
+            "width": 449
+        },
+        {
+            "file": "qcs-ocr-simplified-80px.png",
+            "font": "NotoSansCJKsc-Regular.otf",
+            "fontSha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+            "height": 236,
+            "phrase": "安全出口 禁止吸烟",
+            "pixelSize": 80,
+            "sha256": "ded33620494a47bb0222bf0400cdd5bd38bbcaf1cee9c7256fc6cf928d06b299",
+            "width": 778
+        },
+        {
+            "file": "qcs-ocr-traditional-40px.png",
+            "font": "NotoSansCJKtc-Regular.otf",
+            "fontSha256": "dce08bd4fd91aa8aa76ed8fea4b694c2dfb8550f67871e326843212ddbeb88b4",
+            "height": 178,
+            "phrase": "社區會議 歡迎參加",
+            "pixelSize": 40,
+            "sha256": "d27525c909c530515762aa4d2261c7b4aef7aeb8c43205151a2a27bb1e4e73b4",
+            "width": 449
+        },
+        {
+            "file": "qcs-ocr-traditional-80px.png",
+            "font": "NotoSansCJKtc-Regular.otf",
+            "fontSha256": "dce08bd4fd91aa8aa76ed8fea4b694c2dfb8550f67871e326843212ddbeb88b4",
+            "height": 236,
+            "phrase": "社區會議 歡迎參加",
+            "pixelSize": 80,
+            "sha256": "3fe4e737f53fd2e9766971f137b163b3d9c8d49cba4f506045b6dd475fdef25f",
+            "width": 778
+        }
+    ],
+    "fontRelease": "Noto Sans CJK Sans2.004",
+    "fontRevision": "523d033d6cb47f4a80c58a35753646f5c3608a78",
+    "generatorPlatform": "Windows 11 Version 25H2",
+    "margin": 60,
+    "qt": "6.12.0",
+    "schemaVersion": 1
+}

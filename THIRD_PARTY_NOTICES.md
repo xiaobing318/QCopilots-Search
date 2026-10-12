@@ -58,7 +58,7 @@ SOFTWARE.
 | libtiff | 上游 LICENSE.md 的宽松许可和版权声明 | OCR TIFF 读写 |
 | Microsoft Visual C++ CRT / OpenMP runtime | Microsoft Visual Studio / Visual C++ Redistributable 的适用再分发条款 | Windows 使用获准再分发的 app-local 运行库，非开源对应源码交付对象 |
 
-许可证文件由依赖安装规则收集到 `share/qcopilots-search/licenses`，macOS 位于应用包的 `Contents/Resources/qcopilots-search/licenses`。其中 `qcopilots-search-runtime` 自动保留实际 Qt SDK 的八份模块 SPDX、所含版权声明、自定义许可全文和锁定 Qt 源码中的许可、NOTICE 与 attribution 引用原文。它同时保留 llama.cpp 的完整 MIT 声明，该上游声明覆盖其内置 ggml。生成和安装过程校验源归档及逐项文件哈希，包级验证再次检查必需材料。
+许可证文件由依赖安装规则收集到 `share/qcs/licenses`，macOS 位于应用包的 `Contents/Resources/qcs/licenses`。其中 `qcs-runtime` 自动保留实际 Qt SDK 的八份模块 SPDX、所含版权声明、自定义许可全文和锁定 Qt 源码中的许可、NOTICE 与 attribution 引用原文。它同时保留 llama.cpp 的完整 MIT 声明，该上游声明覆盖其内置 ggml。生成和安装过程校验源归档及逐项文件哈希，包级验证再次检查必需材料。
 
 这些 Qt SPDX 是 SDK 模块清单，可能包含未部署的可选功能或外部引用，不宣称它们是应用完整的运行依赖关系图。保留上游多种许可文本不会改变本项目采用的发行条款。发行审查应检查实际安装包和对应源码，而不仅检查本表。
 

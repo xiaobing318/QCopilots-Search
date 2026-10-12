@@ -143,16 +143,16 @@ public:
     QString watcherWarning;
     QStringList previousRoots;
 
-    QString tokenPath() const { return QDir(paths.profileDir).filePath(QStringLiteral("qcopilots-search-ipc-token")); }
-    QString journalPath() const { return QDir(paths.indexDir).filePath(QStringLiteral("qcopilots-search-progress.json")); }
+    QString tokenPath() const { return QDir(paths.profileDir).filePath(QStringLiteral("qcs-ipc-token")); }
+    QString journalPath() const { return QDir(paths.indexDir).filePath(QStringLiteral("qcs-progress.json")); }
 
     void log(const QString &message) {
-        QFile file(QDir(paths.logDir).filePath(QStringLiteral("qcopilots-search-service.log")));
+        QFile file(QDir(paths.logDir).filePath(QStringLiteral("qcs-service.log")));
         if (file.size() > 4 * 1024 * 1024) {
             const QString previous = file.fileName() + QStringLiteral(".previous");
             QFile::remove(previous);
             file.rename(previous);
-            file.setFileName(QDir(paths.logDir).filePath(QStringLiteral("qcopilots-search-service.log")));
+            file.setFileName(QDir(paths.logDir).filePath(QStringLiteral("qcs-service.log")));
         }
         if (file.open(QIODevice::Append)) file.write((QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)
             + u' ' + message + u'\n').toUtf8());
@@ -592,7 +592,7 @@ public:
     bool ensureWorker(QProcess &worker, bool query) {
         if (worker.state() == QProcess::Running) return true;
         if (worker.state() == QProcess::Starting) return false;
-        worker.setProgram(executablePath(QStringLiteral("qcopilots-search-worker")));
+        worker.setProgram(executablePath(QStringLiteral("qcs-worker")));
         worker.setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir,
                              "--mode", query ? "query" : (modelAvailable ? "full" : "extract"), "--threads", query ? "4" : "2"});
         worker.start();
@@ -922,7 +922,7 @@ public:
         auto *worker = new QProcess(q);
         previewWorkers.insert(internal, worker);
         auto buffer = std::make_shared<QByteArray>();
-        worker->setProgram(executablePath(QStringLiteral("qcopilots-search-worker")));
+        worker->setProgram(executablePath(QStringLiteral("qcs-worker")));
         worker->setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir, "--mode", "extract", "--threads", "2"});
         QObject::connect(worker, &QProcess::started, q, [worker, internal, source, params, start, maximum] {
             const QJsonObject request{{"id", internal}, {"operation", "extract"}, {"path", source.path},

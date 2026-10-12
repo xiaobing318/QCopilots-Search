@@ -33,7 +33,7 @@ RuntimePaths ownedPaths(const QCommandLineParser &parser)
     const QString root = rootInfo.canonicalFilePath();
     const QString profile = profileInfo.canonicalFilePath();
     require(rootInfo.isAbsolute() && rootInfo.isDir() && !rootInfo.isSymLink()
-                && rootInfo.fileName().startsWith(QStringLiteral("qcopilots-search-tests-"))
+                && rootInfo.fileName().startsWith(QStringLiteral("qcs-t-"))
                 && profileInfo.isAbsolute() && profileInfo.isDir() && !profileInfo.isSymLink()
                 && !root.isEmpty() && !profile.isEmpty(),
             QStringLiteral("Recovery child requires an owned test directory"));
@@ -41,7 +41,7 @@ RuntimePaths ownedPaths(const QCommandLineParser &parser)
     require(!QDir::isAbsolutePath(relative) && relative != QStringLiteral("..")
                 && !relative.startsWith(QStringLiteral("../")) && relative != QStringLiteral("."),
             QStringLiteral("Recovery profile is outside the owned test root"));
-    const QFileInfo markerInfo(QDir(root).filePath(QStringLiteral("qcopilots-search-recovery-owner.json")));
+    const QFileInfo markerInfo(QDir(root).filePath(QStringLiteral("qcs-recovery-owner.json")));
     require(markerInfo.isFile() && !markerInfo.isSymLink(),
             QStringLiteral("Recovery child ownership marker is missing"));
     QFile marker(markerInfo.filePath());
@@ -59,7 +59,7 @@ RuntimePaths ownedPaths(const QCommandLineParser &parser)
 int main(int argc, char **argv)
 {
     QCoreApplication application(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("qcopilots-search-tests-recovery-child"));
+    QCoreApplication::setApplicationName(QStringLiteral("qcs-tests-recovery-child"));
     QStandardPaths::setTestModeEnabled(true);
     QCommandLineParser parser;
     parser.addOptions({

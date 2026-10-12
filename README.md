@@ -6,7 +6,9 @@ QCopilots Search 是使用 C++20、Qt Widgets 和 CMake 开发的本地多模态
 
 ## 应用与数据
 
-GUI 为 `qcopilots-search`，本地服务为 `qcopilots-search-service`，提取和推理工作进程为 `qcopilots-search-worker`，命令行入口为 `qcopilots-search-cli`。所有组件使用相同的运行目录配置，服务统一管理索引写入和查询。
+GUI 为 `qcs`，本地服务为 `qcs-service`，提取和推理工作进程为 `qcs-worker`，命令行入口为 `qcs-cli`。所有组件使用相同的运行目录配置，服务统一管理索引写入和查询。
+
+程序、开发脚本和新生成产物采用短名称，不提供旧命令别名。产品显示名称仍为 QCopilots Search，C++ 命名空间为 `qcopilots_search`，配置变量使用 `QCOPILOTS_SEARCH_*`。首次切换使用新的 profile 和构建目录，不把旧构建缓存改名后继续使用，也不自动迁移旧配置或索引。
 
 搜索只处理用户选择的目录。模型保存在本地，下载模型和检查更新需要网络，文件提取与搜索在本机执行。没有模型时仍可使用文件名和已提取文本的关键词搜索。删除索引配置不应删除源文件。
 
@@ -25,13 +27,13 @@ Windows PowerShell 示例，路径可以替换为其他盘符或包含中文、�
 ```powershell
 git clone https://github.com/xiaobing318/QCopilots-search.git
 Set-Location QCopilots-search
-$buildRoot = Join-Path (Split-Path $PWD.Path -Parent) 'QCopilots-search-build'
+$buildRoot = Join-Path (Split-Path $PWD.Path -Parent) 'qcs-build'
 $qtRoot = Join-Path (Split-Path $PWD.Path -Parent) 'Qt-SDK'
-./qcopilots-search-dev.ps1 bootstrap --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 doctor --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 configure --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 build --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 run --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 bootstrap --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 doctor --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 configure --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 build --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 run --build-root $buildRoot --qt-root $qtRoot
 ```
 
 macOS / Linux 的入口参数相同：
@@ -39,13 +41,13 @@ macOS / Linux 的入口参数相同：
 ```bash
 git clone https://github.com/xiaobing318/QCopilots-search.git
 cd QCopilots-search
-build_root="$(dirname "$PWD")/QCopilots-search-build"
+build_root="$(dirname "$PWD")/qcs-build"
 qt_root="$(dirname "$PWD")/Qt-SDK"
-bash ./qcopilots-search-dev.sh bootstrap --build-root "$build_root" --qt-root "$qt_root"
-bash ./qcopilots-search-dev.sh doctor --build-root "$build_root" --qt-root "$qt_root"
-bash ./qcopilots-search-dev.sh configure --build-root "$build_root" --qt-root "$qt_root"
-bash ./qcopilots-search-dev.sh build --build-root "$build_root" --qt-root "$qt_root"
-bash ./qcopilots-search-dev.sh run --build-root "$build_root" --qt-root "$qt_root"
+bash ./qcs-dev.sh bootstrap --build-root "$build_root" --qt-root "$qt_root"
+bash ./qcs-dev.sh doctor --build-root "$build_root" --qt-root "$qt_root"
+bash ./qcs-dev.sh configure --build-root "$build_root" --qt-root "$qt_root"
+bash ./qcs-dev.sh build --build-root "$build_root" --qt-root "$qt_root"
+bash ./qcs-dev.sh run --build-root "$build_root" --qt-root "$qt_root"
 ```
 
 从修改代码到测试、安装和打包的完整流程见 [开发指南](docs/development.md)。脚本按自身位置定位源码，不依赖调用者当前工作目录。
@@ -56,15 +58,17 @@ bash ./qcopilots-search-dev.sh run --build-root "$build_root" --qt-root "$qt_roo
 
 ```powershell
 $modelDir = Join-Path $buildRoot 'models'
-./qcopilots-search-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
-./qcopilots-search-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
-./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
+./qcs-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ```
 
 模型获取、测试分层和保留失败证据见 [测试指南](docs/testing.md)。模型缺失或校验失败会使必需的真实模型验收失败。黄金向量测试验证数值一致性，独立的语义质量集验证检索效果，合成百万向量测试验证容量，三者分别报告。
 
 发行包目标为 Windows ZIP / NSIS、macOS 分架构 APP / DMG、Linux TGZ / DEB。实际包级测试、许可证材料、签名状态与发布门槛见 [发布指南](docs/releasing.md)。CI 生成测试包和报告，不自动公开发布。
+
+交付需要同一候选的本地完整自动化测试、四组合原生 GitHub Actions 和当前 Windows 最终包的 Computer Use 全部完成，另有十万物理文件与百万向量验收。测试程序存在、触发工作流或旧候选通过均不代表本轮通过。每次测试使用动态独立目录，不依赖此电脑的盘符、用户名或临时目录。
 
 ## 文档
 

@@ -68,6 +68,12 @@ private:
     QString modelDir;
 
 private slots:
+    void cleanup()
+    {
+        const auto error = test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void initTestCase()
     {
         QStandardPaths::setTestModeEnabled(true);

@@ -112,10 +112,15 @@ public:
 class ModelFilesTest : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
     void initTestCase()
     {
         QStandardPaths::setTestModeEnabled(true);
-        QCoreApplication::setApplicationName(QStringLiteral("qcopilots-search-tests-model-files"));
+        QCoreApplication::setApplicationName(QStringLiteral("qcs-tests-model-files"));
     }
 
     void pinnedManifest()
@@ -157,6 +162,38 @@ private slots:
         QCOMPARE(readFile(QDir(folder).filePath(artifact.name)), server.body);
         QVERIFY(!models.importFile(source, QStringLiteral("../outside.gguf"), &error));
         QVERIFY(!QFile::exists(root.path(QStringLiteral("outside.gguf"))));
+    }
+
+    void legacyModelLockBlocksWritesButAllowsVerifiedReads()
+    {
+        TestEnvironment root(QStringLiteral("legacy-model"));
+        QVERIFY2(root.isValid(), qPrintable(root.error()));
+        ModelServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const auto artifact = server.artifact();
+        const auto folder = root.path("models");
+        QVERIFY(QDir().mkpath(folder));
+        const auto destination = QDir(folder).filePath(artifact.name);
+        const auto legacyLock = QDir(folder).filePath("qcopilots-search-models.lock");
+        QVERIFY(writeFile(destination, server.body));
+        QVERIFY(writeFile(legacyLock, "preserve old lock"));
+        ModelFiles models(folder, {artifact});
+        QString error;
+        QVERIFY2(models.verify(&error), qPrintable(error));
+        const auto source = root.path("offline.gguf");
+        QVERIFY(writeFile(source, server.body));
+        QVERIFY(!models.importFile(source, artifact.name, &error));
+        QVERIFY(error.startsWith("legacy_model_layout:"));
+        QSignalSpy completed(&models, &ModelFiles::finished);
+        models.downloadMissing();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.size(), 1, 5000);
+        QVERIFY(!completed.at(0).at(0).toBool());
+        QVERIFY(completed.at(0).at(1).toString().startsWith("legacy_model_layout:"));
+        QCOMPARE(server.requests, 0);
+        QCOMPARE(readFile(destination), server.body);
+        QCOMPARE(readFile(legacyLock), QByteArray("preserve old lock"));
+        QVERIFY(!QFileInfo::exists(QDir(folder).filePath("qcs-models.lock")));
+        QVERIFY2(models.verify(&error), qPrintable(error));
     }
 
     void downloadedModelsAreVerifiedAndReused()
@@ -351,7 +388,7 @@ private slots:
         models.cancel();
         QCOMPARE(completed.size(), 1);
         QVERIFY(!completed.at(0).at(0).toBool());
-        QVERIFY(!QFileInfo::exists(QDir(modelDir).filePath(QStringLiteral("qcopilots-search-models.lock"))));
+        QVERIFY(!QFileInfo::exists(QDir(modelDir).filePath(QStringLiteral("qcs-models.lock"))));
         QCOMPARE(readFile(QDir(modelDir).filePath(QStringLiteral("test-model.gguf.download"))), server.body.left(7));
         server.mode = ModelServer::Normal;
         contender.downloadMissing();

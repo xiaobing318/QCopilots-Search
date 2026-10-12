@@ -15,7 +15,7 @@
 
 Qt 6.12.0 和独立 Qt PDF 6.140.0 由 bootstrap 安装。官方 SDK 包按下载校验值锁定。其他依赖通过 CMake 下载到外置依赖目录，不修改系统包的源码，也不在仓库中展开第三方源码。
 
-Linux 主机还需要 Qt 使用的图形、字体、XCB、DBus 和多媒体运行依赖。Qt 的 XCB 平台插件需要 `libxcb-shape0` 提供的 `libxcb-shape.so.0`。Qt Multimedia 的 PulseAudio 客户端动态库由 `libpulse0` 提供，构建和运行都需要该库，不要求安装开发头文件或启动音频服务。无显示服务器的 CI 在 Xvfb 中执行 GUI 用例。平台依赖安装命令以 `.github/workflows/qcopilots-search-native.yml` 为可执行参考，`doctor` 输出用于检查当前主机。
+Linux 主机还需要 Qt 使用的图形、字体、XCB、DBus 和多媒体运行依赖。Qt 的 XCB 平台插件需要 `libxcb-shape0` 提供的 `libxcb-shape.so.0`。Qt Multimedia 的 PulseAudio 客户端动态库由 `libpulse0` 提供，构建和运行都需要该库，不要求安装开发头文件或启动音频服务。无显示服务器的 CI 在 Xvfb 中执行 GUI 用例。平台依赖安装命令以 `.github/workflows/qcs-native.yml` 为可执行参考，`doctor` 输出用于检查当前主机。
 
 ## 目录布局
 
@@ -30,12 +30,21 @@ QCopilots-search/                 源码，可以位于任意可读目录
 <build-root>/                    仓库外，运行参数指定
   release/                       Release 构建树
   debug/                         可选 Debug 构建树
-  dependencies/                  锁定依赖和下载缓存
+  deps/                          锁定依赖和下载缓存
   models/                        可选的共享只读模型缓存
-  test-runs/                     独立测试实例与失败产物
+  runs/                          独立测试实例与失败产物
   stage/                         cmake --install 的输出
+  pkg/                           CPack 工作目录和安装包
   reports/                       CTest 和验收报告
+
+<build-root>/release/            每配置独立生成目录
+  nd/<dep>/                      原生依赖构建
+  sb/<dep>/                      FetchContent 子构建
+  ep/                            ExternalProject 工作目录
+  gen/licenses/                  生成许可证材料
 ```
+
+本机选用 `C:\Dev\github-repos-compilations\qcs` 作为外置根。其他电脑通过 `--build-root` 或 `QCOPILOTS_SEARCH_BUILD_ROOT` 指定位置，脚本的默认短根也位于源码树外。`qcs` 是程序、脚本、真实 CMake target、安装资源和新产物的名称前缀。产品显示名称仍为 QCopilots Search，命名空间 `qcopilots_search` 和 `QCOPILOTS_SEARCH_*` 配置接口不变，不提供旧长命令别名。
 
 `stage` 供部署和打包使用。程序的真实用户数据通过平台标准应用目录解析，开发构建目录不会成为默认用户数据目录。使用 `--profile-dir` 可以让 GUI、服务和 CLI 连接独立实例，`--model-dir` 可以选择模型目录。
 
@@ -43,7 +52,7 @@ Windows 的数据库打开使用扩展 NT 路径和 SQLite `win32-longpath` VFS�
 
 ## 统一脚本入口
 
-Windows 使用 `qcopilots-search-dev.ps1`，macOS / Linux 使用 `bash qcopilots-search-dev.sh`。二者接受相同的动作与参数。
+Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。二者接受相同的动作与参数。
 
 | 动作 | 用途 |
 | --- | --- |
@@ -56,7 +65,7 @@ Windows 使用 `qcopilots-search-dev.ps1`，macOS / Linux 使用 `bash qcopilots
 | `install` | 使用 CMake install 生成 staging 布局 |
 | `package` | 从安装布局生成选定平台包 |
 | `verify-package` | 检查部署文件、许可材料及包内真实多模态推理 |
-| `clean` | 仅清理经过路径边界验证的任务生成目录 |
+| `clean` | 默认仅清理指定构建配置，显式生成物清理须验证归属和路径边界 |
 
 共同参数：
 
@@ -72,23 +81,25 @@ Windows 使用 `qcopilots-search-dev.ps1`，macOS / Linux 使用 `bash qcopilots
 | `--cmake-arg=-DNAME=VALUE` | 向 configure 传递额外的 CMake 配置 |
 | `--report-dir PATH` | 当前测试或包验证的独立外置报告目录 |
 | `--keep-failed-tests` | 保留失败用例的产物 |
+| `--scope generated` | `clean` 的显式生成物清理范围，排除模型、SDK、源码和正式用户配置 |
+| `--dry-run` | `clean` 只列出处理范围，不删除文件 |
 
 使用较少的并行任务可以降低编译峰值内存和磁盘压力。修改构建选项后重新运行 `configure`，修改源文件后运行 `build` 和相关测试。
 
 ## 一次完整开发循环
 
 ```powershell
-$buildRoot = 'D:\Builds\QCopilots Search'
+$buildRoot = 'D:\Builds\qcs 示例'
 $qtRoot = 'D:\SDKs\Qt'
 $modelDir = Join-Path $buildRoot 'models'
-./qcopilots-search-dev.ps1 bootstrap --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 doctor --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 configure --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
-./qcopilots-search-dev.ps1 build --build-root $buildRoot --qt-root $qtRoot --jobs 4
-./qcopilots-search-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
-./qcopilots-search-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
-./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
-./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 bootstrap --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 doctor --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 configure --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 build --build-root $buildRoot --qt-root $qtRoot --jobs 4
+./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
+./qcs-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ```
 
 以上路径是可替换的命令示例。代码、CI 与测试不会依赖这些盘符。模型准备方式及完整测试的门槛见 [测试指南](testing.md)。
@@ -97,14 +108,14 @@ $modelDir = Join-Path $buildRoot 'models'
 
 ## 直接使用 CMake
 
-熟悉 CMake 的开发者可以设置 `QCOPILOTS_SEARCH_BUILD_ROOT` 和 `QCOPILOTS_SEARCH_QT_PREFIX` 后使用仓库的 `qcopilots-search-release` preset。`QCOPILOTS_SEARCH_QT_PREFIX` 指向具体 Qt kit，区别于脚本使用的 SDK 根目录。
+熟悉 CMake 的开发者可以设置 `QCOPILOTS_SEARCH_BUILD_ROOT` 和 `QCOPILOTS_SEARCH_QT_PREFIX` 后使用仓库的 `qcs-release` preset。`QCOPILOTS_SEARCH_QT_PREFIX` 指向具体 Qt kit，区别于脚本使用的 SDK 根目录。
 
 ```bash
 export QCOPILOTS_SEARCH_BUILD_ROOT="/path/outside/source/build"
 export QCOPILOTS_SEARCH_QT_PREFIX="/path/to/Qt/6.12.0/gcc_64"
-cmake --preset qcopilots-search-release
-cmake --build --preset qcopilots-search-release
-ctest --preset qcopilots-search-release
+cmake --preset qcs-release
+cmake --build --preset qcs-release
+ctest --preset qcs-release
 cmake --install "$QCOPILOTS_SEARCH_BUILD_ROOT/release"
 ```
 
@@ -112,6 +123,14 @@ cmake --install "$QCOPILOTS_SEARCH_BUILD_ROOT/release"
 
 ## 排查失败
 
+Windows 配置使用 200 字符的默认对象路径预算，普通构建的其他受控生成路径预算为 240 字符。路径检查覆盖对象、MOC、RCC、response file、依赖辅助文件和打包目录，Windows 按 UTF-16 长度统计。输入文件的长路径压力用例不套用普通构建预算。根目录本身过长时应选择更短的外置位置，不能通过关闭测试或修改系统全局设置隐藏生成路径问题。
+
 先保留控制台错误、CMake 配置日志、CTest 输出与独立测试根。模型问题同时记录文件大小、SHA-256 和模型 revision。IPC 问题记录实例名及脱敏后的配置目录，不发送用户文件内容。包级问题从解压后的安装目录复现，避免使用源码树或开发 SDK 补齐缺失的运行库。
 
 不要通过关闭必需测试、替换黄金向量或把格式失败标记为成功来完成验收。依赖下载失败时先检查锁定 URL 和校验值，不能无提示地回退到任意系统版本。
+
+## 清理与重新构建
+
+运行 `clean --dry-run` 先检查指定配置的删除范围，完整清理本项目生成目录需显式选择 `clean --scope generated`。清理必须核对归属标记、规范化目录边界和链接，先结束本次创建的子进程并释放句柄。清理失败返回失败并列出未删除项，不按进程通用名称终止正式应用，不因为文件被 Git 忽略就视为可删除。
+
+旧长命名构建树不能原地改名后继续使用。首次切换时，在必要外置运行器整理入仓库、模型校验搬移完成后，删除旧构建、日志、历史报告、测试数据和缓存，再在新根配置。Qt、MSVC 等外部 SDK、模型内容、源码、Git 历史、未提交修改和正式用户配置不属于这次生成物清理。每次清理保留简短结果，具体实际完成情况以该记录为准。

@@ -472,7 +472,7 @@ PRAGMA user_version=2;
               QUuid::createUuid().toString(QUuid::WithoutBraces));
     transaction.commit();
     const auto annRoot = QDir(paths.indexDir)
-                             .filePath(QStringLiteral("qcopilots-search-ann-") +
+                             .filePath(QStringLiteral("qcs-ann-") +
                                        meta(db, QStringLiteral("index_uuid")));
     d->ann = std::make_unique<VectorIndex>(annRoot, embeddingDimensions,
                                            d->options.faultHook);

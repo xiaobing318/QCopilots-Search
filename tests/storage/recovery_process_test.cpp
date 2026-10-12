@@ -78,7 +78,7 @@ bool writeOwnership(const TestEnvironment &environment, const RuntimePaths &path
         return false;
     const QJsonObject ownership{{QStringLiteral("token"), token},
                                {QStringLiteral("profile"), QFileInfo(paths.profileDir).canonicalFilePath()}};
-    QSaveFile marker(environment.path(QStringLiteral("qcopilots-search-recovery-owner.json")));
+    QSaveFile marker(environment.path(QStringLiteral("qcs-recovery-owner.json")));
     const QByteArray bytes = QJsonDocument(ownership).toJson(QJsonDocument::Compact);
     if (!marker.open(QIODevice::WriteOnly) || marker.write(bytes) != bytes.size() || !marker.commit()) {
         *error = marker.errorString();
@@ -128,6 +128,12 @@ class RecoveryProcessTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void initTestCase()
     {
         QStandardPaths::setTestModeEnabled(true);
@@ -176,10 +182,10 @@ private slots:
         const qint64 shard = scalar(paths.databaseFile(), "SELECT shard FROM segments", &error);
         QVERIFY2(shard >= 0 && shard < 16, qPrintable(error));
         const auto annDirectories = QDir(paths.indexDir).entryList(
-            {QStringLiteral("qcopilots-search-ann-*")}, QDir::Dirs | QDir::NoDotAndDotDot);
+            {QStringLiteral("qcs-ann-*")}, QDir::Dirs | QDir::NoDotAndDotDot);
         QCOMPARE(annDirectories.size(), qsizetype(1));
         QFile manifest(QDir(paths.indexDir).filePath(
-            annDirectories.first() + QStringLiteral("/qcopilots-search-ann-manifest.json")));
+            annDirectories.first() + QStringLiteral("/qcs-ann-manifest.json")));
         QVERIFY2(manifest.open(QIODevice::ReadOnly), qPrintable(manifest.errorString()));
         const QJsonArray shards = QJsonDocument::fromJson(manifest.readAll()).object()
                                       .value(QStringLiteral("shards")).toArray();

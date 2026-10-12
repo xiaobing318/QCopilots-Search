@@ -35,7 +35,7 @@ public:
     ~TestJunctions()
     {
         QString error;
-        if (!removeAll(&error)) qWarning().noquote() << error;
+        if (!removeAll(&error)) recordCleanupFailure(error);
     }
 
     bool create(const QString &link, const QString &target, QString *error)
@@ -172,6 +172,11 @@ class FileCatalogTest : public QObject {
     Q_OBJECT
     std::unique_ptr<TestEnvironment> gitConfiguration_;
 private slots:
+    void cleanup()
+    {
+        const auto error = takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
     void initTestCase()
     {
         gitConfiguration_ = std::make_unique<TestEnvironment>("git-config");
@@ -186,6 +191,8 @@ private slots:
     {
         git_libgit2_shutdown();
         gitConfiguration_.reset();
+        const auto error = takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
     }
     void normalizedPathsHaveComponentBoundaries()
     {

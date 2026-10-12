@@ -1,19 +1,19 @@
 # 对应源码材料
 
-安装包的许可材料需要对应实际部署的库。`tools/qcopilots-search-source-bundle.py` 收集锁定源码归档、项目源码、补丁、构建适配和公共 SDK 元数据，生成可独立保存的源码材料包。它不会只生成下载链接，也不会为未准备的源码作承诺。
+安装包的许可材料需要对应实际部署的库。`tools/qcs-source-bundle.py` 收集锁定源码归档、项目源码、补丁、构建适配和公共 SDK 元数据，生成可独立保存的源码材料包。它不会只生成下载链接，也不会为未准备的源码作承诺。
 
 ```powershell
-python tools/qcopilots-search-source-bundle.py `
+python tools/qcs-source-bundle.py `
   --build-root $buildRoot --qt-root $qtRoot --download
 ```
 
-输出位于 `<build-root>/packages`：
+输出位于 `<build-root>/pkg`：
 
-- `qcopilots-search-source-materials-<commit>-<platform>-<arch>.zip`
-- `qcopilots-search-source-materials-<commit>-<platform>-<arch>.zip.sha256`
-- `qcopilots-search-source-manifest.json`
+- `qcs-source-materials-<commit>-<platform>-<arch>.zip`
+- `qcs-source-materials-<commit>-<platform>-<arch>.zip.sha256`
+- `qcs-source-manifest.json`
 
-下载文件优先复用已经校验过的 CMake 缓存。Qt 源码由 `tools/qcopilots-search-source-packages.lock.json` 锁定，其他原生库从实际 CMake 依赖声明读取 URL 和 SHA-256。文件大小和哈希校验通过后才能进入材料包。`--manifest-only` 可以查看待收集清单，`--download` 允许补齐缺失归档，不传该参数时缺失归档导致明确失败。
+下载文件优先复用已经校验过的 CMake 缓存。Qt 源码由 `tools/qcs-source-packages.lock.json` 锁定，其他原生库从实际 CMake 依赖声明读取 URL 和 SHA-256。文件大小和哈希校验通过后才能进入材料包。`--manifest-only` 可以查看待收集清单，`--download` 允许补齐缺失归档，不传该参数时缺失归档导致明确失败。
 
 `--verify-bundle FILE --expected-sha256 HASH` 会检查整个材料包的外部哈希，并逐项读取包内源归档、项目源码和 SDK 元数据，核对 manifest 中的大小与哈希，不展开源码到磁盘。
 
@@ -25,7 +25,7 @@ FFmpeg 使用固定 9.0.1 源码，清单记录当前 SDK 的真实 `avcodec_con
 
 项目源码放入 `project/`，其中 `cmake/` 是原生依赖构建适配，`third_party/patches/` 保存 llama.cpp 补丁，`tools/` 保存 SDK、部署及材料生成流程。源文件清单逐项记录哈希。若打包期间文件发生变化，脚本拒绝继续发布该材料包。
 
-指定 `--qt-root` 时，`sdk-metadata/` 同时保留该 SDK 的公共构建配置和原始 SPDX JSON，包含第三方版权及自定义许可全文。运行包中的 `qcopilots-search-runtime` 许可目录由 `tools/qcopilots-search-license-materials.py` 自动生成。它复用上述源码锁与外置 `source-cache`，收集 Qt base、SVG、Image Formats、Multimedia 的原始许可和 attribution 引用文件，并按实际 SDK SPDX 检查标准许可全文是否齐全。PDF / Chromium 的自定义许可来自实际 SDK SPDX 的原始 `extractedText`。任何平台新增未覆盖的许可 ID 都会明确阻止配置。
+指定 `--qt-root` 时，`sdk-metadata/` 同时保留该 SDK 的公共构建配置和原始 SPDX JSON，包含第三方版权及自定义许可全文。运行包中的 `qcs-runtime` 许可目录由 `tools/qcs-license-materials.py` 自动生成。它使用上述源码锁和外置许可证源码缓存，默认位于 `deps/licenses`，收集 Qt base、SVG、Image Formats、Multimedia 的原始许可和 attribution 引用文件，并按实际 SDK SPDX 检查标准许可全文是否齐全。对应源码材料工具的默认归档缓存位于 `deps/sources`。PDF / Chromium 的自定义许可来自实际 SDK SPDX 的原始 `extractedText`。任何平台新增未覆盖的许可 ID 都会明确阻止配置。
 
 离线配置可设置 `QCOPILOTS_SEARCH_DOWNLOAD_LICENSE_SOURCES=OFF`，并通过 `QCOPILOTS_SEARCH_LICENSE_SOURCE_CACHE` 指定预先准备的锁定归档目录。这里的缓存和生成目录均位于源码树外，安装步骤和包级测试会重新验证生成材料的文件集合、大小与哈希。
 
@@ -37,7 +37,7 @@ Windows 另外部署的 Microsoft Visual C++ CRT / OpenMP 是按适用许可再�
 
 先验证外部 SHA-256，再检查包内 `source-manifest.json`。在源码树外展开所需上游归档，保留它们的许可证。应用的一般构建流程见 [开发指南](development.md)。
 
-原生库由项目 CMake 配置控制。开发者可以将已校验的归档放入外置依赖缓存，或使用标准 `FETCHCONTENT_SOURCE_DIR_<DEPENDENCY>` 选项指向匹配的已展开源码。llama.cpp 也接受没有 `.git` 的官方归档展开目录，通过 `QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR` 或 `FETCHCONTENT_SOURCE_DIR_QCOPILOTS_SEARCH_LLAMA` 指定。配置阶段使用自身哈希已锁定的完整文件清单校验该目录，只允许经过审核的 no-logits 和 UTF-8 后端路径补丁对应的精确文件哈希。应用补丁仍需要 Git 程序，不需要网络或上游 Git 元数据。
+原生库由项目 CMake 配置控制。开发者可以将已校验的归档放入外置依赖缓存，或使用标准 `FETCHCONTENT_SOURCE_DIR_<DEPENDENCY>` 选项指向匹配的已展开源码。llama.cpp 也接受没有 `.git` 的官方归档展开目录，通过 `QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR` 或 `FETCHCONTENT_SOURCE_DIR_QCS_LLAMA` 指定。配置阶段使用自身哈希已锁定的完整文件清单校验该目录，只允许经过审核的 no-logits 和 UTF-8 后端路径补丁对应的精确文件哈希。应用补丁仍需要 Git 程序，不需要网络或上游 Git 元数据。
 
 原生 CI 收集源码后，运行 `tests/runtime/source_integrity_test.py --archive <locked-archive> --report <report-path>`。该测试在唯一临时目录中实际展开归档，验证无 Git 元数据的源码、位于无关 Git 仓库中的源码、两份补丁、重复应用以及文件、清单和补丁被修改后的拒绝行为。结果写入 `reports/source-integrity.json`，逐项保留跳过原因，发布验收要求全部必需用例实际执行成功。这个检查证明源码准备与完整性规则，不代替完整应用构建及运行测试。
 

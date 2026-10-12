@@ -108,6 +108,16 @@ void ServiceClient::attemptConnection()
     incoming_.clear();
     token_.clear();
     QString error;
+    if (!paths_.validateProfileLayout(&error)) {
+        lastConnectionError_ = error;
+        connectionDeadline_.stop();
+        retryTimer_.stop();
+        ensureMode_ = false;
+        QTimer::singleShot(0, this, [this, error] {
+            failPending(QStringLiteral("profile_unavailable"), error);
+        });
+        return;
+    }
     if (!paths_.validateIpcDirectory(&error)) {
         lastConnectionError_ = error;
         connectionDeadline_.stop();
@@ -121,7 +131,7 @@ void ServiceClient::attemptConnection()
 
 bool ServiceClient::readToken(QString *error)
 {
-    QFile file(QDir(paths_.profileDir).filePath(QStringLiteral("qcopilots-search-ipc-token")));
+    QFile file(QDir(paths_.profileDir).filePath(QStringLiteral("qcs-ipc-token")));
     if (!file.open(QIODevice::ReadOnly)) {
         if (error)
             *error = tr("Cannot read the local service authentication token: %1")
@@ -230,7 +240,7 @@ void ServiceClient::socketError(QLocalSocket::LocalSocketError)
 
 bool ServiceClient::launchService(QString *error)
 {
-    QString name = QStringLiteral("qcopilots-search-service");
+    QString name = QStringLiteral("qcs-service");
 #ifdef Q_OS_WIN
     name += QStringLiteral(".exe");
 #endif

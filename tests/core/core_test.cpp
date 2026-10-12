@@ -15,6 +15,9 @@
 #include <QLocalSocket>
 #include <QtTest>
 #include <limits>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 #ifdef Q_OS_UNIX
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -27,6 +30,11 @@ using namespace qcopilots_search::test;
 class CoreTest : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
     void explicitRuntimePaths();
     void nativeLockPaths();
     void runtimePathIdentity();
@@ -44,6 +52,14 @@ private slots:
     void temporaryFailureDoesNotFallback();
     void cleanupBoundaries();
     void cleanupRejectsMovedRoot();
+    void cleanupRejectsReplacedRoot();
+    void temporaryWriteFailure();
+    void destructorCleanupFailuresAreObservable();
+#ifdef Q_OS_WIN
+    void cleanupRequiresClosedWindowsHandles();
+#endif
+    void legacyProfileRejected_data();
+    void legacyProfileRejected();
     void settingsRoundTrip();
     void settingsRejectCorruption();
     void settingsRejectUnsupportedTypes();
@@ -60,10 +76,10 @@ void CoreTest::nativeLockPaths()
 {
     QCOMPARE(nativeLockFilePath({}), QString{});
 #ifdef Q_OS_WIN
-    QCOMPARE(nativeLockFilePath(QStringLiteral("C:/中文 folder/qcopilots-search.lock")),
-             QStringLiteral("\\\\?\\C:\\中文 folder\\qcopilots-search.lock"));
-    QCOMPARE(nativeLockFilePath(QStringLiteral("//server/share/中文 folder/qcopilots-search.lock")),
-             QStringLiteral("\\\\?\\UNC\\server\\share\\中文 folder\\qcopilots-search.lock"));
+    QCOMPARE(nativeLockFilePath(QStringLiteral("C:/中文 folder/qcs.lock")),
+             QStringLiteral("\\\\?\\C:\\中文 folder\\qcs.lock"));
+    QCOMPARE(nativeLockFilePath(QStringLiteral("//server/share/中文 folder/qcs.lock")),
+             QStringLiteral("\\\\?\\UNC\\server\\share\\中文 folder\\qcs.lock"));
     for (const QString &extended : {QStringLiteral("\\\\?\\C:\\目录\\lock"),
                                    QStringLiteral("\\\\?\\UNC\\server\\share\\目录\\lock"),
                                    QStringLiteral("\\\\.\\C:\\目录\\lock")}) {
@@ -96,7 +112,7 @@ void CoreTest::explicitRuntimePaths()
     QVERIFY(QFileInfo(paths.logDir).isDir());
     QCOMPARE(QFileInfo(paths.configFile).absolutePath(), paths.profileDir);
     QCOMPARE(QFileInfo(paths.databaseFile()).absolutePath(), paths.indexDir);
-    QVERIFY(QFileInfo(paths.ipcName).fileName().startsWith(QStringLiteral("qcopilots-search-")));
+    QVERIFY(QFileInfo(paths.ipcName).fileName().startsWith(QStringLiteral("qcs-")));
     QVERIFY(paths.ipcName.size() < 100);
 #ifdef Q_OS_UNIX
     QVERIFY(QDir::isAbsolutePath(paths.ipcName));
@@ -292,6 +308,9 @@ void CoreTest::temporaryRootsUnique()
     QVERIFY(first.runtimePaths().ipcName != second.runtimePaths().ipcName);
     QVERIFY(first.path("../escape").isEmpty());
     QVERIFY(first.path(QDir::rootPath()).isEmpty());
+    TestEnvironment longLabel(QString(100, u'x'));
+    QVERIFY2(longLabel.isValid(), qPrintable(longLabel.error()));
+    QCOMPARE(QFileInfo(longLabel.root()).fileName().size(), qsizetype(6 + 16 + 1 + 6));
 }
 
 void CoreTest::customTemporaryRoot()
@@ -349,6 +368,130 @@ void CoreTest::cleanupRejectsMovedRoot()
     QVERIFY(!error.isEmpty());
     QVERIFY(stillPresent);
     QVERIFY2(env.cleanup(&error), qPrintable(error));
+}
+
+void CoreTest::cleanupRejectsReplacedRoot()
+{
+    TestEnvironment parent("replaced-parent");
+    QVERIFY2(parent.isValid(), qPrintable(parent.error()));
+    ScopedEnvironment root("QCOPILOTS_SEARCH_TEST_ROOT", parent.root().toUtf8());
+    TestEnvironment env("replaced");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    const auto original = env.root();
+    const auto moved = original + "-saved";
+    QVERIFY(QDir().rename(original, moved));
+    QVERIFY(QDir().mkpath(original));
+    QFile marker(QDir(original).filePath("unowned.txt"));
+    QVERIFY(marker.open(QIODevice::WriteOnly));
+    QCOMPARE(marker.write("keep"), qint64(4));
+    marker.close();
+    QString error;
+    const bool cleaned = env.cleanup(&error);
+    const bool preserved = QFileInfo::exists(marker.fileName());
+    // Restore the owned directory before reporting any assertion failure.
+    const bool removedReplacement = QFile::remove(marker.fileName()) && QDir().rmdir(original);
+    const bool restored = removedReplacement && QDir().rename(moved, original);
+    QVERIFY(restored);
+    QVERIFY(!cleaned);
+    QVERIFY(error.contains("replaced"));
+    QVERIFY(preserved);
+    QVERIFY2(env.cleanup(&error), qPrintable(error));
+}
+
+void CoreTest::temporaryWriteFailure()
+{
+    TestEnvironment env("write-failure");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    QVERIFY(env.writeFile("blocked", "original"));
+    QString error;
+    QVERIFY(!env.writeFile("blocked/child", "must fail", &error));
+    QVERIFY(!error.isEmpty());
+    QVERIFY(QDir().mkpath(env.path("directory")));
+    error.clear();
+    QVERIFY(!env.writeFile("directory", "must fail", &error));
+    QVERIFY(!error.isEmpty());
+    QVERIFY(!env.writeFile("../escape", "must fail", &error));
+    QFile original(env.path("blocked"));
+    QVERIFY(original.open(QIODevice::ReadOnly));
+    QCOMPARE(original.readAll(), QByteArray("original"));
+}
+
+void CoreTest::destructorCleanupFailuresAreObservable()
+{
+    TestEnvironment parent("cleanup-report");
+    QVERIFY2(parent.isValid(), qPrintable(parent.error()));
+    QString original;
+    QString moved;
+    {
+        TestTemporaryDir child(parent.path("qcs-t-case-XXXXXX"));
+        QVERIFY2(child.isValid(), qPrintable(child.errorString()));
+        original = child.path();
+        moved = original + "-moved";
+        QVERIFY(QDir().rename(original, moved));
+        // Destruction must record the refused cleanup, rather than warn only.
+    }
+    const auto error = takeCleanupErrors();
+    const bool present = QFileInfo(moved).isDir();
+    QVERIFY(QDir().rename(moved, original));
+    QVERIFY(error.contains("Refusing to clean"));
+    QVERIFY(error.contains(original));
+    QVERIFY(present);
+    QVERIFY(takeCleanupErrors().isEmpty());
+}
+
+#ifdef Q_OS_WIN
+void CoreTest::cleanupRequiresClosedWindowsHandles()
+{
+    TestEnvironment env("open-handle");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    QVERIFY(env.writeFile("held.txt", "held by a native handle"));
+    const auto native = nativeLockFilePath(env.path("held.txt"));
+    HANDLE handle = CreateFileW(reinterpret_cast<LPCWSTR>(native.utf16()), GENERIC_READ,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    QVERIFY(handle != INVALID_HANDLE_VALUE);
+    QString error;
+    const bool cleaned = env.cleanup(&error);
+    const bool preserved = QFileInfo::exists(env.path("held.txt"));
+    CloseHandle(handle);
+    QVERIFY(!cleaned);
+    QVERIFY(!error.isEmpty());
+    QVERIFY(preserved);
+    QVERIFY2(env.cleanup(&error), qPrintable(error));
+    QVERIFY(env.cleanup(&error));
+}
+#endif
+
+void CoreTest::legacyProfileRejected_data()
+{
+    QTest::addColumn<QString>("relative");
+    for (const auto &path : {"qcopilots-search-settings.json", "qcopilots-search-service.lock",
+                            "qcopilots-search-ipc-token", "index/qcopilots-search.sqlite3",
+                            "index/qcopilots-search.sqlite3-wal", "index/qcopilots-search.sqlite3-shm",
+                            "index/qcopilots-search-progress.json", "index/qcopilots-search-ann-orphan"})
+        QTest::newRow(path) << QString::fromLatin1(path);
+}
+
+void CoreTest::legacyProfileRejected()
+{
+    QFETCH(QString, relative);
+    TestEnvironment env("legacy-profile");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    const auto paths = env.runtimePaths();
+    QVERIFY(env.writeFile("profile/" + relative, "old-owned-data"));
+    QString error;
+    QVERIFY(!paths.validateProfileLayout(&error));
+    QVERIFY(error.startsWith("legacy_profile_layout:"));
+    QVERIFY(!paths.ensure(&error));
+    QVERIFY(error.startsWith("legacy_profile_layout:"));
+    QVERIFY(!QFileInfo::exists(paths.configFile));
+    QVERIFY(!QFileInfo::exists(paths.databaseFile()));
+    QVERIFY(!QFileInfo::exists(paths.cacheDir));
+    QVERIFY(!QFileInfo::exists(paths.tempDir));
+    QVERIFY(!QFileInfo::exists(paths.logDir));
+    QVERIFY(!QFileInfo::exists(paths.modelDir));
+    QFile old(env.path("profile/" + relative));
+    QVERIFY(old.open(QIODevice::ReadOnly));
+    QCOMPARE(old.readAll(), QByteArray("old-owned-data"));
 }
 
 void CoreTest::settingsRoundTrip()
@@ -523,7 +666,8 @@ void CoreTest::pipelineContracts()
     QCOMPARE(embedding.value("mediaSha256").toString().toLatin1(), manifest.at(1).sha256);
     QVERIFY(manifest.at(0).url.toString().contains(embedding.value("modelRevision").toString()));
     QVERIFY(embeddingPipelineFingerprint().startsWith("qcopilots-search-embedding-v1:"));
-    QCOMPARE(embeddingPipelineFingerprint(), embeddingPipelineFingerprint());
+    QCOMPARE(embeddingPipelineFingerprint(), QStringLiteral("qcopilots-search-embedding-v1:58b7ec0f5d1971431488b9899d8f1eccb8e54b3e37e42d14810dc5732ac7d9b1"));
+    QCOMPARE(extractionPipelineFingerprint(), QStringLiteral("qcopilots-search-extraction-v6:00bbcdbeeddbe3f7af89b6155cf627f607365500eb6bf9493f539a0675c81a55"));
     auto changed = embedding;
     changed["queryPrompt"] = "different prompt";
     QVERIFY(pipelineContractFingerprint("qcopilots-search-embedding-v1", changed)

@@ -273,7 +273,7 @@ struct Collector {
         piece.path = path;
         piece.title = QFileInfo(path).fileName();
         piece.kind = kind;
-        piece.mediaPath = QDir(options.tempDir).filePath(QStringLiteral("qcopilots-search-media-%1.%2")
+        piece.mediaPath = QDir(options.tempDir).filePath(QStringLiteral("qcs-media-%1.%2")
             .arg(QUuid::createUuid().toString(QUuid::WithoutBraces), extension));
         write(piece.mediaPath);
         result.segments.append(std::move(piece));

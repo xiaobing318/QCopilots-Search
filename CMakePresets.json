@@ -3,7 +3,7 @@
   "cmakeMinimumRequired": {"major": 3, "minor": 28, "patch": 0},
   "configurePresets": [
     {
-      "name": "qcopilots-search-release",
+      "name": "qcs-release",
       "displayName": "QCopilots Search external Release build",
       "generator": "Ninja",
       "binaryDir": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/release",
@@ -11,28 +11,28 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_PREFIX_PATH": "$env{QCOPILOTS_SEARCH_QT_PREFIX}",
         "CMAKE_INSTALL_PREFIX": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/stage",
-        "QCOPILOTS_SEARCH_DEPENDENCY_ROOT": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/dependencies",
-        "QCOPILOTS_SEARCH_TEST_ROOT": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/test-runs",
+        "QCOPILOTS_SEARCH_DEPENDENCY_ROOT": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/deps",
+        "QCOPILOTS_SEARCH_TEST_ROOT": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/runs",
         "QCOPILOTS_SEARCH_BUILD_TESTS": "ON"
       },
       "condition": {"type": "notEquals", "lhs": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}", "rhs": ""}
     },
     {
-      "name": "qcopilots-search-debug",
-      "inherits": "qcopilots-search-release",
+      "name": "qcs-debug",
+      "inherits": "qcs-release",
       "binaryDir": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/debug",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
     }
   ],
   "buildPresets": [
-    {"name": "qcopilots-search-release", "configurePreset": "qcopilots-search-release"},
-    {"name": "qcopilots-search-debug", "configurePreset": "qcopilots-search-debug"}
+    {"name": "qcs-release", "configurePreset": "qcs-release"},
+    {"name": "qcs-debug", "configurePreset": "qcs-debug"}
   ],
   "testPresets": [
-    {"name": "qcopilots-search-release", "configurePreset": "qcopilots-search-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
-    {"name": "qcopilots-search-debug", "configurePreset": "qcopilots-search-debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
+    {"name": "qcs-release", "configurePreset": "qcs-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "qcs-debug", "configurePreset": "qcs-debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
   ],
   "workflowPresets": [
-    {"name": "qcopilots-search-release", "steps": [{"type": "configure", "name": "qcopilots-search-release"}, {"type": "build", "name": "qcopilots-search-release"}, {"type": "test", "name": "qcopilots-search-release"}]}
+    {"name": "qcs-release", "steps": [{"type": "configure", "name": "qcs-release"}, {"type": "build", "name": "qcs-release"}, {"type": "test", "name": "qcs-release"}]}
   ]
 }

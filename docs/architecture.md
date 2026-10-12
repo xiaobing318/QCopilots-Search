@@ -3,16 +3,16 @@
 QCopilots Search 将交互、持久化、提取和推理分开。GUI 与 CLI 使用相同的本地协议，服务负责目录配置、任务状态和数据发布，工作进程处理耗时或可能失败的输入。
 
 ```text
-qcopilots-search          qcopilots-search-cli
-          \               /
+  qcs                   qcs-cli
+     \                   /
              本地 IPC
                 |
-     qcopilots-search-service
-       |       |         |
-     配置    SQLite    向量索引
-       |
-     qcopilots-search-worker
-         提取 / 查询编码 / 多模态编码
+           qcs-service
+          /     |      \
+        配置  SQLite  向量索引
+                |
+            qcs-worker
+       提取 / 查询编码 / 多模态编码
 ```
 
 ## 模块边界
@@ -32,7 +32,9 @@ qcopilots-search          qcopilots-search-cli
 
 ## 运行目录与实例隔离
 
-`RuntimePaths` 集中解析配置、数据库、模型、缓存、日志、临时文件、锁和 IPC 名称。正常运行使用平台标准应用目录，显式 `--profile-dir` 和 `--model-dir` 优先。服务锁及 IPC 名称包含 `qcopilots-search` 前缀和实例摘要。
+`RuntimePaths` 集中解析配置、数据库、模型、缓存、日志、临时文件、锁和 IPC 名称。正常运行使用平台标准应用目录，显式 `--profile-dir` 和 `--model-dir` 优先。服务锁及 IPC 名称包含 `qcs` 前缀和实例摘要。
+
+短命名程序使用新的 profile 布局，不自动迁移或回退到旧布局。显式选择含旧持久化文件的目录时报告不兼容，避免在同一目录另建数据库或绕过旧服务锁。模型内容可经锁定校验后导入新布局，命名变更不改变推理、提取或持久化格式的非路径指纹。
 
 同一配置目录由一个服务写入。多个 checkout、自动化测试及正式应用可以使用不同配置目录同时运行。测试设置 `QStandardPaths::setTestModeEnabled(true)`，同时显式使用独立临时目录，不能只依赖 Qt 的测试模式来实现隔离。
 

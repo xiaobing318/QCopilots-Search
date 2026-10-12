@@ -9,6 +9,22 @@
 
 namespace qcopilots_search::test {
 
+// QtTest cleanup slots drain these errors after all case-local fixtures have
+// been destroyed, so a failed RAII cleanup cannot turn into a passing test.
+void recordCleanupFailure(const QString &error);
+QString takeCleanupErrors();
+
+class TestTemporaryDir : public QTemporaryDir {
+public:
+    explicit TestTemporaryDir(const QString &pathTemplate);
+    ~TestTemporaryDir();
+    bool remove(QString *error = nullptr);
+private:
+    QString canonicalParent_;
+    QByteArray identity_;
+    bool removed_ = false;
+};
+
 // Construct once per case. Failure never falls back to a user or source path.
 class TestEnvironment {
 public:
@@ -27,7 +43,7 @@ public:
     bool cleanup(QString *error = nullptr);
 
 private:
-    std::unique_ptr<QTemporaryDir> temporary_;
+    std::unique_ptr<TestTemporaryDir> temporary_;
     QString error_;
     bool cleaned_ = false;
     QString canonicalBase_;

@@ -15,6 +15,10 @@ import tempfile
 import time
 import unittest
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "support"))
+from temp_paths import temporary_root
+
 ARCHIVE_SHA = "778ee590ec7447075e08f2daf6301311ae7f8d9bf810a0b849f26af3f6d10867"
 PATCHED_SHA = {
     "src/llama-context.cpp": "513f5cc789180f4f094217c7397a53aa6cbda7c0a7c2aa239fe1cd0b19a2c025",
@@ -30,10 +34,8 @@ class SourceIntegrityTests(unittest.TestCase):
         archive = Path(OPTIONS.archive).resolve(strict=True)
         if hashlib.sha256(archive.read_bytes()).hexdigest() != ARCHIVE_SHA:
             raise AssertionError("Input archive differs from the locked llama b11461 SHA256")
-        temp_root = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
-        if temp_root:
-            Path(temp_root).mkdir(parents=True, exist_ok=True)
-        cls.temporary = tempfile.TemporaryDirectory(prefix="qcopilots-search-source-", dir=temp_root)
+        temp_root = temporary_root()
+        cls.temporary = tempfile.TemporaryDirectory(prefix="qcs-source-", dir=temp_root)
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name).resolve()
         cls.source = cls.root / "source 中文 archive"

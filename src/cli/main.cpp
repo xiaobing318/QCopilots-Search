@@ -236,7 +236,7 @@ int main(int argc, char **argv)
 {
     qputenv("QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES", "1");
     QCoreApplication application(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("qcopilots-search-cli"));
+    QCoreApplication::setApplicationName(QStringLiteral("qcs-cli"));
     QCoreApplication::setOrganizationName(QStringLiteral("QCopilots"));
     QCoreApplication::setApplicationVersion(QStringLiteral(QCOPILOTS_SEARCH_VERSION));
     QCommandLineParser parser;
@@ -254,10 +254,10 @@ int main(int argc, char **argv)
         "  update                         Check public releases without installing\n"
         "  shutdown                       Stop this profile's service\n\n"
         "Examples:\n"
-        "  qcopilots-search-cli --profile-dir \"profile space\" index \"documents\" --wait\n"
-        "  qcopilots-search-cli search \"中文 查询\" --kind pdf --limit 20\n"
-        "  qcopilots-search-cli model download --timeout 1800000 --progress\n"
-        "  qcopilots-search-cli config set --file settings.json\n\n"
+        "  qcs-cli --profile-dir \"profile space\" index \"documents\" --wait\n"
+        "  qcs-cli search \"中文 查询\" --kind pdf --limit 20\n"
+        "  qcs-cli model download --timeout 1800000 --progress\n"
+        "  qcs-cli config set --file settings.json\n\n"
         "Exit codes: 0 success, 1 operation failed, 2 invalid arguments.\n"
         "The service is discovered beside this executable (or in its macOS bundle)."));
     parser.addHelpOption();

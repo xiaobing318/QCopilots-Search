@@ -24,7 +24,7 @@ struct Fixture {
     QString parseError;
     Fixture() : paths(root.runtimePaths()) {}
     bool token(char letter = 'a') {
-        QFile f(QDir(paths.profileDir).filePath("qcopilots-search-ipc-token"));
+        QFile f(QDir(paths.profileDir).filePath("qcs-ipc-token"));
         return f.open(QIODevice::WriteOnly | QIODevice::Truncate)
             && f.write(QByteArray(64, letter)) == 64;
     }
@@ -50,6 +50,12 @@ struct Fixture {
 class ClientTests : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void fragmentedAndCombinedFrames() {
         const auto frame = encodeIpcFrame({{"protocol", 1}, {"text", QString::fromUtf8("中文 path")}});
         QByteArray buffer;
@@ -101,6 +107,39 @@ private slots:
         QVERIFY(code == QStringLiteral("connection_failed")
                 || code == QStringLiteral("ipc_directory_unavailable"));
         QVERIFY(!QFileInfo::exists(paths.profileDir));
+    }
+    void legacyProfileIsRejectedBeforeConnectingToExistingEndpoint() {
+        Fixture fixture;
+        QVERIFY2(fixture.root.isValid(), qPrintable(fixture.root.error()));
+        QVERIFY(fixture.start());
+        // A live endpoint must not let an explicitly selected legacy profile
+        // bypass layout validation, including when service autostart is off.
+        const QString markerPath = QDir(fixture.paths.profileDir)
+            .filePath(QStringLiteral("qcopilots-search-ipc-token"));
+        const QByteArray legacyContents("legacy-user-data-must-not-change");
+        QFile marker(markerPath);
+        QVERIFY(marker.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+        QCOMPARE(marker.write(legacyContents), legacyContents.size());
+        marker.close();
+        const auto originalEntries = QDir(fixture.paths.profileDir).entryList(QDir::AllEntries | QDir::Hidden);
+        QSignalSpy connections(&fixture.server, &QLocalServer::newConnection);
+        ServiceClient client(fixture.paths);
+        client.setAutoStart(false);
+        QSignalSpy failure(&client, &ServiceClient::failed);
+        QSignalSpy response(&client, &ServiceClient::response);
+        const QString id = client.request(QStringLiteral("status"));
+        QTRY_COMPARE(failure.size(), 1);
+        QCOMPARE(failure.first().at(0).toString(), id);
+        QCOMPARE(failure.first().at(1).toString(), QStringLiteral("profile_unavailable"));
+        QVERIFY(failure.first().at(2).toString().contains(QStringLiteral("legacy_profile_layout:")));
+        QCOMPARE(response.size(), 0);
+        QCOMPARE(connections.size(), 0);
+        QVERIFY(fixture.peer.isNull());
+        QVERIFY(fixture.requests.isEmpty());
+        QVERIFY(!fixture.server.hasPendingConnections());
+        QCOMPARE(QDir(fixture.paths.profileDir).entryList(QDir::AllEntries | QDir::Hidden), originalEntries);
+        QVERIFY(marker.open(QIODevice::ReadOnly));
+        QCOMPARE(marker.readAll(), legacyContents);
     }
 #ifndef Q_OS_WIN
     void unixPeerCredentialsAreVerified() {
@@ -240,7 +279,7 @@ private slots:
     void oversizedTokenFailsClosed() {
         Fixture f;
         QVERIFY(f.start());
-        QFile token(QDir(f.paths.profileDir).filePath("qcopilots-search-ipc-token"));
+        QFile token(QDir(f.paths.profileDir).filePath("qcs-ipc-token"));
         QVERIFY(token.open(QIODevice::WriteOnly));
         token.write(QByteArray(10000, 'a'));
         token.close();

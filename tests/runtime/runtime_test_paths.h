@@ -1,5 +1,7 @@
 #pragma once
 
+#include "support/test_environment.h"
+
 #include <QDir>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -8,7 +10,7 @@
 namespace qcopilots_search::test {
 
 // No test may fall back to a real user profile or a source-tree directory.
-inline std::unique_ptr<QTemporaryDir> temporaryDirectory(QString* error)
+inline std::unique_ptr<TestTemporaryDir> temporaryDirectory(QString* error)
 {
     const auto requestedRoot = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT");
     const auto root = requestedRoot.isEmpty() ? QDir::tempPath() : requestedRoot;
@@ -16,8 +18,8 @@ inline std::unique_ptr<QTemporaryDir> temporaryDirectory(QString* error)
         *error = QStringLiteral("Cannot create the requested test root: %1").arg(root);
         return {};
     }
-    auto directory = std::make_unique<QTemporaryDir>(
-        QDir(root).filePath(QStringLiteral("qcopilots-search-runtime-tests-XXXXXX")));
+    auto directory = std::make_unique<TestTemporaryDir>(
+        QDir(root).filePath(QStringLiteral("qcs-runtime-tests-XXXXXX")));
     if (!directory->isValid()) {
         *error = QStringLiteral("Cannot create an isolated test directory under %1: %2")
                      .arg(root, directory->errorString());

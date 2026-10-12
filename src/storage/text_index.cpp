@@ -64,8 +64,8 @@ QString chineseDictionaryPath() {
   if (!explicitDir.isEmpty())
     candidates.append(explicitDir);
   QDir app(QCoreApplication::applicationDirPath());
-  candidates << app.filePath("../share/qcopilots-search/dict")
-             << app.filePath("../Resources/qcopilots-search/dict")
+  candidates << app.filePath("../share/qcs/dict")
+             << app.filePath("../Resources/qcs/dict")
              << app.filePath("dict");
   for (const auto &dir : candidates) {
     bool valid = true;

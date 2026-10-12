@@ -811,11 +811,25 @@ int main(int argc, char **argv) {
     if (reportPath.isEmpty() && !parser.isSet("validate-only"))
         reportPath = qEnvironmentVariable("QCOPILOTS_SEARCH_SEMANTIC_REPORT");
     if (reportPath.isEmpty() && env && !parser.isSet("validate-only"))
-        reportPath = env->path("qcopilots-search-semantic-report.json");
+        reportPath = env->path("qcs-semantic-report.json");
     if (env && (parser.isSet("preserve") || result != 0 ||
                 (!parser.isSet("report") && !parser.isSet("validate-only")))) {
         env->preserve();
         report["preservedRoot"] = env->root();
+    }
+    // All inference, extraction and storage owners have left scope. Close the
+    // isolated test context before reporting success so a cleanup failure is
+    // part of the acceptance result rather than a destructor-only warning.
+    env.reset();
+    const QString cleanupError = test::takeCleanupErrors();
+    if (!cleanupError.isEmpty()) {
+        result = 1;
+        report["status"] = "cleanup-failed";
+        report["passed"] = false;
+        report["cleanupError"] = cleanupError;
+        const QString previous = report.value("error").toString();
+        report["error"] = previous.isEmpty() ? cleanupError : previous + "\n" + cleanupError;
+        QTextStream(stderr) << cleanupError << '\n';
     }
     if (!reportPath.isEmpty()) {
         report["reportPath"] = reportPath;

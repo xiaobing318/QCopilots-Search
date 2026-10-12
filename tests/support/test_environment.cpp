@@ -6,12 +6,100 @@
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QStringList>
+#include <utility>
 
 #ifdef Q_OS_WIN
 #include <cstdlib>
+#include "core/native_lock_path.h"
+#include <windows.h>
+#else
+#include <sys/stat.h>
 #endif
 
 namespace qcopilots_search::test {
+namespace {
+thread_local QStringList cleanupErrors;
+
+QByteArray directoryIdentity(const QString &path)
+{
+#ifdef Q_OS_WIN
+    const QString native = nativeLockFilePath(path);
+    const HANDLE handle = CreateFileW(reinterpret_cast<LPCWSTR>(native.utf16()), 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return {};
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool valid = GetFileInformationByHandle(handle, &info)
+        && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+    CloseHandle(handle);
+    if (!valid) return {};
+    return QByteArray::number(info.dwVolumeSerialNumber) + ':'
+        + QByteArray::number(info.nFileIndexHigh) + ':' + QByteArray::number(info.nFileIndexLow);
+#else
+    struct stat info{};
+    if (::lstat(QFile::encodeName(path).constData(), &info) != 0 || !S_ISDIR(info.st_mode)) return {};
+    return QByteArray::number(qulonglong(info.st_dev)) + ':' + QByteArray::number(qulonglong(info.st_ino));
+#endif
+}
+}
+
+void recordCleanupFailure(const QString &error)
+{
+    cleanupErrors.append(error);
+}
+
+QString takeCleanupErrors()
+{
+    return std::exchange(cleanupErrors, {}).join(QLatin1Char('\n'));
+}
+
+TestTemporaryDir::TestTemporaryDir(const QString &pathTemplate) : QTemporaryDir(pathTemplate)
+{
+    if (isValid()) {
+        canonicalParent_ = QFileInfo(QFileInfo(path()).absolutePath()).canonicalFilePath();
+        identity_ = directoryIdentity(path());
+        if (identity_.isEmpty()) {
+            setAutoRemove(false);
+            recordCleanupFailure(QStringLiteral("Cannot establish temporary directory ownership: %1").arg(path()));
+        }
+    }
+}
+
+TestTemporaryDir::~TestTemporaryDir()
+{
+    if (autoRemove() && isValid() && !removed_) {
+        QString error;
+        if (!remove(&error)) recordCleanupFailure(error);
+    }
+    // A failed ownership check must never fall through to QTemporaryDir's
+    // unchecked recursive destructor cleanup.
+    setAutoRemove(false);
+}
+
+bool TestTemporaryDir::remove(QString *error)
+{
+    if (removed_ || !isValid()) return true;
+    const QFileInfo target(path());
+    if (canonicalParent_.isEmpty() || identity_.isEmpty() || target.isSymLink()
+        || QFileInfo(target.absolutePath()).canonicalFilePath() != canonicalParent_
+        || target.canonicalFilePath() != QDir(canonicalParent_).filePath(target.fileName())
+        || directoryIdentity(path()) != identity_) {
+        if (error) *error = QStringLiteral("Refusing to clean replaced or unowned temporary directory: %1").arg(path());
+        setAutoRemove(false);
+        return false;
+    }
+    if (!QTemporaryDir::remove()) {
+        if (error) *error = QStringLiteral("Cannot clean temporary directory, release files and child processes: %1").arg(path());
+        setAutoRemove(false);
+        return false;
+    }
+    removed_ = true;
+    setAutoRemove(false);
+    return true;
+}
+
 TestEnvironment::TestEnvironment(const QString &label)
 {
     QStandardPaths::setTestModeEnabled(true);
@@ -33,9 +121,9 @@ TestEnvironment::TestEnvironment(const QString &label)
     base = canonicalBase_;
     QString safeLabel = label;
     safeLabel.replace(QRegularExpression(QStringLiteral("[^a-zA-Z0-9_-]")), QStringLiteral("_"));
-    safeLabel = safeLabel.left(48);
-    temporary_ = std::make_unique<QTemporaryDir>(QDir(base).filePath(
-        QStringLiteral("qcopilots-search-tests-%1-XXXXXX").arg(safeLabel)));
+    safeLabel = safeLabel.left(16);
+    temporary_ = std::make_unique<TestTemporaryDir>(QDir(base).filePath(
+        QStringLiteral("qcs-t-%1-XXXXXX").arg(safeLabel)));
     if (!temporary_->isValid())
         error_ = QStringLiteral("Cannot create isolated test directory under %1: %2")
                      .arg(base, temporary_->errorString());
@@ -50,7 +138,7 @@ TestEnvironment::~TestEnvironment()
     if (!cleaned_ && temporary_ && temporary_->autoRemove() && temporary_->isValid()) {
         QString message;
         if (!cleanup(&message))
-            qWarning().noquote() << message;
+            recordCleanupFailure(message);
     }
 }
 
@@ -78,7 +166,17 @@ RuntimePaths TestEnvironment::runtimePaths() const
 bool TestEnvironment::writeFile(const QString &relative, const QByteArray &data, QString *error) const
 {
     const QString destination = path(relative);
-    if (destination.isEmpty() || !QDir().mkpath(QFileInfo(destination).absolutePath())) {
+    QString existingParent = QFileInfo(destination).absolutePath();
+    while (!QFileInfo::exists(existingParent) && !QFileInfo(existingParent).isSymLink()) {
+        const auto parent = QFileInfo(existingParent).absolutePath();
+        if (parent == existingParent) break;
+        existingParent = parent;
+    }
+    const auto resolvedParent = QFileInfo(existingParent).canonicalFilePath();
+    const bool ownedParent = !canonicalRoot_.isEmpty()
+        && (resolvedParent == canonicalRoot_ || resolvedParent.startsWith(canonicalRoot_ + '/'));
+    if (destination.isEmpty() || !ownedParent || QFileInfo(destination).isSymLink()
+        || !QDir().mkpath(QFileInfo(destination).absolutePath())) {
         if (error)
             *error = QStringLiteral("Invalid fixture destination: %1").arg(relative);
         return false;
@@ -87,6 +185,10 @@ bool TestEnvironment::writeFile(const QString &relative, const QByteArray &data,
     if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size()) {
         if (error)
             *error = QStringLiteral("Cannot write fixture %1: %2").arg(destination, file.errorString());
+        return false;
+    }
+    if (!file.flush()) {
+        if (error) *error = QStringLiteral("Cannot flush fixture %1: %2").arg(destination, file.errorString());
         return false;
     }
     return true;
@@ -105,7 +207,7 @@ bool TestEnvironment::cleanup(QString *error)
     const QFileInfo target(temporary_->path());
     const QString canonicalParent = QFileInfo(target.absolutePath()).canonicalFilePath();
     const QString canonicalTarget = target.canonicalFilePath();
-    if (!target.isAbsolute() || !target.fileName().startsWith(QStringLiteral("qcopilots-search-tests-"))
+    if (!target.isAbsolute() || !target.fileName().startsWith(QStringLiteral("qcs-t-"))
         || target.isSymLink() || canonicalRoot_.isEmpty() || canonicalBase_.isEmpty()
         || canonicalParent != canonicalBase_ || canonicalTarget != canonicalRoot_
         || QFileInfo(canonicalTarget).absolutePath() != canonicalBase_) {
@@ -114,10 +216,7 @@ bool TestEnvironment::cleanup(QString *error)
         temporary_->setAutoRemove(false);
         return false;
     }
-    if (!temporary_->remove()) {
-        if (error)
-            *error = QStringLiteral("Cannot clean test directory (close files and child processes): %1")
-                         .arg(target.filePath());
+    if (!temporary_->remove(error)) {
         temporary_->setAutoRemove(false);
         return false;
     }

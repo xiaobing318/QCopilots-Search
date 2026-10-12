@@ -202,7 +202,7 @@ QJsonObject probeRaw(const QByteArray &bytes, bool traceJpeg)
 int main(int argc, char **argv)
 {
     QCoreApplication application(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("qcopilots-search-tests-jpeg-probe"));
+    QCoreApplication::setApplicationName(QStringLiteral("qcs-tests-jpeg-probe"));
     if (application.arguments().size() != 2) return 2;
     QFile fixture(application.arguments().at(1));
     if (!QFileInfo(fixture.fileName()).isAbsolute() || !fixture.open(QIODevice::ReadOnly)) return 2;

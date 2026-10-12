@@ -111,9 +111,15 @@ bool ModelFiles::verify(QString* error) const
 
 bool ModelFiles::acquireLock(QString* error)
 {
+    // Read-only verification can reuse existing GGUF files. Writers must not
+    // bypass a lock held by a process using the previous naming convention.
+    const QFileInfo legacyLock(QDir(modelDir_).filePath(QStringLiteral("qcopilots-search-models.lock")));
+    if (legacyLock.exists() || legacyLock.isSymbolicLink())
+        return setError(error, tr("legacy_model_layout: The model directory contains an older model lock. "
+                                  "Import the verified model files into a new model directory: %1").arg(modelDir_));
     if (!QDir().mkpath(modelDir_)) return setError(error, tr("Cannot create model directory: %1").arg(modelDir_));
     lock_ = std::make_unique<QLockFile>(nativeLockFilePath(
-        QDir(modelDir_).filePath(QStringLiteral("qcopilots-search-models.lock"))));
+        QDir(modelDir_).filePath(QStringLiteral("qcs-models.lock"))));
     lock_->setStaleLockTime(0);
     if (!lock_->tryLock()) {
         lock_.reset();

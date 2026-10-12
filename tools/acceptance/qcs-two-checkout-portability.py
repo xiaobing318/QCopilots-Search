@@ -1,0 +1,755 @@
+#!/usr/bin/env python3
+"""Opt-in Windows two-checkout portability evidence. Default mode only prints a plan.
+
+Writes only a fresh UUID directory below --run-parent plus the existing main
+build runner's normal reports/runs. Never changes the original source ACL.
+Does not execute model, service or GUI tests and does not claim those contracts.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+from ctypes import wintypes
+from datetime import datetime, timezone
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+sys.dont_write_bytecode = True
+TARGETS = ["qcs-tests-" + suffix for suffix in ("core", "file-catalog", "model-files")]
+
+
+def utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write(path, data):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def snapshot(directory, *, exclude_git=True):
+    """Read source bytes without following junctions/symlinks."""
+    root = Path(directory).resolve()
+    values = {}
+    for parent, directories, files in os.walk(root, followlinks=False):
+        directories[:] = sorted(d for d in directories if not (exclude_git and d == ".git")
+                                and not Path(parent, d).is_symlink()
+                                and not getattr(Path(parent, d), "is_junction", lambda: False)())
+        for name in sorted(files):
+            path = Path(parent, name)
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                values[relative] = {"link": os.readlink(path)}
+            else:
+                values[relative] = {"bytes": path.stat().st_size, "sha256": sha(path)}
+    return values
+
+
+def executable_snapshot(bin_dir, git_dll):
+    files = [Path(bin_dir) / (name + ".exe") for name in TARGETS] + [Path(git_dll)]
+    require(all(path.is_file() for path in files), "Missing independently built test executable or git2.dll")
+    return {str(path.resolve()): {"bytes": path.stat().st_size, "sha256": sha(path)} for path in files}
+
+
+def validate_test_command(command, name, source, build, test_root):
+    """Bind the isolation wrapper and its inner command to this checkout."""
+    command = list(command)
+    while len(command) > 1 and command[1] in {"-B", "-u"}:
+        command.pop(1)
+    expected_wrapper = (Path(source) / "tools/qcs-test-runner.py").resolve()
+    require(len(command) >= 8 and Path(command[0]).resolve() == Path(sys.executable).resolve()
+            and Path(command[1]).resolve() == expected_wrapper,
+            "CTest command does not use the selected Python and this checkout's isolation wrapper: " + name)
+    require(command[2:6] == ["--label", name, "--root", str(test_root)]
+            or (command[2:5] == ["--label", name, "--root"]
+                and Path(command[5]).resolve() == Path(test_root).resolve()),
+            "CTest isolation label or writable root differs: " + name)
+    separator = 7 if command[6] == "--keep-failed" else 6
+    require(command[separator] == "--", "CTest isolation wrapper has unexpected arguments: " + name)
+    inner = command[separator + 1:]
+    if name in TARGETS:
+        require(bool(inner) and inner[1:] in ([], ["-o", "-,txt"])
+                and Path(inner[0]).resolve() == (Path(build) / "bin" / (name + ".exe")).resolve(),
+                "CTest command does not point to its own checkout binary: " + name)
+    else:
+        while len(inner) > 1 and inner[1] in {"-B", "-u"}:
+            inner.pop(1)
+        require(name == "qcs-tests-workflow" and len(inner) == 2
+                and Path(inner[0]).resolve() == Path(sys.executable).resolve()
+                and Path(inner[1]).resolve() == (Path(source) / "tools/qcs-test-workflow.py").resolve(),
+                "Workflow inventory does not point to this checkout script and selected Python")
+    return {"path": str(expected_wrapper), "sha256": sha(expected_wrapper)}
+
+
+def run_size(root):
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+        except FileNotFoundError:
+            # Ninja and tests can atomically rename their own temporary files.
+            continue
+    return total
+
+
+class WindowsProcesses:
+    """Own-job cleanup and Toolhelp snapshots, never global process-name kills."""
+    def __init__(self):
+        self.k = ctypes.WinDLL("kernel32", use_last_error=True)
+        class BasicLimit(ctypes.Structure):
+            _fields_ = [("processTime", ctypes.c_int64), ("jobTime", ctypes.c_int64),
+                        ("flags", wintypes.DWORD), ("minWorking", ctypes.c_size_t),
+                        ("maxWorking", ctypes.c_size_t), ("activeLimit", wintypes.DWORD),
+                        ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD), ("scheduling", wintypes.DWORD)]
+        class IO(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in ("readOps", "writeOps", "otherOps", "readBytes", "writeBytes", "otherBytes")]
+        class ExtendedLimit(ctypes.Structure):
+            _fields_ = [("basic", BasicLimit), ("io", IO), ("processMemory", ctypes.c_size_t),
+                        ("jobMemory", ctypes.c_size_t), ("peakProcess", ctypes.c_size_t), ("peakJob", ctypes.c_size_t)]
+        class Accounting(ctypes.Structure):
+            _fields_ = [("user", ctypes.c_int64), ("kernel", ctypes.c_int64),
+                        ("periodUser", ctypes.c_int64), ("periodKernel", ctypes.c_int64),
+                        ("faults", wintypes.DWORD), ("total", wintypes.DWORD),
+                        ("active", wintypes.DWORD), ("terminated", wintypes.DWORD)]
+        class Process(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("pid", wintypes.DWORD),
+                        ("heap", ctypes.c_size_t), ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+                        ("parent", wintypes.DWORD), ("priority", wintypes.LONG), ("flags", wintypes.DWORD),
+                        ("exe", wintypes.WCHAR * 260)]
+        class Thread(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("tid", wintypes.DWORD),
+                        ("owner", wintypes.DWORD), ("priority", wintypes.LONG),
+                        ("delta", wintypes.LONG), ("flags", wintypes.DWORD)]
+        self.ExtendedLimit, self.Accounting, self.Process, self.Thread = ExtendedLimit, Accounting, Process, Thread
+        for name, arguments, returns in (
+            ("CreateJobObjectW", [ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+            ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+            ("QueryInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
+            ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            ("OpenProcess", [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            ("IsProcessInJob", [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+            ("QueryFullProcessImageNameW", [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+            ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
+            ("CreateToolhelp32Snapshot", [wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+            ("Process32FirstW", [wintypes.HANDLE, ctypes.POINTER(Process)], wintypes.BOOL),
+            ("Process32NextW", [wintypes.HANDLE, ctypes.POINTER(Process)], wintypes.BOOL),
+            ("Thread32First", [wintypes.HANDLE, ctypes.POINTER(Thread)], wintypes.BOOL),
+            ("Thread32Next", [wintypes.HANDLE, ctypes.POINTER(Thread)], wintypes.BOOL),
+            ("OpenThread", [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            ("ResumeThread", [wintypes.HANDLE], wintypes.DWORD),
+        ):
+            function = getattr(self.k, name)
+            function.argtypes, function.restype = arguments, returns
+
+    def job(self, process):
+        handle = self.k.CreateJobObjectW(None, None)
+        require(bool(handle), "Cannot create owned process job")
+        info = self.ExtendedLimit()
+        info.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        try:
+            require(self.k.SetInformationJobObject(handle, 9, ctypes.byref(info), ctypes.sizeof(info)), "Cannot set owned job limits")
+            require(self.k.AssignProcessToJobObject(handle, wintypes.HANDLE(int(process._handle))), "Cannot attach owned subprocess job")
+            return handle
+        except BaseException:
+            try:
+                process.terminate()
+                process.wait(timeout=20)
+            finally:
+                self.k.CloseHandle(handle)
+            raise
+
+    def active(self, handle):
+        info = self.Accounting()
+        require(self.k.QueryInformationJobObject(handle, 1, ctypes.byref(info), ctypes.sizeof(info), None), "Cannot inspect owned process job")
+        return int(info.active)
+
+    def resume(self, process):
+        # Popen used CREATE_SUSPENDED. Assign the job before any application
+        # code can spawn descendants, then resume only its initial thread.
+        snapshot_handle = self.k.CreateToolhelp32Snapshot(4, 0)
+        require(snapshot_handle not in (None, ctypes.c_void_p(-1).value), "Cannot locate owned suspended process thread")
+        threads = []
+        try:
+            row = self.Thread()
+            row.size = ctypes.sizeof(row)
+            valid = self.k.Thread32First(snapshot_handle, ctypes.byref(row))
+            while valid:
+                if row.owner == process.pid:
+                    threads.append(int(row.tid))
+                valid = self.k.Thread32Next(snapshot_handle, ctypes.byref(row))
+        finally:
+            self.k.CloseHandle(snapshot_handle)
+        require(len(threads) == 1, "Expected exactly one suspended initial thread in the owned subprocess")
+        handle = self.k.OpenThread(2, False, threads[0])
+        require(bool(handle), "Cannot open owned suspended initial thread")
+        try:
+            require(self.k.ResumeThread(handle) == 1, "Owned initial thread did not have the expected suspend count")
+        finally:
+            self.k.CloseHandle(handle)
+
+    def close(self, handle):
+        self.k.CloseHandle(handle)
+
+    def stop(self, handle):
+        if self.active(handle):
+            require(self.k.TerminateJobObject(handle, 1), "Cannot stop this runner's owned process job")
+        until = time.monotonic() + 20
+        while self.active(handle) and time.monotonic() < until:
+            time.sleep(.02)
+        return self.active(handle)
+
+    def contains(self, job, pid):
+        process = self.k.OpenProcess(0x1000, False, pid)
+        if not process:
+            return False
+        try:
+            member = wintypes.BOOL()
+            return bool(self.k.IsProcessInJob(process, job, ctypes.byref(member)) and member.value)
+        finally:
+            self.k.CloseHandle(process)
+
+    def image(self, pid):
+        process = self.k.OpenProcess(0x1000, False, pid)
+        if not process:
+            return None
+        try:
+            buffer = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buffer))
+            return buffer.value if self.k.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)) else None
+        finally:
+            self.k.CloseHandle(process)
+
+    def all(self):
+        handle = self.k.CreateToolhelp32Snapshot(2, 0)
+        require(handle not in (None, ctypes.c_void_p(-1).value), "Cannot observe actual concurrent child processes")
+        result = {}
+        try:
+            entry = self.Process()
+            entry.size = ctypes.sizeof(entry)
+            valid = self.k.Process32FirstW(handle, ctypes.byref(entry))
+            while valid:
+                result[int(entry.pid)] = {"parent": int(entry.parent), "name": str(entry.exe)}
+                valid = self.k.Process32NextW(handle, ctypes.byref(entry))
+        finally:
+            self.k.CloseHandle(handle)
+        return result
+
+
+ACL_SCRIPT = r'''param([string]$Source,[string]$Report,[string]$Mode)
+$ErrorActionPreference = 'Stop'
+$ownedRoot = Split-Path -Parent $PSScriptRoot
+$marker = Get-Content -LiteralPath (Join-Path $ownedRoot '.qcs-owned-run.json') -Raw | ConvertFrom-Json
+$expectedClone = [IO.Path]::GetFullPath((Join-Path $ownedRoot '中文 源码'))
+$resolvedSource = [IO.Path]::GetFullPath($Source)
+if ($Mode -in @('deny','restore')) {
+  if ($resolvedSource -ne $expectedClone -or ((Get-Item -LiteralPath $Source).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'ACL mutation is restricted to this invocation owned clone'
+  }
+  if ([IO.Path]::GetFullPath($Report) -ne [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'source-original-acl.json'))) {
+    throw 'ACL recovery record must belong to this invocation'
+  }
+} elseif ($Mode -eq 'inspect' -and $resolvedSource -ne [IO.Path]::GetFullPath($marker.source)) {
+  throw 'Read-only ACL inspection must target the recorded original checkout'
+}
+if ($Mode -eq 'deny') {
+  $acl = Get-Acl -LiteralPath $Source
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+  [pscustomobject]@{source=$Source;sid=$sid.Value;sddl=$acl.Sddl} | ConvertTo-Json | Set-Content -LiteralPath $Report -Encoding utf8
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid,
+    [System.Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles',
+    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Deny)
+  $acl.AddAccessRule($rule)
+  Set-Acl -LiteralPath $Source -AclObject $acl
+} elseif ($Mode -eq 'restore') {
+  $original = Get-Content -LiteralPath $Report -Raw | ConvertFrom-Json
+  if ($original.source -ne $Source) { throw 'ACL recovery path mismatch' }
+  $acl = Get-Acl -LiteralPath $Source
+  $acl.SetSecurityDescriptorSddlForm($original.sddl)
+  Set-Acl -LiteralPath $Source -AclObject $acl
+  if ((Get-Acl -LiteralPath $Source).Sddl -ne $original.sddl) { throw 'ACL restoration did not reproduce original SDDL' }
+} elseif ($Mode -eq 'inspect') {
+  Get-Acl -LiteralPath $Source | Select-Object Owner,Sddl | ConvertTo-Json -Compress
+} else { throw 'Unknown bounded ACL operation' }
+'''
+
+ENV_SCRIPT = r'''$ErrorActionPreference = 'Stop'
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $installation) { throw 'No installed x64 MSVC toolchain' }
+Import-Module (Join-Path $installation 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+Enter-VsDevShell -VsInstallPath $installation -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+Get-ChildItem Env: | Select-Object Name,Value | ConvertTo-Json -Compress
+'''
+
+
+def write_probes(source):
+    records = []
+    for relative, existing in (("qcs-write-probe.tmp", False), ("CMakeLists.txt", True),
+                               ("src/core/qcs-write-probe.tmp", False)):
+        path = source / relative
+        flags = os.O_WRONLY if existing else os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except PermissionError as error:
+            records.append({"path": str(path), "denied": True, "error": str(error), "winerror": error.winerror})
+        else:
+            os.close(descriptor)
+            if not existing:
+                path.unlink()
+            records.append({"path": str(path), "denied": False})
+    for operation in ("delete", "rename"):
+        path = source / ".git" / ("qcs-acl-" + operation + ".tmp")
+        try:
+            if operation == "delete":
+                path.unlink()
+            else:
+                path.rename(path.with_suffix(".renamed"))
+        except PermissionError as error:
+            records.append({"path": str(path), "operation": operation, "denied": True,
+                            "error": str(error), "winerror": error.winerror})
+        else:
+            records.append({"path": str(path), "operation": operation, "denied": False})
+    require(all(item["denied"] for item in records), "The isolated source is not effectively read-only")
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for flag in ("head", "source-tree"):
+        parser.add_argument("--" + flag, required=True)
+    for flag in ("build-root", "build-record", "run-parent", "qt-root", "qt-prefix", "calligra-source"):
+        parser.add_argument("--" + flag, type=Path, required=True)
+    parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--dependency-root", type=Path)
+    parser.add_argument("--nsis-root", type=Path, help="Existing locked private NSIS, defaults to BUILD_ROOT/bootstrap/nsis")
+    parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--sentinel-launch-record", type=Path,
+                        help="Optional existing ordinary GUI/service launch record. Observer never starts or stops them")
+    parser.add_argument("--launch-cwd", type=Path, default=Path.cwd())
+    parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--reserve-gib", type=float, default=3.0)
+    parser.add_argument("--budget-gib", type=float, default=0.5)
+    parser.add_argument("--command-timeout", type=int, default=900)
+    parser.add_argument("--execute", action="store_true")
+    args = parser.parse_args()
+    require(re.fullmatch(r"[0-9a-f]{40}", args.head) and re.fullmatch(r"[0-9a-f]{40}", args.source_tree),
+            "Head and tree must be full lower-case Git identities")
+    root = args.run_parent.resolve() / ("qcs-port-" + uuid.uuid4().hex[:12])
+    plan = {"executeRequested": args.execute, "head": args.head, "sourceTree": args.source_tree,
+            "source": str(args.source.resolve()), "buildRecord": str(args.build_record.resolve()), "uniqueRunRoot": str(root),
+            "newTargets": TARGETS, "readonlyCTestNames": TARGETS + ["qcs-tests-workflow"],
+            "originalCTestNames": TARGETS, "scope": "Windows independent subset rebuild and actual concurrent two-checkout tests. No model inference, service startup or GUI control. Optional existing ordinary sentinel observation is reported separately.",
+            "reserveGiB": args.reserve_gib, "budgetGiB": args.budget_gib,
+            "nsisRoot": str((args.nsis_root or args.build_root / "bootstrap/nsis").resolve()),
+            "sentinelLaunchRecord": str(args.sentinel_launch_record.resolve()) if args.sentinel_launch_record else None}
+    if not args.execute:
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return 0
+    require(os.name == "nt" and sys.version_info >= (3, 12), "Windows and Python 3.12+ are required for junction-safe evidence")
+    require(args.jobs > 0 and args.reserve_gib >= 3 and args.budget_gib > 0, "Invalid resource parameters")
+    source, main_build = args.source.resolve(), args.build_root.resolve()
+    nsis_root = (args.nsis_root or main_build / "bootstrap/nsis").resolve()
+    nsis_lock_path = source / "tools/nsis-package.lock.json"
+    nsis_lock = json.loads(nsis_lock_path.read_text(encoding="utf-8"))
+    nsis_marker_path = nsis_root / ".qcs-nsis.json"
+    nsis_marker = json.loads(nsis_marker_path.read_text(encoding="utf-8"))
+    require(nsis_marker["sha256"] == nsis_lock["sha256"] and nsis_marker["version"] == nsis_lock["version"]
+            and sha(nsis_root / "makensis.exe") == nsis_lock["compilerSha256"], "Private NSIS does not match its locked version and compiler")
+    for relative in nsis_marker["files"]:
+        path = (nsis_root / relative).resolve()
+        require(path.is_relative_to(nsis_root) and path.is_file(), "Private NSIS has a missing or unsafe installed member")
+    nsis_before = snapshot(nsis_root)
+    require(not root.is_relative_to(source) and root != root.parent, "Run root must be outside the original source")
+    require(args.launch_cwd.is_dir() and args.qt_prefix.is_dir() and args.calligra_source.is_dir(), "Required directory is missing")
+    os.environ["GIT_OPTIONAL_LOCKS"] = "0"
+    spec = importlib.util.spec_from_file_location("qcopilots_release_evidence", source / "tools/qcs-release-evidence.py")
+    evidence = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evidence)
+    original_identity = evidence.source_identity(source, args.head)
+    receipt = evidence.read_json(args.build_record)
+    require(original_identity == receipt["identity"] and not evidence.verified_build(args.build_record.parent, receipt), "Source and successful build receipt disagree")
+    require(Path(receipt["sourceDirectory"]).resolve() == source, "Build receipt belongs to another source checkout")
+    require(original_identity["sourceTree"] == args.source_tree and original_identity["checkoutCommit"] == args.head
+            and not original_identity["workingTreeModified"] and len(receipt["programs"]) == 6, "The expected frozen clean candidate is not available")
+    original_producers = {name: sha(Path(item["originalPath"])) for name, item in receipt["programs"].items()}
+    require(all(original_producers[name] == item["sha256"] for name, item in receipt["programs"].items()),
+            "Actual main build producer bytes no longer match the frozen build receipt")
+    require(all(Path(item["originalPath"]).resolve().parent == (main_build / "release/bin").resolve()
+                for item in receipt["programs"].values()), "Producer paths do not belong to the selected main build")
+    free = shutil.disk_usage(args.run_parent).free
+    require(free >= (args.reserve_gib + args.budget_gib) * 1024**3, "Insufficient disk budget with required reserve")
+    # mkdtemp uses exclusive creation and retries collisions. No directory name
+    # supplied in a dry-run plan is ever claimed as ownership evidence.
+    root = Path(tempfile.mkdtemp(prefix="qcs-port-", dir=args.run_parent.resolve()))
+    plan["uniqueRunRoot"] = str(root)
+    reports = root / "reports"
+    reports.mkdir()
+    clone, external, caller = root / "中文 源码", root / "外置 构建", root / "任意 工作目录"
+    caller.mkdir()
+    clone_build = external / "release"
+    dependency = (args.dependency_root or main_build / "deps").resolve()
+    model_dir = (args.model_dir or main_build / "models").resolve()
+    initial_receipt_sha, runner_sha = sha(args.build_record), sha(__file__)
+    shutil.copyfile(__file__, reports / "qcs-portability-runner.py")
+    require(sha(reports / "qcs-portability-runner.py") == runner_sha, "Cannot preserve this runner's exact source")
+    for item in receipt["files"]:
+        old = evidence.safe_file(args.build_record.parent, item["path"])
+        new = reports / "main-build" / item["path"]
+        new.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(old, new)
+        require(sha(new) == item["sha256"], "Cannot preserve main build provenance")
+    shutil.copyfile(args.build_record, reports / "main-build/build-record.json")
+    write(root / ".qcs-owned-run.json", plan)
+    (reports / "qcs-owned-acl.ps1").write_text(ACL_SCRIPT, encoding="utf-8")
+    (reports / "qcs-vs-environment.ps1").write_text(ENV_SCRIPT, encoding="utf-8")
+    processes = WindowsProcesses()
+    pwsh = shutil.which("pwsh")
+    require(pwsh is not None, "PowerShell 7 is required")
+    commands, jobs, children, streams = [], [], [], []
+    record = {**plan, "schemaVersion": 2, "kind": "two-checkout-portability", "passed": False, "startedAt": utc(),
+              "identity": original_identity, "buildRecordSha256": initial_receipt_sha, "runnerSha256": runner_sha,
+              "freeBeforeBytes": free, "commands": commands,
+              "mainProducerHashesBefore": original_producers, "preservedBuildRecord": "main-build/build-record.json"}
+    record["nsisTool"] = {"root": str(nsis_root), "lockPath": str(nsis_lock_path), "lockSha256": sha(nsis_lock_path),
+                          "compilerSha256": sha(nsis_root / "makensis.exe"), "archiveSha256": nsis_lock["sha256"],
+                          "version": nsis_lock["version"], "ownershipMarkerSha256": sha(nsis_marker_path)}
+    write(reports / "nsis-files-before.json", nsis_before)
+    acl_attempted = False
+    before_clone = None
+    before_native = None
+    before_original = None
+    before_original_source = None
+    observed, overlap = [{}, {}], []
+    sentinel, sentinel_module_path, sentinel_module_sha = None, None, None
+    record["sentinelObservation"] = {"requested": bool(args.sentinel_launch_record), "status": "notRun"}
+
+    def guard():
+        size = run_size(root)
+        record["peakObservedRunBytes"] = max(record.get("peakObservedRunBytes", 0), size)
+        require(size <= args.budget_gib * 1024**3, "The task exceeded its configured disk budget")
+        require(shutil.disk_usage(root).free >= args.reserve_gib * 1024**3, "Free-space reserve exhausted")
+
+    def start(command, label, env, cwd):
+        out, err = (reports / (label + ".stdout.log")).open("wb"), (reports / (label + ".stderr.log")).open("wb")
+        streams.extend((out, err))
+        child = subprocess.Popen([str(value) for value in command], cwd=cwd, env=env, stdout=out, stderr=err,
+                                 creationflags=0x00000004)  # CREATE_SUSPENDED
+        children.append(child)
+        try:
+            job = processes.job(child)
+            jobs.append(job)
+            processes.resume(child)
+        except BaseException:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=20)
+            raise
+        entry = {"label": label, "command": [str(value) for value in command], "cwd": str(cwd), "pid": child.pid,
+                 "startedAt": utc(), "stdout": out.name, "stderr": err.name}
+        commands.append(entry)
+        write(reports / "execution-progress.json", record)
+        return child, job, entry
+
+    def finish(child, job, entry):
+        deadline = time.monotonic() + args.command_timeout
+        while child.poll() is None:
+            require(time.monotonic() < deadline, "Command timed out: " + entry["label"])
+            guard()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        code = child.returncode
+        entry.update({"exitCode": code, "finishedAt": utc()})
+        until = time.monotonic() + 10
+        while processes.active(job) and time.monotonic() < until:
+            time.sleep(.02)
+        entry["remainingOwnedProcesses"] = processes.active(job)
+        require(entry["remainingOwnedProcesses"] == 0, "An owned command left child processes alive")
+        require(code == 0, "Command failed: " + entry["label"])
+        return entry
+
+    def run(command, label, env, cwd):
+        entry = finish(*start(command, label, env, cwd))
+        guard()
+        return entry
+
+    def command_env(base, build, git_dll):
+        env = dict(base)
+        exclude = {str(main_build / "release/bin").casefold(), str(main_build / "release/lib").casefold()}
+        rest = [piece for piece in env.get("PATH", "").split(os.pathsep) if piece and piece.casefold() not in exclude]
+        env["PATH"] = os.pathsep.join([str(build / "bin"), str(Path(git_dll).parent), str(args.qt_prefix / "bin"), str(nsis_root), *rest])
+        env["NSISDIR"] = str(nsis_root)
+        env["QT_PLUGIN_PATH"] = str(args.qt_prefix / "plugins")
+        env["QCOPILOTS_SEARCH_PYTHON"] = sys.executable
+        env["PATH"] = os.pathsep.join((str(nsis_root), env.get("PATH", "")))
+        env["NSISDIR"] = str(nsis_root)
+        require(Path(shutil.which("makensis", path=env["PATH"])).resolve() == (nsis_root / "makensis.exe").resolve(),
+                "Locked NSIS compiler is not first on the prepared PATH")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+        return env
+
+    try:
+        before_original = executable_snapshot(main_build / "release/bin", main_build / "release/bin/git2.dll")
+        before_original_source = snapshot(source)
+        record["originalBinariesBefore"] = before_original
+        write(reports / "original-source-before.json", before_original_source)
+        plain_env = dict(os.environ)
+        run([pwsh, "-NoProfile", "-File", reports / "qcs-vs-environment.ps1"], "vs-environment", plain_env, args.launch_cwd)
+        rows = json.loads((reports / "vs-environment.stdout.log").read_text(encoding="utf-8-sig"))
+        env = {row["Name"].upper(): row["Value"] for row in rows}
+        env["PYTHONDONTWRITEBYTECODE"], env["GIT_OPTIONAL_LOCKS"] = "1", "0"
+        env["QCOPILOTS_SEARCH_PYTHON"] = sys.executable
+        run([pwsh, "-NoProfile", "-File", reports / "qcs-owned-acl.ps1", "-Source", source,
+             "-Mode", "inspect"], "original-source-acl-before", env, caller)
+        record["originalSourceAclBefore"] = json.loads((reports / "original-source-acl-before.stdout.log").read_text(encoding="utf-8-sig"))
+        run(["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "clone", "--no-hardlinks", "--no-checkout", "--no-tags", source, clone], "clone", env, caller)
+        for key, value in (("core.autocrlf", "false"), ("core.eol", "lf")):
+            run(["git", "-C", clone, "config", key, value], "git-" + key, env, caller)
+        run(["git", "-C", clone, "checkout", "--detach", args.head], "checkout", env, caller)
+        require(evidence.source_identity(clone, args.head) == original_identity, "Cloned source identity or lock bytes differ")
+        for operation in ("delete", "rename"):
+            (clone / ".git" / ("qcs-acl-" + operation + ".tmp")).write_text("Owned disposable ACL probe\n", encoding="utf-8")
+        before_clone = snapshot(clone)
+        write(reports / "source-before.json", before_clone)
+        acl_attempted = True
+        run([pwsh, "-NoProfile", "-File", reports / "qcs-owned-acl.ps1", "-Source", clone,
+             "-Report", reports / "source-original-acl.json", "-Mode", "deny"], "acl-deny", env, caller)
+        record["readonlyProbesBefore"] = write_probes(clone)
+        write(reports / "readonly-proof.json", record["readonlyProbesBefore"])
+        cached_sources = sorted(path for path in dependency.glob("*-src") if path.is_dir()) + [args.calligra_source.resolve()]
+        record["sharedSourceRoots"] = list(map(str, cached_sources))
+        before_native = {str(path): snapshot(path) for path in cached_sources}
+        write(reports / "shared-source-before.json", before_native)
+        wrapper = [pwsh, "-NoProfile", "-File", clone / "qcs-dev.ps1"]
+        common = ["--build-root", external, "--qt-root", args.qt_root, "--model-dir", model_dir]
+        run([*wrapper, "doctor", *common], "doctor", env, caller)
+        configure = [*wrapper, "configure", *common,
+                     "--cmake-arg=-DQCOPILOTS_SEARCH_DEPENDENCY_ROOT=" + str(dependency),
+                     "--cmake-arg=-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
+                     "--cmake-arg=-DFETCHCONTENT_SOURCE_DIR_QCS_CALLIGRA=" + str(args.calligra_source.resolve()),
+                     "--cmake-arg=-DQCOPILOTS_SEARCH_NATIVE_BINARY_ROOT=" + str(clone_build / "nd"),
+                     "--cmake-arg=-DQCOPILOTS_SEARCH_LLAMA_BINARY_DIR=" + str(clone_build / "nd/llama")]
+        run(configure, "configure", env, caller)
+        run(["cmake", "--build", clone_build, "--config", "Release", "--parallel", args.jobs, "--target", *TARGETS], "subset-build", env, caller)
+        clone_dll = clone_build / "bin/git2.dll"
+        main_dll = main_build / "release/bin/git2.dll"
+        clone_binaries = executable_snapshot(clone_build / "bin", clone_dll)
+        record["originalBinariesBefore"], record["cloneBinariesBefore"] = before_original, clone_binaries
+        clone_env = command_env(env, clone_build, clone_dll)
+        main_env = command_env(env, main_build / "release", main_dll)
+        inv_args = [("clone", clone_build, "^(core|workflow)$", clone_env, TARGETS + ["qcs-tests-workflow"]),
+                    ("original", main_build / "release", "^core$", main_env, TARGETS)]
+        for label, build, regex, used_env, names in inv_args:
+            run(["ctest", "--test-dir", build, "-C", "Release", "--show-only=json-v1", "-L", regex], label + "-inventory", used_env, caller)
+            inventory = json.loads((reports / (label + "-inventory.stdout.log")).read_text(encoding="utf-8-sig"))
+            require({row["name"] for row in inventory["tests"]} == set(names), "Selected registered CTest set differs: " + label)
+            checkout = clone if label == "clone" else source
+            configured_test_root = external / "runs" if label == "clone" else main_build / "runs"
+            for row in inventory["tests"]:
+                wrapper_identity = validate_test_command(row.get("command", []), row["name"], checkout,
+                                                         build, configured_test_root)
+                record.setdefault("testWrapperIdentities", {})[label] = wrapper_identity
+            write(reports / (label + "-inventory.json"), inventory)
+        test_a = [*wrapper, "test", *common, "--jobs", "1", "--test-label", "^(core|workflow)$", "--report-dir", reports / "clone-tests"]
+        test_b = [pwsh, "-NoProfile", "-File", source / "qcs-dev.ps1", "test", "--build-root", main_build,
+                  "--qt-root", args.qt_root, "--jobs", "1", "--test-label", "^core$", "--report-dir", reports / "original-tests"]
+        if args.sentinel_launch_record:
+            launch = json.loads(args.sentinel_launch_record.read_text(encoding="utf-8-sig"))
+            require(launch.get("preparationComplete") is True,
+                    "Sentinel launch has not completed its strict readiness checks")
+            sentinel_module_path = Path(__file__).with_name("qcs-portability-sentinel.py")
+            sentinel_module_sha = sha(sentinel_module_path)
+            observer_spec = importlib.util.spec_from_file_location("qcopilots_portability_sentinel", sentinel_module_path)
+            observer_module = importlib.util.module_from_spec(observer_spec)
+            observer_spec.loader.exec_module(observer_module)
+            sentinel = observer_module.SentinelObserver(args.sentinel_launch_record, reports / "sentinel", args.head, original_producers, args.qt_prefix)
+            record["sentinelObserverSha256"] = sentinel_module_sha
+            sentinel.begin()
+        both = [start(test_a, "clone-test", clone_env, caller), start(test_b, "original-test", main_env, args.launch_cwd)]
+        known = [{both[0][0].pid}, {both[1][0].pid}]
+        deadline = time.monotonic() + args.command_timeout
+        next_guard = time.monotonic()
+        while any(item[0].poll() is None for item in both):
+            require(time.monotonic() < deadline, "Concurrent subset test timeout")
+            if time.monotonic() >= next_guard:
+                guard()
+                next_guard = time.monotonic() + 2
+            state, at = processes.all(), utc()
+            alive_tests, alive_ctest = [], []
+            for index in range(2):
+                changed = True
+                while changed:
+                    new = {pid for pid, row in state.items() if row["parent"] in known[index]} - known[index]
+                    known[index].update(new)
+                    changed = bool(new)
+                active = {pid: row for pid, row in state.items() if pid in known[index] and processes.contains(both[index][1], pid)}
+                for pid, row in active.items():
+                    observed[index].setdefault(str(pid), {**row, "firstObservedAt": at})["lastObservedAt"] = at
+                    image = processes.image(pid)
+                    if image:
+                        observed[index][str(pid)]["imagePath"] = image
+                expected_bin = clone_build / "bin" if index == 0 else main_build / "release/bin"
+                expected_images = {expected_bin / (name + ".exe") for name in TARGETS}
+                alive_tests.append([pid for pid, row in active.items()
+                                    if Path(observed[index][str(pid)].get("imagePath", "")) in expected_images])
+                alive_ctest.append([pid for pid, row in active.items() if row["name"].casefold() == "ctest.exe"])
+            if all(alive_tests):
+                overlap.append({"observedAt": at, "qtTestPids": alive_tests, "ctestPids": alive_ctest})
+            if sentinel is not None:
+                sentinel.sample(processes, alive_tests)
+            time.sleep(.02)
+        for item in both:
+            finish(*item)
+        record["observedProcesses"], record["actualQtTestOverlapSamples"] = observed, overlap
+        write(reports / "actual-process-overlap.json", {"processes": observed, "simultaneousQtTestSamples": overlap})
+        require(bool(overlap), "No actual simultaneous QtTest processes were observed, wrapper overlap alone is insufficient")
+        roots = []
+        for label, build_root, used_env in (("clone", external, clone_env), ("original", main_build, main_env)):
+            latest = json.loads((build_root / "reports/latest-test-run.json").read_text(encoding="utf-8"))
+            require(Path(latest["directory"]).resolve() == (reports / (label + "-tests")).resolve(), "Runner report was replaced by another invocation")
+            roots.append(latest["testRoot"])
+            write(reports / (label + "-run-context.json"), latest)
+            run([sys.executable, source / ".github/scripts/qcs-ctest-evidence.py", "--junit", reports / (label + "-tests/ctest.xml"),
+                 "--platform", "Windows", "--inventory", reports / (label + "-inventory.json"), "--output", reports / (label + "-case-evidence.json"),
+                 "--require-complete"], label + "-case-check", used_env, caller)
+        require(roots[0] != roots[1], "Two checkout runs unexpectedly shared a writable root")
+        record["testRoots"] = roots
+        record["readonlyProbesAfter"] = write_probes(clone)
+        record["cloneBinariesAfter"] = executable_snapshot(clone_build / "bin", clone_dll)
+        require(record["cloneBinariesAfter"] == clone_binaries, "Clone binary bytes changed during tests")
+        record["testExecutionPassed"] = True
+    except BaseException as error:
+        record["error"] = type(error).__name__ + ": " + str(error)
+    finally:
+        cleanup_errors = []
+        record["observedProcesses"], record["actualQtTestOverlapSamples"] = observed, overlap
+        try:
+            write(reports / "actual-process-overlap.json", {"processes": observed, "simultaneousQtTestSamples": overlap})
+        except BaseException as error:
+            cleanup_errors.append("Cannot save partial overlap: " + str(error))
+        record["activeOwnedProcessesBeforeCleanup"] = []
+        record["activeOwnedProcessesAfterCleanup"] = []
+        for handle in jobs:
+            try:
+                record["activeOwnedProcessesBeforeCleanup"].append(processes.active(handle))
+                record["activeOwnedProcessesAfterCleanup"].append(processes.stop(handle))
+            except BaseException as error:
+                cleanup_errors.append(str(error))
+            finally:
+                processes.close(handle)  # owns only child processes started by this script
+        for child in children:
+            try:
+                if child.poll() is None:
+                    child.wait(timeout=20)
+            except BaseException as error:
+                cleanup_errors.append(str(error))
+        for stream in streams:
+            try:
+                stream.close()
+            except BaseException as error:
+                cleanup_errors.append(str(error))
+        record["ownedProcessesExited"] = (not cleanup_errors and all(child.poll() is not None for child in children)
+                                          and not any(record["activeOwnedProcessesAfterCleanup"]))
+        record["cleanupErrors"] = cleanup_errors
+        if sentinel is not None:
+            try:
+                record["sentinelObservation"] = {"requested": True, **sentinel.finish()}
+                record["sentinelObserverUnchanged"] = sha(sentinel_module_path) == sentinel_module_sha
+            except BaseException as error:
+                record["sentinelObservation"] = {"requested": True, "passed": False, "error": str(error)}
+        try:
+            if before_clone is not None:
+                after_clone = snapshot(clone)
+                write(reports / "source-after.json", after_clone)
+                record["sourceFilesUnchanged"] = after_clone == before_clone
+                record["cloneEndIdentity"] = evidence.source_identity(clone, args.head)
+                record["cloneIdentityUnchanged"] = record["cloneEndIdentity"] == original_identity
+            if before_original_source is not None:
+                after_original_source = snapshot(source)
+                write(reports / "original-source-after.json", after_original_source)
+                record["originalSourceBytesUnchanged"] = after_original_source == before_original_source
+            if before_native is not None:
+                after_native = {path: snapshot(Path(path)) for path in before_native}
+                write(reports / "shared-source-after.json", after_native)
+                record["sharedSourceBytesUnchanged"] = after_native == before_native
+            if before_original is not None:
+                record["originalBinariesAfter"] = executable_snapshot(main_build / "release/bin", main_build / "release/bin/git2.dll")
+                record["originalBinariesUnchanged"] = before_original == record["originalBinariesAfter"]
+            record["endIdentity"] = evidence.source_identity(source, args.head)
+            record["originalSourceIdentityUnchanged"] = record["endIdentity"] == original_identity
+            record["mainProducerHashesAfter"] = {name: sha(Path(item["originalPath"])) for name, item in receipt["programs"].items()}
+            record["mainProducersUnchanged"] = record["mainProducerHashesAfter"] == original_producers
+            record["buildRecordUnchanged"] = sha(args.build_record) == initial_receipt_sha
+            record["runnerUnchanged"] = sha(__file__) == runner_sha
+            record["testWrappersUnchanged"] = (len(record.get("testWrapperIdentities", {})) == 2
+                and all(sha(item["path"]) == item["sha256"] for item in record["testWrapperIdentities"].values()))
+            nsis_after = snapshot(nsis_root)
+            write(reports / "nsis-files-after.json", nsis_after)
+            record["nsisToolsUnchanged"] = nsis_after == nsis_before and sha(nsis_lock_path) == record["nsisTool"]["lockSha256"]
+            observed_acl = subprocess.run([pwsh, "-NoProfile", "-File", str(reports / "qcs-owned-acl.ps1"),
+                "-Source", str(source), "-Mode", "inspect"], capture_output=True, cwd=caller, timeout=30)
+            (reports / "original-source-acl-after.stdout.log").write_bytes(observed_acl.stdout)
+            (reports / "original-source-acl-after.stderr.log").write_bytes(observed_acl.stderr)
+            require(observed_acl.returncode == 0, "Cannot inspect original source ACL after run")
+            record["originalSourceAclAfter"] = json.loads(observed_acl.stdout.decode("utf-8-sig"))
+            record["originalSourceAclUnchanged"] = record["originalSourceAclAfter"] == record["originalSourceAclBefore"]
+        except BaseException as error:
+            record["finalVerificationError"] = type(error).__name__ + ": " + str(error)
+        try:
+            if acl_attempted and (reports / "source-original-acl.json").is_file():
+                restoration = subprocess.run([pwsh, "-NoProfile", "-File", str(reports / "qcs-owned-acl.ps1"),
+                    "-Source", str(clone), "-Report", str(reports / "source-original-acl.json"), "-Mode", "restore"],
+                    capture_output=True, cwd=caller, timeout=30)
+                (reports / "acl-restore.stdout.log").write_bytes(restoration.stdout)
+                (reports / "acl-restore.stderr.log").write_bytes(restoration.stderr)
+                record["isolatedSourceAclRestored"] = restoration.returncode == 0
+        except BaseException as error:
+            record["aclRestorationError"] = str(error)
+        record["finishedAt"], record["freeAfterBytes"] = utc(), shutil.disk_usage(root).free
+        record["runBytes"] = run_size(root)
+        required = ("testExecutionPassed", "ownedProcessesExited", "sourceFilesUnchanged", "cloneIdentityUnchanged", "sharedSourceBytesUnchanged",
+                    "originalBinariesUnchanged", "originalSourceBytesUnchanged", "originalSourceIdentityUnchanged", "originalSourceAclUnchanged", "mainProducersUnchanged",
+                    "buildRecordUnchanged", "runnerUnchanged", "testWrappersUnchanged", "nsisToolsUnchanged", "isolatedSourceAclRestored")
+        record["passed"] = all(record.get(key) is True for key in required) and not record.get("error") and not record.get("finalVerificationError")
+        if args.sentinel_launch_record:
+            record["passed"] = record["passed"] and record["sentinelObservation"].get("passed") is True and record.get("sentinelObserverUnchanged") is True
+        write(reports / "qcs-portability-report.json", record)
+        print(json.dumps({"passed": record["passed"], "report": str(reports / "qcs-portability-report.json"),
+                          "error": record.get("error"), "scope": record["scope"]}, ensure_ascii=False, indent=2))
+    return 0 if record["passed"] else 1
+
+
+if __name__ == "__main__":
+    for output in (sys.stdout, sys.stderr):
+        if hasattr(output, "reconfigure"):
+            output.reconfigure(encoding="utf-8", errors="backslashreplace")
+    raise SystemExit(main())

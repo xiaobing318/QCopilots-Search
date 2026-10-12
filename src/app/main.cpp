@@ -37,7 +37,7 @@ void writeCommandLineOutput(const QString &text, bool error = false) {
 
 int main(int argc, char **argv) {
     QApplication application(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("qcopilots-search"));
+    QCoreApplication::setApplicationName(QStringLiteral("qcs"));
     QCoreApplication::setOrganizationName(QStringLiteral("QCopilots"));
     QCoreApplication::setApplicationVersion(QStringLiteral(QCOPILOTS_SEARCH_VERSION));
     QApplication::setApplicationDisplayName(QStringLiteral("QCopilots Search"));

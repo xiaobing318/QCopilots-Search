@@ -13,4 +13,4 @@ DNG 使用本项目构造的 TIFF IFD 和 DNG 1.4 元数据。未压缩梯度值
 
 测试要求真实解码、按像素尺寸验证结果、确认非均匀图像并验证中文文件名下的解码和预览。LibRaw 对 CFA 使用半尺寸处理。其当前后端不支持的整数 16-bit Deflate DNG 不在这些通过的样本范围内。
 
-另有四张固定中文 OCR PNG，由原句与 Noto Sans CJK 2.004 字体经 Qt QPainter 生成。字体来源、SIL Open Font License 1.1 和重现步骤见 `../generator/README.md`，每张图的精确 SHA、像素尺寸和字体 SHA 见 `qcopilots-search-ocr-fixtures.json`。这里只包含文字栅格图，不包含字体软件。测试必须完整识别同一简体和繁体原句，使用固定输入避免依赖宿主已安装字体。
+另有四张固定中文 OCR PNG，由原句与 Noto Sans CJK 2.004 字体经 Qt QPainter 生成。字体来源、SIL Open Font License 1.1 和重现步骤见 `../generator/README.md`，每张图的精确 SHA、像素尺寸和字体 SHA 见 `qcs-ocr-fixtures.json`。这里只包含文字栅格图，不包含字体软件。测试必须完整识别同一简体和繁体原句，使用固定输入避免依赖宿主已安装字体。

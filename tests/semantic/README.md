@@ -1,6 +1,6 @@
 # 真实推理语义验收
 
-`qcopilots-search-tests-semantic` 将文件实际交给生产提取器，再调用锁定的 EmbeddingGemma 运行时生成 768 维向量，通过生产 `IndexRepository` 完成入库和搜索。没有随机向量或预先写好的搜索结果。临时语料、数据库、ANN 和媒体帧全部位于独立 `TestEnvironment` 中。模型目录只读。
+`qcs-tests-semantic` 将文件实际交给生产提取器，再调用锁定的 EmbeddingGemma 运行时生成 768 维向量，通过生产 `IndexRepository` 完成入库和搜索。没有随机向量或预先写好的搜索结果。临时语料、数据库、ANN 和媒体帧全部位于独立 `TestEnvironment` 中。模型目录只读。
 
 语料包含 80 个独立编写的主题说明，其中 20 个主题的正文为中文。每个主题有显式指定的中英文查询和唯一相关文件，前四个主题生成真实 PDF。另有简单图形、英文和中文 OCR 告示、代码、合成语音、电子音及短视频。补充素材包括真实猫照片、卫星合成图、狗叫和风雨录音以及实拍雨景视频。正例总计 222 条。
 
@@ -10,7 +10,7 @@
 
 ## 运行
 
-通过 CTest 运行 `qcopilots-search-tests-semantic-manifest` 可校验固定资产的大小、SHA-256 和语料结构。运行 `qcopilots-search-tests-semantic` 执行完整模型验收。设置 `QCOPILOTS_SEARCH_MODEL_DIR` 和 `QCOPILOTS_SEARCH_TESSDATA_DIR` 后执行，或向程序传入 `--model-dir`、`--tessdata-dir`。
+通过 CTest 运行 `qcs-tests-semantic-manifest` 可校验固定资产的大小、SHA-256 和语料结构。运行 `qcs-tests-semantic` 执行完整模型验收。设置 `QCOPILOTS_SEARCH_MODEL_DIR` 和 `QCOPILOTS_SEARCH_TESSDATA_DIR` 后执行，或向程序传入 `--model-dir`、`--tessdata-dir`。
 
 `--report <路径>` 指定 JSON 报告，优先于 `QCOPILOTS_SEARCH_SEMANTIC_REPORT` 环境变量。`--preserve` 保留当前运行的独立数据。未显式指定报告时，报告写入本次唯一测试目录并保留该目录，避免多个 checkout 或并行运行覆盖同一报告。失败也保留本次临时目录，报告给出实际位置。只有清单检查的运行不会覆盖环境变量指定的模型验收报告。`--smoke` 只验证小规模执行链，报告明确标记为 smoke，不满足发行门槛。所有路径都可以包含空格和中文。
 

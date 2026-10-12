@@ -1,6 +1,7 @@
 // Adapted from DigUp ImageSizingTests.swift, Copyright (c) 2026 Abdur Rahim.
 // SPDX-License-Identifier: MIT
 #include "runtime/ImageSizing.h"
+#include "support/test_environment.h"
 
 #include <QtTest>
 
@@ -34,6 +35,12 @@ QByteArray resize(int width, int height)
 class ImageSizingTest : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void targetSizeFillsBudget_data()
     {
         QTest::addColumn<int>("height");

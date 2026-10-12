@@ -1,11 +1,11 @@
 #include "extraction/legacy_doc_extractor.h"
-#include "../../cmake/qcopilots-search-native-doc-iconv.h"
+#include "../../cmake/qcs-native-doc-iconv.h"
+#include "../support/test_environment.h"
 
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QStandardPaths>
-#include <QTemporaryDir>
 #include <QtTest>
 #include <memory>
 
@@ -13,7 +13,7 @@ using namespace qcopilots_search;
 
 class LegacyDocTests final : public QObject {
     Q_OBJECT
-    std::unique_ptr<QTemporaryDir> temporary_;
+    std::unique_ptr<test::TestTemporaryDir> temporary_;
     QString copyFixture(const QString &name) {
         const QString path = QDir(temporary_->path()).filePath(QStringLiteral("中文 空格 ") + name);
         if (!QFile::copy(QStringLiteral(":/legacy-doc/") + name, path)) return {};
@@ -22,22 +22,26 @@ class LegacyDocTests final : public QObject {
 private slots:
     void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
     void init() {
-        const QString root = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT", QDir::tempPath());
+        QString root = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT");
+        if (root.isEmpty()) root = QDir::tempPath();
         QVERIFY2(QDir().mkpath(root), qPrintable(QStringLiteral("Cannot create test root: ") + root));
-        temporary_ = std::make_unique<QTemporaryDir>(QDir(root).filePath(QStringLiteral("qcopilots-search-tests-doc-XXXXXX")));
+        temporary_ = std::make_unique<test::TestTemporaryDir>(QDir(root).filePath(QStringLiteral("qcs-doc-XXXXXX")));
         QVERIFY2(temporary_->isValid(), qPrintable(temporary_->errorString()));
     }
     void cleanup() {
-        if (!temporary_) return;
-        if (temporary_->isValid() && (QTest::currentTestFailed()
-            || qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS") == 1)) {
-            temporary_->setAutoRemove(false);
-            qInfo().noquote() << "Preserved DOC test artifacts:" << temporary_->path();
-            temporary_.reset();
-            return;
+        QString cleanupError;
+        if (temporary_ && temporary_->isValid()) {
+            if (QTest::currentTestFailed()
+                || qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS") == 1) {
+                temporary_->setAutoRemove(false);
+                qInfo().noquote() << "Preserved DOC test artifacts:" << temporary_->path();
+            } else {
+                if (!temporary_->remove(&cleanupError)) temporary_->setAutoRemove(false);
+            }
         }
-        QVERIFY(temporary_->remove());
         temporary_.reset();
+        cleanupError += test::takeCleanupErrors();
+        QVERIFY2(cleanupError.isEmpty(), qPrintable(cleanupError));
     }
     void fixtureIntegrity_data() {
         QTest::addColumn<QString>("name");
@@ -45,7 +49,7 @@ private slots:
         QTest::newRow("footnote") << QStringLiteral("footnote.doc") << QByteArray("81a18ac63010789ca08c28de107658a308c758a3cfc667a6edf11ffe888d3e13");
         QTest::newRow("table") << QStringLiteral("simple-table.doc") << QByteArray("67d7fe8e0555c16516354498a5935f24eeef90beb5efbf526f93a1d6c734da43");
         QTest::newRow("unicode") << QStringLiteral("HeaderFooterUnicode.doc") << QByteArray("8bd7fc9552bccb7b71a0dc34ffd801e7d3547d1317fd75d0c35fca3572f6fa4b");
-        QTest::newRow("original-Chinese") << QStringLiteral("qcopilots-original.doc") << QByteArray("c7a3174bd536246bff63f6db75f596cc6e5aadf80fb01c48a36878581d35be76");
+        QTest::newRow("original-Chinese") << QStringLiteral("qcs-original.doc") << QByteArray("c7a3174bd536246bff63f6db75f596cc6e5aadf80fb01c48a36878581d35be76");
     }
     void fixtureIntegrity() {
         QFETCH(QString, name);
@@ -87,7 +91,7 @@ private slots:
         QVERIFY2(text.contains(QStringLiteral("The footer, with Molière, has Unicode in it.")), qPrintable(text));
     }
     void originalChineseAndEnglishDocument() {
-        const QString path = copyFixture(QStringLiteral("qcopilots-original.doc"));
+        const QString path = copyFixture(QStringLiteral("qcs-original.doc"));
         QVERIFY(!path.isEmpty());
         QString error;
         const QString text = legacy_doc::extract(path, &error);

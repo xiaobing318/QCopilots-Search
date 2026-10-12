@@ -53,7 +53,7 @@ QJsonObject localCall(ServiceClient &client, const QString &method, const QJsonO
 }
 
 QString serviceDiagnostics(const RuntimePaths &paths, const QJsonObject &status) {
-    QFile log(QDir(paths.logDir).filePath(QStringLiteral("qcopilots-search-service.log")));
+    QFile log(QDir(paths.logDir).filePath(QStringLiteral("qcs-service.log")));
     QString contents;
     if (log.open(QIODevice::ReadOnly)) {
         log.seek(qMax<qint64>(0, log.size() - 16384));
@@ -82,7 +82,7 @@ public:
                 error = QStringLiteral("Service exited with code %1: %2").arg(process.exitCode()).arg(QString::fromUtf8(process.readAllStandardError()));
                 return false;
             }
-            QFile tokenFile(QDir(paths.profileDir).filePath("qcopilots-search-ipc-token"));
+            QFile tokenFile(QDir(paths.profileDir).filePath("qcs-ipc-token"));
             if (tokenFile.open(QIODevice::ReadOnly)) { token = tokenFile.readAll(); tokenFile.close(); }
             if (!token.isEmpty() && call("status").value("ok").toBool()) return true;
             QTest::qWait(20);
@@ -136,6 +136,12 @@ public:
 class ServiceTests final : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
 #ifndef Q_OS_WIN
     void unixLongTemporaryDirectoryUsesStableEndpoint() {
         TestEnvironment environment("service-long-tmpdir");
@@ -412,7 +418,7 @@ private slots:
         QVERIFY2(service.start(), qPrintable(service.error));
         QVERIFY(QFileInfo::exists(paths.lockFile));
         QCOMPARE(RuntimePaths::resolve(paths.profileDir, paths.modelDir).ipcName, paths.ipcName);
-        QCOMPARE(paths.lockFile, QDir(paths.profileDir).filePath(QStringLiteral("qcopilots-search-service.lock")));
+        QCOMPARE(paths.lockFile, QDir(paths.profileDir).filePath(QStringLiteral("qcs-service.lock")));
         const auto status = service.call("status");
         QVERIFY(status.value("ok").toBool());
         QVERIFY(!status.value("result").toObject().value("modelAvailable").toBool());
@@ -765,7 +771,7 @@ private slots:
         // waits for the search pool during destruction.
         const auto releaseGuard = qScopeGuard(releaseBarrier);
         QVERIFY2(service.start(&error), qPrintable(error));
-        QFile tokenFile(QDir(paths.profileDir).filePath("qcopilots-search-ipc-token"));
+        QFile tokenFile(QDir(paths.profileDir).filePath("qcs-ipc-token"));
         QVERIFY(tokenFile.open(QIODevice::ReadOnly));
         const QString token = QString::fromLatin1(tokenFile.readAll());
         tokenFile.close();
@@ -1002,7 +1008,7 @@ private slots:
         if (longPath) while (environment.path(relativeRoot).size() < 320)
             relativeRoot += QStringLiteral("/中文 空格 nested");
         const QString repository = environment.path(relativeRoot);
-        const QString excludesPath = repository + "/.git/qcopilots-search-empty-excludes";
+        const QString excludesPath = repository + "/.git/qcs-empty-excludes";
         QString escapedExcludesPath = QDir::fromNativeSeparators(excludesPath);
         escapedExcludesPath.replace('\\', "\\\\").replace('"', "\\\"");
         const QByteArray config = QByteArray("[core]\nrepositoryformatversion = 0\nbare = false\nlongpaths = false\nexcludesfile = \"")
@@ -1010,7 +1016,7 @@ private slots:
         // A valid empty repository fixture needs no installed Git executable.
         QVERIFY(environment.writeFile(relativeRoot + "/.git/HEAD", "ref: refs/heads/main\n"));
         // User-level ignore patterns must not hide this fixture's untracked source.
-        QVERIFY(environment.writeFile(relativeRoot + "/.git/qcopilots-search-empty-excludes", {}));
+        QVERIFY(environment.writeFile(relativeRoot + "/.git/qcs-empty-excludes", {}));
         QVERIFY(environment.writeFile(relativeRoot + "/.git/config", config));
         QVERIFY(QDir().mkpath(repository + "/.git/objects"));
         QVERIFY(QDir().mkpath(repository + "/.git/refs/heads"));
@@ -1077,7 +1083,7 @@ private slots:
             QVERIFY2(repository.replaceFile(path, indexedVersion + "|partial:40", original.first(40), false, &error), qPrintable(error));
         }
         // Simulate loss of diagnostic state after the authoritative batch commit.
-        const QString journal = QDir(paths.indexDir).filePath("qcopilots-search-progress.json");
+        const QString journal = QDir(paths.indexDir).filePath("qcs-progress.json");
         QVERIFY(!QFileInfo::exists(journal) || QFile::remove(journal));
         {
             ServiceProcess resumed(paths);

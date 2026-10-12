@@ -28,7 +28,7 @@ def check_linux_deployment(options, source, repo, root):
 
     command = [options.cmake, "-S", source / "linux_deploy", "-B", build,
                "-G", options.generator, "-DCMAKE_BUILD_TYPE=Release",
-               f"-DQCOPILOTS_SEARCH_LINUX_DEPLOY_CMAKE={repo / 'cmake/QCopilotsSearchLinuxDeploy.cmake'}"]
+               f"-DQCOPILOTS_SEARCH_LINUX_DEPLOY_CMAKE={repo / 'cmake/qcs-linux-deploy.cmake'}"]
     if options.compiler:
         command.append(f"-DCMAKE_C_COMPILER={options.compiler}")
     if options.qt_cmake_dir:
@@ -51,7 +51,7 @@ def check_linux_deployment(options, source, repo, root):
     records = []
 
     def verify(stage, label):
-        binary = stage / "bin/qcopilots-search-deploy-fixture"
+        binary = stage / "bin/qcs-deploy-fixture"
         for name in (owner, module, transitive):
             if not (stage / "lib" / name).is_file():
                 raise RuntimeError(f"Missing deployed transitive/owned library: {name}")
@@ -75,12 +75,12 @@ def check_linux_deployment(options, source, repo, root):
         run(arguments)
         verify(stage, label)
     run([cpack, "--config", build / "CPackConfig.cmake", "-C", "Release", "-G", "TGZ", "-B", build / "packages"])
-    archive = build / "packages/qcopilots-search-linux-deploy-fixture.tar.gz"
+    archive = build / "packages/qcs-linux-deploy-fixture.tar.gz"
     unpack = root / "linux-deploy" / "package 中文 空格"
     unpack.mkdir()
     with tarfile.open(archive) as package:
         # This archive was generated immediately above from the local fixture.
         # Older supported Python 3.10 installations lack extraction filters.
         package.extractall(unpack, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
-    verify(unpack / "qcopilots-search-linux-deploy-fixture", "linux-cpack-tgz")
+    verify(unpack / "qcs-linux-deploy-fixture", "linux-cpack-tgz")
     return records

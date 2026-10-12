@@ -133,7 +133,7 @@ QString writeImage(const QImage &image, const QString &directory, QString *error
         *error = QStringLiteral("Insufficient temporary space for the next prepared image");
         return {};
     }
-    const QString path = QDir(directory).filePath(QStringLiteral("qcopilots-search-image-%1.png").arg(QUuid::createUuid().toString(QUuid::Id128)));
+    const QString path = QDir(directory).filePath(QStringLiteral("qcs-image-%1.png").arg(QUuid::createUuid().toString(QUuid::Id128)));
     QSaveFile file(path);
     if (!file.open(QIODevice::WriteOnly) || !image.save(&file, "PNG") || !file.commit()) {
         *error = QStringLiteral("Cannot write prepared image: %1").arg(file.errorString());
@@ -299,9 +299,9 @@ QString recognizeText(const QImage &source, const ExtractionOptions &options, QS
     QString directory = options.tessdataDir;
     if (directory.isEmpty()) {
         const QDir applicationDirectory(QCoreApplication::applicationDirPath());
-        QStringList candidates{QStringLiteral("../share/qcopilots-search/tessdata")};
+        QStringList candidates{QStringLiteral("../share/qcs/tessdata")};
 #ifdef Q_OS_MACOS
-        candidates.prepend(QStringLiteral("../Resources/qcopilots-search/tessdata"));
+        candidates.prepend(QStringLiteral("../Resources/qcs/tessdata"));
 #endif
         directory = applicationDirectory.filePath(candidates.first());
         for (const QString &candidate : candidates) {

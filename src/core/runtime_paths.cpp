@@ -159,7 +159,7 @@ RuntimePaths RuntimePaths::resolve(const QString &profile, const QString &models
         const QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
         if (base.isEmpty())
             return paths; // ensure() reports the unavailable platform directory.
-        selectedProfile = QDir(base).filePath(QStringLiteral("qcopilots-search"));
+        selectedProfile = QDir(base).filePath(QStringLiteral("qcs"));
     }
     paths.profileDir = canonicalWithMissingTail(selectedProfile);
     QString selectedModels = models;
@@ -173,20 +173,20 @@ RuntimePaths RuntimePaths::resolve(const QString &profile, const QString &models
     paths.cacheDir = root.filePath(QStringLiteral("cache"));
     paths.logDir = root.filePath(QStringLiteral("logs"));
     paths.tempDir = root.filePath(QStringLiteral("tmp"));
-    paths.configFile = root.filePath(QStringLiteral("qcopilots-search-settings.json"));
-    paths.lockFile = root.filePath(QStringLiteral("qcopilots-search-service.lock"));
+    paths.configFile = root.filePath(QStringLiteral("qcs-settings.json"));
+    paths.lockFile = root.filePath(QStringLiteral("qcs-service.lock"));
     QString identityPath = paths.profileDir;
 #ifdef Q_OS_WIN
     identityPath = identityPath.toCaseFolded();
 #endif
     const QByteArray identity = currentUserIdentity().toUtf8() + '\0' + identityPath.toUtf8();
-    paths.ipcName = QStringLiteral("qcopilots-search-")
+    paths.ipcName = QStringLiteral("qcs-")
         + QString::fromLatin1(QCryptographicHash::hash(identity, QCryptographicHash::Sha256)
                                  .toHex().left(40));
 #ifndef Q_OS_WIN
     // Socket addresses have a much smaller byte budget than filesystem paths.
     // Never derive this location from TMPDIR, the profile or the current cwd.
-    const QString ipcRoot = QStringLiteral("/tmp/qcopilots-search-%1").arg(currentUserIdentity());
+    const QString ipcRoot = QStringLiteral("/tmp/qcs-%1").arg(currentUserIdentity());
     paths.ipcName = QDir(ipcRoot).filePath(paths.ipcName);
 #endif
     return paths;
@@ -216,8 +216,8 @@ bool RuntimePaths::validateIpcDirectory(QString *error) const
 
 bool RuntimePaths::ensure(QString *error) const
 {
-    if (error)
-        error->clear();
+    if (!validateProfileLayout(error))
+        return false;
     const QStringList directories{profileDir, indexDir, cacheDir, logDir, tempDir, modelDir};
     for (qsizetype index = 0; index < directories.size(); ++index) {
         const QString &directory = directories.at(index);
@@ -263,8 +263,56 @@ bool RuntimePaths::ensure(QString *error) const
     return ensureIpcDirectory(error);
 }
 
+bool RuntimePaths::validateProfileLayout(QString *error) const
+{
+    if (error)
+        error->clear();
+    if (profileDir.isEmpty() || !QDir::isAbsolutePath(profileDir)) {
+        if (error)
+            *error = QStringLiteral("An absolute runtime directory is required: %1").arg(profileDir);
+        return false;
+    }
+    if (indexDir.isEmpty() || !QDir::isAbsolutePath(indexDir)) {
+        if (error)
+            *error = QStringLiteral("An absolute runtime directory is required: %1").arg(indexDir);
+        return false;
+    }
+
+    // A new lock/IPC namespace must never start a second writer in an old
+    // profile. Inspect only the known persistent entry points, including
+    // dangling links, before ensure() creates any new layout directories.
+    const QDir root(profileDir);
+    QStringList legacyPaths;
+    for (const auto &name : {QStringLiteral("qcopilots-search-settings.json"),
+                             QStringLiteral("qcopilots-search-service.lock"),
+                             QStringLiteral("qcopilots-search-ipc-token")}) {
+        const QFileInfo entry(root.filePath(name));
+        if (entry.exists() || entry.isSymbolicLink())
+            legacyPaths.append(entry.filePath());
+    }
+    const QDir index(indexDir);
+    const auto entries = index.entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System
+                                             | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QFileInfo &entry : entries) {
+        const QString name = entry.fileName();
+        if (name == QStringLiteral("qcopilots-search.sqlite3")
+            || name.startsWith(QStringLiteral("qcopilots-search.sqlite3-"))
+            || name == QStringLiteral("qcopilots-search-progress.json")
+            || name.startsWith(QStringLiteral("qcopilots-search-ann-")))
+            legacyPaths.append(entry.filePath());
+    }
+    if (!legacyPaths.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("legacy_profile_layout: This directory contains an older profile (%1). "
+                                    "Select a new empty --profile-dir. Existing files were not changed.")
+                         .arg(legacyPaths.first());
+        return false;
+    }
+    return true;
+}
+
 QString RuntimePaths::databaseFile() const
 {
-    return QDir(indexDir).filePath(QStringLiteral("qcopilots-search.sqlite3"));
+    return QDir(indexDir).filePath(QStringLiteral("qcs.sqlite3"));
 }
 } // namespace qcopilots_search

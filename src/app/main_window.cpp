@@ -461,7 +461,7 @@ void MainWindow::updateProgress(const QJsonObject &value) {
 }
 void MainWindow::showSettings(bool firstRun) {
     if (auto *existing = findChild<SettingsDialog *>()) { existing->raise(); existing->activateWindow(); return; }
-    const QString platformDefault = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)).filePath(QStringLiteral("qcopilots-search"));
+    const QString platformDefault = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)).filePath(QStringLiteral("qcs"));
     const bool defaultProfile = !QStandardPaths::isTestModeEnabled()
         && !qEnvironmentVariableIsSet("QCOPILOTS_SEARCH_PROFILE_DIR")
         && paths_.profileDir == RuntimePaths::resolve(platformDefault).profileDir;

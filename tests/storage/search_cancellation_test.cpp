@@ -15,6 +15,12 @@ using qcopilots_search::test::TestEnvironment;
 class SearchCancellationTest : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup()
+    {
+        const auto error = qcopilots_search::test::takeCleanupErrors();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
     void cancelFromInsideSqliteVirtualMachineReleasesReader()
     {
         TestEnvironment environment(QStringLiteral("running-sqlite-cancellation"));

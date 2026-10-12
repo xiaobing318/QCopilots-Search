@@ -47,8 +47,8 @@ QJsonObject success(const QJsonValue &id, const QJsonObject &result)
             {QStringLiteral("result"), result}};
 }
 
-constexpr auto temporaryMarker = "qcopilots-search-worker-owner.json";
-constexpr auto temporaryLock = "qcopilots-search-worker-lock";
+constexpr auto temporaryMarker = "qcs-worker-owner.json";
+constexpr auto temporaryLock = "qcs-worker-lock";
 
 // Only reclaim directories carrying our exact profile marker and an abandoned
 // lock. A parallel worker's lock prevents its media from being removed.
@@ -57,7 +57,7 @@ void reclaimAbandonedJobs(const RuntimePaths &paths)
     const QDir temporaryRoot(paths.tempDir);
     const auto canonicalRoot = QFileInfo(paths.tempDir).canonicalFilePath();
     if (canonicalRoot.isEmpty()) return;
-    const auto jobs = temporaryRoot.entryInfoList({QStringLiteral("qcopilots-search-worker-*")},
+    const auto jobs = temporaryRoot.entryInfoList({QStringLiteral("qcs-worker-*")},
         QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
     for (const auto &job : jobs) {
         if (QFileInfo(job.absolutePath()).canonicalFilePath() != canonicalRoot) continue;
@@ -345,7 +345,7 @@ private:
         QString error;
         if (embed && !loadRuntime(false, &error))
             return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("model_unavailable"), error);
-        QTemporaryDir temporary(QDir(paths_.tempDir).filePath(QStringLiteral("qcopilots-search-worker-XXXXXX")));
+        QTemporaryDir temporary(QDir(paths_.tempDir).filePath(QStringLiteral("qcs-worker-XXXXXX")));
         if (!temporary.isValid())
             return failure(id, QStringLiteral("temporary_directory"), QStringLiteral("Cannot create isolated worker temporary directory: %1").arg(temporary.errorString()));
         QLockFile jobLock(nativeLockFilePath(QDir(temporary.path()).filePath(QString::fromLatin1(temporaryLock))));
@@ -443,7 +443,7 @@ int main(int argc, char **argv)
     qputenv("QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES", "1");
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");
     QGuiApplication application(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("qcopilots-search-worker"));
+    QCoreApplication::setApplicationName(QStringLiteral("qcs-worker"));
     QCoreApplication::setApplicationVersion(QStringLiteral(QCOPILOTS_SEARCH_VERSION));
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("Isolated QCopilots Search extraction and embedding worker. NDJSON protocol on standard input/output."));
@@ -475,8 +475,8 @@ int main(int argc, char **argv)
     if (tessdata.isEmpty()) tessdata = qEnvironmentVariable("QCOPILOTS_SEARCH_TESSDATA_DIR");
     if (tessdata.isEmpty()) {
         const QDir applicationDir(QCoreApplication::applicationDirPath());
-        for (const auto &relative : {QStringLiteral("tessdata"), QStringLiteral("../share/qcopilots-search/tessdata"),
-                                    QStringLiteral("../Resources/qcopilots-search/tessdata"),
+        for (const auto &relative : {QStringLiteral("tessdata"), QStringLiteral("../share/qcs/tessdata"),
+                                    QStringLiteral("../Resources/qcs/tessdata"),
                                     QStringLiteral("../Resources/tessdata")}) {
             const auto candidate = applicationDir.absoluteFilePath(relative);
             if (QFileInfo::exists(QDir(candidate).filePath(QStringLiteral("eng.traineddata")))) {
