@@ -1036,8 +1036,13 @@ class ExecutionWorkingDirectoryTests(unittest.TestCase):
             # It needs no synthetic Git checkout or external Git cwd support.
             selected = cases[:-1] if both_roots_long else cases
             environment = os.environ.copy()
-            if both_roots_long:
-                environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(self.long_root)
+            # Keep the nested Git fixture in an explicitly owned original root.
+            # An unset inherited variable must not move it into the overridden
+            # long tempfile root and accidentally test Git's own cwd limit.
+            original_fixture_root = min((self.root, self.launcher),
+                key=lambda path: len(str(path).encode("utf-16-le")))
+            environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(
+                self.long_root if both_roots_long else original_fixture_root)
             result = subprocess.run([*command, *selected, "-v"], cwd=self.absolute_output_cwd,
                 env=environment, capture_output=True, text=True, encoding="utf-8", timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1057,7 +1062,7 @@ class ExecutionProvenanceTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="qcopilots-search-provenance-中文 ",
             dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT"))
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         launcher = tempfile.TemporaryDirectory(prefix="qcopilots-search-cwd-")
         self.addCleanup(launcher.cleanup)
         self.launcher = Path(launcher.name).resolve()
@@ -1085,11 +1090,14 @@ class ExecutionProvenanceTests(unittest.TestCase):
             *[str(path) for path in self.programs.values()]]
 
     def git(self, *arguments):
-        return subprocess.run(["git", "-c", "user.name=Validator fixture",
+        result = subprocess.run(["git", "-c", "user.name=Validator fixture",
             "-c", "user.email=validator@example.invalid", "-c", "commit.gpgsign=false",
             "-c", "core.autocrlf=false", "-c", "core.fsmonitor=false",
             "-c", f"core.hooksPath={self.hooks}", "-C", str(self.source), *arguments],
-            env=self.environment, capture_output=True, text=True, encoding="utf-8", check=True)
+            env=self.environment, capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0,
+            f"Synthetic Git fixture command failed: {arguments!r}\n{result.stdout}\n{result.stderr}")
+        return result
 
     def build(self):
         return evidence.record_build(self.source, self.root / "recorded builds",
@@ -1145,7 +1153,7 @@ class ExecutionProvenanceTests(unittest.TestCase):
         build_path = Path(json.loads(result.stdout)["record"])
         build = evidence.read_json(build_path)
         self.assertTrue(build["passed"])
-        self.assertTrue(build_path.is_relative_to(parent))
+        self.assertTrue(build_path.resolve().is_relative_to(parent.resolve()))
         self.assertEqual(evidence.verified_build(build_path.parent, build), [])
         local_command = self.local_command(
             f"assert pathlib.Path({input_argument!r}).read_text()=='explicit cwd'\n")
@@ -1159,7 +1167,7 @@ class ExecutionProvenanceTests(unittest.TestCase):
         local_path = Path(json.loads(result.stdout)["record"])
         local = evidence.read_json(local_path)
         self.assertTrue(local["passed"])
-        self.assertTrue(local_path.is_relative_to(parent))
+        self.assertTrue(local_path.resolve().is_relative_to(parent.resolve()))
         self.assertEqual(evidence.inspect_local_run(local_path.parent, local, "physical", build["identity"]), [])
         for receipt in (build, local):
             execution = receipt["execution"]
