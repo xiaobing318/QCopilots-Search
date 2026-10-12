@@ -15,10 +15,11 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,70 @@ def write_json(path, value):
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def verify_preserved_corpus(semantic, test_runs):
+    """Check original semantic inputs in this candidate's isolated test tree.
+
+    Do not regenerate or relocate files, and never rewrite preservedRoot in the
+    producer's report. Later latency and Computer Use runs need these exact bytes.
+    """
+    def ordinary(path, directory):
+        try:
+            info = path.lstat()
+        except OSError as error:
+            raise ValueError(f"Preserved semantic input is missing or unreadable: {path}") from error
+        require(not stat.S_ISLNK(info.st_mode)
+                and not getattr(info, "st_file_attributes", 0) & 0x400,
+                f"Preserved semantic input redirects through a link: {path}")
+        require(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode),
+                f"Preserved semantic input has the wrong file type: {path}")
+
+    boundary = Path(test_runs).absolute()
+    ordinary(boundary, True)
+    boundary = boundary.resolve()
+    value = semantic.get("preservedRoot")
+    require(isinstance(value, str) and bool(value.strip()) and Path(value).is_absolute(),
+            "Semantic preservedRoot must be an existing absolute directory")
+    preserved = Path(value)
+    require(".." not in preserved.parts and preserved != boundary
+            and preserved.is_relative_to(boundary),
+            "Semantic preservedRoot is outside this candidate's test run directory")
+    current = preserved
+    while current != boundary:
+        ordinary(current, True)
+        current = current.parent
+    corpus = preserved / "corpus"
+    ordinary(corpus, True)
+    files = semantic.get("files")
+    require(isinstance(files, list) and bool(files), "Semantic corpus file manifest is empty")
+    verified, seen = [], set()
+    for item in files:
+        require(isinstance(item, dict), "Semantic corpus file entry must be an object")
+        relative = item.get("file")
+        require(isinstance(relative, str), "Semantic corpus file path must be text")
+        name = PurePosixPath(relative)
+        require(relative == name.as_posix() and bool(name.parts) and not name.is_absolute()
+                and not any(part in ("..", ".") for part in name.parts)
+                and "\\" not in relative and ":" not in relative,
+                "Semantic corpus file path must be canonical and relative")
+        path = corpus.joinpath(*name.parts)
+        identity = os.path.normcase(str(path))
+        require(identity not in seen, "Semantic corpus contains a duplicate file path")
+        seen.add(identity)
+        for index in range(1, len(name.parts) + 1):
+            ordinary(corpus.joinpath(*name.parts[:index]), index < len(name.parts))
+        expected = item.get("sha256")
+        require(isinstance(expected, str) and re.fullmatch(r"[0-9a-f]{64}", expected),
+                "Semantic corpus file requires a complete SHA-256")
+        actual = file_info(path)
+        require(actual["sha256"] == expected, f"Preserved semantic corpus bytes changed: {relative}")
+        if "bytes" in item:
+            require(type(item["bytes"]) is int and item["bytes"] == actual["bytes"],
+                    f"Preserved semantic corpus byte count differs: {relative}")
+        verified.append({"file": relative, **actual})
+    return {"verified": True, "preservedRoot": str(preserved), "corpus": str(corpus),
+            "fileCount": len(verified), "files": verified}
 
 
 def cache_directory(cache, key):
@@ -275,9 +340,10 @@ def execute(args, plan):
     tests = root / "tests"
     record = {"schemaVersion": 2, "kind": "full-ctest-execution", "classification": "execution-record",
               "passed": False, "startedAt": now(), "reportRoot": str(root),
-              "plan": plan, "errors": [], "archives": []}
+              "plan": plan, "errors": [], "archives": [], "semanticCorpusVerified": False}
     evidence = None
     before = initial_binaries = None
+    semantic = preserved_corpus = None
     bin_dir = args.build_root / "release" / "bin"
     receipt_digest = runner_digest = None
     bound_inputs = {}
@@ -459,6 +525,8 @@ def execute(args, plan):
                                        record["archives"], origin="Original semantic executable JSON, written during this run")
         semantic = evidence.read_json(semantic_path)
         semantic_errors = evidence.validate_semantic(semantic)
+        preserved_corpus = verify_preserved_corpus(semantic, args.build_root / "runs")
+        record["semanticCorpusVerified"] = True
         if len(semantic.get("queries", [])) < 222 or semantic.get("actualEmbeddedSegments", 0) < 1310:
             semantic_errors.append("The full 222-query/1310-vector acceptance scale was not reached")
         if len(semantic.get("files", [])) < 138:
@@ -471,6 +539,7 @@ def execute(args, plan):
                             "actualEmbeddedSegments": semantic.get("actualEmbeddedSegments"),
                             "modelFingerprint": semantic.get("modelFingerprint"),
                             "extractionFingerprint": semantic.get("extractionFingerprint"),
+                            "preservedCorpus": preserved_corpus,
                             "metrics": semantic.get("metrics"), "noAnswerSummary": semantic.get("noAnswerSummary")}
         semantic_summary_path = root / "derived" / "semantic-summary.json"
         write_json(semantic_summary_path, semantic_summary)
@@ -520,6 +589,11 @@ def execute(args, plan):
             except Exception as error:
                 record["errors"].append(str(error))
         try:
+            if preserved_corpus is not None:
+                record["semanticCorpusVerified"] = False
+                record["semanticCorpusVerified"] = (
+                    verify_preserved_corpus(semantic, args.build_root / "runs") == preserved_corpus)
+                require(record["semanticCorpusVerified"], "Preserved semantic corpus changed before completion")
             record["runnerUnchanged"] = runner_digest is not None and digest(Path(__file__)) == runner_digest
             record["buildRecordUnchanged"] = receipt_digest is not None and digest(args.build_record) == receipt_digest
             for item in record["archives"]:
@@ -535,7 +609,8 @@ def execute(args, plan):
         record["passed"] = (not record["errors"] and record.get("exitCode") == 0
                             and all(record.get(key) is True for key in
                                     ("sourceUnchanged", "binariesUnchanged", "runnerUnchanged", "buildRecordUnchanged",
-                                     "archivedBuildPassed", "caseEvidencePassed", "referencePassed", "semanticPassed")))
+                                     "archivedBuildPassed", "caseEvidencePassed", "referencePassed", "semanticPassed",
+                                     "semanticCorpusVerified")))
         try:
             write_json(tests / "execution-record.json", record)
             summarize_execution(root, record)

@@ -59,6 +59,8 @@ Python 执行型入口默认只检查或展示计划，添加 `--execute` 才实
 
 候选 CTest 记录还保存 `tests/support/temp_paths.py` 的原始副本和 SHA-256，并在执行结束后再次校验。该共享临时路径 helper 同时属于完整源码提交身份，不能在冻结候选测试期间修改。
 
+语义用例成功后保留其独立运行目录。候选运行器按原始报告的 `preservedRoot` 检查 corpus，要求目录位于本次构建根的 `runs` 下、没有目录重定向，且每个原始文件与报告 SHA-256 一致。检查结果写入派生摘要，结束前再次验证，并作为完整 CTest 成功门槛。服务延迟和 Computer Use 准备继续使用这些原字节，不重新生成 PDF 等样本，也不改写原报告的路径。
+
 ## 百万验收的完整执行记录
 
 沿用上面的 `$qcsSource`、`$qcsBuildRoot`、`$qcsPython`、`$qcsPowerShell` 和 `$qcsBuildRecord`。另将 `$qcsQtPrefix` 设置为具体的 Qt kit 目录，例如本机 Qt 安装根内的 `6.12.0/msvc2022_64`。必须先结束构建、CTest、其他容量运行和产品进程。默认需要至少 10.375 GiB 可用空间，包括监视器的缓冲预算。

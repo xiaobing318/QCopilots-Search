@@ -35,14 +35,20 @@ def require_identity(path: Path, expected: tuple[int, int]) -> None:
         raise RuntimeError(f"Directory identity changed: {path}")
 
 
-def cleanup_run(root: Path, root_id: tuple[int, int], run: Path,
-                run_id: tuple[int, int]) -> None:
-    """Reject replaced roots and reparse points instead of following them."""
+def validate_run(root: Path, root_id: tuple[int, int], run: Path,
+                 run_id: tuple[int, int], children: dict[Path, tuple[int, int]] | None = None) -> None:
+    """Validate evidence ownership before either retaining or deleting it."""
     require_identity(root, root_id)
     if run.parent != root or not run.name.startswith("qcs-t-"):
         raise RuntimeError(f"Cleanup boundary violation: {run}")
     require_identity(run, run_id)
-    for current, directories, files in os.walk(run, followlinks=False):
+    for child, expected in (children or {}).items():
+        if child.parent != run:
+            raise RuntimeError(f"Test child directory boundary violation: {child}")
+        require_identity(child, expected)
+    def on_error(error):
+        raise error
+    for current, directories, files in os.walk(run, followlinks=False, onerror=on_error):
         for name in directories + files:
             item = Path(current) / name
             info = item.lstat()
@@ -50,6 +56,14 @@ def cleanup_run(root: Path, root_id: tuple[int, int], run: Path,
                 raise RuntimeError(f"Refusing cleanup across a link or reparse point: {item}")
     require_identity(root, root_id)
     require_identity(run, run_id)
+    for child, expected in (children or {}).items():
+        require_identity(child, expected)
+
+
+def cleanup_run(root: Path, root_id: tuple[int, int], run: Path,
+                run_id: tuple[int, int]) -> None:
+    """Reject replaced roots and reparse points instead of following them."""
+    validate_run(root, root_id, run, run_id)
     shutil.rmtree(run)
     if run.exists() or run.is_symlink():
         raise RuntimeError(f"Test directory remains after cleanup: {run}")
@@ -109,6 +123,7 @@ def run_test(args: argparse.Namespace) -> int:
     root_id: tuple[int, int] | None = None
     run: Path | None = None
     run_id: tuple[int, int] | None = None
+    child_directories: dict[Path, tuple[int, int]] = {}
     child: subprocess.Popen[Any] | None = None
     old_handlers: dict[int, Any] = {}
     interrupted: list[int] = []
@@ -142,6 +157,7 @@ def run_test(args: argparse.Namespace) -> int:
                       workingDirectory=str(cwd), testRoot=str(temporary))
         cwd.mkdir()
         temporary.mkdir()
+        child_directories = {cwd: identity(cwd), temporary: identity(temporary)}
         env = os.environ.copy()
         env.update(QCOPILOTS_SEARCH_TEST_ROOT=str(temporary),
                    QCOPILOTS_SEARCH_TEST_RUN_DIR=str(run),
@@ -181,7 +197,15 @@ def run_test(args: argparse.Namespace) -> int:
             keep = report["exitCode"] != 0 and (
                 args.keep_failed or os.environ.get("QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS") == "1"
                 or os.environ.get("QCOPILOTS_SEARCH_KEEP_FAILED_TESTS") == "1")
-            if keep or (child is not None and child.poll() is None):
+            if report["exitCode"] == 0 and getattr(args, "keep_success", False):
+                report["retained"] = True
+                report["retentionReason"] = "requested-success"
+                try:
+                    validate_run(root, root_id, run, run_id, child_directories)
+                except (OSError, RuntimeError) as error:
+                    report["retentionError"] = str(error)
+                    report["exitCode"] = FAILURE
+            elif keep or (child is not None and child.poll() is None):
                 report["retained"] = True
             else:
                 report["cleanup"]["attempted"] = True
@@ -217,6 +241,8 @@ def main() -> int:
     parser.add_argument("--label", required=True)
     parser.add_argument("--root", required=True)
     parser.add_argument("--keep-failed", action="store_true")
+    parser.add_argument("--keep-success", action="store_true",
+                        help="Retain successful test artifacts for downstream acceptance checks")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command and args.command[0] == "--":

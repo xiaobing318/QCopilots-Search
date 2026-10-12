@@ -3,7 +3,7 @@
 # concurrent invocations and must never hold writable test state.
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 function(qcopilots_search_add_test)
-  cmake_parse_arguments(PARSE_ARGV 0 _test "COMMAND_EXPAND_LISTS" "NAME;WORKING_DIRECTORY" "COMMAND;CONFIGURATIONS")
+  cmake_parse_arguments(PARSE_ARGV 0 _test "COMMAND_EXPAND_LISTS;KEEP_SUCCESS_ARTIFACTS" "NAME;WORKING_DIRECTORY" "COMMAND;CONFIGURATIONS")
   if(NOT _test_NAME MATCHES "^qcs-tests-" OR NOT _test_COMMAND)
     message(FATAL_ERROR "Owned tests require a qcs-tests- name and an explicit command")
   endif()
@@ -14,9 +14,13 @@ function(qcopilots_search_add_test)
   if(_test_CONFIGURATIONS)
     list(APPEND _extra CONFIGURATIONS ${_test_CONFIGURATIONS})
   endif()
+  set(_runner_options)
+  if(_test_KEEP_SUCCESS_ARTIFACTS)
+    list(APPEND _runner_options --keep-success)
+  endif()
   add_test(NAME "${_test_NAME}" COMMAND "${Python3_EXECUTABLE}" -B
     "${PROJECT_SOURCE_DIR}/tools/qcs-test-runner.py"
-    --label "${_test_NAME}" --root "${QCOPILOTS_SEARCH_TEST_ROOT}"
+    --label "${_test_NAME}" --root "${QCOPILOTS_SEARCH_TEST_ROOT}" ${_runner_options}
     -- ${_test_COMMAND} ${_extra})
   set_tests_properties("${_test_NAME}" PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 endfunction()

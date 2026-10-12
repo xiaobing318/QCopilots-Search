@@ -19,7 +19,7 @@ else()
 endif()
 set_tests_properties(qcs-tests-semantic-manifest PROPERTIES
   LABELS "unit;semantic" ENVIRONMENT "QT_QPA_PLATFORM=${_qcopilots_semantic_platform}")
-qcopilots_search_add_test(NAME qcs-tests-semantic
+qcopilots_search_add_test(NAME qcs-tests-semantic KEEP_SUCCESS_ARTIFACTS
   COMMAND "$<TARGET_FILE:qcs-tests-semantic>")
 set_tests_properties(qcs-tests-semantic PROPERTIES
   LABELS "real-model;semantic;release-acceptance" RUN_SERIAL TRUE TIMEOUT 21600

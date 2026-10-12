@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -155,6 +156,126 @@ class CandidateContracts(unittest.TestCase):
         module.write_json(self.root / "derived/qt-test-cases.json", {"releaseComplete": False, "errors": ["missing"]})
         with self.assertRaisesRegex(ValueError, "complete individual-case"):
             module.summarize_execution(self.root, record)
+
+
+class PreservedSemanticContracts(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="qcs-sc-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.runs = self.root / "runs"
+        self.preserved = self.runs / "qcs-t-wrapper" / "tmp" / "qcs-t-semantic"
+        self.corpus = self.preserved / "corpus"
+        self.corpus.mkdir(parents=True)
+        self.original = self.corpus / "中文 example.pdf"
+        self.original.write_bytes(b"synthetic unit bytes, never a real semantic fixture")
+        self.report = {"syntheticTestOnly": True, "preservedRoot": str(self.preserved),
+                       "files": [{"file": self.original.name, "sha256": module.digest(self.original)}]}
+
+    def verify(self):
+        return module.verify_preserved_corpus(self.report, self.runs)
+
+    def test_original_corpus_verified_without_changing_report_or_bytes(self):
+        before_report = json.dumps(self.report, ensure_ascii=False, sort_keys=True)
+        before_bytes = self.original.read_bytes()
+        checked = self.verify()
+        self.assertTrue(checked["verified"])
+        self.assertEqual(checked["fileCount"], 1)
+        self.assertEqual(checked["files"][0]["sha256"], self.report["files"][0]["sha256"])
+        self.assertEqual(checked["files"][0]["bytes"], len(before_bytes))
+        self.assertEqual(before_report, json.dumps(self.report, ensure_ascii=False, sort_keys=True))
+        self.assertEqual(before_bytes, self.original.read_bytes())
+
+    def test_removed_wrapper_corpus_cannot_claim_preservation(self):
+        self.original.unlink()
+        self.corpus.rmdir()
+        with self.assertRaisesRegex(ValueError, "missing or unreadable"):
+            self.verify()
+
+    def test_changed_original_bytes_are_rejected(self):
+        self.original.write_bytes(b"regenerated content")
+        with self.assertRaisesRegex(ValueError, "bytes changed"):
+            self.verify()
+
+    def test_missing_original_file_is_rejected(self):
+        self.original.unlink()
+        with self.assertRaisesRegex(ValueError, "missing or unreadable"):
+            self.verify()
+
+    def test_missing_relative_or_external_preserved_root_is_rejected(self):
+        for value in (None, "", "relative", str(self.root), str(self.runs)):
+            with self.subTest(value=value):
+                self.report["preservedRoot"] = value
+                with self.assertRaisesRegex(ValueError, "absolute directory|outside this candidate"):
+                    self.verify()
+
+    def test_escaped_or_noncanonical_manifest_paths_are_rejected(self):
+        for value in ("", "../foreign", "/foreign", "a/../foreign", "a//foreign", "./foreign", "a\\foreign", "C:foreign"):
+            with self.subTest(value=value):
+                self.report["files"][0]["file"] = value
+                with self.assertRaisesRegex(ValueError, "canonical and relative"):
+                    self.verify()
+
+    def test_empty_duplicate_or_invalid_manifest_is_rejected(self):
+        entry = self.report["files"][0]
+        for files in ([], None, [None], [entry, dict(entry)]):
+            with self.subTest(files=files):
+                self.report["files"] = files
+                with self.assertRaisesRegex(ValueError, "manifest is empty|must be an object|duplicate file"):
+                    self.verify()
+
+    def test_existing_nested_files_remain_within_corpus(self):
+        nested = self.corpus / "目录 with space" / "text.txt"
+        nested.parent.mkdir()
+        nested.write_text("original nested bytes", encoding="utf-8")
+        self.report["files"].append({"file": nested.relative_to(self.corpus).as_posix(),
+                                     "sha256": module.digest(nested)})
+        self.assertEqual(self.verify()["fileCount"], 2)
+
+    if os.name == "nt":
+        def test_windows_case_alias_does_not_count_as_another_file(self):
+            entry = dict(self.report["files"][0])
+            entry["file"] = entry["file"].upper()
+            self.report["files"].append(entry)
+            with self.assertRaisesRegex(ValueError, "duplicate file"):
+                self.verify()
+
+    def test_complete_hash_and_optional_byte_count_are_enforced(self):
+        for value in (None, "abc", "A" * 64):
+            with self.subTest(hash=value):
+                self.report["files"][0]["sha256"] = value
+                with self.assertRaisesRegex(ValueError, "complete SHA-256"):
+                    self.verify()
+        self.report["files"][0]["sha256"] = module.digest(self.original)
+        self.report["files"][0]["bytes"] = self.original.stat().st_size
+        self.assertTrue(self.verify()["verified"])
+        self.report["files"][0]["bytes"] += 1
+        with self.assertRaisesRegex(ValueError, "byte count differs"):
+            self.verify()
+
+    def test_directory_cannot_replace_a_manifest_file(self):
+        self.original.unlink()
+        self.original.mkdir()
+        with self.assertRaisesRegex(ValueError, "wrong file type"):
+            self.verify()
+
+    def test_real_directory_redirect_cannot_supply_preserved_corpus(self):
+        target = self.root / "foreign corpus"
+        self.corpus.rename(target)
+        if os.name == "nt":
+            result = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(self.corpus), str(target)],
+                                    cwd=self.root, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.corpus.symlink_to(target, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(ValueError, "redirects through a link"):
+                self.verify()
+        finally:
+            if os.name == "nt":
+                os.rmdir(self.corpus)
+            else:
+                self.corpus.unlink()
 
 
 if __name__ == "__main__":

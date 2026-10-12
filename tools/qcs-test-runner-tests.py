@@ -45,11 +45,14 @@ class TestRunner(unittest.TestCase):
 
     def invoke(self, code: str, *, root: Path | None = None,
                env: dict[str, str] | None = None, keep: bool = False,
+               keep_success: bool = False,
                label: str = "portable 中文", cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         command = [sys.executable, str(RUNNER), "--label", label,
                    "--root", str(root or self.root)]
         if keep:
             command.append("--keep-failed")
+        if keep_success:
+            command.append("--keep-success")
         command.extend(["--", sys.executable, "-c", code])
         return subprocess.run(command, cwd=cwd or self.base, env=env or self.env,
                               encoding="utf-8", errors="replace", capture_output=True,
@@ -76,6 +79,87 @@ class TestRunner(unittest.TestCase):
         report, = self.reports()
         self.assertFalse(report["passed"])
         self.assertTrue(report["cleanup"]["succeeded"])
+
+    def test_explicit_success_retains_original_artifact_bytes(self) -> None:
+        code = ("import os; from pathlib import Path; "
+                "p=Path(os.environ['QCOPILOTS_SEARCH_TEST_ROOT'])/'corpus'; p.mkdir(); "
+                "(p/'original.bin').write_bytes(bytes(range(256)))")
+        result = self.invoke(code, keep_success=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report, = self.reports()
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["retained"])
+        self.assertEqual(report["retentionReason"], "requested-success")
+        self.assertFalse(report["cleanup"]["attempted"])
+        self.assertEqual((Path(report["testRoot"]) / "corpus/original.bin").read_bytes(), bytes(range(256)))
+
+    def test_keep_success_does_not_change_failure_cleanup(self) -> None:
+        result = self.invoke("raise SystemExit(23)", keep_success=True)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        report, = self.reports()
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["retained"])
+        self.assertTrue(report["cleanup"]["succeeded"])
+
+    def test_cmake_registration_only_retains_explicitly_selected_test(self) -> None:
+        source = RUNNER.parent.parent
+        registration = (source / "tests/CMakeLists.txt").read_text(encoding="utf-8")
+        start = registration.index("function(qcopilots_search_add_test)")
+        helper = registration[start:registration.index("endfunction()", start) + len("endfunction()")]
+        project = self.base / "cmake fixture"
+        project.mkdir()
+        (project / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.28)\nproject(qcs-retention NONE)\nenable_testing()\n"
+            f'set(PROJECT_SOURCE_DIR "{source.as_posix()}")\n'
+            f'set(Python3_EXECUTABLE "{Path(sys.executable).as_posix()}")\n'
+            f'set(QCOPILOTS_SEARCH_TEST_ROOT "{self.root.as_posix()}")\n' + helper + "\n"
+            'qcopilots_search_add_test(NAME qcs-tests-default COMMAND "${CMAKE_COMMAND}" -E true)\n'
+            'qcopilots_search_add_test(NAME qcs-tests-kept KEEP_SUCCESS_ARTIFACTS COMMAND "${CMAKE_COMMAND}" -E true)\n',
+            encoding="utf-8")
+        build = self.base / "cmake build"
+        configured = subprocess.run(["cmake", "-S", str(project), "-B", str(build)],
+                                    cwd=self.base, env=self.env, capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace", timeout=30)
+        self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+        listing = subprocess.run(["ctest", "--test-dir", str(build), "-C", "Release", "--show-only=json-v1"],
+                                 cwd=self.base, env=self.env, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=30)
+        self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+        commands = {test["name"]: test["command"] for test in json.loads(listing.stdout)["tests"]}
+        self.assertNotIn("--keep-success", commands["qcs-tests-default"])
+        self.assertIn("--keep-success", commands["qcs-tests-kept"])
+        self.assertLess(commands["qcs-tests-kept"].index("--keep-success"), commands["qcs-tests-kept"].index("--"))
+
+    def test_keep_success_rejects_replaced_temporary_directory(self) -> None:
+        code = ("import os; from pathlib import Path; "
+                "p=Path(os.environ['QCOPILOTS_SEARCH_TEST_ROOT']); p.rename(p.with_name('original-tmp')); "
+                "p.mkdir(); (p/'foreign').write_text('preserve')")
+        result = self.invoke(code, keep_success=True)
+        self.assertEqual(result.returncode, MODULE.FAILURE, result.stderr)
+        report, = self.reports()
+        self.assertEqual(report["childExitCode"], 0)
+        self.assertFalse(report["passed"])
+        self.assertIn("identity changed", report["retentionError"])
+        self.assertEqual((Path(report["testRoot"]) / "foreign").read_text(), "preserve")
+
+    def test_keep_success_rejects_replaced_run_identity(self) -> None:
+        args = argparse.Namespace(root=str(self.root), label="retain-replaced", keep_failed=False,
+                                  keep_success=True, command=[sys.executable, "-c", "pass"])
+        original = MODULE.validate_run
+        def replace(root, root_id, run, run_id, children=None):
+            run.rename(root / "original-run")
+            run.mkdir()
+            (run / "foreign").write_text("preserve")
+            return original(root, root_id, run, run_id, children)
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(MODULE, "validate_run", side_effect=replace), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = MODULE.run_test(args)
+        self.assertEqual(result, MODULE.FAILURE)
+        report, = self.reports()
+        self.assertFalse(report["passed"])
+        self.assertIn("identity changed", report["retentionError"])
+        self.assertEqual((Path(report["runDirectory"]) / "foreign").read_text(), "preserve")
 
     def test_keep_failed_switch_preserves_artifacts(self) -> None:
         result = self.invoke("from pathlib import Path; Path('evidence').write_text('failure'); "
