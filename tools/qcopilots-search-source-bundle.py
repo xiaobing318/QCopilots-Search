@@ -38,6 +38,51 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def refresh_package_checksums(output: Path, produced: list[Path]):
+    """Retain verified package entries and add this invocation's completed outputs."""
+    output = output.resolve()
+    destination = output / "SHA256SUMS"
+    if destination.is_symlink():
+        raise RuntimeError("Refusing a package checksum symlink")
+    updated = {}
+    for path in produced:
+        if path.parent.resolve() != output or path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Invalid completed source output: {path}")
+        if not path.name.startswith(PRODUCT + "-") or path.suffix == ".sha256":
+            raise RuntimeError(f"Invalid source checksum entry: {path.name}")
+        updated[path.name] = digest(path)
+    if not updated:
+        raise RuntimeError("No completed source outputs were provided")
+    retained = {}
+    if destination.exists():
+        for line in destination.read_text(encoding="utf-8").splitlines():
+            match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+            if not match:
+                raise RuntimeError("Malformed existing package checksum entry")
+            expected, name = match.groups()
+            if (not name.startswith(PRODUCT + "-") or "/" in name or "\\" in name
+                    or ":" in name or name.endswith(".sha256") or name in retained):
+                raise RuntimeError(f"Invalid existing package checksum name: {name}")
+            path = output / name
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError(f"Existing package checksum refers to a missing or linked file: {name}")
+            if name not in updated and digest(path) != expected:
+                raise RuntimeError(f"Existing package changed since checksum creation: {name}")
+            retained[name] = expected
+    retained.update(updated)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="." + PRODUCT + "-checksums-", dir=output)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            for name in sorted(retained):
+                stream.write(f"{retained[name]}  {name}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def external(path: Path) -> Path:
     path = path.expanduser().resolve()
     if path == SOURCE or SOURCE in path.parents or path == Path(path.anchor):
@@ -306,6 +351,7 @@ def main():
     manifest_path.write_text(content, encoding="utf-8")
     checksum = digest(bundle)
     bundle.with_suffix(".zip.sha256").write_text(checksum + "  " + bundle.name + "\n", encoding="utf-8")
+    refresh_package_checksums(output, [bundle, manifest_path])
     print(json.dumps({"ok": True, "bundle": str(bundle), "sha256": checksum, "size": bundle.stat().st_size,
                       "sourcePackages": len(archives), "manifest": str(manifest_path)}, ensure_ascii=False, indent=2))
 

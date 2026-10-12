@@ -16,6 +16,12 @@
 #include <algorithm>
 #include <limits>
 
+#ifdef Q_OS_MACOS
+#include <cerrno>
+#include <cstring>
+#include <sys/mount.h>
+#endif
+
 namespace qcopilots_search {
 namespace {
 bool setError(QString* error, const QString& message)
@@ -116,11 +122,36 @@ bool ModelFiles::acquireLock(QString* error)
 
 bool ModelFiles::checkSpace(qint64 required, QString* error) const
 {
+    qint64 available = -1;
+#ifdef Q_OS_MACOS
+    // Qt 6.12 resolves kCFURLVolumeURLKey before calling statfs. APFS firmlinks
+    // such as /Users can therefore be mapped to the read-only System volume.
+    // Query the actual target path so both flags and capacity describe the Data
+    // volume that will receive the download and atomic publication copy.
+    struct statfs volume = {};
+    if (::statfs(QFile::encodeName(modelDir_).constData(), &volume) != 0) {
+        const int failure = errno;
+        return setError(error, tr("Cannot query model storage for %1: %2")
+                        .arg(modelDir_, QString::fromLocal8Bit(std::strerror(failure))));
+    }
+    if ((volume.f_flags & MNT_RDONLY) != 0)
+        return setError(error, tr("Cannot access writable model storage: %1").arg(modelDir_));
+    const auto blockSize = static_cast<quint64>(volume.f_bsize);
+    const auto blocksAvailable = static_cast<quint64>(volume.f_bavail);
+    if (blockSize == 0 || volume.f_bsize == std::numeric_limits<decltype(volume.f_bsize)>::max() ||
+        blocksAvailable > static_cast<quint64>(std::numeric_limits<qint64>::max()) / blockSize)
+        return setError(error, tr("Cannot determine available model storage: %1").arg(modelDir_));
+    available = static_cast<qint64>(blocksAvailable * blockSize);
+#else
     QStorageInfo storage(modelDir_);
-    storage.refresh();
     if (!storage.isValid() || !storage.isReady() || storage.isReadOnly())
         return setError(error, tr("Cannot access writable model storage: %1").arg(modelDir_));
-    if (storage.bytesAvailable() >= 0 && storage.bytesAvailable() < required + reserveBytes)
+    available = storage.bytesAvailable();
+#endif
+    // Unknown capacity must not silently disable the download budget.
+    if (available < 0 || required < 0 || required > std::numeric_limits<qint64>::max() - reserveBytes)
+        return setError(error, tr("Cannot determine available model storage: %1").arg(modelDir_));
+    if (available < required + reserveBytes)
         return setError(error, tr("Insufficient model storage. Need %1 bytes plus %2 bytes reserve.")
                         .arg(required).arg(reserveBytes));
     return true;

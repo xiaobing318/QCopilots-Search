@@ -3,6 +3,7 @@
 #include "core/runtime_paths.h"
 #include "core/types.h"
 #include <QHash>
+#include <QJsonObject>
 #include <QLineEdit>
 #include <QMainWindow>
 #include <QTimer>
@@ -88,6 +89,7 @@ private:
     QLabel *popupStatus_ = nullptr;
     QTimer debounce_, popupDebounce_, refresh_;
     QString currentSearch_, popupSearch_, indexState_;
+    QJsonObject requestedSearchContext_, displayedSearchContext_;
     QString popupRequestedQuery_, popupResultQuery_;
     QString lastSearchWarning_;
     QString documentRequest_, documentPath_;

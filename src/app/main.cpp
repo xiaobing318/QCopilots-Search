@@ -3,7 +3,9 @@
 #include "core/runtime_paths.h"
 #include <QApplication>
 #include <QCommandLineParser>
+#include <QLocale>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <cstdio>
@@ -67,7 +69,9 @@ int main(int argc, char **argv) {
     QString error;
     if (!paths.ensure(&error)) {
         std::fprintf(stderr, "%s\n", error.toUtf8().constData());
-        QMessageBox::critical(nullptr, QStringLiteral("QCopilots Search"), error);
+        QMessageBox prompt(QMessageBox::Critical, QStringLiteral("QCopilots Search"), error, QMessageBox::Ok);
+        prompt.button(QMessageBox::Ok)->setText(QLocale::system().language() == QLocale::Chinese ? QStringLiteral("确定") : QStringLiteral("OK"));
+        prompt.exec();
         return 2;
     }
     qcopilots_search::ServiceBackend backend(paths);

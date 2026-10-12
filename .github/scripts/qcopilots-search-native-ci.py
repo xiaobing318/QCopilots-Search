@@ -125,15 +125,65 @@ def test_evidence(*, require_complete=False):
     return json.loads((REPORTS / "tests/qt-test-cases.json").read_text(encoding="utf-8"))
 
 
+def signature_evidence(stage: Path, *, system: str | None = None):
+    """Inspect the installed app. codesign does not establish notarization."""
+    result = {"status": "unknown", "scope": "staging",
+              "verified": False, "developerIdSignatureVerified": False,
+              "notarization": "not-assessed", "commands": []}
+    if (system or platform.system()) != "Darwin":
+        result["reason"] = "Native signing verification is not configured for this platform"
+        return result
+    target = stage / "qcopilots-search.app"
+    result["target"] = str(target)
+    if not target.is_dir():
+        result["reason"] = "The installed application bundle is absent"
+        return result
+    commands = [["/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", str(target)],
+                ["/usr/bin/codesign", "--display", "--verbose=4", str(target)]]
+    for command in commands:
+        try:
+            completed = subprocess.run(command, check=False, capture_output=True,
+                                       text=True, encoding="utf-8", errors="replace", timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            result["commands"].append({"command": command, "error": str(error)})
+            result["reason"] = "codesign could not complete"
+            return result
+        result["commands"].append({"command": command, "exitCode": completed.returncode,
+                                   "stdout": completed.stdout, "stderr": completed.stderr})
+    verification, details = result["commands"]
+    output = details["stdout"] + "\n" + details["stderr"]
+    result["authorities"] = [line.partition("=")[2] for line in output.splitlines()
+                             if line.startswith("Authority=")]
+    if verification["exitCode"] != 0:
+        combined = output + "\n" + verification["stdout"] + "\n" + verification["stderr"]
+        result["status"] = "unsigned" if "is not signed at all" in combined else "invalid"
+        result["reason"] = "The installed bundle did not pass codesign verification"
+        return result
+    result["verified"] = True
+    if details["exitCode"] != 0:
+        result["reason"] = "Signature verification succeeded but identity inspection failed"
+    elif "Signature=adhoc" in output.splitlines():
+        result["status"] = "ad-hoc"
+    elif any(value.startswith("Developer ID Application:") for value in result["authorities"]):
+        result["status"] = "developer-id"
+        result["developerIdSignatureVerified"] = True
+    elif result["authorities"]:
+        result["status"] = "signed-other"
+    else:
+        result["reason"] = "codesign did not report a recognized signing identity"
+    return result
+
+
 def report():
     case_evidence = test_evidence()
+    signature = signature_evidence(ROOT / "stage")
     document = {"schemaVersion": 1, "product": PRODUCT,
                 "commit": os.environ.get("GITHUB_SHA"),
                 "runId": os.environ.get("GITHUB_RUN_ID"),
                 "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
                 "platform": platform.platform(), "architecture": platform.machine(),
                 "expectedArchitecture": os.environ.get("QCOPILOTS_SEARCH_CI_ARCH"),
-                "signature": "unsigned", "published": False,
+                "signature": signature["status"], "signatureEvidence": signature, "published": False,
                 "testReportPresent": (REPORTS / "tests/ctest.xml").is_file(),
                 "testCasesComplete": case_evidence["releaseComplete"],
                 "testInventoryVerified": case_evidence["inventoryVerified"],

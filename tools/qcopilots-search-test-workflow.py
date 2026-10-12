@@ -44,6 +44,36 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             workflow.assert_external(Path(self.root.anchor))
 
+    def test_qt_deploy_rejects_zero_exit_error_diagnostics(self):
+        helper = workflow.SOURCE / "cmake/QCopilotsSearchCheckedDeploy.cmake"
+        deployment = self.root / "deploy script.cmake"
+        wrapper = self.root / "checked deployment.cmake"
+        prefix = self.root / "安装 空格"
+        wrapper.write_text(
+            f'include("{helper.as_posix()}")\n'
+            f'qcopilots_search_checked_deploy("{deployment.as_posix()}")\n',
+            encoding="utf-8")
+        cases = [
+            ('message(STATUS "Deployment complete")\n', True),
+            ('execute_process(COMMAND "${CMAKE_COMMAND}" -E echo "ERROR: unresolved library")\n', False),
+            ('message("ERROR: unresolved library")\n', False),
+            ('message(FATAL_ERROR "Tool returned a failure")\n', False),
+        ]
+        for program, expected in cases:
+            with self.subTest(program=program):
+                deployment.write_text(
+                    f'if(NOT CMAKE_INSTALL_PREFIX STREQUAL "{prefix.as_posix()}" OR '
+                    'NOT CMAKE_INSTALL_CONFIG_NAME STREQUAL "Release")\n'
+                    'message(FATAL_ERROR "Installation context was lost")\nendif()\n' + program,
+                    encoding="utf-8")
+                result = subprocess.run(
+                    ["cmake", f"-DCMAKE_INSTALL_PREFIX={prefix.as_posix()}",
+                     "-DCMAKE_INSTALL_CONFIG_NAME=Release", "-P", str(wrapper)],
+                    cwd=self.root, capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
+                if not expected:
+                    self.assertIn("Qt deployment failed", result.stderr)
+
     def test_distribution_archive_traversal_rejected_before_write(self):
         import zipfile
         package = self.root / "qcopilots-search-test.zip"

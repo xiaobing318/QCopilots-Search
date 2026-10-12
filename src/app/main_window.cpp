@@ -247,7 +247,7 @@ void MainWindow::applyLanguage() {
     const QString currentKind = kind_->currentData().toString();
     kind_->clear();
     kind_->addItem(label("All file types", "所有类型"), "");
-    kind_->addItem(label("Documents", "文档"), "document");
+    kind_->addItem(label("Documents", "文档"), "text");
     kind_->addItem("PDF", "pdf");
     kind_->addItem(label("Images", "图片"), "image");
     kind_->addItem(label("Audio", "音频"), "audio");
@@ -307,6 +307,11 @@ void MainWindow::sendSearch(bool popup) {
     if (!previous.isEmpty()) { backend_->cancel(previous); pending_.remove(previous); }
     QJsonObject parameters{{"query", input->text().trimmed()}, {"limit", popup ? 12 : 100}, {"semantic", true}, {"code", popup ? false : code_->isChecked()}};
     if (!popup) { parameters.insert("kind", code_->isChecked() ? "" : kind_->currentData().toString()); parameters.insert("root", root_->currentData().toString()); }
+    if (!popup) {
+        requestedSearchContext_ = parameters;
+        requestedSearchContext_.insert("configuredRoots", QJsonArray::fromStringList(settings_.roots));
+        requestedSearchContext_.insert("configuredExcludes", QJsonArray::fromStringList(settings_.excludes));
+    }
     previous = send("search", parameters, 120000);
     if (popup) popupRequestedQuery_ = input->text().trimmed();
     if (popup) popupStatus_->setText(label("Searching…", "正在搜索…")); else summary_->setText(label("Searching…", "正在搜索…"));
@@ -321,6 +326,10 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
         QListWidget *list = popup ? popupResults_ : results_;
         QLabel *summary = popup ? popupStatus_ : summary_;
         const SearchHit previous = preview_->currentHit();
+        // Retain a preview during an index refresh, but a new question or
+        // filter must start with its highest-ranked result.
+        const bool sameContext = !popup && requestedSearchContext_ == displayedSearchContext_;
+        if (!popup) displayedSearchContext_ = requestedSearchContext_;
         const QSignalBlocker resultBlocker(list);
         hits.clear();
         list->clear();
@@ -344,7 +353,7 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
         summary->setText(hits.isEmpty() ? label("No matching files", "没有匹配的文件") : label("Results: ", "结果：") + QString::number(hits.size()) + (data.value("semantic").toBool() ? label(" · semantic + keywords", " · 语义与关键词") : label(" · keywords", " · 关键词")));
         int selection = hits.isEmpty() ? -1 : 0;
         bool sameHit = false;
-        if (!popup) {
+        if (sameContext) {
             for (int row = 0; row < hits.size(); ++row) {
                 const auto &hit = hits.at(row);
                 if (hit.path == previous.path && hit.segmentId == previous.segmentId && hit.text == previous.text && hit.page == previous.page && hit.startMs == previous.startMs) {
@@ -355,6 +364,7 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
             }
         }
         list->setCurrentRow(selection);
+        if (!sameContext) list->scrollToTop();
         if (!popup && !sameHit) selectResult(selection);
         const QString warning = data.value("warning").toString(data.value("error").toString());
         if (popup) {
@@ -569,8 +579,13 @@ void MainWindow::checkForUpdates(bool manual) {
     connect(reply, &QNetworkReply::finished, this, [this, reply, manual] {
         updateButton_->setEnabled(true);
         reply->deleteLater();
+        const auto showInformation = [this](const QString &message) {
+            QMessageBox prompt(QMessageBox::Information, label("Updates", "更新"), message, QMessageBox::Ok, this);
+            prompt.button(QMessageBox::Ok)->setText(label("OK", "确定"));
+            prompt.exec();
+        };
         if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404) {
-            if (manual) QMessageBox::information(this, label("Updates", "更新"), label("No public release is available yet.", "目前尚无公开发布版本。"));
+            if (manual) showInformation(label("No public release is available yet.", "目前尚无公开发布版本。"));
             return;
         }
         if (reply->error() != QNetworkReply::NoError) { if (manual) showError(label("Update check failed: ", "检查更新失败：") + reply->errorString()); return; }
@@ -580,12 +595,14 @@ void MainWindow::checkForUpdates(bool manual) {
         const QVersionNumber latest = QVersionNumber::fromString(version);
         const QVersionNumber installed = QVersionNumber::fromString(QCoreApplication::applicationVersion());
         if (latest.isNull() || latest <= installed) {
-            if (manual) QMessageBox::information(this, label("Updates", "更新"), label("You are using the latest available version.", "当前已是最新可用版本。"));
+            if (manual) showInformation(label("You are using the latest available version.", "当前已是最新可用版本。"));
             return;
         }
         const QUrl url(release.value("html_url").toString());
         if (url.scheme() != "https" || url.host() != "github.com" || !url.path().startsWith("/xiaobing318/QCopilots-search/releases/")) { if (manual) showError(label("The update response contains an unexpected download address.", "更新响应中的下载地址不符合预期。")); return; }
         QMessageBox prompt(QMessageBox::Information, label("Update available", "有可用更新"), label("Version ", "版本 ") + version + label(" is available. Open the release page to download it?", " 已发布，是否打开发布页面下载？"), QMessageBox::Open | QMessageBox::Cancel, this);
+        prompt.button(QMessageBox::Open)->setText(label("Open", "打开"));
+        prompt.button(QMessageBox::Cancel)->setText(label("Cancel", "取消"));
         if (prompt.exec() == QMessageBox::Open) QDesktopServices::openUrl(url);
     });
 }

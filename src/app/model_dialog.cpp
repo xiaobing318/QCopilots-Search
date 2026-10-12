@@ -47,6 +47,8 @@ ModelDialog::ModelDialog(const QString &modelDir, const QString &language, QWidg
     actions->addWidget(cancel_);
     layout->addLayout(actions);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
+    buttons->button(QDialogButtonBox::Close)->setObjectName("closeModelButton");
+    buttons->button(QDialogButtonBox::Close)->setText(label("Close", "关闭"));
     connect(buttons, &QDialogButtonBox::rejected, this, &ModelDialog::reject);
     layout->addWidget(buttons);
     connect(download_, &QPushButton::clicked, this, [this] { downloading_ = true; setBusy(true); status_->setText(label("Downloading and verifying…", "正在下载与校验…")); QMetaObject::invokeMethod(files_, &ModelFiles::downloadMissing, Qt::QueuedConnection); });

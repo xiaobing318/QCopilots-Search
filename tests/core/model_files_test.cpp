@@ -9,6 +9,12 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QtTest>
+#include <filesystem>
+#include <limits>
+#ifdef Q_OS_MACOS
+#include <QStorageInfo>
+#include <sys/mount.h>
+#endif
 
 using namespace qcopilots_search;
 using qcopilots_search::test::TestEnvironment;
@@ -157,6 +163,20 @@ private slots:
     {
         TestEnvironment root(QStringLiteral("model-files"));
         QVERIFY2(root.isValid(), qPrintable(root.error()));
+#ifdef Q_OS_MACOS
+        // Preserve native runner evidence of the System/Data volume distinction
+        // without assuming any machine-specific mount or temporary path.
+        const QStorageInfo qtStorage(root.root());
+        struct statfs nativeStorage = {};
+        QVERIFY(::statfs(QFile::encodeName(root.root()).constData(), &nativeStorage) == 0);
+        qInfo().noquote() << "Model storage target:" << root.root()
+                         << "Qt volume:" << qtStorage.rootPath()
+                         << "Qt valid/ready/readonly:" << qtStorage.isValid()
+                         << qtStorage.isReady() << qtStorage.isReadOnly()
+                         << "native mount:" << nativeStorage.f_mntonname
+                         << "native readonly:" << ((nativeStorage.f_flags & MNT_RDONLY) != 0)
+                         << "native available blocks/block size:" << nativeStorage.f_bavail << nativeStorage.f_bsize;
+#endif
         ModelServer server;
         QVERIFY(server.listen(QHostAddress::LocalHost, 0));
         ModelFiles models(root.root(), {server.artifact()});
@@ -175,6 +195,36 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(completed.size(), 2, 5000);
         QVERIFY(completed.at(1).at(0).toBool());
         QCOMPARE(server.requests, 1);
+    }
+
+    void insufficientStorageRejectsBeforeTransfer()
+    {
+        TestEnvironment root(QStringLiteral("model-storage-budget"));
+        QVERIFY2(root.isValid(), qPrintable(root.error()));
+        ModelServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const QByteArray encodedPath = root.root().toUtf8();
+        const auto filesystemPath = std::filesystem::u8path(encodedPath.constBegin(), encodedPath.constEnd());
+        std::error_code error;
+        const auto space = std::filesystem::space(filesystemPath, error);
+        QVERIFY2(!error, error.message().c_str());
+        QVERIFY(space.capacity > 0);
+        QVERIFY(space.capacity < static_cast<std::uintmax_t>(std::numeric_limits<qint64>::max() / 2));
+        auto artifact = server.artifact();
+        // A new download reserves both the partial file and its publication
+        // copy. No large fixture is created: the budget must reject it first.
+        artifact.size = static_cast<qint64>(space.capacity / 2) + 1;
+        ModelFiles models(root.root(), {artifact});
+        QSignalSpy completed(&models, &ModelFiles::finished);
+        models.downloadMissing();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.size(), 1, 5000);
+        QVERIFY(!completed.at(0).at(0).toBool());
+        QVERIFY2(completed.at(0).at(1).toString().contains(QStringLiteral("Insufficient model storage")),
+                 qPrintable(completed.at(0).at(1).toString()));
+        QCOMPARE(server.requests, 0);
+        QVERIFY(!models.isBusy());
+        QVERIFY(!QFile::exists(root.path(artifact.name)));
+        QVERIFY(readFile(root.path(artifact.name + QStringLiteral(".download"))).isEmpty());
     }
 
     void resumesRanges_data()

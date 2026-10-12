@@ -9,6 +9,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDialogButtonBox>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
@@ -21,6 +22,7 @@
 #include <QPdfWriter>
 #include <QProcess>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSignalSpy>
 #include <QSpinBox>
 #include <QStandardPaths>
@@ -153,6 +155,90 @@ private slots:
         auto *results = window.findChild<QListWidget *>("searchResults");
         QCOMPARE(results->count(), 1);
         QVERIFY(results->item(0)->text().contains("new match"));
+    }
+    void changedSearchContextSelectsFirstResult_data() {
+        QTest::addColumn<QString>("change");
+        for (const auto *change : {"query", "clear-query", "kind", "root", "code"}) QTest::newRow(change) << QString::fromLatin1(change);
+    }
+    void changedSearchContextSelectsFirstResult() {
+        QFETCH(QString, change);
+        TestEnvironment env("gui-new-search-selection"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.settings.includeCode = true; backend.settings.roots << env.root();
+        for (int i = 0; i < 30; ++i) {
+            const QString name = QStringLiteral("result-%1.txt").arg(i);
+            const QString text = QStringLiteral("Distinct passage %1").arg(i);
+            QVERIFY(env.writeFile(name, text.toUtf8()));
+            SearchHit hit; hit.path = env.path(name); hit.title = name; hit.text = text; hit.kind = "document"; hit.segmentId = i + 1;
+            backend.hits.append(hit);
+        }
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.resize(850, 540); window.show(); window.start();
+        auto *query = window.findChild<SearchEdit *>("searchInput");
+        query->setText("initial query");
+        auto *results = window.findChild<QListWidget *>("searchResults");
+        QTRY_COMPARE(results->count(), 30);
+        results->setCurrentRow(20);
+        results->scrollToItem(results->currentItem(), QAbstractItemView::PositionAtTop);
+        QTRY_VERIFY(results->verticalScrollBar()->value() > 0);
+        const QString previousPath = backend.hits.at(20).path;
+        QCOMPARE(window.findChild<PreviewPanel *>()->currentHit().path, previousPath);
+        backend.hits.move(29, 0);
+        const auto expected = backend.hits.first();
+        const int before = backend.count("search");
+        if (change == "query") query->setText(QString::fromUtf8("兰花港口"));
+        else if (change == "clear-query") query->clear();
+        else if (change == "kind") window.findChild<QComboBox *>("kindFilter")->setCurrentIndex(1);
+        else if (change == "root") window.findChild<QComboBox *>("rootFilter")->setCurrentIndex(1);
+        else window.findChild<QCheckBox *>("codeSearchCheck")->setChecked(true);
+        QTRY_VERIFY(backend.count("search") > before);
+        QTRY_COMPARE(results->item(0)->data(Qt::UserRole).toString(), expected.path);
+        QCOMPARE(results->currentRow(), 0);
+        QCOMPARE(results->verticalScrollBar()->value(), results->verticalScrollBar()->minimum());
+        QCOMPARE(window.findChild<PreviewPanel *>()->currentHit().path, expected.path);
+        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), expected.text);
+        QVERIFY(results->item(21)->data(Qt::UserRole).toString() == previousPath);
+    }
+    void sameSearchRefreshPreservesSelectedPreview() {
+        TestEnvironment env("gui-refresh-selection"); QVERIFY(env.isValid());
+        FakeBackend backend;
+        for (int i = 0; i < 30; ++i) {
+            const QString name = QStringLiteral("result-%1.txt").arg(i);
+            const QString text = QStringLiteral("Distinct passage %1").arg(i);
+            QVERIFY(env.writeFile(name, text.toUtf8()));
+            SearchHit hit; hit.path = env.path(name); hit.title = name; hit.text = text; hit.kind = "document"; hit.segmentId = i + 1;
+            backend.hits.append(hit);
+        }
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.resize(850, 540); window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("unchanged query");
+        auto *results = window.findChild<QListWidget *>("searchResults");
+        QTRY_COMPARE(results->count(), 30);
+        results->setCurrentRow(20);
+        auto *preview = window.findChild<PreviewPanel *>();
+        const auto selected = backend.hits.at(20);
+        const QString expanded = selected.text + "\nAlready loaded full document body";
+        preview->setDocumentPreview({{"text", expanded}, {"partial", false}, {"next", 0}}, false);
+        backend.hits.move(20, 25);
+        const int before = backend.count("search");
+        emit backend.eventReceived("indexChanged", {});
+        QTRY_VERIFY(backend.count("search") > before);
+        QTRY_COMPARE(results->currentRow(), 25);
+        QCOMPARE(results->currentItem()->data(Qt::UserRole).toString(), selected.path);
+        QCOMPARE(preview->currentHit().path, selected.path);
+        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), expanded);
+        QVERIFY(results->verticalScrollBar()->value() > 0);
+    }
+    void chineseDialogButtonsUseApplicationLanguage() {
+        TestEnvironment env("gui-chinese-buttons"); QVERIFY(env.isValid());
+        AppSettings settings; settings.language = "zh_CN";
+        SettingsDialog preferences(settings, false, false);
+        auto *preferenceButtons = preferences.findChild<QDialogButtonBox *>(); QVERIFY(preferenceButtons);
+        QCOMPARE(preferenceButtons->button(QDialogButtonBox::Save)->text(), QString::fromUtf8("保存"));
+        QCOMPARE(preferenceButtons->button(QDialogButtonBox::Cancel)->text(), QString::fromUtf8("取消"));
+        ModelDialog models(env.runtimePaths().modelDir, "zh_CN");
+        auto *close = models.findChild<QPushButton *>("closeModelButton"); QVERIFY(close);
+        QCOMPARE(close->text(), QString::fromUtf8("关闭"));
+        QTRY_VERIFY(models.findChild<QPushButton *>("importModelButton")->isEnabled());
     }
     void semanticFailureShowsKeywordFallbackWarning() {
         TestEnvironment env("gui-semantic-warning"); QVERIFY(env.isValid());

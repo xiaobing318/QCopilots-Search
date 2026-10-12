@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
@@ -15,6 +16,10 @@ spec = importlib.util.spec_from_file_location(
     "qcopilots_search_ci_evidence", Path(__file__).with_name("qcopilots-search-ctest-evidence.py"))
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
+native_spec = importlib.util.spec_from_file_location(
+    "qcopilots_search_native_ci", Path(__file__).with_name("qcopilots-search-native-ci.py"))
+native = importlib.util.module_from_spec(native_spec)
+native_spec.loader.exec_module(native)
 
 
 class EvidenceTests(unittest.TestCase):
@@ -129,6 +134,66 @@ class EvidenceTests(unittest.TestCase):
     def test_ctest_failure_error_or_skip_cannot_pass(self):
         for kind in ("failure", "error", "skipped"):
             self.assertFalse(self.inspect(failure=kind)["releaseComplete"])
+
+
+class SignatureEvidenceTests(unittest.TestCase):
+    def inspect(self, *, verify_code=0, display_code=0, details="Signature=adhoc\n",
+                verify_error="", exists=True, system="Darwin", error=None):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-signature-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+            stage = Path(temporary)
+            if exists:
+                (stage / "qcopilots-search.app").mkdir()
+            outcomes = [native.subprocess.CompletedProcess([], verify_code, "", verify_error),
+                        native.subprocess.CompletedProcess([], display_code, "", details)]
+            with mock.patch.object(native.subprocess, "run", side_effect=error or outcomes) as run:
+                result = native.signature_evidence(stage, system=system)
+                if exists and system == "Darwin" and not error:
+                    self.assertEqual(run.call_count, 2)
+                    self.assertIn("--strict", run.call_args_list[0].args[0])
+                    self.assertIn("--deep", run.call_args_list[0].args[0])
+                return result
+
+    def test_verified_ad_hoc_is_not_developer_id_or_notarization(self):
+        result = self.inspect()
+        self.assertEqual(result["status"], "ad-hoc")
+        self.assertTrue(result["verified"])
+        self.assertFalse(result["developerIdSignatureVerified"])
+        self.assertEqual(result["notarization"], "not-assessed")
+
+    def test_developer_id_requires_successful_verification(self):
+        details = "Authority=Developer ID Application: Example (TEAM)\nAuthority=Apple Root CA\n"
+        self.assertEqual(self.inspect(details=details)["status"], "developer-id")
+        result = self.inspect(details=details, verify_code=1, verify_error="a sealed resource is missing")
+        self.assertEqual(result["status"], "invalid")
+        self.assertFalse(result["developerIdSignatureVerified"])
+
+    def test_explicit_unsigned_diagnostic(self):
+        result = self.inspect(verify_code=1, display_code=1,
+                              details="app: code object is not signed at all")
+        self.assertEqual(result["status"], "unsigned")
+        self.assertFalse(result["verified"])
+
+    def test_missing_bundle_does_not_claim_unsigned_or_signed(self):
+        self.assertEqual(self.inspect(exists=False)["status"], "unknown")
+
+    def test_unavailable_or_timed_out_codesign_remains_unknown(self):
+        for error in (FileNotFoundError("codesign"), native.subprocess.TimeoutExpired("codesign", 60)):
+            self.assertEqual(self.inspect(error=error)["status"], "unknown")
+
+    def test_unavailable_identity_remains_unknown(self):
+        self.assertEqual(self.inspect(display_code=1)["status"], "unknown")
+        self.assertEqual(self.inspect(details="Identifier=org.example.app")["status"], "unknown")
+
+    def test_other_certificate_is_distinct(self):
+        result = self.inspect(details="Authority=Apple Development: Example (TEAM)\n")
+        self.assertEqual(result["status"], "signed-other")
+        self.assertFalse(result["developerIdSignatureVerified"])
+
+    def test_non_macos_is_uninspected(self):
+        result = self.inspect(system="Windows")
+        self.assertEqual(result["status"], "unknown")
+        self.assertFalse(result["commands"])
 
 
 if __name__ == "__main__":

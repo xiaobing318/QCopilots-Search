@@ -4,11 +4,14 @@
 #include "service/service_client.h"
 #include "support/test_environment.h"
 #include <QFileInfo>
+#include <QComboBox>
 #include <QDir>
 #include <QEventLoop>
 #include <QLabel>
 #include <QListWidget>
 #include <QLocalSocket>
+#include <QPainter>
+#include <QPdfWriter>
 #include <QProcess>
 #include <QPushButton>
 #include <QSignalSpy>
@@ -47,7 +50,14 @@ private slots:
     void actualServiceIndexesAndSearchesInIsolatedProfile() {
         TestEnvironment env("gui-service-中文");
         QVERIFY2(env.isValid(), qPrintable(env.error()));
-        QVERIFY(env.writeFile("selected folder/contract 中文.txt", QString::fromUtf8("orchidcontract identifies this document. 中文项目合同。\n").toUtf8()));
+        QVERIFY(env.writeFile("selected folder/contract 中文.txt", QString::fromUtf8("orchidcontract identifies this document. 中文项目合同。sharedcategorycanary also identifies this text file.\n").toUtf8()));
+        const QString pdfPath = env.path("selected folder/category 中文.pdf");
+        {
+            QPdfWriter writer(pdfPath);
+            QPainter painter(&writer);
+            QVERIFY(painter.isActive());
+            painter.drawText(100, 200, "sharedcategorycanary identifies this portable document with enough text for native extraction.");
+        }
         const auto paths = env.runtimePaths();
         QString error;
         QVERIFY2(paths.ensure(&error), qPrintable(error));
@@ -91,6 +101,20 @@ private slots:
         QVERIFY(document->isEnabled());
         document->click();
         QTRY_COMPARE_WITH_TIMEOUT(document->text(), QString::fromUtf8("正文已读取"), 90000);
+        // Exercise the real GUI -> IPC -> worker -> database kind contract.
+        // The user-facing Documents label must select stored kind=text.
+        input->setText("sharedcategorycanary");
+        QTRY_COMPARE_WITH_TIMEOUT(results->count(), 2, 90000);
+        auto *kind = window.findChild<QComboBox *>("kindFilter"); QVERIFY(kind);
+        kind->setCurrentIndex(1);
+        QTRY_COMPARE_WITH_TIMEOUT(results->count(), 1, 10000);
+        QVERIFY(results->item(0)->data(Qt::UserRole).toString().endsWith(QString::fromUtf8("contract 中文.txt")));
+        kind->setCurrentIndex(kind->findData("pdf"));
+        QTRY_VERIFY_WITH_TIMEOUT(results->count() == 1 && results->item(0)->data(Qt::UserRole).toString() == pdfPath, 10000);
+        kind->setCurrentIndex(kind->findData("image"));
+        QTRY_COMPARE_WITH_TIMEOUT(results->count(), 0, 10000);
+        kind->setCurrentIndex(0);
+        QTRY_COMPARE_WITH_TIMEOUT(results->count(), 2, 10000);
         backend.request("shutdown");
         QTRY_VERIFY_WITH_TIMEOUT(service.process.state() == QProcess::NotRunning, 15000);
         QCOMPARE(service.process.exitCode(), 0);

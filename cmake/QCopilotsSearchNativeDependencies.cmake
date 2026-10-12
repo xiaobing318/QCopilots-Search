@@ -165,6 +165,7 @@ function(qcopilots_search_add_git_dependency)
         "https://codeload.github.com/libgit2/libgit2/tar.gz/refs/tags/v1.9.1"
         "14cab3014b2b7ad75970ff4548e83615f74d719afe00aa479b4a889c1e13fc00")
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+    set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
     set(BUILD_SHARED_LIBS ON)
     set(BUILD_TESTS OFF)
     set(BUILD_CLI OFF)
@@ -179,6 +180,19 @@ function(qcopilots_search_add_git_dependency)
     set(USE_BUNDLED_ZLIB ON)
     set(STATIC_CRT OFF)
     set(USE_NSEC ON)
+    # Upstream writes these generic settings to the global CMake cache. A
+    # function alone does not isolate CACHE variables from later dependencies.
+    foreach(language_setting IN ITEMS CMAKE_C_STANDARD CMAKE_C_EXTENSIONS)
+        get_property(saved_${language_setting}_exists CACHE ${language_setting} PROPERTY TYPE SET)
+        if(saved_${language_setting}_exists)
+            foreach(cache_property IN ITEMS VALUE TYPE HELPSTRING)
+                get_property(saved_${language_setting}_${cache_property}
+                    CACHE ${language_setting} PROPERTY ${cache_property})
+            endforeach()
+        endif()
+    endforeach()
+    set(CMAKE_C_STANDARD 90)
+    set(CMAKE_C_EXTENSIONS OFF)
     if(UNIX)
         # libgit2 1.9.1 probes struct stat before DefaultCFlags adds _GNU_SOURCE
         # to its real compilation. Match that feature-test environment, so
@@ -193,6 +207,15 @@ function(qcopilots_search_add_git_dependency)
         endforeach()
     endif()
     add_subdirectory("${qcopilots_search_libgit2_SOURCE_DIR}" "${qcopilots_search_libgit2_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    foreach(language_setting IN ITEMS CMAKE_C_STANDARD CMAKE_C_EXTENSIONS)
+        if(saved_${language_setting}_exists)
+            set(${language_setting} "${saved_${language_setting}_VALUE}"
+                CACHE "${saved_${language_setting}_TYPE}"
+                "${saved_${language_setting}_HELPSTRING}" FORCE)
+        else()
+            unset(${language_setting} CACHE)
+        endif()
+    endforeach()
     if(UNIX AND NOT (HAVE_STRUCT_STAT_MTIME_NSEC OR
             ((HAVE_STRUCT_STAT_ST_MTIM OR HAVE_STRUCT_STAT_ST_MTIMESPEC)
             AND HAVE_STRUCT_STAT_NSEC)))

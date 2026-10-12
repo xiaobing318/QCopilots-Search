@@ -59,12 +59,27 @@ if(TARGET qcopilots-search AND QCOPILOTS_SEARCH_DEPLOY_QT)
   endforeach()
   if(APPLE)
     set(_qcopilots_deploy_executable "qcopilots-search.app")
+    # Qt 6.12's macdeployqt resolves @rpath through the app's LC_RPATH entries,
+    # not -libpath. JPEG's ExternalProject output is outside the common library
+    # directory, so expose that locked source only during deployment and require
+    # macdeployqt to remove it before signing. Installed libraries stay in Frameworks.
+    set(_qcopilots_deploy_prepare "include(\"${CMAKE_CURRENT_LIST_DIR}/QCopilotsSearchCheckedDeploy.cmake\")\nqcopilots_search_deploy_rpath(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app/Contents/MacOS/qcopilots-search\" \"$<TARGET_FILE_DIR:qcopilots-search-native-jpeg>\" ADD)\n")
+    set(_qcopilots_deploy_finish "\nqcopilots_search_deploy_rpath(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app/Contents/MacOS/qcopilots-search\" \"$<TARGET_FILE_DIR:qcopilots-search-native-jpeg>\" VERIFY_REMOVED)\nqcopilots_search_verify_bundle_signature(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\")\n")
   else()
     set(_qcopilots_deploy_executable "$<TARGET_FILE:qcopilots-search>")
+    set(_qcopilots_deploy_prepare "")
+    set(_qcopilots_deploy_finish "")
   endif()
   qt_generate_deploy_script(TARGET qcopilots-search OUTPUT_SCRIPT _qcopilots_deploy
-    CONTENT "qt_deploy_runtime_dependencies(\n EXECUTABLE \"${_qcopilots_deploy_executable}\"\n ADDITIONAL_EXECUTABLES ${_qcopilots_extra_executables}\n ${_qcopilots_runtime_options}\n GENERATE_QT_CONF\n)")
-  install(SCRIPT "${_qcopilots_deploy}")
+    CONTENT "${_qcopilots_deploy_prepare}qt_deploy_runtime_dependencies(\n EXECUTABLE \"${_qcopilots_deploy_executable}\"\n ADDITIONAL_EXECUTABLES ${_qcopilots_extra_executables}\n ${_qcopilots_runtime_options}\n GENERATE_QT_CONF\n)${_qcopilots_deploy_finish}")
+  if(APPLE)
+    # macdeployqt can print ERROR and nevertheless return zero. Run Qt's
+    # generated deployment script in a checked subprocess so install and CPack
+    # cannot silently publish a partial bundle.
+    set(_qcopilots_checked_deploy "include(\"${CMAKE_CURRENT_LIST_DIR}/QCopilotsSearchCheckedDeploy.cmake\")\nqcopilots_search_checked_deploy(\"${_qcopilots_deploy}\")")
+  else()
+    install(SCRIPT "${_qcopilots_deploy}")
+  endif()
 endif()
 install(FILES "${PROJECT_SOURCE_DIR}/LICENSE" "${PROJECT_SOURCE_DIR}/dependencies.lock.json"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/qcopilots-search")
@@ -79,6 +94,10 @@ if(EXISTS "${PROJECT_SOURCE_DIR}/third_party")
     DESTINATION "${CMAKE_INSTALL_DATADIR}/qcopilots-search/source-materials")
 endif()
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/docs/" DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/qcopilots-search")
+if(APPLE AND DEFINED _qcopilots_checked_deploy)
+  # macdeployqt signs the finished bundle, including its resource manifest.
+  install(CODE "${_qcopilots_checked_deploy}")
+endif()
 set(CPACK_PACKAGE_NAME "qcopilots-search")
 set(CPACK_PACKAGE_VENDOR "QCopilots")
 set(CPACK_PACKAGE_CONTACT "https://github.com/xiaobing318/QCopilots-search/issues")
@@ -90,6 +109,10 @@ set(CPACK_PACKAGE_CHECKSUM SHA256)
 set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/../packages")
 set(CPACK_PACKAGE_FILE_NAME "qcopilots-search-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_STRIP_FILES TRUE)
+if(APPLE)
+  # macdeployqt strips before ad-hoc signing. Never strip signed Mach-O again.
+  set(CPACK_STRIP_FILES FALSE)
+endif()
 set(CPACK_PROJECT_CONFIG_FILE "${PROJECT_SOURCE_DIR}/cmake/QCopilotsSearchCPackConfig.cmake")
 if(WIN32)
   set(CPACK_GENERATOR ZIP)
