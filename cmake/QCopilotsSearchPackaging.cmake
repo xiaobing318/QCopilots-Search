@@ -1,4 +1,5 @@
 include_guard(GLOBAL)
+include(QCopilotsSearchLicenseMaterials)
 if(MSVC)
   # Qt's deploy tool supplies a redist installer. Portable ZIP packages and
   # the per-user installer need these redistributable DLLs beside the app.
@@ -30,6 +31,15 @@ foreach(_program qcopilots-search qcopilots-search-service qcopilots-search-work
     endif()
   endif()
 endforeach()
+if(APPLE)
+  include(QCopilotsSearchMacOSDeploy)
+  get_property(_qcopilots_native GLOBAL PROPERTY QCOPILOTS_SEARCH_NATIVE_RUNTIME_TARGETS)
+  get_property(_qcopilots_inference GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS)
+  get_property(_qcopilots_cpu GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_CPU_RUNTIME_TARGETS)
+  qcopilots_search_install_macos_runtime_after_bundle(
+    NATIVE_TARGETS ${_qcopilots_native}
+    INFERENCE_TARGETS ${_qcopilots_inference} CPU_TARGETS ${_qcopilots_cpu})
+endif()
 if(TARGET qcopilots-search AND QCOPILOTS_SEARCH_DEPLOY_QT)
   if(NOT TARGET Qt6::QOffscreenIntegrationPlugin)
     message(FATAL_ERROR "The Qt SDK must provide the offscreen platform plugin used by the worker")
@@ -46,6 +56,15 @@ if(TARGET qcopilots-search AND QCOPILOTS_SEARCH_DEPLOY_QT)
   set(_qcopilots_runtime_options)
   if(MSVC)
     set(_qcopilots_runtime_options NO_COMPILER_RUNTIME)
+  endif()
+  set(_qcopilots_linux_deploy_options "")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(QCopilotsSearchLinuxDeploy)
+    get_property(_qcopilots_native GLOBAL PROPERTY QCOPILOTS_SEARCH_NATIVE_RUNTIME_TARGETS)
+    get_property(_qcopilots_imported GLOBAL PROPERTY QCOPILOTS_SEARCH_IMAGE_IMPORTED_RUNTIME_TARGETS)
+    get_property(_qcopilots_inference GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS)
+    qcopilots_search_linux_deploy_arguments(_qcopilots_linux_deploy_options
+      ${_qcopilots_native} ${_qcopilots_imported} ${_qcopilots_inference})
   endif()
   set(_qcopilots_extra_executables)
   foreach(_helper qcopilots-search-service qcopilots-search-worker qcopilots-search-cli)
@@ -72,18 +91,17 @@ if(TARGET qcopilots-search AND QCOPILOTS_SEARCH_DEPLOY_QT)
     string(REPLACE "$" "\\$" _qcopilots_identity "${_qcopilots_identity}")
     set(_qcopilots_runtime_options "DEPLOY_TOOL_OPTIONS -no-codesign")
     set(_qcopilots_deploy_executable "qcopilots-search.app")
-    # Imported library SONAME metadata gives each source library its correct
-    # build rpaths. macdeployqt then resolves those libraries and removes the
-    # paths before the final inventory-based signing pass.
+    # Inspect every final Mach-O, including SONAME copies added by macdeployqt,
+    # before signing. Checking only the main executable misses transitive leaks.
     set(_qcopilots_deploy_prepare "include(\"${CMAKE_CURRENT_LIST_DIR}/QCopilotsSearchCheckedDeploy.cmake\")\n")
-    set(_qcopilots_deploy_finish "\nqcopilots_search_verify_deploy_rpath(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app/Contents/MacOS/qcopilots-search\" \"$<TARGET_FILE_DIR:qcopilots-search-native-jpeg>\")\nqcopilots_search_sign_macos_bundle(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\" \"${Python3_EXECUTABLE}\" \"${PROJECT_SOURCE_DIR}/tools/qcopilots-search-sign-macos.py\" \"${CMAKE_BINARY_DIR}/../reports/qcopilots-search-macos-signing-$<CONFIG>.json\" \"${_qcopilots_identity}\" \"${QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP}\")\nqcopilots_search_verify_bundle_signature(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\")\n")
+    set(_qcopilots_deploy_finish "\nqcopilots_search_verify_macos_links(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\" \"${Python3_EXECUTABLE}\" \"${PROJECT_SOURCE_DIR}/tools/qcopilots-search-verify-macos-links.py\" \"${CMAKE_BINARY_DIR}/../reports/qcopilots-search-macos-links-$<CONFIG>.json\")\nqcopilots_search_sign_macos_bundle(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\" \"${Python3_EXECUTABLE}\" \"${PROJECT_SOURCE_DIR}/tools/qcopilots-search-sign-macos.py\" \"${CMAKE_BINARY_DIR}/../reports/qcopilots-search-macos-signing-$<CONFIG>.json\" \"${_qcopilots_identity}\" \"${QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP}\")\nqcopilots_search_verify_bundle_signature(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\")\n")
   else()
     set(_qcopilots_deploy_executable "$<TARGET_FILE:qcopilots-search>")
     set(_qcopilots_deploy_prepare "")
     set(_qcopilots_deploy_finish "")
   endif()
   qt_generate_deploy_script(TARGET qcopilots-search OUTPUT_SCRIPT _qcopilots_deploy
-    CONTENT "${_qcopilots_deploy_prepare}qt_deploy_runtime_dependencies(\n EXECUTABLE \"${_qcopilots_deploy_executable}\"\n ADDITIONAL_EXECUTABLES ${_qcopilots_extra_executables}\n ${_qcopilots_runtime_options}\n GENERATE_QT_CONF\n)${_qcopilots_deploy_finish}")
+    CONTENT "${_qcopilots_deploy_prepare}qt_deploy_runtime_dependencies(\n EXECUTABLE \"${_qcopilots_deploy_executable}\"\n ADDITIONAL_EXECUTABLES ${_qcopilots_extra_executables}\n${_qcopilots_linux_deploy_options} ${_qcopilots_runtime_options}\n GENERATE_QT_CONF\n)${_qcopilots_deploy_finish}")
   if(APPLE)
     # macdeployqt can print ERROR and nevertheless return zero. Run Qt's
     # generated deployment script in a checked subprocess so install and CPack

@@ -58,7 +58,9 @@ SOFTWARE.
 | libtiff | 上游 LICENSE.md 的宽松许可和版权声明 | OCR TIFF 读写 |
 | Microsoft Visual C++ CRT / OpenMP runtime | Microsoft Visual Studio / Visual C++ Redistributable 的适用再分发条款 | Windows 使用获准再分发的 app-local 运行库，非开源对应源码交付对象 |
 
-许可证文件由依赖安装规则收集到 `share/qcopilots-search/licenses`。发行审查应检查实际安装包，而不仅检查本表。Qt 的完整第三方清单和许可证应随实际 SDK 部署材料保留，不能用本表替代。
+许可证文件由依赖安装规则收集到 `share/qcopilots-search/licenses`，macOS 位于应用包的 `Contents/Resources/qcopilots-search/licenses`。其中 `qcopilots-search-runtime` 自动保留实际 Qt SDK 的八份模块 SPDX、所含版权声明、自定义许可全文和锁定 Qt 源码中的许可、NOTICE 与 attribution 引用原文。它同时保留 llama.cpp 的完整 MIT 声明，该上游声明覆盖其内置 ggml。生成和安装过程校验源归档及逐项文件哈希，包级验证再次检查必需材料。
+
+这些 Qt SPDX 是 SDK 模块清单，可能包含未部署的可选功能或外部引用，不宣称它们是应用完整的运行依赖关系图。保留上游多种许可文本不会改变本项目采用的发行条款。发行审查应检查实际安装包和对应源码，而不仅检查本表。
 
 Windows 包中的 `msvcp140`、`vcruntime140` 和 `vcomp140` 等编译器运行库来自构建所用 Visual Studio 的可再分发目录，按 Microsoft 适用许可分发，保留未经修改的发行版本并排除 `debug_nonredist` 文件。它们以应用目录中的动态库部署，无需为了运行该包单独启动管理员权限的 VC Redistributable 安装程序。对应源码工具只收集项目和开源依赖，不为 Microsoft 运行库宣称提供源码。参见 [Visual Studio 2022 再分发清单](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution) 和 [Visual C++ 文件再分发说明](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files?view=msvc-170)。
 

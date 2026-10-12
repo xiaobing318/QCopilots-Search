@@ -65,6 +65,7 @@ def inside_container():
     work = Path("/work")
     profile = work / "user-profile"
     report = {"schemaVersion": 1, "scenario": "deb-install-uninstall", "passed": False,
+              "releaseComplete": False,
               "containerImage": IMAGE, "packageSha256": digest(package),
               "commit": os.environ.get("QCOPILOTS_SEARCH_CI_COMMIT"), "checks": []}
     installed = False
@@ -114,11 +115,12 @@ def inside_container():
              "/source/tools/qcopilots-search-verify-package.py",
              "--build-root", work, "--installed-root", "/usr",
              "--installed-manifest", manifest, "--profile-dir", profile,
-             "--report-dir", report_root / "smoke"])
+             "--model-dir", "/models", "--report-dir", report_root / "smoke"])
         smoke = json.loads((report_root / "smoke/report.json").read_text(encoding="utf-8"))
-        if smoke.get("passed") is not True:
-            raise RuntimeError("The installed DEB failed the common package smoke")
-        report["checks"].append("non-root GUI, service, worker, OCR, PDF, media and search smoke passed")
+        if (smoke.get("passed") is not True or smoke.get("releaseComplete") is not True
+                or smoke.get("modelSmoke", {}).get("passed") is not True):
+            raise RuntimeError("The installed DEB failed the complete package and real-model smoke")
+        report["checks"].append("non-root GUI, service, worker, OCR, PDF, media, real-model inference and search smoke passed")
         sentinel = profile / "qcopilots-search-uninstall-preservation.txt"
         sentinel.write_text(str(uuid.uuid4()), encoding="utf-8")
         before = snapshot_profile(profile)
@@ -132,6 +134,7 @@ def inside_container():
             raise RuntimeError("DEB removal left package payload files: " + ", ".join(remaining[:10]))
         report["retainedProfileFiles"] = len(after)
         report["checks"].append("dpkg removed all owned payload files and preserved every user profile file hash")
+        report["releaseComplete"] = True
         report["passed"] = True
     except Exception as error:
         report["error"] = str(error)
@@ -150,6 +153,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-root", type=Path)
     parser.add_argument("--package-file", type=Path)
+    parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--report-dir", type=Path)
     parser.add_argument("--inside-container", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -160,10 +164,13 @@ def main():
         raise RuntimeError("DEB acceptance requires the native Linux CI host")
     if os.geteuid() == 0 or os.getegid() == 0:
         raise RuntimeError("Start DEB acceptance from a non-root CI user with Docker access")
-    if not args.build_root or not args.package_file:
-        parser.error("--build-root and --package-file are required")
+    if not args.build_root or not args.package_file or not args.model_dir:
+        parser.error("--build-root, --package-file and --model-dir are required")
     root = external(args.build_root)
     package = args.package_file.resolve()
+    models = args.model_dir.expanduser().resolve()
+    if not models.is_dir():
+        raise RuntimeError("Required real-model directory does not exist")
     report = external(args.report_dir or root / "reports/package-deb")
     report.mkdir(parents=True, exist_ok=True)
     work = root / "test-runs" / (PRODUCT + "-deb-" + str(uuid.uuid4()))
@@ -187,6 +194,7 @@ exec python3 /source/.github/scripts/qcopilots-search-deb-ci.py --inside-contain
                "--env", "QCOPILOTS_SEARCH_CI_COMMIT=" + os.environ.get("GITHUB_SHA", ""),
                "--mount", f"type=bind,source={SOURCE},target=/source,readonly",
                "--mount", f"type=bind,source={package},target=/incoming/qcopilots-search.deb,readonly",
+               "--mount", f"type=bind,source={models},target=/models,readonly",
                "--mount", f"type=bind,source={report},target=/reports",
                "--mount", f"type=bind,source={work},target=/work",
                IMAGE, "bash", "-c", container_script]

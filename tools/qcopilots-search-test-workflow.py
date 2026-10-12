@@ -2,14 +2,20 @@
 """Safety and relocation contracts for the developer workflow."""
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 SCRIPT = Path(__file__).resolve().with_name("qcopilots-search-dev.py")
 spec = importlib.util.spec_from_file_location("qcopilots_search_dev", SCRIPT)
 workflow = importlib.util.module_from_spec(spec)
@@ -155,6 +161,241 @@ include(CPack)
                 with self.assertRaises(RuntimeError):
                     package_verifier.unpack(package, destination)
                 self.assertFalse((self.root / "escaped.txt").exists())
+
+    def test_release_package_requires_models_before_launching(self):
+        report = self.root / "missing-model-report"
+        with patch.object(package_verifier.subprocess, "Popen") as launch, \
+                patch.object(package_verifier.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "requires --model-dir"):
+                package_verifier.verify(None, self.root / "build", report, self.root / "installed")
+        launch.assert_not_called()
+        evidence = json.loads((report / "report.json").read_text(encoding="utf-8"))
+        self.assertFalse(evidence["passed"])
+        self.assertFalse(evidence["releaseComplete"])
+        self.assertTrue(evidence["realModelRequired"])
+        self.assertEqual(evidence["verificationScope"], "release")
+
+    def test_license_inventory_cannot_be_omitted_or_satisfied_by_unrelated_files(self):
+        binary = self.root / "app/bin"
+        binary.mkdir(parents=True)
+        with self.assertRaisesRegex(RuntimeError, "complete runtime license manifest"):
+            package_verifier.verify_license_materials(binary, self.root / "app", self.root / "reports")
+        materials = binary.parent / "share/qcopilots-search/licenses/qcopilots-search-runtime"
+        materials.mkdir(parents=True)
+        (materials / "qcopilots-search-license-manifest.json").write_text(
+            json.dumps({"schemaVersion": 1, "kind": "runtime-license-materials", "files": []}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "version/modules"):
+            package_verifier.verify_license_materials(binary, self.root / "app", self.root / "reports")
+        self.assertFalse((self.root / "reports/runtime-license-materials").exists())
+
+    def test_dev_forwards_explicit_models_or_partial_scope(self):
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                models = self.root / "模型 cache"
+                arguments = [str(SCRIPT), "verify-package", "--build-root", str(self.root / "output"),
+                             "--model-dir", str(models), *(["--keyword-only"] if partial else [])]
+                with patch.object(sys, "argv", arguments), patch.object(workflow, "run") as run:
+                    workflow.main()
+                command = list(map(str, run.call_args.args[0]))
+                self.assertEqual("--keyword-only" in command, partial)
+                self.assertEqual("--model-dir" in command, not partial)
+                if not partial:
+                    self.assertEqual(command[command.index("--model-dir") + 1], str(models.resolve()))
+
+    def test_real_model_manifest_rejects_changed_missing_or_duplicate_artifacts(self):
+        import copy
+        result = {"valid": True, "directory": str(self.root), "artifacts": [
+            {"name": name, "present": True, "bytes": size, "expectedBytes": size, "sha256": digest}
+            for name, (size, digest) in package_verifier.MODEL_ARTIFACTS.items()]}
+        self.assertEqual(package_verifier.model_verification(result, self.root), result)
+        mutations = [lambda value: value.update(valid=False),
+                     lambda value: value["artifacts"].pop(),
+                     lambda value: value["artifacts"][0].update(sha256="0" * 64),
+                     lambda value: value["artifacts"][0].update(bytes=1),
+                     lambda value: value["artifacts"].__setitem__(1, value["artifacts"][0]),
+                     lambda value: value.update(directory=str(self.root / "elsewhere"))]
+        for mutate in mutations:
+            changed = copy.deepcopy(result)
+            mutate(changed)
+            with self.assertRaises(RuntimeError):
+                package_verifier.model_verification(changed, self.root)
+
+    def test_packaged_vector_requires_dimensions_finite_l2_and_old_reference(self):
+        reference = [1.0] + [0.0] * 767
+        self.assertEqual(package_verifier.validate_vector(reference, reference)["cosine"], 1.0)
+        for actual in (reference[:-1], [False] + reference[1:], [math.nan] + reference[1:],
+                       [math.inf] + reference[1:], [0.0] * 768, [2.0] + reference[1:],
+                       [0.0, 1.0] + [0.0] * 766):
+            with self.subTest(first=actual[:2]), self.assertRaises(RuntimeError):
+                package_verifier.validate_vector(actual, reference)
+
+    def test_model_smoke_uses_unmodified_reference_inputs(self):
+        destination = self.root / "参考 vectors"
+        vectors = package_verifier.reference_inputs(destination)
+        self.assertEqual(set(vectors), {"query", "query-bn", "query-ar", "document", "document-long",
+                                       "screen-280", "photo-140", "frame-70", "speech"})
+        self.assertEqual(package_verifier.file_digest(destination / "Screenshot golden.png"),
+                         package_verifier.REFERENCE_HASHES["screen.png"])
+        self.assertFalse((destination / "screen.png").exists())
+        with patch.object(package_verifier, "REFERENCE_HASHES", {"screen.png": "0" * 64}), self.assertRaises(RuntimeError):
+            package_verifier.reference_inputs(self.root / "tampered-input")
+
+    def test_macos_library_inventory_requires_mapped_text_descriptor(self):
+        output = "p100\0\nftxt\0n/app/Contents/Frameworks/libllama.dylib\0\nf7\0n/sdk/libmtmd.dylib\0\nftxt\0n/app/Contents/MacOS/qcopilots-search-worker\0"
+        self.assertEqual(package_verifier.mapped_macos_paths(output), ["/app/Contents/Frameworks/libllama.dylib",
+                          "/app/Contents/MacOS/qcopilots-search-worker"])
+        with self.assertRaisesRegex(RuntimeError, "enumerate all mapped"):
+            package_verifier.mapped_macos_paths(output + "\nferr\0nregion info error\0")
+
+    def test_inference_library_roles_do_not_accept_similarly_named_files(self):
+        expected = {"llama.dll": "llama", "libmtmd.0.dylib": "mtmd", "libggml.so.0": "ggml",
+                    "ggml-base.dll": "ggml-base", "libggml-cpu-x64.so": "cpu-backend"}
+        for name, role in expected.items():
+            self.assertEqual(package_verifier.inference_library_role(name), role)
+        for name in ("llama.dll.txt", "libggml-extra.so", "mtmd.json", "Qt6Core.dll"):
+            self.assertIsNone(package_verifier.inference_library_role(name))
+
+    def test_inference_origins_require_all_dynamic_roles_and_package_membership(self):
+        application = self.root / "app"
+        binary = application / "bin"
+        binary.mkdir(parents=True)
+        worker = binary / "qcopilots-search-worker"
+        worker.write_bytes(b"owned worker fixture")
+        files = []
+        for name in ("libllama.so", "libmtmd.so", "libggml.so", "libggml-base.so", "libggml-cpu-x64.so"):
+            path = binary / name
+            path.write_bytes(name.encode("ascii"))
+            files.append(str(path))
+        with patch.object(package_verifier.platform, "machine", return_value="x86_64"), \
+                patch.object(package_verifier.sys, "platform", "linux"), \
+                patch.object(package_verifier, "loaded_libraries", return_value=files):
+            inventory = package_verifier.inference_runtime_origins(None, worker, application)
+            self.assertEqual(len(inventory["libraries"]), 5)
+            self.assertEqual(inventory["linkage"], "shared-cpu-dispatch")
+            for missing in files:
+                with patch.object(package_verifier, "loaded_libraries", return_value=[path for path in files if path != missing]), self.assertRaises(RuntimeError):
+                    package_verifier.inference_runtime_origins(None, worker, application)
+            with self.assertRaises(RuntimeError):
+                package_verifier.inference_runtime_origins(None, worker, application, {worker.resolve()})
+            external = self.root / "SDK/libllama.so"
+            external.parent.mkdir()
+            external.write_bytes(b"external dependency")
+            with patch.object(package_verifier, "loaded_libraries", return_value=[*files, str(external)]), self.assertRaises(RuntimeError):
+                package_verifier.inference_runtime_origins(None, worker, application)
+
+    def test_arm_static_runtime_still_requires_owned_worker_and_qt_origins(self):
+        application = self.root / "app"
+        binary = application / "Contents/MacOS"
+        binary.mkdir(parents=True)
+        worker = binary / "qcopilots-search-worker"
+        worker.write_bytes(b"static inference worker fixture")
+        qt = application / "Contents/Frameworks/QtNetwork.framework/Versions/A/QtNetwork"
+        qt.parent.mkdir(parents=True)
+        qt.write_bytes(b"Qt framework fixture")
+        with patch.object(package_verifier.platform, "machine", return_value="arm64"), \
+                patch.object(package_verifier.sys, "platform", "darwin"), \
+                patch.object(package_verifier, "loaded_libraries", return_value=[str(qt)]):
+            inventory = package_verifier.inference_runtime_origins(None, worker, application)
+            self.assertEqual(inventory["linkage"], "static-cpu")
+            self.assertEqual(inventory["libraries"], [])
+            with self.assertRaises(RuntimeError):
+                package_verifier.inference_runtime_origins(None, self.root / "external-worker", application)
+
+    def test_worker_protocol_rejects_wrong_ids_eof_and_nonzero_shutdown(self):
+        import io
+        import queue
+        from unittest.mock import Mock
+        worker = Mock()
+        worker.stdin = io.StringIO()
+        replies = queue.Queue()
+        replies.put(json.dumps({"id": "wrong", "ok": True, "result": {}}))
+        with self.assertRaises(RuntimeError):
+            package_verifier.worker_request(worker, replies, {"id": "expected", "operation": "query"}, self.root)
+        replies.put(None)
+        with self.assertRaisesRegex(RuntimeError, "without a response"):
+            package_verifier.worker_request(worker, replies, {"id": "expected", "operation": "query"}, self.root)
+        worker.poll.return_value = None
+        worker.returncode = 3
+        reader = Mock()
+        reader.is_alive.return_value = False
+        replies.put(json.dumps({"id": "worker-shutdown", "ok": True, "result": {"stopping": True}}))
+        with self.assertRaisesRegex(RuntimeError, "shutdown failed"):
+            package_verifier.stop_worker(worker, replies, reader, self.root)
+
+    @unittest.skipUnless(os.name == "nt", "NSIS is native to Windows")
+    def test_nsis_compiles_recursive_unicode_payload_beyond_max_path(self):
+        compiler = shutil.which("makensis")
+        self.assertIsNotNone(compiler, "NSIS compiler missing: run bootstrap before Windows CTest")
+        template = (workflow.SOURCE / "cmake/nsis/NSIS.template.in").read_text(encoding="utf-8")
+        macro = template[template.index("!macro QCOPILOTS_SEARCH_COMPILER_PATH"):
+                         template.index("!macroend") + len("!macroend")]
+        guard_start = template.index("!macro QCOPILOTS_SEARCH_REQUIRE_WRITE_SUCCESS")
+        guard = template[guard_start:template.index("!macroend", guard_start) + len("!macroend")]
+        payload = self.root / "编译输入 空格"
+        while len(str(payload)) < 290:
+            payload /= "long-payload-segment"
+        license = payload / "share/qcopilots-search/licenses/qt/third-party/许可声明.txt"
+        license.parent.mkdir(parents=True)
+        content = "Real recursive license payload 中文\n"
+        license.write_text(content, encoding="utf-8")
+        output = payload.parent / "installer-output.exe"
+        cases = [
+            ("C:/外置 build/payload", r"\\?\C:\外置 build\payload"),
+            ("//server/share/许可 payload", r"\\?\UNC\server\share\许可 payload"),
+            (r"\\?\C:\already long", r"\\?\C:\already long"),
+            (r"\\?\UNC\server\share\already long", r"\\?\UNC\server\share\already long"),
+        ]
+        manifest_option = next(line for line in template.splitlines()
+                               if line.startswith("ManifestLongPathAware "))
+        program = ["Unicode true", manifest_option, macro, guard]
+        for index, (value, expected) in enumerate(cases):
+            program += [f'!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH P{index} "{value}"',
+                        f'!assert "${{P{index}}}" S== "{expected}" "Path conversion failed"']
+        program += [f'!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH PAYLOAD "{payload.as_posix()}"',
+                    f'!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH OUTPUT "{output.as_posix()}"',
+                    f'!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH LICENSE "{license.as_posix()}"',
+                    'Name "QCopilots Search compiler path fixture"', 'OutFile "${OUTPUT}"',
+                    'RequestExecutionLevel user', 'LicenseData "${LICENSE}"',
+                    'Section', 'ClearErrors', 'SetOutPath "$INSTDIR"', 'File /r "${PAYLOAD}\\*.*"',
+                    '!insertmacro QCOPILOTS_SEARCH_REQUIRE_WRITE_SUCCESS',
+                    'FileOpen $0 "$INSTDIR\\completed.txt" w', 'FileWrite $0 "completed"',
+                    'FileClose $0', 'SectionEnd']
+        script = self.root / "compiler-path.nsi"
+        script.write_text("\n".join(program) + "\n", encoding="utf-8")
+        # Feed the script on stdin so this regression concerns compiler file
+        # paths even when the parent test root itself exceeds MAX_PATH.
+        result = subprocess.run([compiler, "/INPUTCHARSET", "UTF8", "/NOCD", "-"],
+                                input=script.read_text(encoding="utf-8"),
+                                capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertGreater(output.stat().st_size, 1000)
+        self.assertEqual(license.read_text(encoding="utf-8"), content)
+        destination = self.root / "安装目标 空格"
+        while len(str(destination)) < 230:
+            destination /= "long-target-segment"
+        executable = str(output.resolve())
+        if executable.startswith("\\\\?\\"):
+            pass
+        elif executable.startswith("\\\\"):
+            executable = "\\\\?\\UNC\\" + executable[2:]
+        else:
+            executable = "\\\\?\\" + executable
+        # An explicit executable allows CreateProcessW to launch the long
+        # output filename. NSIS requires the final /D value to be unquoted.
+        installed = subprocess.run('"qcopilots-search-path-fixture.exe" /S /D=' + str(destination),
+                                   executable=executable, capture_output=True, timeout=30)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        received = destination / license.relative_to(payload)
+        self.assertGreater(len(str(received)), 259)
+        self.assertEqual(received.read_text(encoding="utf-8"), content)
+        self.assertEqual((destination / "completed.txt").read_text(), "completed")
+        failed_destination = destination.parent / (destination.name + "-write-failure")
+        (failed_destination / license.relative_to(payload)).mkdir(parents=True)
+        failed = subprocess.run('"qcopilots-search-path-fixture.exe" /S /D=' + str(failed_destination),
+                                executable=executable, capture_output=True, timeout=30)
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertFalse((failed_destination / "completed.txt").exists())
 
     @unittest.skipUnless(os.name == "nt", "NSIS is native to Windows")
     def test_installer_guard_rejects_existing_start_menu_before_execution(self):

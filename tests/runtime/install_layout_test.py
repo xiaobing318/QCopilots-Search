@@ -9,12 +9,15 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cmake", default=shutil.which("cmake"))
     parser.add_argument("--generator", default="Ninja")
     parser.add_argument("--compiler")
+    parser.add_argument("--qt-cmake-dir")
     parser.add_argument("--report", type=Path)
     options = parser.parse_args()
     if not options.cmake:
@@ -63,6 +66,12 @@ def main():
             assert installed == {(base_dir / base).as_posix(), (cpu_dir / cpu).as_posix()}, installed
             records.append({"case": name, "passed": True, "installed": sorted(installed)})
             print(f"PASS {name}: actual cmake --install files and CPU RPATH verified", flush=True)
+        if sys.platform.startswith("linux"):
+            from linux_deploy_test import check_linux_deployment
+            records.extend(check_linux_deployment(options, source, repo, Path(root)))
+        if sys.platform == "darwin":
+            from macos_deploy_test import check_macos_deployment
+            records.extend(check_macos_deployment(options, source, repo, Path(root)))
     if options.report:
         options.report.parent.mkdir(parents=True, exist_ok=True)
         options.report.write_text(json.dumps({"passed": True, "cases": records}, indent=2) + "\n", encoding="utf-8")

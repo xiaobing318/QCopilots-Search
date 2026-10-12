@@ -59,6 +59,13 @@ function(qcopilots_search_add_image_codec_dependencies)
     else()
         set(jpeg_config Release)
     endif()
+    # Install all public headers together. In particular, jpeglib.h includes
+    # "jconfig.h", which must be the configuration of this exact shared library.
+    # Separate source/build include paths can pick up an unrelated host header.
+    set(jpeg_include "${jpeg_stage}/${jpeg_config}/include")
+    foreach(config IN ITEMS Debug Release RelWithDebInfo MinSizeRel ${CMAKE_CONFIGURATION_TYPES} ${CMAKE_BUILD_TYPE})
+        file(MAKE_DIRECTORY "${jpeg_stage}/${config}/include")
+    endforeach()
     file(MAKE_DIRECTORY "${qcopilots_search_jpeg_BINARY_DIR}")
     set(jpeg_cmake_args
         "-DCMAKE_C_COMPILER:FILEPATH=${CMAKE_C_COMPILER}"
@@ -96,6 +103,9 @@ function(qcopilots_search_add_image_codec_dependencies)
     if(WIN32)
         list(APPEND jpeg_byproducts "${jpeg_stage}/${jpeg_config}/${jpeg_import}")
     endif()
+    foreach(header IN ITEMS jconfig.h jerror.h jmorecfg.h jpeglib.h)
+        list(APPEND jpeg_byproducts "${jpeg_include}/${header}")
+    endforeach()
     ExternalProject_Add(qcopilots-search-build-jpeg
         SOURCE_DIR "${qcopilots_search_jpeg_SOURCE_DIR}"
         BINARY_DIR "${qcopilots_search_jpeg_BINARY_DIR}"
@@ -106,13 +116,15 @@ function(qcopilots_search_add_image_codec_dependencies)
         BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> --config "${jpeg_config}" --target jpeg
         INSTALL_COMMAND "${CMAKE_COMMAND}" --install <BINARY_DIR> --config "${jpeg_config}"
             --prefix "${jpeg_stage}/${jpeg_config}"
-        BUILD_BYPRODUCTS ${jpeg_byproducts}
+        INSTALL_BYPRODUCTS ${jpeg_byproducts}
         EXCLUDE_FROM_ALL TRUE)
     add_library(qcopilots-search-native-jpeg SHARED IMPORTED GLOBAL)
-    set_property(TARGET qcopilots-search-native-jpeg PROPERTY
-        INTERFACE_INCLUDE_DIRECTORIES
-        "${qcopilots_search_jpeg_SOURCE_DIR}/src;${qcopilots_search_jpeg_BINARY_DIR}")
     set_target_properties(qcopilots-search-native-jpeg PROPERTIES
+        SYSTEM FALSE
+        INTERFACE_INCLUDE_DIRECTORIES "${jpeg_include}"
+        # Compile the ABI contract with each actual consumer's include search
+        # path, including C consumers such as Leptonica, without forced headers.
+        INTERFACE_SOURCES "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcopilots-search-jpeg-contract.c"
         IMPORTED_LOCATION "${jpeg_stage}/Release/${jpeg_runtime}")
     if(WIN32)
         set_target_properties(qcopilots-search-native-jpeg PROPERTIES

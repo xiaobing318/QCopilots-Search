@@ -57,8 +57,8 @@ function(qcopilots_search_add_ocr_codec_dependencies)
     file(WRITE "${find_modules}/FindJPEG.cmake"
         "set(JPEG_FOUND TRUE)\nset(JPEG_VERSION 3.1.4.1)\n"
         "set(JPEG_LIBRARY JPEG::JPEG)\nset(JPEG_LIBRARIES JPEG::JPEG)\n"
-        "set(JPEG_INCLUDE_DIR [==[${qcopilots_search_jpeg_SOURCE_DIR}/src;${qcopilots_search_jpeg_BINARY_DIR}]==])\n"
-        "set(JPEG_INCLUDE_DIRS [==[${qcopilots_search_jpeg_SOURCE_DIR}/src;${qcopilots_search_jpeg_BINARY_DIR}]==])\n")
+        "get_target_property(JPEG_INCLUDE_DIR JPEG::JPEG INTERFACE_INCLUDE_DIRECTORIES)\n"
+        "set(JPEG_INCLUDE_DIRS \"\${JPEG_INCLUDE_DIR}\")\n")
     file(WRITE "${find_modules}/FindPNG.cmake"
         "set(PNG_FOUND TRUE)\nset(PNG_VERSION 1.6.59)\n"
         "set(PNG_LIBRARY PNG::PNG)\nset(PNG_LIBRARIES PNG::PNG)\n"

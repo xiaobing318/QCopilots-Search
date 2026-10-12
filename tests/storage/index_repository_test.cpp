@@ -1,5 +1,6 @@
 #include "storage/index_repository.h"
 #include "support/test_environment.h"
+#include "support/sqlite_database.h"
 
 #include <QDir>
 #include <QFile>
@@ -55,14 +56,12 @@ QSet<QString> hitPaths(const QList<SearchHit> &hits)
     return result;
 }
 
-// SQLite's UTF-8 entry point accepts the same Unicode and space paths as the
-// application. Keep this helper local so no developer SDK or CLI is required.
+// Inspect the actual repository using raw SQL without a developer SDK or CLI.
 bool executeSql(const QString &path, const char *statement, QString *error)
 {
     sqlite3 *raw = nullptr;
-    const QByteArray encoded = path.toUtf8();
-    if (sqlite3_open_v2(encoded.constData(), &raw,
-                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
+    if (test::openSqliteDatabase(path, &raw,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) != SQLITE_OK) {
         *error = raw ? QString::fromUtf8(sqlite3_errmsg(raw))
                      : QStringLiteral("SQLite did not return a database handle");
         if (raw)

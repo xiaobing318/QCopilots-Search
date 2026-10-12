@@ -14,19 +14,12 @@ function(qcopilots_search_sign_macos_bundle bundle python helper report identity
     endif()
 endfunction()
 
-function(qcopilots_search_verify_deploy_rpath binary library_directory)
-    find_program(QCOPILOTS_SEARCH_OTOOL otool REQUIRED)
-    execute_process(COMMAND "${QCOPILOTS_SEARCH_OTOOL}" -l "${binary}"
-        RESULT_VARIABLE inspect_result OUTPUT_VARIABLE load_commands ERROR_VARIABLE inspect_errors)
+function(qcopilots_search_verify_macos_links bundle python helper report)
+    execute_process(COMMAND "${python}" -B "${helper}" --bundle "${bundle}" --report "${report}"
+        RESULT_VARIABLE inspect_result OUTPUT_VARIABLE inspect_output ERROR_VARIABLE inspect_errors)
+    message("${inspect_output}")
     if(NOT inspect_result STREQUAL "0")
-        message(FATAL_ERROR "Cannot inspect deployment rpaths: ${inspect_errors}")
-    endif()
-    string(FIND "${load_commands}" "path ${library_directory} (offset" rpath_position)
-    string(FIND "${load_commands}" "path @executable_path/../Frameworks (offset" bundle_rpath_position)
-    string(FIND "${load_commands}" "path @loader_path/../Frameworks (offset" loader_rpath_position)
-    if(NOT rpath_position EQUAL -1 OR
-            (bundle_rpath_position EQUAL -1 AND loader_rpath_position EQUAL -1))
-        message(FATAL_ERROR "Deployed executable retains a build rpath or lacks its bundle-relative Frameworks rpath")
+        message(FATAL_ERROR "Deployed bundle has invalid runtime dependency paths: ${inspect_errors}")
     endif()
 endfunction()
 

@@ -1,5 +1,6 @@
 #include "storage/index_repository.h"
 #include "support/test_environment.h"
+#include "support/sqlite_database.h"
 
 #include <QtTest>
 #include <sqlite3.h>
@@ -74,9 +75,8 @@ private slots:
         QCOMPARE(searchError, QStringLiteral("Search cancelled"));
 
         sqlite3 *raw = nullptr;
-        const auto path = repository.databasePath().toUtf8();
-        const int opened = sqlite3_open_v2(path.constData(), &raw,
-                                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, nullptr);
+        const int opened = test::openSqliteDatabase(repository.databasePath(), &raw,
+                                                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX);
         std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(raw, sqlite3_close);
         QCOMPARE(opened, SQLITE_OK);
         sqlite3_busy_timeout(raw, 1000);

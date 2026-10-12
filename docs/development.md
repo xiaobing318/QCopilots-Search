@@ -55,7 +55,7 @@ Windows 使用 `qcopilots-search-dev.ps1`，macOS / Linux 使用 `bash qcopilots
 | `run` | 从构建结果启动应用 |
 | `install` | 使用 CMake install 生成 staging 布局 |
 | `package` | 从安装布局生成选定平台包 |
-| `verify-package` | 检查部署文件并执行包级启动验证 |
+| `verify-package` | 检查部署文件、许可材料及包内真实多模态推理 |
 | `clean` | 仅清理经过路径边界验证的任务生成目录 |
 
 共同参数：
@@ -88,10 +88,12 @@ $modelDir = Join-Path $buildRoot 'models'
 ./qcopilots-search-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ./qcopilots-search-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
 ./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
-./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot
+./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ```
 
 以上路径是可替换的命令示例。代码、CI 与测试不会依赖这些盘符。模型准备方式及完整测试的门槛见 [测试指南](testing.md)。
+
+`verify-package` 默认执行发布验收，需要通过 `--model-dir` 或 `QCOPILOTS_SEARCH_MODEL_DIR` 提供两份完整、校验通过的锁定模型。验收使用最终包内的 worker 执行文字、图片和音频黄金向量，并通过安装后的服务执行语义检索。它保留原始 worker 回复、实际加载库的来源与哈希，以及对应许可材料。仅做开发阶段关键词检查时可显式使用 `--keyword-only`，该报告的 `releaseComplete` 为 false，不能用于发布门禁。
 
 ## 直接使用 CMake
 

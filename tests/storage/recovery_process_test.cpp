@@ -1,4 +1,5 @@
 #include "storage/index_repository.h"
+#include "support/sqlite_database.h"
 #include "support/test_environment.h"
 
 #include <QCoreApplication>
@@ -42,8 +43,12 @@ public:
         process.setArguments({QStringLiteral("--test-root"), environment.root(),
                               QStringLiteral("--profile-dir"), paths.profileDir,
                               QStringLiteral("--fault-token"), token});
+        // Windows process creation cannot use an over-MAX_PATH current directory.
+        // Inherit the valid launcher directory there while passing absolute paths.
+#ifndef Q_OS_WIN
         // An unrelated working directory catches accidental relative paths.
         process.setWorkingDirectory(paths.tempDir);
+#endif
         QElapsedTimer elapsed;
         elapsed.start();
         process.start();
@@ -86,8 +91,7 @@ qint64 scalar(const QString &databasePath, const char *sql, QString *error,
               qint64 shard = -1, qint64 watermark = -1)
 {
     sqlite3 *rawDatabase = nullptr;
-    const int opened = sqlite3_open_v2(databasePath.toUtf8().constData(), &rawDatabase,
-                                      SQLITE_OPEN_READONLY, nullptr);
+    const int opened = test::openSqliteDatabase(databasePath, &rawDatabase, SQLITE_OPEN_READONLY);
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
     if (opened != SQLITE_OK) {
         *error = QStringLiteral("Cannot inspect recovery database: %1").arg(databasePath);

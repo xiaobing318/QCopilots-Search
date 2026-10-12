@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression checks for release evidence that can otherwise falsely pass."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,10 @@ native_spec = importlib.util.spec_from_file_location(
     "qcopilots_search_native_ci", Path(__file__).with_name("qcopilots-search-native-ci.py"))
 native = importlib.util.module_from_spec(native_spec)
 native_spec.loader.exec_module(native)
+deb_spec = importlib.util.spec_from_file_location(
+    "qcopilots_search_deb_ci", Path(__file__).with_name("qcopilots-search-deb-ci.py"))
+deb = importlib.util.module_from_spec(deb_spec)
+deb_spec.loader.exec_module(deb)
 
 SIGNING_PROGRAM = "qcopilots-search-tests-macos-signing"
 SIGNING_SKIP_REASON = ("Windows lacks symbolic-link creation privilege (WinError 1314). "
@@ -38,6 +43,14 @@ SIGNING_CASES = SIGNING_SYMLINK_CASES + (
     "test_commands_sign_every_unit_in_plan_order_without_deep_signing",
     "test_each_unit_has_strict_verification_and_final_app_has_deep",
 )
+WORKFLOW_PROGRAM = "qcopilots-search-tests-workflow"
+WORKFLOW_SKIP_REASON = "NSIS is native to Windows"
+WORKFLOW_NSIS_CASES = (
+    "test_nsis_compiles_recursive_unicode_payload_beyond_max_path",
+    "test_installer_guard_rejects_existing_start_menu_before_execution",
+)
+WORKFLOW_CASES = ("test_clean_preserves_unowned_directory",
+                  "test_release_package_requires_models_before_launching", *WORKFLOW_NSIS_CASES)
 
 
 def signing_verbose(rows=None, *, run=None, footer=None):
@@ -49,6 +62,28 @@ def signing_verbose(rows=None, *, run=None, footer=None):
         footer = f"OK (skipped={skipped})" if skipped else "OK"
     return ("\n".join(f"{name} (__main__.SigningTests.{name}) ... {status}" for name, status in rows)
             + f"\n\n----------------------------------------------------------------------\nRan {len(rows) if run is None else run} tests in 0.012s\n\n{footer}\n")
+
+
+def workflow_verbose(rows=None):
+    """Match observed workflow verbose records with interleaved JSON stdout."""
+    rows = [(name, "ok") for name in WORKFLOW_CASES] if rows is None else rows
+    lines = []
+    for name, status in rows:
+        if name == "test_release_package_requires_models_before_launching":
+            # The real workflow-nsis-final.log prints this expected failure
+            # report between complete unittest records. Paths here are synthetic.
+            lines.append(json.dumps({"package": None, "installedRoot": "synthetic 安装 空格",
+                "runId": "synthetic-workflow-parser-input", "workingDirectory": "synthetic 工作目录",
+                "checks": [], "passed": False, "verificationScope": "release", "realModelRequired": True,
+                "releaseComplete": False, "commit": None, "workingTreeModified": None,
+                "profileDirectory": "synthetic 独立配置", "applicationRoot": "synthetic 安装 空格",
+                "error": "Release package verification requires --model-dir with both locked GGUF files. "
+                         "Use --keyword-only only for an explicitly partial developer check."},
+                ensure_ascii=False, indent=2))
+        lines.append(f"{name} (__main__.WorkflowTests.{name}) ... {status}")
+    skipped = sum(status.startswith("skipped ") for _, status in rows)
+    footer = f"OK (skipped={skipped})" if skipped else "OK"
+    return "\n".join(lines) + f"\n\n----------------------------------------------------------------------\nRan {len(rows)} tests in 0.012s\n\n{footer}\n"
 
 
 class EvidenceTests(unittest.TestCase):
@@ -158,7 +193,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_non_qt_programs_do_not_require_qt_totals(self):
         for name in evidence.NON_QT_TESTS:
-            if name == SIGNING_PROGRAM:
+            if name in evidence.PYTHON_CASE_TESTS:
                 continue
             self.assertTrue(self.inspect("success\n", name=name)["releaseComplete"])
 
@@ -273,6 +308,73 @@ class PythonSigningEvidenceTests(unittest.TestCase):
             self.assertFalse(self.inspect(signing_verbose(rows, footer=footer))["releaseComplete"])
 
 
+class PythonWorkflowEvidenceTests(unittest.TestCase):
+    def inspect(self, output=None, *, system="Windows", program=WORKFLOW_PROGRAM):
+        return EvidenceTests.inspect(self, workflow_verbose() if output is None else output,
+                                     name=program, system=system, raw=True)
+
+    def skipped_rows(self, *, reason=WORKFLOW_SKIP_REASON):
+        return [(name, "skipped " + repr(reason) if name in WORKFLOW_NSIS_CASES else "ok")
+                for name in WORKFLOW_CASES]
+
+    def test_exact_non_windows_nsis_skips_are_counted_separately_from_passes(self):
+        expected = {"run": 4, "passed": 2, "failed": 0, "skipped": 2, "notApplicable": 2}
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system=system):
+                result = self.inspect(workflow_verbose(self.skipped_rows()), system=system)
+                self.assertTrue(result["releaseComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"], expected)
+                program = result["ctestPrograms"][0]
+                self.assertTrue(program["pythonTest"])
+                self.assertFalse(program["qtTest"])
+                self.assertEqual(program["pythonTestTotals"], expected)
+                self.assertEqual(len(program["cases"]), 4)
+                self.assertEqual({item["case"] for item in result["pythonTestSkips"]},
+                                 {"__main__.WorkflowTests." + name for name in WORKFLOW_NSIS_CASES})
+                self.assertTrue(all(item["classification"] == "notApplicable" for item in result["pythonTestSkips"]))
+
+    def test_windows_execution_counts_all_cases_despite_expected_failure_json_stdout(self):
+        result = self.inspect()
+        self.assertTrue(result["releaseComplete"], result["errors"])
+        self.assertEqual(result["pythonTestTotals"],
+                         {"run": 4, "passed": 4, "failed": 0, "skipped": 0, "notApplicable": 0})
+        self.assertEqual(len(result["ctestPrograms"][0]["cases"]), 4)
+        self.assertEqual(result["pythonTestSkips"], [])
+        self.assertEqual(result["qtTestTotals"]["passed"], 0)
+
+    def test_windows_nsis_skip_is_required_not_run(self):
+        result = self.inspect(workflow_verbose(self.skipped_rows()))
+        self.assertFalse(result["releaseComplete"])
+        self.assertEqual(result["pythonTestTotals"],
+                         {"run": 4, "passed": 2, "failed": 0, "skipped": 2, "notApplicable": 0})
+        self.assertTrue(all(item["classification"] == "requiredNotRun" for item in result["pythonTestSkips"]))
+
+    def test_unknown_nsis_method_or_skip_reason_is_not_allowlisted(self):
+        unknown = self.skipped_rows()
+        unknown[-1] = ("test_unrecognized_nsis_case", unknown[-1][1])
+        for rows in (unknown, self.skipped_rows(reason="NSIS unavailable")):
+            for system in ("Linux", "Darwin"):
+                with self.subTest(rows=rows, system=system):
+                    result = self.inspect(workflow_verbose(rows), system=system)
+                    self.assertFalse(result["releaseComplete"])
+                    self.assertTrue(any(item["classification"] == "requiredNotRun" for item in result["pythonTestSkips"]))
+
+    def test_nsis_exception_cannot_apply_to_another_python_program(self):
+        for program in (SIGNING_PROGRAM, "qcopilots-search-tests-license-materials"):
+            with self.subTest(program=program):
+                result = self.inspect(workflow_verbose(self.skipped_rows()), system="Linux", program=program)
+                self.assertFalse(result["releaseComplete"])
+                self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+                self.assertTrue(all(item["classification"] == "requiredNotRun" for item in result["pythonTestSkips"]))
+
+    def test_workflow_requires_complete_individual_records_and_matching_summary(self):
+        complete = workflow_verbose()
+        for output in ("success\n", "Ran 4 tests in 0.012s\n\nOK\n",
+                       complete.replace("Ran 4 tests", "Ran 5 tests"), complete.replace("\nOK\n", "\n")):
+            with self.subTest(output=output):
+                self.assertFalse(self.inspect(output)["releaseComplete"])
+
+
 class NativeTestFlowTests(unittest.TestCase):
     def run_test_action(self, failure=None):
         with tempfile.TemporaryDirectory(prefix="qcopilots-search-ci-test-flow-",
@@ -318,6 +420,173 @@ class NativeTestFlowTests(unittest.TestCase):
 
     def test_fail_fast_failure_preserves_original_error_without_acceptance_success(self):
         self.run_test_action(native.subprocess.CalledProcessError(17, ["synthetic-dev", "test"]))
+
+
+class PackageModelFlowTests(unittest.TestCase):
+    def test_native_deb_installer_keeps_model_path_as_one_argument(self):
+        root = Path("synthetic build 中文 空格")
+        models = root / "shared models 中文"
+        package = root / "packages/qcopilots-search package.deb"
+        with mock.patch.object(native, "ROOT", root, create=True), \
+                mock.patch.object(native, "REPORTS", root / "reports", create=True), \
+                mock.patch.object(native, "MODELS", models, create=True), \
+                mock.patch.object(native.os, "name", "posix"), \
+                mock.patch.object(native.platform, "system", return_value="Linux"), \
+                mock.patch.object(native, "package_for_suffix", return_value=package), \
+                mock.patch.object(native, "run") as run:
+            native.installers()
+        command = run.call_args.args[0]
+        self.assertEqual(command.count("--model-dir"), 1)
+        self.assertEqual(command[command.index("--model-dir") + 1], models)
+        self.assertEqual(command[command.index("--package-file") + 1], package)
+
+    def test_common_and_nsis_verification_keep_shared_model_argument(self):
+        root = Path("synthetic build 中文 空格")
+        models = root / "shared models 中文"
+        for extra in ((), ("--package-file", str(root / "packages/installer with spaces.exe"))):
+            with self.subTest(extra=extra), \
+                    mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "QT", root / "Qt SDK", create=True), \
+                    mock.patch.object(native, "MODELS", models, create=True), \
+                    mock.patch.object(native, "run") as run:
+                native.dev("verify-package", *extra, display=True)
+                command = run.call_args.args[0]
+                self.assertEqual(command.count("--model-dir"), 1)
+                self.assertEqual(command[command.index("--model-dir") + 1], models)
+                if extra:
+                    self.assertEqual(command[command.index("--package-file") + 1], extra[1])
+                self.assertTrue(run.call_args.kwargs["display"])
+
+    def invoke_deb_outer(self, root, model_argument):
+        package = root / "package 中文 空格.deb"
+        package.write_bytes(b"synthetic package, never installed")
+        argv = ["synthetic-deb-ci", "--build-root", str(root / "build with spaces"),
+                "--package-file", str(package)]
+        if model_argument is not None:
+            argv += ["--model-dir", str(model_argument)]
+        with mock.patch.object(deb.sys, "argv", argv), \
+                mock.patch.object(deb.platform, "system", return_value="Linux"), \
+                mock.patch.object(deb.os, "geteuid", return_value=1000, create=True), \
+                mock.patch.object(deb.os, "getegid", return_value=1000, create=True), \
+                mock.patch.object(deb.os, "getuid", return_value=1000, create=True), \
+                mock.patch.object(deb.os, "getgid", return_value=1000, create=True), \
+                mock.patch.object(deb, "run", return_value=deb.subprocess.CompletedProcess([], 0, "synthetic stdout", "")) as run, \
+                mock.patch.object(deb.subprocess, "Popen") as spawn, \
+                mock.patch.object(deb.sys, "stderr", io.StringIO()):
+            try:
+                deb.main()
+            except (SystemExit, RuntimeError):
+                run.assert_not_called()
+                spawn.assert_not_called()
+                self.assertFalse((root / "build with spaces").exists())
+                raise
+            spawn.assert_not_called()
+            run.assert_called_once()
+            return run.call_args.args[0]
+
+    def test_deb_host_mounts_existing_models_readonly_without_splitting_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-ci-deb-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+            root = Path(temporary)
+            models = root / "models 中文 空格"
+            models.mkdir()
+            command = self.invoke_deb_outer(root, models)
+            self.assertEqual(command[:3], ["docker", "run", "--rm"])
+            mounts = [command[i + 1] for i, item in enumerate(command) if item == "--mount"]
+            model_mounts = [item for item in mounts if "target=/models" in item]
+            self.assertEqual(model_mounts, [f"type=bind,source={models.resolve()},target=/models,readonly"])
+
+    def test_deb_host_rejects_missing_or_invalid_models_before_docker_and_output(self):
+        for case in ("argument absent", "directory absent", "regular file"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix="qcopilots-search-ci-deb-missing-",
+                    dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+                root = Path(temporary)
+                models = None if case == "argument absent" else root / "models 中文 空格"
+                if case == "regular file":
+                    models.write_text("not a model directory", encoding="utf-8")
+                if models is None:
+                    with self.assertRaises(SystemExit) as caught:
+                        self.invoke_deb_outer(root, models)
+                    self.assertEqual(caught.exception.code, 2)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "Required real-model directory does not exist"):
+                        self.invoke_deb_outer(root, models)
+
+    def inspect_container_smoke(self, smoke):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-ci-deb-container-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as temporary:
+            root = Path(temporary)
+            for relative in ("incoming", "reports/smoke", "work/user-profile", "etc", "usr/bin"):
+                (root / relative).mkdir(parents=True, exist_ok=True)
+            (root / ".dockerenv").touch()
+            (root / "incoming/qcopilots-search.deb").write_bytes(b"synthetic DEB fixture")
+            (root / "etc/os-release").write_text("synthetic container", encoding="utf-8")
+            (root / "reports/smoke/report.json").write_text(json.dumps(smoke), encoding="utf-8")
+            payload = root / "usr/bin/qcopilots-search"
+            payload.write_bytes(b"synthetic payload")
+            commands = []
+            installed_queries = 0
+
+            def container_path(value):
+                self.assertTrue(str(value).startswith("/"))
+                return root / str(value).lstrip("/")
+
+            def fake_run(command, **kwargs):
+                nonlocal installed_queries
+                parts = [str(item) for item in command]
+                commands.append(parts)
+                result = deb.subprocess.CompletedProcess(parts, 0, "", "")
+                if parts[:2] == ["dpkg-deb", "--field"]:
+                    result.stdout = "qcopilots-search" if parts[-1] == "Package" else "0.1.0"
+                elif parts[:2] == ["dpkg-query", "--show"]:
+                    installed_queries += 1
+                    result.returncode = 1 if installed_queries == 1 else 0
+                    result.stdout = "" if installed_queries == 1 else "ii "
+                elif parts[:2] == ["dpkg-query", "--listfiles"]:
+                    result.stdout = "/usr/bin/qcopilots-search\n"
+                elif parts[:2] == ["dpkg", "--remove"]:
+                    payload.unlink()
+                return result
+
+            complete = (smoke.get("passed") is True and smoke.get("releaseComplete") is True
+                        and smoke.get("modelSmoke", {}).get("passed") is True)
+            with mock.patch.object(deb, "Path", side_effect=container_path), \
+                    mock.patch.object(deb.platform, "system", return_value="Linux"), \
+                    mock.patch.object(deb.os, "geteuid", return_value=0, create=True), \
+                    mock.patch.dict(deb.os.environ, {"QCOPILOTS_SEARCH_DEB_CONTAINER": "1",
+                        "QCOPILOTS_SEARCH_HOST_UID": "1000", "QCOPILOTS_SEARCH_HOST_GID": "1000"}), \
+                    mock.patch.dict(sys.modules, {"grp": mock.Mock()}), \
+                    mock.patch.object(deb, "run", side_effect=fake_run), \
+                    mock.patch.object(deb.subprocess, "Popen") as spawn, \
+                    mock.patch("builtins.print"):
+                if complete:
+                    deb.inside_container()
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "complete package and real-model smoke"):
+                        deb.inside_container()
+                spawn.assert_not_called()
+            report = json.loads((root / "reports/report.json").read_text(encoding="utf-8"))
+            verifier = [command for command in commands if command[0] == "runuser"]
+            self.assertEqual(len(verifier), 1)
+            self.assertEqual(verifier[0][verifier[0].index("--model-dir") + 1], "/models")
+            self.assertEqual(verifier[0].count("--model-dir"), 1)
+            return report
+
+    def test_deb_container_verifier_receives_models_and_complete_smoke_can_pass(self):
+        report = self.inspect_container_smoke({"passed": True, "releaseComplete": True,
+                                              "modelSmoke": {"passed": True}})
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["releaseComplete"])
+        self.assertEqual(report["retainedProfileFiles"], 1)
+
+    def test_deb_container_partial_smoke_cannot_claim_release_completion(self):
+        for smoke in ({"passed": True}, {"passed": True, "releaseComplete": False,
+                       "modelSmoke": {"passed": True}}, {"passed": True, "releaseComplete": True},
+                      {"passed": True, "releaseComplete": True, "modelSmoke": {"passed": False}}):
+            with self.subTest(smoke=smoke):
+                report = self.inspect_container_smoke(smoke)
+                self.assertFalse(report["passed"])
+                self.assertFalse(report["releaseComplete"])
 
 
 class NativeIdentityTests(unittest.TestCase):
@@ -697,6 +966,33 @@ class SignatureEvidenceTests(unittest.TestCase):
         result = self.inspect(system="Windows")
         self.assertEqual(result["status"], "unknown")
         self.assertFalse(result["commands"])
+
+
+class PythonLicenseEvidenceTests(unittest.TestCase):
+    program = "qcopilots-search-tests-license-materials"
+
+    def inspect(self, output, system="Windows"):
+        return EvidenceTests.inspect(self, output, name=self.program, system=system, raw=True)
+
+    def test_verbose_license_cases_are_counted_without_qt_totals(self):
+        output = ("test_materials (__main__.LicenseMaterialsTests.test_materials) ... ok\n"
+                  "Ran 1 test in 0.001s\n\nOK\n")
+        for system in ("Windows", "Linux", "Darwin"):
+            with self.subTest(system=system):
+                result = self.inspect(output, system)
+                self.assertTrue(result["releaseComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"]["passed"], 1)
+                self.assertFalse(result["ctestPrograms"][0]["qtTest"])
+
+    def test_license_summary_without_case_records_is_incomplete(self):
+        self.assertFalse(self.inspect("Ran 32 tests in 0.001s\n\nOK\n")["releaseComplete"])
+
+    def test_signing_skip_exemption_does_not_apply_to_license_program(self):
+        output = signing_verbose([(SIGNING_SYMLINK_CASES[0], "skipped " + repr(SIGNING_SKIP_REASON))])
+        result = self.inspect(output)
+        self.assertFalse(result["releaseComplete"])
+        self.assertEqual(result["pythonTestSkips"][0]["program"], self.program)
+        self.assertEqual(result["pythonTestSkips"][0]["classification"], "requiredNotRun")
 
 
 if __name__ == "__main__":

@@ -148,7 +148,7 @@ def installers():
     elif platform.system() == "Linux":
         run([sys.executable, SOURCE / ".github/scripts/qcopilots-search-deb-ci.py",
              "--build-root", ROOT, "--package-file", package_for_suffix(".deb"),
-             "--report-dir", REPORTS / "package-deb"])
+             "--model-dir", MODELS, "--report-dir", REPORTS / "package-deb"])
     else:
         raise RuntimeError("There is no additional installer acceptance for this platform")
 

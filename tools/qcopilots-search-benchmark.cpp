@@ -57,6 +57,34 @@ void require(bool condition, const QString &message)
         throw std::runtime_error(message.toUtf8().constData());
 }
 
+using BenchmarkDatabase = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>;
+
+BenchmarkDatabase openBenchmarkDatabase(const QString &file, int flags, const QString &context)
+{
+    QString nativeFile = file;
+    const char *vfs = nullptr;
+#ifdef Q_OS_WIN
+    // Match the repository connection: the extended name and longpath VFS
+    // are both required. Keep the original readonly/readwrite flags intact.
+    nativeFile = QDir::toNativeSeparators(QFileInfo(file).absoluteFilePath());
+    if (!nativeFile.startsWith(QStringLiteral("\\\\?\\"))) {
+        nativeFile = nativeFile.startsWith(QStringLiteral("\\\\"))
+            ? QStringLiteral("\\\\?\\UNC\\") + nativeFile.mid(2)
+            : QStringLiteral("\\\\?\\") + nativeFile;
+    }
+    vfs = "win32-longpath";
+    require(sqlite3_vfs_find(vfs) != nullptr,
+            context + QStringLiteral(": required SQLite win32-longpath VFS is unavailable"));
+#endif
+    sqlite3 *rawDatabase = nullptr;
+    const auto path = nativeFile.toUtf8();
+    const int result = sqlite3_open_v2(path.constData(), &rawDatabase, flags, vfs);
+    BenchmarkDatabase database(rawDatabase, sqlite3_close);
+    require(result == SQLITE_OK, context + QStringLiteral(": ")
+            + QString::fromUtf8(rawDatabase ? sqlite3_errmsg(rawDatabase) : sqlite3_errstr(result)));
+    return database;
+}
+
 qint64 directoryBytes(const QString &root)
 {
     qint64 total = 0;
@@ -236,11 +264,8 @@ using Heap = std::priority_queue<Candidate, std::vector<Candidate>, WorstFirst>;
 std::vector<QSet<QString>> exactOracle(const QString &databasePath, const std::vector<Query> &queries,
                                      qint64 expectedRows, QJsonObject &report, const QString &root = {})
 {
-    sqlite3 *rawDatabase = nullptr;
-    const QByteArray path = databasePath.toUtf8();
-    const int openResult = sqlite3_open_v2(path.constData(), &rawDatabase, SQLITE_OPEN_READONLY, nullptr);
-    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
-    require(openResult == SQLITE_OK, QStringLiteral("Exact oracle cannot open SQLite database"));
+    auto database = openBenchmarkDatabase(databasePath, SQLITE_OPEN_READONLY,
+                                          QStringLiteral("Exact oracle cannot open SQLite database"));
     sqlite3_busy_timeout(database.get(), 30000);
     // file_id is indexed by the repository. ORDER BY groups one file's vectors,
     // so the oracle stores only each query's top 20 files, not a million scores.
@@ -507,11 +532,8 @@ bool exerciseMutationsAndRebuild(IndexRepository &repository, const RuntimePaths
         token += QStringLiteral("token");
         qint64 filesChecked = 0, keywordQueries = 0, vectorQueries = 0;
         qint64 staleHits = 0, retiredChecked = 0, retiredRemaining = 0;
-        sqlite3 *rawDatabase = nullptr;
-        const int opened = sqlite3_open_v2(repository.databasePath().toUtf8().constData(), &rawDatabase,
-                                           SQLITE_OPEN_READONLY, nullptr);
-        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
-        require(opened == SQLITE_OK, QStringLiteral("Cannot inspect retired mutation segments"));
+        auto database = openBenchmarkDatabase(repository.databasePath(), SQLITE_OPEN_READONLY,
+                                              QStringLiteral("Cannot inspect retired mutation segments"));
         sqlite3_busy_timeout(database.get(), 30000);
         sqlite3_stmt *rawStatement = nullptr;
         require(sqlite3_prepare_v2(database.get(), "SELECT count(*) FROM segments WHERE id=?", -1,
@@ -802,11 +824,8 @@ int runCrashChild(const QCommandLineParser &parser)
             // test-only SQL path. A large same-shard outbox reproduces the exact
             // threshold that previously allowed stale events to keep triggering
             // maintenance after the manifest had already committed.
-            sqlite3 *rawDatabase = nullptr;
-            const int opened = sqlite3_open_v2(paths.databaseFile().toUtf8().constData(), &rawDatabase,
-                                               SQLITE_OPEN_READWRITE, nullptr);
-            std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
-            require(opened == SQLITE_OK, QStringLiteral("Cannot prepare the recovery outbox"));
+            auto database = openBenchmarkDatabase(paths.databaseFile(), SQLITE_OPEN_READWRITE,
+                                                  QStringLiteral("Cannot prepare the recovery outbox"));
             sqlite3_busy_timeout(database.get(), 30000);
             const char *sql =
                 "WITH RECURSIVE copies(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM copies WHERE n<2048) "
@@ -829,11 +848,10 @@ int runCrashChild(const QCommandLineParser &parser)
         std::_Exit(73); // No destructors or ANN flush: emulate abrupt process loss.
     }
     require(mode == QStringLiteral("uncommitted-sqlite"), QStringLiteral("Unknown recovery child phase"));
-    sqlite3 *database = nullptr;
-    require(sqlite3_open_v2(paths.databaseFile().toUtf8().constData(), &database, SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK,
-            QStringLiteral("Recovery child cannot open database"));
+    auto database = openBenchmarkDatabase(paths.databaseFile(), SQLITE_OPEN_READWRITE,
+                                          QStringLiteral("Recovery child cannot open database"));
     const char *sql = "BEGIN IMMEDIATE; UPDATE files SET version='uncommitted-corruption';";
-    require(sqlite3_exec(database, sql, nullptr, nullptr, nullptr) == SQLITE_OK,
+    require(sqlite3_exec(database.get(), sql, nullptr, nullptr, nullptr) == SQLITE_OK,
             QStringLiteral("Recovery child could not start uncommitted transaction"));
     std::_Exit(73); // SQLite must roll this transaction back on the next open.
 }
@@ -868,7 +886,8 @@ void exerciseRecovery(const RuntimePaths &paths, Budget &budget, bool enforceFol
         child.setArguments({QStringLiteral("--profile-dir"), paths.profileDir,
                             QStringLiteral("--fault-child"), phase, QStringLiteral("--fault-token"), token,
                             QStringLiteral("--min-free-gib"), QString::number(budget.reserve / gib)});
-        child.setWorkingDirectory(paths.tempDir);
+        // All recovery inputs are absolute. Inherit the valid launch cwd:
+        // Windows process creation cannot use every long filesystem directory.
         child.start();
         require(child.waitForStarted(10000), QStringLiteral("Cannot start recovery child: %1").arg(child.errorString()));
         if (!child.waitForFinished(300000)) {
@@ -931,11 +950,8 @@ void exerciseRecovery(const RuntimePaths &paths, Budget &budget, bool enforceFol
         // storage decoder. A matching path alone cannot prove this phase's
         // replacement vector survived the crash.
         {
-            sqlite3 *rawDatabase = nullptr;
-            const int opened = sqlite3_open_v2(paths.databaseFile().toUtf8().constData(), &rawDatabase,
-                                               SQLITE_OPEN_READONLY, nullptr);
-            std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
-            require(opened == SQLITE_OK, QStringLiteral("Cannot inspect recovered vector and rollback state"));
+            auto database = openBenchmarkDatabase(paths.databaseFile(), SQLITE_OPEN_READONLY,
+                                                  QStringLiteral("Cannot inspect recovered vector and rollback state"));
             sqlite3_busy_timeout(database.get(), 30000);
             sqlite3_stmt *rawStatement = nullptr;
             require(sqlite3_prepare_v2(database.get(), "SELECT embedding FROM segments WHERE id=?", -1,
@@ -985,11 +1001,8 @@ void exerciseRecovery(const RuntimePaths &paths, Budget &budget, bool enforceFol
             require(corruptionRows == 0, QStringLiteral("Recovery exposed uncommitted versions in the corpus"));
         }
         if (phase == QStringLiteral("ann-manifest-published-before-outbox-cleanup")) {
-            sqlite3 *rawDatabase = nullptr;
-            const int opened = sqlite3_open_v2(paths.databaseFile().toUtf8().constData(), &rawDatabase,
-                                               SQLITE_OPEN_READONLY, nullptr);
-            std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
-            require(opened == SQLITE_OK, QStringLiteral("Cannot inspect the recovered outbox"));
+            auto database = openBenchmarkDatabase(paths.databaseFile(), SQLITE_OPEN_READONLY,
+                                                  QStringLiteral("Cannot inspect the recovered outbox"));
             const char *sql =
                 "SELECT count(*) FROM ann_events e JOIN segments s ON e.shard=s.shard "
                 "JOIN files f ON f.id=s.file_id WHERE f.path=? AND e.generation<=s.generation";

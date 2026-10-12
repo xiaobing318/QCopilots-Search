@@ -1,5 +1,6 @@
 #include "storage/index_repository.h"
 #include "support/test_environment.h"
+#include "support/sqlite_database.h"
 
 #include <QDir>
 #include <QDirIterator>
@@ -52,7 +53,7 @@ using TestDatabase = std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)>;
 TestDatabase openTestDatabase(const QString &path, int flags, QString *error)
 {
     sqlite3 *raw = nullptr;
-    const int rc = sqlite3_open_v2(path.toUtf8().constData(), &raw, flags, nullptr);
+    const int rc = test::openSqliteDatabase(path, &raw, flags);
     TestDatabase database(raw, sqlite3_close_v2);
     if (rc != SQLITE_OK) {
         *error = raw ? QString::fromUtf8(sqlite3_errmsg(raw)) : QStringLiteral("Cannot open SQLite fixture");

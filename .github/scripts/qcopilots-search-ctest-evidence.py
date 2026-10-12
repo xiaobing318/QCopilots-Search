@@ -16,6 +16,7 @@ NON_QT_TESTS = {
     "qcopilots-search-tests-workflow",
     "qcopilots-search-tests-inference-install-layout",
     "qcopilots-search-tests-macos-signing",
+    "qcopilots-search-tests-license-materials",
 }
 TOTALS = re.compile(r"^Totals:\s+(\d+) passed,\s+(\d+) failed,\s+(\d+) skipped,\s+(\d+) blacklisted", re.MULTILINE)
 SKIP = re.compile(r"^SKIP\s*:\s*(\S+)\s+(.*)$", re.MULTILINE)
@@ -29,18 +30,26 @@ PLATFORM_EXCLUSIONS = {
         "Non-Windows path keys are case-sensitive. Windows intentionally folds path keys.",
 }
 SIGNING_TEST = "qcopilots-search-tests-macos-signing"
+WORKFLOW_TEST = "qcopilots-search-tests-workflow"
+PYTHON_CASE_TESTS = {SIGNING_TEST, WORKFLOW_TEST, "qcopilots-search-tests-license-materials"}
 SIGNING_WINDOWS_SKIP_REASON = "Windows lacks symbolic-link creation privilege (WinError 1314). Native CI must run this case."
 SIGNING_WINDOWS_SKIPS = {
     "__main__.SigningTests." + name for name in (
         "test_directory_symlink_is_not_recursed", "test_external_directory_symlink_is_rejected",
         "test_external_file_symlink_is_rejected", "test_internal_library_symlink_is_not_signed_twice")
 }
+WORKFLOW_NSIS_SKIP_REASON = "NSIS is native to Windows"
+WORKFLOW_NSIS_SKIPS = {
+    "__main__.WorkflowTests." + name for name in (
+        "test_nsis_compiles_recursive_unicode_payload_beyond_max_path",
+        "test_installer_guard_rejects_existing_start_menu_before_execution")
+}
 UNITTEST_CASE = re.compile(r"^(test\S+) \((\S+)\) \.\.\. (ok|FAIL|ERROR|expected failure|unexpected success|skipped [^\r\n]*)\r?$", re.MULTILINE)
 UNITTEST_TOTAL = re.compile(r"^Ran (\d+) tests? in [\d.]+s\r?$", re.MULTILINE)
 UNITTEST_RESULT = re.compile(r"^(OK(?: \(skipped=\d+\))?|FAILED(?: \([^\r\n]*\))?)\r?$", re.MULTILINE)
 
 
-def inspect_signing_unittest(output, operating_system):
+def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
     errors, records, skips = [], [], []
     counts = {"run": 0, "passed": 0, "failed": 0, "skipped": 0, "notApplicable": 0}
     for method, identifier, status in UNITTEST_CASE.findall(output):
@@ -59,9 +68,12 @@ def inspect_signing_unittest(output, operating_system):
             except (ValueError, SyntaxError):
                 reason = status.removeprefix("skipped ")
                 errors.append("Python unittest skip reason is malformed")
-            applicable = (operating_system == "Windows" and identifier in SIGNING_WINDOWS_SKIPS
-                          and reason == SIGNING_WINDOWS_SKIP_REASON)
-            entry = {"program": SIGNING_TEST, "case": identifier, "reason": reason,
+            applicable = (
+                (program == SIGNING_TEST and operating_system == "Windows" and identifier in SIGNING_WINDOWS_SKIPS
+                 and reason == SIGNING_WINDOWS_SKIP_REASON)
+                or (program == WORKFLOW_TEST and operating_system in ("Linux", "Darwin")
+                    and identifier in WORKFLOW_NSIS_SKIPS and reason == WORKFLOW_NSIS_SKIP_REASON))
+            entry = {"program": program, "case": identifier, "reason": reason,
                      "classification": "notApplicable" if applicable else "requiredNotRun"}
             skips.append(entry)
             record["reason"] = reason
@@ -138,7 +150,7 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
             errors.append("CTest truncated captured output, so individual case evidence is incomplete")
         totals = [tuple(map(int, match)) for match in TOTALS.findall(output)]
         skips = SKIP.findall(output)
-        is_qt_test = name != SIGNING_TEST and (name not in NON_QT_TESTS or "Start testing of " in output)
+        is_qt_test = name not in PYTHON_CASE_TESTS and (name not in NON_QT_TESTS or "Start testing of " in output)
         summary = {"name": name, "qtTest": is_qt_test, "errors": errors}
         if is_qt_test:
             if not totals:
@@ -175,15 +187,15 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
                     document["qtTestTotals"]["notApplicable"] += 1
                 else:
                     errors.append(f"Required QtTest case did not run: {identifier}")
-        elif name == SIGNING_TEST:
-            counts, records, python_skips, python_errors = inspect_signing_unittest(output, operating_system)
+        elif name in PYTHON_CASE_TESTS:
+            counts, records, python_skips, python_errors = inspect_signing_unittest(output, operating_system, name)
             summary.update({"pythonTest": True, "pythonTestTotals": counts, "cases": records})
             errors.extend(python_errors)
             document["pythonTestSkips"].extend(python_skips)
             for key, value in counts.items():
                 document["pythonTestTotals"][key] += value
             if totals or skips:
-                errors.append("Unexpected QtTest output in the Python signing test")
+                errors.append("Unexpected QtTest output in a Python unittest program")
         elif totals or skips:
             errors.append("Unexpected QtTest output in a non-QtTest program")
         document["ctestPrograms"].append(summary)

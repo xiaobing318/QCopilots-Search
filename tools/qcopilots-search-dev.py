@@ -104,6 +104,7 @@ def main():
     parser.add_argument("--config", choices=["Release", "Debug", "RelWithDebInfo"], default="Release")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 2))
     parser.add_argument("--model-dir", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_MODEL_DIR"))
+    parser.add_argument("--keyword-only", action="store_true", help="Partial verify-package without models, insufficient for release")
     parser.add_argument("--test-label")
     parser.add_argument("--fail-fast", action="store_true",
                         help="Stop scheduling further tests after the first failure")
@@ -205,6 +206,10 @@ def main():
         (root / "packages/SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
     elif args.action == "verify-package":
         command = [sys.executable, SOURCE / "tools/qcopilots-search-verify-package.py", "--build-root", root]
+        if args.keyword_only:
+            command.append("--keyword-only")
+        elif args.model_dir:
+            command.extend(["--model-dir", args.model_dir.expanduser().resolve()])
         if args.package_file:
             command.extend(["--package-file", args.package_file.expanduser().resolve()])
         if args.report_dir:

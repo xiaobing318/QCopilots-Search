@@ -312,9 +312,10 @@ def main():
     sdk_metadata = []
     if args.qt_root:
         qt_root = args.qt_root.expanduser().resolve()
-        # Include only public SDK build metadata. No binaries, credentials, user
+        # Include only public SDK build/license metadata. No binaries, credentials, user
         # configuration or whole SDK directory is copied into source materials.
-        for pattern in ("6.12.0/*/mkspecs/qconfig.pri", "6.12.0/*/mkspecs/qmodule.pri", "6.12.0/*/lib/Qt6*.prl"):
+        for pattern in ("6.12.0/*/mkspecs/qconfig.pri", "6.12.0/*/mkspecs/qmodule.pri", "6.12.0/*/lib/Qt6*.prl",
+                        "6.12.0/*/sbom/*.spdx.json"):
             for path in sorted(qt_root.glob(pattern)):
                 if path.is_file() and not path.is_symlink():
                     sdk_metadata.append((path.relative_to(qt_root).as_posix(), path))

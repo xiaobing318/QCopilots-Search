@@ -25,6 +25,10 @@ FFmpeg 使用固定 9.0.1 源码，清单记录当前 SDK 的真实 `avcodec_con
 
 项目源码放入 `project/`，其中 `cmake/` 是原生依赖构建适配，`third_party/patches/` 保存 llama.cpp 补丁，`tools/` 保存 SDK、部署及材料生成流程。源文件清单逐项记录哈希。若打包期间文件发生变化，脚本拒绝继续发布该材料包。
 
+指定 `--qt-root` 时，`sdk-metadata/` 同时保留该 SDK 的公共构建配置和原始 SPDX JSON，包含第三方版权及自定义许可全文。运行包中的 `qcopilots-search-runtime` 许可目录由 `tools/qcopilots-search-license-materials.py` 自动生成。它复用上述源码锁与外置 `source-cache`，收集 Qt base、SVG、Image Formats、Multimedia 的原始许可和 attribution 引用文件，并按实际 SDK SPDX 检查标准许可全文是否齐全。PDF / Chromium 的自定义许可来自实际 SDK SPDX 的原始 `extractedText`。任何平台新增未覆盖的许可 ID 都会明确阻止配置。
+
+离线配置可设置 `QCOPILOTS_SEARCH_DOWNLOAD_LICENSE_SOURCES=OFF`，并通过 `QCOPILOTS_SEARCH_LICENSE_SOURCE_CACHE` 指定预先准备的锁定归档目录。这里的缓存和生成目录均位于源码树外，安装步骤和包级测试会重新验证生成材料的文件集合、大小与哈希。
+
 材料包使用固定 ZIP 时间戳和稳定排序。清单记录 `commit` 与 `workingTreeModified`，有未提交修改的材料包用于开发验证，不能作为不可变发行提交的证明。最终发布前在干净的目标提交重新生成源码材料和运行包。
 
 Windows 另外部署的 Microsoft Visual C++ CRT / OpenMP 是按适用许可再分发的运行库，不属于开源对应源码收集范围。它们的归属和部署方式见 [第三方声明](../THIRD_PARTY_NOTICES.md)。

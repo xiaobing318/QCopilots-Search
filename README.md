@@ -59,7 +59,7 @@ $modelDir = Join-Path $buildRoot 'models'
 ./qcopilots-search-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ./qcopilots-search-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
 ./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
-./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot
+./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ```
 
 模型获取、测试分层和保留失败证据见 [测试指南](docs/testing.md)。模型缺失或校验失败会使必需的真实模型验收失败。黄金向量测试验证数值一致性，独立的语义质量集验证检索效果，合成百万向量测试验证容量，三者分别报告。

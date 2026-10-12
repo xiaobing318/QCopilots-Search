@@ -527,6 +527,18 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(len(runner.commands), 1)
 
 
+def load_tests(loader, suite, pattern):
+    # Keep the final-bundle link and signing contracts in the existing CTest
+    # entry while reporting every portable unittest separately at verbosity 2.
+    path = Path(__file__).with_name("qcopilots-search-test-macos-links.py")
+    spec = importlib.util.spec_from_file_location("qcopilots_search_test_macos_links", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    suite.addTests(loader.loadTestsFromModule(module))
+    return suite
+
+
 if __name__ == "__main__":
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):

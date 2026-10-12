@@ -11,7 +11,8 @@ set_tests_properties(qcopilots-search-tests-backend-layout PROPERTIES LABELS "un
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 add_test(NAME qcopilots-search-tests-inference-install-layout
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/install_layout_test.py"
-    --cmake "${CMAKE_COMMAND}" --generator "${CMAKE_GENERATOR}" --compiler "${CMAKE_C_COMPILER}")
+    --cmake "${CMAKE_COMMAND}" --generator "${CMAKE_GENERATOR}" --compiler "${CMAKE_C_COMPILER}"
+    --qt-cmake-dir "${Qt6_DIR}")
 set_tests_properties(qcopilots-search-tests-inference-install-layout PROPERTIES LABELS "integration;runtime;package" TIMEOUT 180)
 foreach(_entry IN LISTS _qcopilots_runtime_tests)
   string(REPLACE "|" ";" _parts "${_entry}")

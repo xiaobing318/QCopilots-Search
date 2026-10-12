@@ -10,7 +10,7 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -30,6 +30,7 @@ LOCKS = ("dependencies.lock.json", "tools/qt-packages.lock.json", "tools/nsis-pa
 FAULTS = {"committed-before-ann", "uncommitted-sqlite", "ann-file-saved-before-manifest",
           "ann-manifest-published-before-outbox-cleanup"}
 APPLICATIONS = {"qcopilots-search", "qcopilots-search-service", "qcopilots-search-worker", "qcopilots-search-cli"}
+PACKAGE_GOLDENS = {"query": "text", "screen-280": "image", "speech": "audio"}
 
 
 def digest(path: Path) -> str:
@@ -427,6 +428,158 @@ def verify_manifest(root: Path, manifest):
     return errors
 
 
+def package_contract():
+    """Share immutable pins, independently verify the recorded measurements."""
+    spec = importlib.util.spec_from_file_location("qcopilots_search_package_contract",
+        SOURCE / "tools/qcopilots-search-verify-package.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = SOURCE / "tests/runtime/fixtures/vectors.json"
+    if digest(path) != module.REFERENCE_HASHES["vectors.json"]:
+        raise ValueError("Immutable package reference vectors have changed")
+    return module.MODEL_ARTIFACTS, module.REFERENCE_HASHES, read_json(path)["vectors"]
+
+
+def package_evidence_paths(doc, root: Path):
+    paths = [item["rawReply"]["path"] for item in doc.get("modelSmoke", {}).get("vectors", [])]
+    manifest = doc.get("licenseMaterials", {}).get("manifest")
+    if isinstance(manifest, str):
+        paths.append(manifest)
+        content = read_json(safe_file(root, manifest))
+        paths.extend((PurePosixPath(manifest).parent / entry["path"]).as_posix() for entry in content["files"])
+    return paths
+
+
+@malformed_as_error
+def validate_package_release(doc, root: Path, *, model_fingerprint=None,
+                             extraction_fingerprint=None, platform_id=None, worker_sha256=None):
+    errors = []
+    check(errors, doc.get("passed") is True and doc.get("releaseComplete") is True
+          and doc.get("verificationScope") == "release" and doc.get("realModelRequired") is True,
+          "Package verification is not a complete release acceptance")
+    check(errors, doc.get("licenseMaterials", {}).get("passed") is True,
+          "Package license materials were not verified")
+    try:
+        licenses = doc.get("licenseMaterials", {})
+        manifest_path = safe_file(root, licenses.get("manifest", ""))
+        check(errors, digest(manifest_path) == licenses.get("manifestSha256"), "Package license manifest content changed")
+        spec = importlib.util.spec_from_file_location("qcopilots_search_license_evidence",
+            SOURCE / "tools/qcopilots-search-license-materials.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        summary = module.verify_materials(manifest_path.parent)
+        check(errors, all(licenses.get(key) == value for key, value in summary.items()),
+              "Package license summary does not match its preserved materials")
+    except (OSError, ValueError, KeyError) as error:
+        errors.append("Package license materials are incomplete: " + str(error))
+    smoke = doc.get("modelSmoke", {})
+    check(errors, smoke.get("passed") is True and smoke.get("dimensions") == 768
+          and smoke.get("minimumCosine") == .999, "Package real-model acceptance is missing")
+    expected_models, references, goldens = package_contract()
+    check(errors, smoke.get("referenceHashes") == references, "Package golden inputs differ from the immutable reference")
+    verified = smoke.get("modelVerification", {})
+    artifacts = verified.get("artifacts", [])
+    check(errors, verified.get("valid") is True and verified.get("directory") == smoke.get("modelDirectory")
+          and bool(smoke.get("modelDirectory")), "Package model verification directory is missing or inconsistent")
+    check(errors, len(artifacts) == len(expected_models)
+          and {item.get("name") for item in artifacts} == set(expected_models), "Package model artifacts are incomplete or repeated")
+    for item in artifacts:
+        expected = expected_models.get(item.get("name"))
+        check(errors, expected is not None and item.get("present") is True
+              and (item.get("bytes"), item.get("sha256")) == expected
+              and item.get("expectedBytes") == expected[0], "Package model artifact does not match its pinned content")
+    vectors = smoke.get("vectors", [])
+    check(errors, len(vectors) == 3 and {item.get("name") for item in vectors} == set(PACKAGE_GOLDENS),
+          "Package requires each text, image and audio golden vector exactly once")
+    for field, expected in (("modelFingerprint", model_fingerprint), ("extractionFingerprint", extraction_fingerprint)):
+        values = {item.get(field) for item in vectors}
+        check(errors, len(values) == 1 and all(isinstance(value, str) and value for value in values)
+              and (expected is None or values == {expected}), "Package vectors disagree on " + field)
+    for item in vectors:
+        name = item.get("name")
+        check(errors, item.get("modality") == PACKAGE_GOLDENS.get(name) and item.get("dimensions") == 768,
+              "Package vector modality or dimensionality is wrong")
+        actual, expected = item.get("embedding", []), item.get("expectedEmbedding", [])
+        if (not isinstance(actual, list) or len(actual) != 768 or not all(finite(v) for v in actual)
+                or expected != goldens.get(name)):
+            errors.append("Package raw vector is invalid or its reference was replaced")
+            continue
+        actual_norm = math.sqrt(math.fsum(value * value for value in actual))
+        expected_norm = math.sqrt(math.fsum(value * value for value in expected))
+        check(errors, abs(actual_norm - 1) <= .0001 and abs(expected_norm - 1) <= .0001,
+              "Package raw vector is not L2 normalized")
+        if actual_norm <= 0 or expected_norm <= 0:
+            continue
+        cosine = math.fsum(a * b for a, b in zip(actual, expected)) / (actual_norm * expected_norm)
+        check(errors, within(cosine, .999, 1.00001) and same_number(item.get("l2Norm"), actual_norm)
+              and same_number(item.get("cosine"), cosine), "Package vector measurements do not match their raw components")
+        try:
+            raw = item["rawReply"]
+            path = safe_file(root, raw["path"])
+            check(errors, digest(path) == raw.get("sha256"), "Package worker reply content changed")
+            reply = read_json(path)
+            result = reply.get("result", {})
+            check(errors, reply.get("ok") is True and reply.get("id") == "model-" + name,
+                  "Package worker reply is unsuccessful or belongs to another request")
+            if name == "query":
+                recorded_vector = result.get("embedding")
+            else:
+                segments = [segment for segment in result.get("segments", []) if segment.get("modality") == item.get("modality")]
+                check(errors, result.get("complete") is True and result.get("state") == "complete"
+                      and result.get("embedded") is True and not result.get("error")
+                      and not result.get("embeddingErrors") and len(segments) == 1
+                      and len(result.get("segments", [])) == 1,
+                      "Package worker did not complete the multimodal inference")
+                if len(segments) == 1 and name == "screen-280":
+                    check(errors, segments[0].get("imageBudget") == 280,
+                          "Package screenshot extraction changed its reference image budget")
+                if len(segments) == 1 and name == "speech":
+                    check(errors, (segments[0].get("startMs"), segments[0].get("endMs")) == (0, 4000),
+                          "Package audio extraction changed its reference time window")
+                recorded_vector = segments[0].get("embedding") if len(segments) == 1 else None
+            check(errors, recorded_vector == actual and all(result.get(field) == item.get(field)
+                  for field in ("modelFingerprint", "extractionFingerprint")), "Package vector differs from its raw worker reply")
+        except (OSError, ValueError) as error:
+            errors.append(str(error))
+    semantic = smoke.get("serviceSemantic", {})
+    check(errors, semantic.get("semantic") is True and not semantic.get("warning") and bool(semantic.get("hits")),
+          "Installed service did not complete semantic retrieval")
+    runtime = smoke.get("runtime", {})
+    linkage, architecture = runtime.get("linkage"), runtime.get("architecture")
+    expected_arch = PLATFORMS.get(platform_id, (None, None))[1]
+    check(errors, architecture in ("x86_64", "amd64", "arm64", "aarch64")
+          and (expected_arch is None or architecture in (("x86_64", "amd64") if expected_arch == "x86_64" else ("arm64", "aarch64"))),
+          "Package inference runtime architecture differs from the native platform")
+    check(errors, runtime.get("cpuBaselineForced") is False, "Package smoke CPU dispatch scope is missing or misreported")
+    windows = PureWindowsPath(doc.get("applicationRoot", "")).is_absolute()
+    path_type = PureWindowsPath if windows else PurePosixPath
+    application = path_type(doc.get("applicationRoot", ""))
+    check(errors, application.is_absolute() and ".." not in application.parts, "Package application root is not an absolute path")
+    worker = runtime.get("workerExecutable", {})
+    libraries = runtime.get("libraries", [])
+    for record in [worker, *libraries]:
+        path = path_type(record.get("path", ""))
+        check(errors, path.is_absolute() and path != application and ".." not in path.parts and path.is_relative_to(application)
+              and integer_at_least(record.get("bytes"), 1) and bool(re.fullmatch(r"[0-9a-f]{64}", record.get("sha256", ""))),
+              "Package inference executable or library has no valid installed origin and content hash")
+    check(errors, path_type(worker.get("path", "")).name in ("qcopilots-search-worker", "qcopilots-search-worker.exe")
+          and (worker_sha256 is None or worker.get("sha256") == worker_sha256), "Package inference worker differs from the recorded executable")
+    if architecture in ("x86_64", "amd64"):
+        check(errors, linkage == "shared-cpu-dispatch" and {"llama", "mtmd", "ggml", "ggml-base", "cpu-backend"}
+              .issubset({item.get("role") for item in libraries}), "Package shared CPU runtime libraries are incomplete")
+        check(errors, len({path_type(item.get("path", "")) for item in libraries}) == len(libraries),
+              "Package shared CPU runtime repeats a loaded file")
+        if platform_id == "macos-x64":
+            for item in libraries:
+                if item.get("role") == "cpu-backend":
+                    check(errors, path_type(item["path"]).parent.parts[-3:] == ("Contents", "PlugIns", "ggml"),
+                          "macOS CPU backend did not load from the application plugin directory")
+    else:
+        check(errors, linkage == "static-cpu" and not libraries and platform_id in (None, "macos-arm64"),
+              "Only the Apple Silicon package may use the static CPU runtime contract")
+    return errors
+
+
 def inspect_native(root: Path, *, expected_head: str | None = None):
     errors = []
     result = {"schemaVersion": 1, "kind": "native-gate", "passed": False, "errors": errors}
@@ -500,6 +653,15 @@ def inspect_native(root: Path, *, expected_head: str | None = None):
                   and package.get("workingTreeModified", False) is False and package.get("packageSha256") in package_hashes,
                   f"Native package result is missing, stale or unbound: {name}")
             check(errors, len(package.get("checks", [])) >= (3 if "package-deb" in name else 9), f"Native package scenarios are incomplete: {name}")
+            smoke_name = "reports/package-deb/smoke/report.json" if "package-deb" in name else name
+            smoke = document(smoke_name) if smoke_name != name else package
+            check(errors, package.get("releaseComplete") is True, f"Native package acceptance is partial: {name}")
+            for relative in package_evidence_paths(smoke, (root / smoke_name).parent):
+                check(errors, (PurePosixPath(smoke_name).parent / relative).as_posix() in paths,
+                      "Package inference or license raw evidence is not bound to the native manifest")
+            errors.extend(validate_package_release(smoke, (root / smoke_name).parent,
+                model_fingerprint=result["modelFingerprint"], extraction_fingerprint=result["extractionFingerprint"],
+                platform_id=platform_id))
         integrity = document("reports/source-integrity.json")
         check(errors, integrity.get("passed") is True and integrity.get("tests_run", 0) >= 10
               and integrity.get("skipped") == 0 and len(integrity.get("cases", [])) == integrity.get("tests_run")
@@ -736,6 +898,11 @@ def record_package(build_record: Path, package: Path, verification: Path, parent
         raise ValueError("The package requires a bound successful build record")
     if checked.get("passed") is not True or checked.get("commit") != build["identity"]["checkoutCommit"] or checked.get("workingTreeModified") is not False or checked.get("packageSha256") != package_hash:
         raise ValueError("Package verification is stale, modified or unsuccessful")
+    errors.extend(validate_package_release(checked, verification.parent, model_fingerprint=model_fingerprint,
+        extraction_fingerprint=extraction_fingerprint, platform_id="windows-x64",
+        worker_sha256=build.get("programs", {}).get("qcopilots-search-worker", {}).get("sha256")))
+    if errors:
+        raise ValueError("Package release evidence is incomplete: " + "; ".join(errors))
     executables = {}
     with zipfile.ZipFile(package) as archive:
         for name in ("qcopilots-search", "qcopilots-search-service", "qcopilots-search-worker", "qcopilots-search-cli"):
@@ -753,6 +920,13 @@ def record_package(build_record: Path, package: Path, verification: Path, parent
     shutil.copytree(build_record.parent, root / "build")
     shutil.copyfile(package, root / package.name)
     shutil.copyfile(verification, root / "package-verification.json")
+    for relative in package_evidence_paths(checked, verification.parent):
+        source = safe_file(verification.parent, relative)
+        destination = root.joinpath(*PurePosixPath(relative).parts)
+        if destination.exists():
+            raise ValueError("Package evidence would overwrite an existing candidate file")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
     candidate = {"schemaVersion": 1, "kind": "package-candidate", "identity": build["identity"],
                  "package": package.name, "packageSha256": package_hash, "executables": executables,
                  "modelFingerprint": model_fingerprint, "extractionFingerprint": extraction_fingerprint,
@@ -781,6 +955,11 @@ def inspect_candidate(root: Path, candidate):
     check(errors, verification.get("passed") is True and verification.get("commit") == candidate["identity"]["checkoutCommit"]
           and verification.get("workingTreeModified") is False and verification.get("packageSha256") == candidate["packageSha256"]
           and len(verification.get("checks", [])) >= 9, "Candidate package verification is incomplete or bound to different bytes")
+    for relative in package_evidence_paths(verification, root):
+        check(errors, relative in bound, "Candidate inference or license raw evidence is not bound")
+    errors.extend(validate_package_release(verification, root, model_fingerprint=candidate["modelFingerprint"],
+        extraction_fingerprint=candidate["extractionFingerprint"], platform_id="windows-x64",
+        worker_sha256=candidate.get("executables", {}).get("qcopilots-search-worker", {}).get("sha256")))
     check(errors, set(candidate.get("executables", {})) == APPLICATIONS, "Candidate must contain all four application executable identities")
     with zipfile.ZipFile(package) as archive:
         for name in APPLICATIONS:

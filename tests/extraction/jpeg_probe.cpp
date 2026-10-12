@@ -12,6 +12,7 @@
 #include <jpeglib.h>
 #include <jerror.h>
 #include <libraw/libraw.h>
+static_assert(JPEG_LIB_VERSION == 62, "The JPEG diagnostic must use the pinned API 62 headers");
 #ifdef Q_OS_WIN
 #include <windows.h>
 #else
@@ -94,8 +95,10 @@ QJsonObject probeJpeg(const QByteArray &bytes)
     }
     QJsonObject report{{"headerApi", JPEG_LIB_VERSION},
         {"runtimeApi", probe->created ? QJsonValue(JPEG_LIB_VERSION) : QJsonValue(QJsonValue::Null)},
-        {"runtimeVersion", probe->error.jpeg_message_table && JMSG_VERSION <= probe->error.last_jpeg_message
-            ? QString::fromLatin1(probe->error.jpeg_message_table[JMSG_VERSION]) : QString{}},
+        {"runtimeVersion", probe->created && probe->error.jpeg_message_table
+                && JMSG_VERSION <= probe->error.last_jpeg_message
+            ? QJsonValue(QString::fromLatin1(probe->error.jpeg_message_table[JMSG_VERSION]))
+            : QJsonValue(QJsonValue::Null)},
         {"decompressStructBytes", qint64(sizeof(jpeg_decompress_struct))},
         {"errorStructBytes", qint64(sizeof(jpeg_error_mgr))},
         {"library", jpegLibraryPath()}, {"stage", QString::fromLatin1(probe->stage)},

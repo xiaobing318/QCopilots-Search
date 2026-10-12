@@ -27,7 +27,7 @@
 ./qcopilots-search-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
 ./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
 ./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator NSIS
-./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot
+./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ```
 
 Windows NSIS 生成器需要安装 NSIS。macOS 使用 `DragNDrop`，分架构生成 `.app` 和 `.dmg`。Linux 分别使用 `TGZ` 和 `DEB`。包位于 `<build-root>/packages`，文件统一采用 `qcopilots-search` 前缀，校验和写入 `SHA256SUMS`。
@@ -37,6 +37,10 @@ Windows NSIS 生成器需要安装 NSIS。macOS 使用 `DragNDrop`，分架构�
 使用新的目录解压或安装最终包。测试路径应与源码、SDK、构建树和 staging 不同。运行时清除开发 Qt 插件环境和工具链 PATH，仅保留系统及安装目录。使用新的 profile 启动 GUI、服务、worker 和 CLI，验证索引与查询、PDF 和媒体资源定位、OCR 数据、字典、重启以及卸载后数据保留策略。
 
 自动部署检查和用户操作验收分别报告。只运行 `--version` 可以证明一部分动态库加载，不能替代 GUI 插件加载、后台索引或多媒体预览。`verify-package` 的实际执行范围需要在报告中注明，缺少的完整流程由包级测试补齐。
+
+默认包级验收必须读取已校验的模型目录，执行 `query`、`screen-280` 和 `speech` 三条原始黄金输入，并保存全部 768 维结果和 worker 原始回复。发布门禁独立重算归一化长度和 cosine，要求 cosine ≥ 0.999，并核对安装目录内推理库的来源、实际字节哈希及服务语义检索结果。Windows 和 x64 Unix 包验证实际加载的共享 CPU 后端，Apple Silicon 验证静态 CPU 实现。本步骤不替代单独的九条黄金向量和强制基线后端测试。`--keyword-only` 只生成开发阶段的部分验收报告，发布门禁会拒绝它。
+
+包中 Qt SDK 的许可清单、对应许可文本和 llama/ggml 许可会完整复制到验收报告目录。`record-package` 同时保留这些材料和三份原始 worker 回复，检查清单哈希、模块覆盖及每份附件的实际字节。DEB 验收容器以只读方式挂载模型目录，不把模型写入安装包。
 
 Windows CI 分别验证 ZIP 和最终 NSIS。NSIS 验证真实执行单用户安装、GUI / 服务 / worker / 提取及搜索测试，再执行卸载并检查独立用户配置保留。若检查到已有产品安装，验证器会停止，不修改已有安装。
 

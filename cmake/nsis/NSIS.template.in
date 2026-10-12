@@ -1,16 +1,43 @@
 Unicode true
 !include "MUI2.nsh"
-!define INST_DIR "@CPACK_TEMPORARY_DIRECTORY@"
+# These are compiler input/output paths, never the user's installation path.
+# NSIS File /r otherwise fails once a nested payload exceeds MAX_PATH. Convert
+# CMake separators first, and preserve the distinct extended UNC spelling.
+!macro QCOPILOTS_SEARCH_COMPILER_PATH _qcopilots_path_symbol _qcopilots_source_path
+  !searchreplace ${_qcopilots_path_symbol} "${_qcopilots_source_path}" "/" "\"
+  !searchparse /noerrors "|${${_qcopilots_path_symbol}}" "|\\?\" _qcopilots_extended
+  !ifdef _qcopilots_extended
+    !undef _qcopilots_extended
+  !else
+    !searchparse /noerrors "|${${_qcopilots_path_symbol}}" "|\\" _qcopilots_unc
+    !ifdef _qcopilots_unc
+      !undef ${_qcopilots_path_symbol}
+      !define ${_qcopilots_path_symbol} "\\?\UNC\${_qcopilots_unc}"
+      !undef _qcopilots_unc
+    !else
+      !define /redef ${_qcopilots_path_symbol} "\\?\${${_qcopilots_path_symbol}}"
+    !endif
+  !endif
+!macroend
+!macro QCOPILOTS_SEARCH_REQUIRE_WRITE_SUCCESS
+  IfErrors 0 +3
+  SetErrorLevel 1
+  Quit
+!macroend
+!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH INST_DIR "@CPACK_TEMPORARY_DIRECTORY@"
+!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH QCOPILOTS_SEARCH_OUTPUT "@CPACK_TOPLEVEL_DIRECTORY@/@CPACK_OUTPUT_FILE_NAME@"
+!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH QCOPILOTS_SEARCH_LICENSE "@CPACK_RESOURCE_FILE_LICENSE@"
 !define PRODUCT_KEY "Software\QCopilots\qcopilots-search"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\qcopilots-search"
 Name "QCopilots Search"
-OutFile "@CPACK_TOPLEVEL_DIRECTORY@/@CPACK_OUTPUT_FILE_NAME@"
+OutFile "${QCOPILOTS_SEARCH_OUTPUT}"
 InstallDir "$LOCALAPPDATA\Programs\QCopilots Search"
 InstallDirRegKey HKCU "${PRODUCT_KEY}" ""
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 SetCompressorDictSize 32
 ManifestDPIAware true
+ManifestLongPathAware true
 ShowInstDetails show
 ShowUninstDetails show
 VIProductVersion "@CPACK_PACKAGE_VERSION@.0"
@@ -20,7 +47,7 @@ VIAddVersionKey /LANG=1033 "FileVersion" "@CPACK_PACKAGE_VERSION@"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "QCopilots contributors"
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
-@CPACK_NSIS_LICENSE_PAGE@
+!insertmacro MUI_PAGE_LICENSE "${QCOPILOTS_SEARCH_LICENSE}"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -39,9 +66,15 @@ Function un.onInit
 FunctionEnd
 
 Section "QCopilots Search"
+  ClearErrors
   SetOutPath "$INSTDIR"
-  @CPACK_NSIS_FULL_INSTALL@
+  # Keep a way to remove a partial payload, but register the product only after
+  # extraction succeeds. Silent NSIS extraction can otherwise return success.
   WriteUninstaller "$INSTDIR\Uninstall.exe"
+  !insertmacro QCOPILOTS_SEARCH_REQUIRE_WRITE_SUCCESS
+  ClearErrors
+  @CPACK_NSIS_FULL_INSTALL@
+  !insertmacro QCOPILOTS_SEARCH_REQUIRE_WRITE_SUCCESS
   WriteRegStr HKCU "${PRODUCT_KEY}" "" "$INSTDIR"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "QCopilots Search"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "@CPACK_PACKAGE_VERSION@"

@@ -10,6 +10,7 @@ from copy import deepcopy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -25,6 +26,394 @@ spec = importlib.util.spec_from_file_location(
     Path(__file__).resolve().parents[2] / "tools" / "qcopilots-search-release-evidence.py")
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
+
+
+def package_license_fixture(root, application):
+    """Small synthetic SPDX tree with actual file hashes, no SDK download."""
+    materials = root / "runtime-license-materials"
+    materials.mkdir()
+    modules = {name: "6.12.0" for name in (
+        "qtbase", "qt5compat", "qtsvg", "qtimageformats", "qtmultimedia", "qttranslations")}
+    modules.update({"qtpdf": "6.140.0", "qtwebengine-chromium-pdf": "6.140.0"})
+    source_lock = Path(__file__).resolve().parents[2] / "tools/qcopilots-search-source-packages.lock.json"
+    locked = json.loads(source_lock.read_text(encoding="utf-8"))
+    archives = {item["name"]: item for item in locked["packages"]}
+    contents = {"README.txt": "SYNTHETIC VALIDATOR FIXTURE, NOT RELEASE LICENSE MATERIALS\n",
+                "llama/LICENSE": "Synthetic llama license text for validator tests only.\n",
+                "llama/vendor/stb/stb_image.h": "SYNTHETIC stb_image.h notice placeholder, validator input only.\n",
+                "llama/vendor/miniaudio/miniaudio.h": "SYNTHETIC miniaudio.h notice placeholder, validator input only.\n",
+                "llama/vendor/sheredom/subprocess.h": "SYNTHETIC subprocess.h notice placeholder, validator input only.\n",
+                "qt/source-packages.lock.json": json.dumps(locked),
+                "qt/sources/qtbase/LICENSES/MIT.txt": "Synthetic MIT license text for validator tests only.\n"}
+    for module, version in modules.items():
+        contents[f"qt/sbom/{module}-{version}.spdx.json"] = json.dumps({
+            "spdxVersion": "SPDX-2.3", "packages": [{"name": module, "licenseDeclared": "MIT"}]})
+    files = []
+    for name, text in contents.items():
+        path = materials / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        files.append({"path": name, "bytes": path.stat().st_size,
+                      "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    manifest = materials / "qcopilots-search-license-manifest.json"
+    manifest.write_text(json.dumps({"schemaVersion": 1, "kind": "runtime-license-materials", "qtModules": modules,
+        "files": files, "sourceArchives": [{key: archives[module][key]
+            for key in ("name", "url", "filename", "size", "sha256")}
+            for module in ("qtbase", "qtsvg", "qtimageformats", "qtmultimedia")],
+        "moduleCoverage": {module: ["MIT"] for module in modules}, "customLicenseFiles": {},
+        "standardLicenseIds": ["MIT"], "standardLicenseFiles": {"MIT": "qt/sources/qtbase/LICENSES/MIT.txt"}}),
+        encoding="utf-8")
+    return {"passed": True, "files": len(files), "qtModules": list(modules), "standardLicenses": 1,
+            "manifest": manifest.relative_to(root).as_posix(),
+            "manifestSha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            "installedManifestPath": str(application / "share/qcopilots-search/licenses/qcopilots-search-runtime" / manifest.name)}
+
+
+def package_release_fixture(root, *, worker=None, model_fingerprint="synthetic-model-fingerprint",
+                            extraction_fingerprint="synthetic-extraction-fingerprint"):
+    """Synthetic verifier input using immutable vectors, never an inference run."""
+    root.mkdir(parents=True, exist_ok=True)
+    if worker is None:
+        worker = root / "synthetic application 中文" / "qcopilots-search-worker.exe"
+        worker.parent.mkdir()
+        worker.write_bytes(b"SYNTHETIC VALIDATOR WORKER, NOT AN EXECUTABLE")
+    application = worker.parent.resolve()
+    fixtures = Path(__file__).resolve().parents[2] / "tests/runtime/fixtures"
+    references = json.loads((fixtures / "vectors.json").read_text(encoding="utf-8"))["vectors"]
+    vectors = []
+    for name, modality in (("query", "text"), ("screen-280", "image"), ("speech", "audio")):
+        embedding = deepcopy(references[name])
+        result = {"modelFingerprint": model_fingerprint, "extractionFingerprint": extraction_fingerprint}
+        if modality == "text":
+            result["embedding"] = embedding
+        else:
+            segment = {"modality": modality, "embedding": embedding}
+            segment.update({"imageBudget": 280} if modality == "image" else {"startMs": 0, "endMs": 4000})
+            result.update({"complete": True, "state": "complete", "error": "", "embedded": True,
+                           "embeddingErrors": [], "segments": [segment]})
+        raw = root / ("model-" + name + "-reply.json")
+        raw.write_text(json.dumps({"id": "model-" + name, "ok": True, "result": result}), encoding="utf-8")
+        vectors.append({"name": name, "modality": modality, "dimensions": 768,
+                        "modelFingerprint": model_fingerprint, "extractionFingerprint": extraction_fingerprint,
+                        "l2Norm": math.sqrt(math.fsum(value * value for value in embedding)), "cosine": 1.0,
+                        "embedding": embedding, "expectedEmbedding": deepcopy(embedding),
+                        "rawReply": {"path": raw.name, "sha256": hashlib.sha256(raw.read_bytes()).hexdigest()}})
+    libraries = []
+    for role, filename in (("llama", "llama.dll"), ("mtmd", "mtmd.dll"), ("ggml", "ggml.dll"),
+                           ("ggml-base", "ggml-base.dll"), ("cpu-backend", "ggml-cpu-synthetic.dll")):
+        library = application / filename
+        library.write_bytes(b"SYNTHETIC VALIDATOR LIBRARY " + role.encode())
+        libraries.append({"role": role, "path": str(library), "bytes": library.stat().st_size,
+                          "sha256": hashlib.sha256(library.read_bytes()).hexdigest()})
+    model_directory = root / "synthetic model metadata only"
+    artifacts = [
+        {"name": "embeddinggemma-2-Q8_0.gguf", "bytes": 309855456, "expectedBytes": 309855456,
+         "sha256": "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135", "present": True},
+        {"name": "mmproj-embeddinggemma-2-Q8_0.gguf", "bytes": 554821024, "expectedBytes": 554821024,
+         "sha256": "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f", "present": True},
+    ]
+    return {"syntheticValidatorFixture": True, "passed": True, "releaseComplete": True,
+            "verificationScope": "release", "realModelRequired": True,
+            "applicationRoot": str(application), "licenseMaterials": package_license_fixture(root, application),
+            "modelSmoke": {"passed": True, "dimensions": 768, "minimumCosine": 0.999,
+                "modelDirectory": str(model_directory),
+                "modelVerification": {"valid": True, "directory": str(model_directory), "artifacts": artifacts},
+                "referenceHashes": {name: hashlib.sha256((fixtures / name).read_bytes()).hexdigest()
+                                    for name in ("screen.png", "speech.wav", "vectors.json")},
+                "vectors": vectors,
+                "runtime": {"linkage": "shared-cpu-dispatch", "architecture": "amd64", "cpuBaselineForced": False,
+                    "workerExecutable": {"path": str(worker.resolve()), "bytes": worker.stat().st_size,
+                                         "sha256": hashlib.sha256(worker.read_bytes()).hexdigest()},
+                    "libraries": libraries},
+                "serviceSemantic": {"semantic": True, "warning": "", "hits": [{"path": "synthetic-notes.txt"}]}}}
+
+
+class PackageReleaseEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="qcopilots-search-package-evidence-中文 ",
+            dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT"))
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.doc = package_release_fixture(self.root)
+
+    def inspect(self, doc=..., *, platform_id="windows-x64", **fingerprints):
+        return evidence.validate_package_release(self.doc if doc is ... else doc, self.root,
+            model_fingerprint=fingerprints.get("model", "synthetic-model-fingerprint"),
+            extraction_fingerprint=fingerprints.get("extraction", "synthetic-extraction-fingerprint"),
+            platform_id=platform_id)
+
+    def change_raw(self, vector, change):
+        path = self.root / vector["rawReply"]["path"]
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        change(raw)
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        vector["rawReply"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def synchronize_embedding(self, vector):
+        def update(raw):
+            if vector["modality"] == "text":
+                raw["result"]["embedding"] = vector["embedding"]
+            else:
+                raw["result"]["segments"][0]["embedding"] = vector["embedding"]
+        self.change_raw(vector, update)
+
+    def test_complete_synthetic_golden_reports_validate_without_running_models(self):
+        self.assertEqual(self.inspect(), [])
+
+    def test_static_runtime_is_valid_only_for_apple_silicon(self):
+        runtime = self.doc["modelSmoke"]["runtime"]
+        runtime.update({"linkage": "static-cpu", "architecture": "arm64", "libraries": []})
+        self.assertEqual(self.inspect(platform_id="macos-arm64"), [])
+        for platform_id in ("windows-x64", "linux-x64", "macos-x64"):
+            with self.subTest(platform_id=platform_id):
+                self.assertTrue(self.inspect(platform_id=platform_id))
+
+    def test_partial_or_unrequired_verification_is_not_release_evidence(self):
+        for key, value in (("passed", False), ("releaseComplete", False), ("verificationScope", "keyword-only"),
+                           ("realModelRequired", False)):
+            with self.subTest(key=key):
+                changed = deepcopy(self.doc)
+                changed[key] = value
+                self.assertTrue(self.inspect(changed))
+
+    def test_missing_or_false_model_smoke_is_rejected(self):
+        for value in (None, {}, {"passed": False}):
+            with self.subTest(value=value):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"] = value
+                self.assertTrue(self.inspect(changed))
+
+    def test_both_locked_models_are_required_without_duplicates(self):
+        for artifacts in ([], self.doc["modelSmoke"]["modelVerification"]["artifacts"][:1],
+                          [self.doc["modelSmoke"]["modelVerification"]["artifacts"][0]] * 2):
+            with self.subTest(count=len(artifacts)):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["modelVerification"]["artifacts"] = artifacts
+                self.assertTrue(self.inspect(changed))
+
+    def test_model_manifest_hash_size_presence_and_directory_must_agree(self):
+        for key, value in (("sha256", "0" * 64), ("bytes", 1), ("expectedBytes", 1), ("present", False)):
+            with self.subTest(key=key):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["modelVerification"]["artifacts"][0][key] = value
+                self.assertTrue(self.inspect(changed))
+        self.doc["modelSmoke"]["modelVerification"]["directory"] += "-different"
+        self.assertTrue(self.inspect())
+
+    def test_exact_three_golden_names_and_modalities_are_required(self):
+        original = self.doc["modelSmoke"]["vectors"]
+        for vectors in (original[:2], [original[0], original[0], original[2]]):
+            with self.subTest(names=[v["name"] for v in vectors]):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["vectors"] = vectors
+                self.assertTrue(self.inspect(changed))
+        self.doc["modelSmoke"]["vectors"][1]["modality"] = "text"
+        self.assertTrue(self.inspect())
+
+    def test_vectors_require_768_finite_numeric_components(self):
+        for values in ([0.0] * 767, [0.0] * 769, [float("nan")] * 768,
+                       [float("inf")] * 768, [True] * 768):
+            with self.subTest(first=values[0], count=len(values)):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["vectors"][0]["embedding"] = values
+                self.assertTrue(self.inspect(changed))
+
+    def test_norm_is_recomputed_from_matching_raw_embedding(self):
+        vector = self.doc["modelSmoke"]["vectors"][0]
+        vector["embedding"] = [value * 2 for value in vector["embedding"]]
+        self.synchronize_embedding(vector)
+        self.assertTrue(self.inspect())
+
+    def test_cosine_is_recomputed_even_when_reported_value_claims_success(self):
+        vector = self.doc["modelSmoke"]["vectors"][0]
+        vector["embedding"] = [-value for value in vector["embedding"]]
+        self.synchronize_embedding(vector)
+        self.assertTrue(self.inspect())
+
+    def test_expected_embedding_cannot_be_replaced_along_with_actual(self):
+        vector = self.doc["modelSmoke"]["vectors"][0]
+        replacement = deepcopy(self.doc["modelSmoke"]["vectors"][2]["embedding"])
+        vector.update({"embedding": replacement, "expectedEmbedding": deepcopy(replacement),
+                       "l2Norm": math.sqrt(math.fsum(value * value for value in replacement))})
+        self.synchronize_embedding(vector)
+        self.assertTrue(self.inspect())
+
+    def test_reported_norm_cosine_and_reference_hash_cannot_be_forged(self):
+        for key, value in (("l2Norm", 0.5), ("cosine", 0.1), ("dimensions", 3)):
+            with self.subTest(key=key):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["vectors"][0][key] = value
+                self.assertTrue(self.inspect(changed))
+        self.doc["modelSmoke"]["referenceHashes"]["vectors.json"] = "0" * 64
+        self.assertTrue(self.inspect())
+
+    def test_raw_reply_file_and_hash_are_required(self):
+        vector = self.doc["modelSmoke"]["vectors"][0]
+        changed = deepcopy(self.doc)
+        changed["modelSmoke"]["vectors"][0]["rawReply"]["sha256"] = "0" * 64
+        self.assertTrue(self.inspect(changed))
+        (self.root / vector["rawReply"]["path"]).unlink()
+        self.assertTrue(self.inspect())
+
+    def test_raw_reply_paths_cannot_escape_the_report_root(self):
+        for path in ("../outside.json", str(self.root / "absolute.json"), "nested/../../outside.json"):
+            with self.subTest(path=path):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["vectors"][0]["rawReply"]["path"] = path
+                self.assertTrue(self.inspect(changed))
+
+    def test_raw_reply_embedding_must_equal_the_vector_record(self):
+        vector = self.doc["modelSmoke"]["vectors"][0]
+        self.change_raw(vector, lambda raw: raw["result"]["embedding"].__setitem__(0, 0.0))
+        self.assertTrue(self.inspect())
+
+    def test_raw_reply_success_id_and_unique_media_segment_are_checked(self):
+        vector = self.doc["modelSmoke"]["vectors"][1]
+        for field, value in (("ok", False), ("id", "another-request")):
+            with self.subTest(field=field):
+                original = json.loads((self.root / vector["rawReply"]["path"]).read_text(encoding="utf-8"))
+                self.change_raw(vector, lambda raw: raw.__setitem__(field, value))
+                self.assertTrue(self.inspect())
+                self.change_raw(vector, lambda raw: raw.update(original))
+        self.change_raw(vector, lambda raw: raw["result"]["segments"].append(deepcopy(raw["result"]["segments"][0])))
+        self.assertTrue(self.inspect())
+
+    def test_media_partial_state_or_error_cannot_hide_behind_complete_flags(self):
+        for vector in self.doc["modelSmoke"]["vectors"][1:]:
+            original = json.loads((self.root / vector["rawReply"]["path"]).read_text(encoding="utf-8"))
+            for field, value in (("state", "partial"), ("state", None), ("error", "synthetic extraction error")):
+                with self.subTest(name=vector["name"], field=field, value=value):
+                    try:
+                        self.change_raw(vector, lambda raw: raw["result"].__setitem__(field, value))
+                        self.assertTrue(self.inspect())
+                    finally:
+                        self.change_raw(vector, lambda raw: raw.update(original))
+
+    def test_media_reply_cannot_contain_an_extra_different_modality_segment(self):
+        for vector in self.doc["modelSmoke"]["vectors"][1:]:
+            with self.subTest(name=vector["name"]):
+                original = json.loads((self.root / vector["rawReply"]["path"]).read_text(encoding="utf-8"))
+                try:
+                    self.change_raw(vector, lambda raw: raw["result"]["segments"].append(
+                        {"modality": "text", "text": "unexpected synthetic extra segment"}))
+                    self.assertTrue(self.inspect())
+                finally:
+                    self.change_raw(vector, lambda raw: raw.update(original))
+
+    def test_media_budget_and_audio_window_must_match_reference_input(self):
+        for index, field, value in ((1, "imageBudget", 140), (1, "imageBudget", None),
+                                    (2, "startMs", 1), (2, "endMs", 4001), (2, "endMs", None)):
+            vector = self.doc["modelSmoke"]["vectors"][index]
+            with self.subTest(name=vector["name"], field=field, value=value):
+                original = json.loads((self.root / vector["rawReply"]["path"]).read_text(encoding="utf-8"))
+                try:
+                    self.change_raw(vector, lambda raw: raw["result"]["segments"][0].__setitem__(field, value))
+                    self.assertTrue(self.inspect())
+                finally:
+                    self.change_raw(vector, lambda raw: raw.update(original))
+
+    def test_vector_and_raw_reply_fingerprints_match_the_bound_candidate(self):
+        for key in ("modelFingerprint", "extractionFingerprint"):
+            with self.subTest(key=key):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["vectors"][1][key] = "synthetic-wrong-fingerprint"
+                self.assertTrue(self.inspect(changed))
+        self.assertTrue(self.inspect(model="synthetic-other-candidate"))
+        self.assertTrue(self.inspect(extraction="synthetic-other-candidate"))
+        vector = self.doc["modelSmoke"]["vectors"][0]
+        self.change_raw(vector, lambda raw: raw["result"].__setitem__("modelFingerprint", "wrong-raw-fingerprint"))
+        self.assertTrue(self.inspect())
+
+    def test_shared_runtime_requires_all_five_library_roles(self):
+        self.doc["modelSmoke"]["runtime"]["libraries"].pop()
+        self.assertTrue(self.inspect())
+
+    def test_runtime_paths_hashes_and_sizes_are_required(self):
+        self.assertTrue(evidence.validate_package_release(self.doc, self.root, worker_sha256="0" * 64))
+        for key, value in (("path", str(self.root / "outside-application.dll")), ("sha256", "not-a-hash"), ("bytes", 0)):
+            with self.subTest(key=key):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["runtime"]["libraries"][0][key] = value
+                self.assertTrue(self.inspect(changed))
+        self.doc["modelSmoke"]["runtime"]["workerExecutable"]["path"] = str(self.root / "outside-worker.exe")
+        self.assertTrue(self.inspect())
+
+    def test_missing_licenses_or_nonsemantic_service_results_are_rejected(self):
+        changed = deepcopy(self.doc)
+        changed["licenseMaterials"]["passed"] = False
+        self.assertTrue(self.inspect(changed))
+        for result in ({}, {"semantic": False, "hits": [{}]}, {"semantic": True, "hits": []},
+                       {"semantic": True, "hits": [{}], "warning": "synthetic degraded result"}):
+            with self.subTest(result=result):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["serviceSemantic"] = result
+                self.assertTrue(self.inspect(changed))
+
+    def test_license_manifest_and_referenced_files_must_exist(self):
+        materials = self.doc["licenseMaterials"]
+        manifest = self.root / materials["manifest"]
+        (manifest.parent / "llama/LICENSE").unlink()
+        self.assertTrue(self.inspect())
+        manifest.unlink()
+        self.assertTrue(self.inspect())
+
+    def test_license_manifest_hash_and_material_content_are_verified(self):
+        changed = deepcopy(self.doc)
+        changed["licenseMaterials"]["manifestSha256"] = "0" * 64
+        self.assertTrue(self.inspect(changed))
+        manifest = self.root / self.doc["licenseMaterials"]["manifest"]
+        (manifest.parent / "llama/LICENSE").write_text("Changed synthetic license bytes", encoding="utf-8")
+        self.assertTrue(self.inspect())
+
+    def test_license_coverage_is_recomputed_even_when_manifest_hash_is_updated(self):
+        materials = self.doc["licenseMaterials"]
+        manifest = self.root / materials["manifest"]
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        value["moduleCoverage"]["qtpdf"] = []
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+        materials["manifestSha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        self.assertTrue(self.inspect())
+
+    def test_required_vendor_headers_cannot_be_removed_from_files_and_manifest(self):
+        manifest = self.root / self.doc["licenseMaterials"]["manifest"]
+        original_manifest = manifest.read_bytes()
+        for name in ("llama/vendor/stb/stb_image.h", "llama/vendor/miniaudio/miniaudio.h",
+                     "llama/vendor/sheredom/subprocess.h"):
+            with self.subTest(name=name):
+                header = manifest.parent / name
+                original_header = header.read_bytes()
+                try:
+                    header.unlink()
+                    value = json.loads(original_manifest)
+                    value["files"] = [entry for entry in value["files"] if entry["path"] != name]
+                    manifest.write_text(json.dumps(value), encoding="utf-8")
+                    changed = deepcopy(self.doc)
+                    changed["licenseMaterials"]["files"] = len(value["files"])
+                    changed["licenseMaterials"]["manifestSha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+                    self.assertTrue(any("Required vendored license header" in error for error in self.inspect(changed)))
+                finally:
+                    header.write_bytes(original_header)
+                    manifest.write_bytes(original_manifest)
+
+    def test_sdk_license_info_in_files_requires_corresponding_license_coverage(self):
+        materials = self.doc["licenseMaterials"]
+        manifest = self.root / materials["manifest"]
+        name = "qt/sbom/qtbase-6.12.0.spdx.json"
+        sbom = manifest.parent / name
+        document = json.loads(sbom.read_text(encoding="utf-8"))
+        document["packages"][0]["licenseInfoInFiles"] = ["Apache-2.0"]
+        sbom.write_text(json.dumps(document), encoding="utf-8")
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        record = next(entry for entry in value["files"] if entry["path"] == name)
+        record.update({"bytes": sbom.stat().st_size, "sha256": hashlib.sha256(sbom.read_bytes()).hexdigest()})
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+        materials["manifestSha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        self.assertTrue(any("SDK license coverage differs" in error for error in self.inspect()))
+
+    def test_malformed_external_shapes_return_errors(self):
+        for doc in (None, [], "not-a-report", {"modelSmoke": []}, {"passed": True}):
+            with self.subTest(doc=doc):
+                self.assertTrue(self.inspect(doc))
 
 
 def capacity_fixture():
@@ -1111,11 +1500,11 @@ class ExecutionProvenanceTests(unittest.TestCase):
             for name, path in self.programs.items():
                 archive.write(path, "bin/" + name + ".exe")
         verification = self.root / "synthetic-package-verification.json"
-        verification.write_text(json.dumps({"passed": True,
-            "commit": build["identity"]["checkoutCommit"], "workingTreeModified": False,
+        report = package_release_fixture(self.root, worker=self.programs["qcopilots-search-worker"])
+        report.update({"commit": build["identity"]["checkoutCommit"], "workingTreeModified": False,
             "packageSha256": hashlib.sha256(package.read_bytes()).hexdigest(),
-            "checks": [{"name": f"synthetic-validator-{n}", "passed": True} for n in range(9)]}),
-            encoding="utf-8")
+            "checks": [{"name": f"synthetic-validator-{n}", "passed": True} for n in range(9)]})
+        verification.write_text(json.dumps(report), encoding="utf-8")
         return evidence.record_package(build_path, package, verification,
             self.root / "recorded candidates", "synthetic-model-fingerprint", "synthetic-extraction-fingerprint")
 
@@ -1191,7 +1580,10 @@ class ExecutionProvenanceTests(unittest.TestCase):
         stale = deepcopy(candidate)
         stale["buildProvenance"]["sha256"] = "0" * 64
         self.assertTrue(evidence.inspect_candidate(path.parent, stale))
-        for name in (candidate["package"], candidate["verification"], candidate["buildProvenance"]["path"]):
+        verification = evidence.read_json(path.parent / candidate["verification"])
+        required = [candidate["package"], candidate["verification"], candidate["buildProvenance"]["path"],
+                    *evidence.package_evidence_paths(verification, path.parent)]
+        for name in required:
             unbound = deepcopy(candidate)
             unbound["files"] = [item for item in unbound["files"] if item["path"] != name]
             self.assertTrue(evidence.inspect_candidate(path.parent, unbound))

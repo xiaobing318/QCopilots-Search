@@ -1,4 +1,5 @@
 #include "storage/index_repository.h"
+#include "../support/sqlite_database.h"
 
 #include <QCommandLineParser>
 #include <QCoreApplication>
@@ -93,8 +94,8 @@ int main(int argc, char **argv)
         // Only an owned test database may use this synthetic threshold setup.
         {
             sqlite3 *rawDatabase = nullptr;
-            const int result = sqlite3_open_v2(paths.databaseFile().toUtf8().constData(),
-                                               &rawDatabase, SQLITE_OPEN_READWRITE, nullptr);
+            const int result = test::openSqliteDatabase(paths.databaseFile(), &rawDatabase,
+                                                       SQLITE_OPEN_READWRITE);
             std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
             require(result == SQLITE_OK, QStringLiteral("Cannot open the recovery outbox"));
             sqlite3_busy_timeout(database.get(), 5000);
