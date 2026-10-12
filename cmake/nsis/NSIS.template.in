@@ -1,0 +1,73 @@
+Unicode true
+!include "MUI2.nsh"
+!define INST_DIR "@CPACK_TEMPORARY_DIRECTORY@"
+!define PRODUCT_KEY "Software\QCopilots\qcopilots-search"
+!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\qcopilots-search"
+Name "QCopilots Search"
+OutFile "@CPACK_TOPLEVEL_DIRECTORY@/@CPACK_OUTPUT_FILE_NAME@"
+InstallDir "$LOCALAPPDATA\Programs\QCopilots Search"
+InstallDirRegKey HKCU "${PRODUCT_KEY}" ""
+RequestExecutionLevel user
+SetCompressor /SOLID lzma
+SetCompressorDictSize 32
+ManifestDPIAware true
+ShowInstDetails show
+ShowUninstDetails show
+VIProductVersion "@CPACK_PACKAGE_VERSION@.0"
+VIAddVersionKey /LANG=1033 "ProductName" "QCopilots Search"
+VIAddVersionKey /LANG=1033 "FileDescription" "QCopilots Search per-user installer"
+VIAddVersionKey /LANG=1033 "FileVersion" "@CPACK_PACKAGE_VERSION@"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "QCopilots contributors"
+!define MUI_ABORTWARNING
+!insertmacro MUI_PAGE_WELCOME
+@CPACK_NSIS_LICENSE_PAGE@
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+!insertmacro MUI_LANGUAGE "SimpChinese"
+
+Function .onInit
+  SetShellVarContext current
+  SetRegView 64
+FunctionEnd
+Function un.onInit
+  SetShellVarContext current
+  SetRegView 64
+FunctionEnd
+
+Section "QCopilots Search"
+  SetOutPath "$INSTDIR"
+  @CPACK_NSIS_FULL_INSTALL@
+  WriteUninstaller "$INSTDIR\Uninstall.exe"
+  WriteRegStr HKCU "${PRODUCT_KEY}" "" "$INSTDIR"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "QCopilots Search"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "@CPACK_PACKAGE_VERSION@"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "QCopilots"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\bin\qcopilots-search.exe"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "QuietUninstallString" '$\"$INSTDIR\Uninstall.exe$\" /S'
+  WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
+  WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
+  CreateDirectory "$SMPROGRAMS\QCopilots Search"
+  CreateShortCut "$SMPROGRAMS\QCopilots Search\QCopilots Search.lnk" "$INSTDIR\bin\qcopilots-search.exe"
+  CreateShortCut "$SMPROGRAMS\QCopilots Search\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
+SectionEnd
+
+Section "Uninstall"
+  @CPACK_NSIS_DELETE_FILES@
+  @CPACK_NSIS_DELETE_DIRECTORIES@
+  Delete "$INSTDIR\Uninstall.exe"
+  RMDir "$INSTDIR"
+  ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallLocation"
+  StrCmp $0 "$INSTDIR" 0 done
+  DeleteRegKey HKCU "${UNINSTALL_KEY}"
+  DeleteRegKey HKCU "${PRODUCT_KEY}"
+  Delete "$SMPROGRAMS\QCopilots Search\QCopilots Search.lnk"
+  Delete "$SMPROGRAMS\QCopilots Search\Uninstall.lnk"
+  RMDir "$SMPROGRAMS\QCopilots Search"
+  done:
+SectionEnd

@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "assets": [
+    {
+      "path": "assets/book-001.txt",
+      "bytes": 724725,
+      "sha256": "48e0522844402a86a3ea98f0947ba85ea54838db3c59022299298ed968a5a163",
+      "title": "Pride and Prejudice",
+      "author": "Jane Austen (1775–1817)",
+      "source": "https://www.gutenberg.org/ebooks/1342",
+      "download": "https://raw.githubusercontent.com/GITenberg/Pride-and-Prejudice_1342/81db45c9c48c592f0b77f01fc59e677ad0a5634e/1342-0.txt",
+      "license": "Public domain in the United States. Project Gutenberg notice and distribution terms retained in the unmodified file.",
+      "role": "Distinct literary text used as background distractors"
+    },
+    {
+      "path": "assets/book-002.txt",
+      "bytes": 594941,
+      "sha256": "2a0ce5568625a304f54fbb6bfdeeadf527a1437254b5f0e06b5a9e233d4784a2",
+      "title": "The Adventures of Sherlock Holmes",
+      "author": "Arthur Conan Doyle (1859–1930)",
+      "source": "https://www.gutenberg.org/ebooks/1661",
+      "download": "https://raw.githubusercontent.com/GITenberg/The-Adventures-of-Sherlock-Holmes_1661/7e5dd2703fbf503c004063e96ab7c61262375e5f/1661.txt",
+      "license": "Public domain in the United States. Project Gutenberg notice and distribution terms retained in the unmodified file.",
+      "role": "Distinct literary text used as background distractors"
+    },
+    {
+      "path": "assets/book-003.txt",
+      "bytes": 174311,
+      "sha256": "01b38ea4c710a84bc18d0bd41271a5a1a92b94e97b2812f4dece97d4a694725e",
+      "title": "Alice's Adventures in Wonderland",
+      "author": "Lewis Carroll (1832–1898)",
+      "source": "https://www.gutenberg.org/ebooks/11",
+      "download": "https://www.gutenberg.org/cache/epub/11/pg11.txt",
+      "license": "Public domain in the United States. Project Gutenberg notice and distribution terms retained in the unmodified file.",
+      "role": "Distinct literary text used as background distractors"
+    },
+    {
+      "path": "assets/speech-001.wav",
+      "bytes": 235726,
+      "sha256": "aa9f7012ac77bf5a33295412f9dd894959d04902a132a2d9353db22391e88c9c",
+      "source": "Original authored fixture rendered using Windows System.Speech, Microsoft Zira Desktop, 16000 Hz mono PCM16",
+      "license": "Original fixture text and generated recording contributed under the repository MIT license. No synthesizer program or voice model is distributed.",
+      "transcript": "Attention passengers. The train to the airport is delayed because a fallen tree is blocking the railway line."
+    },
+    {
+      "path": "assets/speech-002.wav",
+      "bytes": 156046,
+      "sha256": "a6713c9dabf25fac1c38cdc615b980b376992fdcf4da0febe500bec03ec143fd",
+      "source": "Original authored fixture rendered using Windows System.Speech, Microsoft Zira Desktop, 16000 Hz mono PCM16",
+      "license": "Original fixture text and generated recording contributed under the repository MIT license. No synthesizer program or voice model is distributed.",
+      "transcript": "Please buy milk, eggs and bread at the grocery store on your way home."
+    },
+    {
+      "path": "assets/speech-003.wav",
+      "bytes": 202126,
+      "sha256": "6fc781d4342b478c25ced568f798ec82a808d24adfbc2588882957b375e805ea",
+      "source": "Original authored fixture rendered using Windows System.Speech, Microsoft Zira Desktop, 16000 Hz mono PCM16",
+      "license": "Original fixture text and generated recording contributed under the repository MIT license. No synthesizer program or voice model is distributed.",
+      "transcript": "The museum opens at nine in the morning. Guided tours begin at ten beside the main entrance."
+    },
+    {
+      "path": "assets/speech-004.wav",
+      "bytes": 290606,
+      "sha256": "bb9fef86e585965f6a0c6d2f49a22e960cac4c16f4c873d18c2db241ce0b6656",
+      "source": "Original authored fixture rendered using Windows System.Speech, Microsoft Zira Desktop, 16000 Hz mono PCM16",
+      "license": "Original fixture text and generated recording contributed under the repository MIT license. No synthesizer program or voice model is distributed.",
+      "transcript": "To bake a chocolate cake, mix flour, sugar, eggs and cocoa powder. Bake the mixture in the oven until it rises."
+    },
+    {
+      "path": "assets/environment-001.ogg",
+      "title": "Barking of a dog",
+      "author": "Amada44",
+      "source": "https://commons.wikimedia.org/wiki/File:Barking_of_a_dog.ogg",
+      "download": "https://upload.wikimedia.org/wikipedia/commons/a/a2/Barking_of_a_dog.ogg",
+      "license": "CC-BY-SA-3.0",
+      "licenseUrl": "https://creativecommons.org/licenses/by-sa/3.0/",
+      "changes": "Unmodified original recording",
+      "bytes": 82638,
+      "sha256": "e4438897b68360e54c9e9319a8aea14a78527f022c2b78086f4b2348c03b2fa1"
+    },
+    {
+      "path": "assets/environment-002.wav",
+      "title": "Rain and wind in London 2026 08 28",
+      "author": "Acabashi",
+      "source": "https://commons.wikimedia.org/wiki/File:Rain_and_wind_in_London_2026_08_28.wav",
+      "download": "https://upload.wikimedia.org/wikipedia/commons/7/73/Rain_and_wind_in_London_2026_08_28.wav",
+      "license": "CC-BY-SA-4.0",
+      "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "changes": "Unmodified original recording",
+      "bytes": 6050714,
+      "sha256": "21f958d0842eee1dfa938dc62758eaca3415fe3f54caa15af16288d88d26e59d"
+    },
+    {
+      "path": "assets/video-001.webm",
+      "title": "Lluvia intensa",
+      "author": "Salvadormello30",
+      "source": "https://commons.wikimedia.org/wiki/File:Lluvia_intensa.ogg",
+      "download": "https://upload.wikimedia.org/wikipedia/commons/transcoded/8/8d/Lluvia_intensa.ogg/Lluvia_intensa.ogg.360p.vp9.webm",
+      "license": "CC0-1.0",
+      "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "changes": "Wikimedia 360p VP9 transcode of original 1920x1080 Theora video, downloaded unchanged",
+      "bytes": 2814879,
+      "sha256": "3260a2cf9798ece5c2308698d9288f8d2992a2f5033d86c0af1e7496e39a5e55"
+    },
+    {
+      "path": "assets/photo-001.jpg",
+      "title": "Blue Marble Eastern Hemisphere",
+      "author": "NASA images by Reto Stoeckli, based on NASA and NOAA data",
+      "source": "https://commons.wikimedia.org/wiki/File:Blue_Marble_Eastern_Hemisphere.jpg",
+      "download": "https://upload.wikimedia.org/wikipedia/commons/4/4e/Blue_Marble_Eastern_Hemisphere.jpg",
+      "license": "Public domain United States federal government work (NASA/NOAA)",
+      "changes": "Unmodified original composite satellite image",
+      "bytes": 2926600,
+      "sha256": "2be3050fc30064885b741013b1ea4a3d3dbbde205911743a99d6771557aa5d23"
+    },
+    {
+      "path": "assets/photo-002.jpg",
+      "title": "Felis catus-cat on snow",
+      "author": "Von.grzanka",
+      "source": "https://commons.wikimedia.org/wiki/File:Felis_catus-cat_on_snow.jpg",
+      "download": "https://upload.wikimedia.org/wikipedia/commons/b/b6/Felis_catus-cat_on_snow.jpg",
+      "license": "CC-BY-SA-3.0",
+      "licenseUrl": "https://creativecommons.org/licenses/by-sa/3.0/",
+      "changes": "Unmodified current Commons original, cropped by original photographer",
+      "bytes": 2125399,
+      "sha256": "74d09a7c6463a844572c58634a798d4fa1b646aeff8be81a42ab68915e54e049"
+    }
+  ],
+  "generatedFixtures": {
+    "source": "semantic_acceptance.cpp and topics.tsv",
+    "license": "MIT, original QCopilots Search test data",
+    "contents": "80 original topic notes including 20 Chinese documents, 4 PDF versions, 8 simple illustrations, 4 OCR notices, 6 labelled Python algorithm examples plus 24 unrelated code distractors, 2 synthesized sound signals, and 2 six-second moving-shape AVI videos",
+    "filenamePolicy": "Only opaque hexadecimal names are presented to extraction and retrieval. Source descriptions and transcripts are never added to the indexed corpus."
+  }
+}

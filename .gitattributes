@@ -1,0 +1,17 @@
+# Portable scripts and source files keep the same line endings on every host.
+* text=auto eol=lf
+
+# Reference fixtures and third-party inputs are verified byte for byte.
+tests/runtime/fixtures/** -text -whitespace
+tests/extraction/fixtures/** -text -whitespace
+tests/semantic/assets/** -text -whitespace
+third_party/patches/*.patch text eol=lf -whitespace
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.wav -text
+*.ogg -text
+*.webm -text
+*.doc -text
+*.heic -text
+*.dng -text

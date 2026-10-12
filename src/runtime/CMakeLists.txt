@@ -1,0 +1,87 @@
+# Runtime dependencies are always built outside the checkout.
+include(FetchContent)
+find_package(Git REQUIRED)
+
+set(BUILD_SHARED_LIBS OFF)
+set(_qcopilots_cpu_dispatch OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+  set(_qcopilots_cpu_dispatch ON)
+  set(BUILD_SHARED_LIBS ON)
+endif()
+set(GGML_NATIVE OFF CACHE BOOL "Portable CPU instruction baseline" FORCE)
+foreach(_instruction SSE42 AVX AVX2 AVX_VNNI AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 FMA F16C BMI2)
+  set(GGML_${_instruction} OFF CACHE BOOL "Portable x64 baseline" FORCE)
+endforeach()
+set(GGML_METAL OFF CACHE BOOL "CPU baseline" FORCE)
+set(GGML_CUDA OFF CACHE BOOL "CPU baseline" FORCE)
+set(GGML_VULKAN OFF CACHE BOOL "CPU baseline" FORCE)
+set(GGML_SYCL OFF CACHE BOOL "CPU baseline" FORCE)
+set(GGML_OPENCL OFF CACHE BOOL "CPU baseline" FORCE)
+set(GGML_BLAS OFF CACHE BOOL "CPU baseline" FORCE)
+set(GGML_BACKEND_DL ${_qcopilots_cpu_dispatch} CACHE BOOL "Runtime selection of a compatible CPU backend" FORCE)
+set(GGML_CPU_ALL_VARIANTS ${_qcopilots_cpu_dispatch} CACHE BOOL "Portable baseline plus accelerated CPU backends" FORCE)
+set(LLAMA_BUILD_IS_DEV OFF CACHE BOOL "Pinned inference build" FORCE)
+set(LLAMA_BUILD_COMMON OFF CACHE BOOL "Only embedding libraries" FORCE)
+set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Application owns regression tests" FORCE)
+set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Only embedding libraries" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Only embedding libraries" FORCE)
+set(LLAMA_BUILD_SERVER OFF CACHE BOOL "No inference network service" FORCE)
+set(LLAMA_BUILD_APP OFF CACHE BOOL "Only embedding libraries" FORCE)
+set(LLAMA_BUILD_UI OFF CACHE BOOL "No inference web UI" FORCE)
+set(LLAMA_BUILD_MTMD ON CACHE BOOL "Multimodal embedding library" FORCE)
+set(LLAMA_OPENSSL OFF CACHE BOOL "Models are downloaded by the application" FORCE)
+set(LLAMA_SUBPROCESS OFF CACHE BOOL "Use application's controlled media extraction" FORCE)
+set(MTMD_VIDEO OFF CACHE BOOL "No external ffmpeg subprocess lookup" FORCE)
+
+set(QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR "" CACHE PATH "Existing checkout or verified source archive of the pinned llama.cpp commit")
+set(QCOPILOTS_SEARCH_LLAMA_BINARY_DIR "${CMAKE_BINARY_DIR}/native-dependencies/llama" CACHE PATH "Configuration-specific inference build directory")
+if(QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR)
+  set(FETCHCONTENT_SOURCE_DIR_QCOPILOTS_SEARCH_LLAMA "${QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR}")
+endif()
+if(FETCHCONTENT_SOURCE_DIR_QCOPILOTS_SEARCH_LLAMA)
+  set(_qcopilots_llama_lock "${FETCHCONTENT_SOURCE_DIR_QCOPILOTS_SEARCH_LLAMA}.qcopilots-search.lock")
+else()
+  file(MAKE_DIRECTORY "${FETCHCONTENT_BASE_DIR}")
+  set(_qcopilots_llama_lock "${FETCHCONTENT_BASE_DIR}/qcopilots-search-llama.lock")
+endif()
+file(LOCK "${_qcopilots_llama_lock}" GUARD FILE TIMEOUT 300 RESULT_VARIABLE _qcopilots_llama_lock_result)
+if(NOT _qcopilots_llama_lock_result STREQUAL "0")
+  message(FATAL_ERROR "Cannot lock shared llama.cpp dependency: ${_qcopilots_llama_lock_result}")
+endif()
+FetchContent_Declare(qcopilots_search_llama
+  GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
+  GIT_TAG b11461
+  GIT_SHALLOW TRUE
+  GIT_PROGRESS TRUE
+  UPDATE_DISCONNECTED TRUE
+  BINARY_DIR "${QCOPILOTS_SEARCH_LLAMA_BINARY_DIR}"
+  SUBBUILD_DIR "${CMAKE_BINARY_DIR}/native-dependencies/llama-subbuild")
+FetchContent_GetProperties(qcopilots_search_llama)
+if(NOT qcopilots_search_llama_POPULATED)
+  FetchContent_Populate(qcopilots_search_llama)
+endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/verify_llama_source.cmake")
+qcopilots_search_prepare_llama_source("${qcopilots_search_llama_SOURCE_DIR}"
+  "${PROJECT_SOURCE_DIR}/third_party/patches")
+file(LOCK "${_qcopilots_llama_lock}" RELEASE)
+# EXCLUDE_FROM_ALL prevents upstream developer headers/tools from entering application packages.
+add_subdirectory("${qcopilots_search_llama_SOURCE_DIR}" "${qcopilots_search_llama_BINARY_DIR}" EXCLUDE_FROM_ALL)
+
+add_library(qcopilots-search-runtime STATIC EmbeddingRuntime.cpp EmbeddingRuntime.h ImageSizing.cpp ImageSizing.h)
+target_compile_features(qcopilots-search-runtime PUBLIC cxx_std_20)
+target_include_directories(qcopilots-search-runtime PUBLIC "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(qcopilots-search-runtime PUBLIC Qt6::Core Qt6::Gui PRIVATE llama mtmd)
+if(_qcopilots_cpu_dispatch)
+  target_compile_definitions(qcopilots-search-runtime PRIVATE QCOPILOTS_SEARCH_CPU_DISPATCH=1)
+  set(_qcopilots_runtime_libraries llama mtmd ggml ggml-base)
+  foreach(_variant x64 sse42 sandybridge ivybridge piledriver haswell skylakex cannonlake cascadelake icelake cooperlake zen4 alderlake sapphirerapids)
+    if(TARGET ggml-cpu-${_variant})
+      list(APPEND _qcopilots_runtime_libraries ggml-cpu-${_variant})
+    endif()
+  endforeach()
+  set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS "${_qcopilots_runtime_libraries}")
+  install(TARGETS ${_qcopilots_runtime_libraries}
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE EXCLUDE_FROM_ALL)
+endif()

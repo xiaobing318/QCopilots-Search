@@ -1,0 +1,113 @@
+# 开发指南
+
+开发脚本把源码位置与生成物位置分开。脚本从自身文件路径找到仓库，`--build-root` 指定外置构建根，`--qt-root` 指定 Qt SDK 根。路径按参数传递，包含空格或中文时需要正常引用，不要拼接成另一个 shell 命令。
+
+## 工具链
+
+| 平台 | 编译器与系统 SDK | 发行目标 |
+| --- | --- | --- |
+| Windows x64 | Visual Studio 2022 C++ 桌面工作负载、Windows SDK、CMake 3.28+、Ninja | Windows 10 1809+ / Windows 11 |
+| macOS arm64 | Xcode Command Line Tools、CMake 3.28+、Ninja | macOS 14.4+ |
+| macOS x86_64 | Xcode Command Line Tools、CMake 3.28+、Ninja | macOS 14.4+ |
+| Linux x86_64 | GCC / Clang C++20、CMake 3.28+、Ninja 和 Qt 运行依赖 | Ubuntu 22.04+ |
+
+开发脚本需要 Python 3.10+，安装后的程序不需要 Python。CPU 是四个构建组合的必需推理后端。硬件加速只有获得对应硬件的测试证据后才声明支持。
+
+Qt 6.12.0 和独立 Qt PDF 6.140.0 由 bootstrap 安装。官方 SDK 包按下载校验值锁定。其他依赖通过 CMake 下载到外置依赖目录，不修改系统包的源码，也不在仓库中展开第三方源码。
+
+Linux 主机还需要 Qt 使用的图形、字体、XCB、DBus 和多媒体运行依赖。无显示服务器的 CI 在 Xvfb 中执行 GUI 用例。平台依赖安装命令以 `.github/workflows/qcopilots-search-native.yml` 为可执行参考，`doctor` 输出用于检查当前主机。
+
+## 目录布局
+
+```text
+QCopilots-search/                 源码，可以位于任意可读目录
+  src/                           C++ 模块
+  tests/                         QtTest、进程与模型测试及只读夹具
+  tools/                         开发与验收工具
+  cmake/                         依赖、部署和打包配置
+  docs/                          开发和验收说明
+
+<build-root>/                    仓库外，运行参数指定
+  release/                       Release 构建树
+  debug/                         可选 Debug 构建树
+  dependencies/                  锁定依赖和下载缓存
+  models/                        可选的共享只读模型缓存
+  test-runs/                     独立测试实例与失败产物
+  stage/                         cmake --install 的输出
+  reports/                       CTest 和验收报告
+```
+
+`stage` 供部署和打包使用。程序的真实用户数据通过平台标准应用目录解析，开发构建目录不会成为默认用户数据目录。使用 `--profile-dir` 可以让 GUI、服务和 CLI 连接独立实例，`--model-dir` 可以选择模型目录。
+
+## 统一脚本入口
+
+Windows 使用 `qcopilots-search-dev.ps1`，macOS / Linux 使用 `bash qcopilots-search-dev.sh`。二者接受相同的动作与参数。
+
+| 动作 | 用途 |
+| --- | --- |
+| `bootstrap` | 获取并校验锁定 Qt SDK，准备外置依赖环境 |
+| `doctor` | 检查编译器、SDK、构建工具、路径和必要环境 |
+| `configure` | 生成外置 CMake 构建树 |
+| `build` | 编译程序、工具和启用的测试 |
+| `test` | 在隔离测试根中运行 CTest，并保存报告 |
+| `run` | 从构建结果启动应用 |
+| `install` | 使用 CMake install 生成 staging 布局 |
+| `package` | 从安装布局生成选定平台包 |
+| `verify-package` | 检查部署文件并执行包级启动验证 |
+| `clean` | 仅清理经过路径边界验证的任务生成目录 |
+
+共同参数：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--build-root PATH` | 外置构建根 |
+| `--qt-root PATH` | Qt SDK 安装根 |
+| `--config Release\|Debug` | 构建配置，默认 Release |
+| `--jobs N` | 并行编译任务数 |
+| `--model-dir PATH` | 实际模型目录 |
+| `--test-label LABEL` | 选择 CTest 标签 |
+| `--generator NAME` | CPack 生成器，如 ZIP、NSIS、TGZ、DEB、DragNDrop |
+| `--cmake-arg=-DNAME=VALUE` | 向 configure 传递额外的 CMake 配置 |
+| `--report-dir PATH` | 当前测试或包验证的独立外置报告目录 |
+| `--keep-failed-tests` | 保留失败用例的产物 |
+
+使用较少的并行任务可以降低编译峰值内存和磁盘压力。修改构建选项后重新运行 `configure`，修改源文件后运行 `build` 和相关测试。
+
+## 一次完整开发循环
+
+```powershell
+$buildRoot = 'D:\Builds\QCopilots Search'
+$qtRoot = 'D:\SDKs\Qt'
+$modelDir = Join-Path $buildRoot 'models'
+./qcopilots-search-dev.ps1 bootstrap --build-root $buildRoot --qt-root $qtRoot
+./qcopilots-search-dev.ps1 doctor --build-root $buildRoot --qt-root $qtRoot
+./qcopilots-search-dev.ps1 configure --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcopilots-search-dev.ps1 build --build-root $buildRoot --qt-root $qtRoot --jobs 4
+./qcopilots-search-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcopilots-search-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
+./qcopilots-search-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
+./qcopilots-search-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot
+```
+
+以上路径是可替换的命令示例。代码、CI 与测试不会依赖这些盘符。模型准备方式及完整测试的门槛见 [测试指南](testing.md)。
+
+## 直接使用 CMake
+
+熟悉 CMake 的开发者可以设置 `QCOPILOTS_SEARCH_BUILD_ROOT` 和 `QCOPILOTS_SEARCH_QT_PREFIX` 后使用仓库的 `qcopilots-search-release` preset。`QCOPILOTS_SEARCH_QT_PREFIX` 指向具体 Qt kit，区别于脚本使用的 SDK 根目录。
+
+```bash
+export QCOPILOTS_SEARCH_BUILD_ROOT="/path/outside/source/build"
+export QCOPILOTS_SEARCH_QT_PREFIX="/path/to/Qt/6.12.0/gcc_64"
+cmake --preset qcopilots-search-release
+cmake --build --preset qcopilots-search-release
+ctest --preset qcopilots-search-release
+cmake --install "$QCOPILOTS_SEARCH_BUILD_ROOT/release"
+```
+
+不同操作系统的 Qt kit 名称不同。Windows 在 MSVC 环境中运行直接 CMake 命令，或使用会初始化工具链的开发脚本。CMake 会拒绝源码树内构建。
+
+## 排查失败
+
+先保留控制台错误、CMake 配置日志、CTest 输出与独立测试根。模型问题同时记录文件大小、SHA-256 和模型 revision。IPC 问题记录实例名及脱敏后的配置目录，不发送用户文件内容。包级问题从解压后的安装目录复现，避免使用源码树或开发 SDK 补齐缺失的运行库。
+
+不要通过关闭必需测试、替换黄金向量或把格式失败标记为成功来完成验收。依赖下载失败时先检查锁定 URL 和校验值，不能无提示地回退到任意系统版本。

@@ -1,0 +1,188 @@
+#include "extraction/legacy_doc_extractor.h"
+#include "../../cmake/qcopilots-search-native-doc-iconv.h"
+
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QStandardPaths>
+#include <QTemporaryDir>
+#include <QtTest>
+#include <memory>
+
+using namespace qcopilots_search;
+
+class LegacyDocTests final : public QObject {
+    Q_OBJECT
+    std::unique_ptr<QTemporaryDir> temporary_;
+    QString copyFixture(const QString &name) {
+        const QString path = QDir(temporary_->path()).filePath(QStringLiteral("中文 空格 ") + name);
+        if (!QFile::copy(QStringLiteral(":/legacy-doc/") + name, path)) return {};
+        return path;
+    }
+private slots:
+    void initTestCase() { QStandardPaths::setTestModeEnabled(true); }
+    void init() {
+        const QString root = qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_ROOT", QDir::tempPath());
+        QVERIFY2(QDir().mkpath(root), qPrintable(QStringLiteral("Cannot create test root: ") + root));
+        temporary_ = std::make_unique<QTemporaryDir>(QDir(root).filePath(QStringLiteral("qcopilots-search-tests-doc-XXXXXX")));
+        QVERIFY2(temporary_->isValid(), qPrintable(temporary_->errorString()));
+    }
+    void cleanup() {
+        if (!temporary_) return;
+        if (temporary_->isValid() && (QTest::currentTestFailed()
+            || qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS") == 1)) {
+            temporary_->setAutoRemove(false);
+            qInfo().noquote() << "Preserved DOC test artifacts:" << temporary_->path();
+            temporary_.reset();
+            return;
+        }
+        QVERIFY(temporary_->remove());
+        temporary_.reset();
+    }
+    void fixtureIntegrity_data() {
+        QTest::addColumn<QString>("name");
+        QTest::addColumn<QByteArray>("digest");
+        QTest::newRow("footnote") << QStringLiteral("footnote.doc") << QByteArray("81a18ac63010789ca08c28de107658a308c758a3cfc667a6edf11ffe888d3e13");
+        QTest::newRow("table") << QStringLiteral("simple-table.doc") << QByteArray("67d7fe8e0555c16516354498a5935f24eeef90beb5efbf526f93a1d6c734da43");
+        QTest::newRow("unicode") << QStringLiteral("HeaderFooterUnicode.doc") << QByteArray("8bd7fc9552bccb7b71a0dc34ffd801e7d3547d1317fd75d0c35fca3572f6fa4b");
+        QTest::newRow("original-Chinese") << QStringLiteral("qcopilots-original.doc") << QByteArray("c7a3174bd536246bff63f6db75f596cc6e5aadf80fb01c48a36878581d35be76");
+    }
+    void fixtureIntegrity() {
+        QFETCH(QString, name);
+        QFETCH(QByteArray, digest);
+        QFile fixture(QStringLiteral(":/legacy-doc/") + name);
+        QVERIFY(fixture.open(QIODevice::ReadOnly));
+        QCOMPARE(QCryptographicHash::hash(fixture.readAll(), QCryptographicHash::Sha256).toHex(), digest);
+    }
+    void tableAndBody() {
+        const QString path = copyFixture(QStringLiteral("simple-table.doc"));
+        QVERIFY(!path.isEmpty());
+        QString error;
+        const QString text = legacy_doc::extract(path, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(text.contains(QStringLiteral("Word 97")));
+        for (int row = 1; row <= 2; ++row)
+            for (int column = 1; column <= 3; ++column)
+                QVERIFY2(text.contains(QStringLiteral("Cell %1,%2").arg(row).arg(column)), qPrintable(text));
+        QVERIFY(text.contains(QStringLiteral("This text is below the table.")));
+        QVERIFY(QFile::rename(path, path + QStringLiteral(".released")));
+    }
+    void footnotesEndnotesAndComments() {
+        const QString path = copyFixture(QStringLiteral("footnote.doc"));
+        QVERIFY(!path.isEmpty());
+        QString error;
+        const QString text = legacy_doc::extract(path, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(text.contains(QStringLiteral("TestFootnote")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("TestEndnote")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("TestComment")), qPrintable(text));
+    }
+    void unicodeHeadersAndFooters() {
+        const QString path = copyFixture(QStringLiteral("HeaderFooterUnicode.doc"));
+        QVERIFY(!path.isEmpty());
+        QString error;
+        const QString text = legacy_doc::extract(path, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(text.contains(QStringLiteral("This is a simple header, with a € euro symbol in it.")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("The footer, with Molière, has Unicode in it.")), qPrintable(text));
+    }
+    void originalChineseAndEnglishDocument() {
+        const QString path = copyFixture(QStringLiteral("qcopilots-original.doc"));
+        QVERIFY(!path.isEmpty());
+        QString error;
+        const QString text = legacy_doc::extract(path, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(text.contains(QStringLiteral("The community workshop repairs a wooden chair by tightening loose joints.")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("中文测试：社区维修活动修复木椅。")), qPrintable(text));
+    }
+    void cancellationAndOutputBound() {
+        const QString path = copyFixture(QStringLiteral("simple-table.doc"));
+        QVERIFY(!path.isEmpty());
+        QString error;
+        QVERIFY(legacy_doc::extract(path, &error, 10000, [] { return true; }).isEmpty());
+        QVERIFY(error.contains(QStringLiteral("cancelled")));
+        QVERIFY(legacy_doc::extract(path, &error, 10).isEmpty());
+        QVERIFY2(error.contains(QStringLiteral("size limit")), qPrintable(error));
+        int polls = 0;
+        QVERIFY(legacy_doc::extract(path, &error, 10000, [&] { return ++polls > 3; }).isEmpty());
+        QVERIFY(error.contains(QStringLiteral("cancelled")));
+        QVERIFY(QFile::rename(path, path + QStringLiteral(".released")));
+    }
+    void malformedAndMissing() {
+        QString error;
+        const QString path = QDir(temporary_->path()).filePath(QStringLiteral("missing.doc"));
+        QVERIFY(legacy_doc::extract(path, &error).isEmpty());
+        QVERIFY(!error.isEmpty());
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(QByteArray(512, '\0')), 512);
+        file.close();
+        QVERIFY(legacy_doc::extract(path, &error).isEmpty());
+        QVERIFY(error.contains(QStringLiteral("signature")));
+    }
+    void legacyCodePages_data() {
+        QTest::addColumn<QByteArray>("codePage");
+        QTest::addColumn<QByteArray>("encoded");
+        QTest::addColumn<QByteArray>("expected");
+        QTest::addColumn<QByteArray>("destination");
+        QTest::newRow("simplified-Chinese") << QByteArray("CP936") << QByteArray::fromHex("d6d0cec4")
+            << QByteArray::fromHex("2d4e8765") << QByteArray("UCS-2LE");
+        QTest::newRow("traditional-Chinese") << QByteArray("CP950") << QByteArray::fromHex("c163c5e9")
+            << QByteArray::fromHex("417ed49a") << QByteArray("UCS-2LE");
+        QTest::newRow("Windows-Latin") << QByteArray("CP1252") << QByteArray::fromHex("e9")
+            << QByteArray::fromHex("e900") << QByteArray("UCS-2LE");
+        QTest::newRow("big-endian") << QByteArray("CP936") << QByteArray::fromHex("d6d0cec4")
+            << QByteArray::fromHex("4e2d6587") << QByteArray("UCS-2BE");
+    }
+    void legacyCodePages() {
+        QFETCH(QByteArray, codePage);
+        QFETCH(QByteArray, encoded);
+        QFETCH(QByteArray, expected);
+        QFETCH(QByteArray, destination);
+        std::unique_ptr<qcopilots_search_wv2_converter, decltype(&iconv_close)> converter(
+            iconv_open(destination.constData(), codePage.constData()), iconv_close);
+        QVERIFY(converter.get() != reinterpret_cast<iconv_t>(-1));
+        const char *input = encoded.constData();
+        size_t inputSize = size_t(encoded.size());
+        QByteArray output(expected.size(), '\0');
+        char *target = output.data();
+        size_t targetSize = size_t(output.size());
+        QCOMPARE(iconv(converter.get(), &input, &inputSize, &target, &targetSize), size_t(0));
+        QCOMPARE(inputSize, size_t(0));
+        QCOMPARE(targetSize, size_t(0));
+        QCOMPARE(output, expected);
+    }
+    void codePageErrorsPreserveInput() {
+        std::unique_ptr<qcopilots_search_wv2_converter, decltype(&iconv_close)> converter(
+            iconv_open("UCS-2LE", "CP936"), iconv_close);
+        QVERIFY(converter.get() != reinterpret_cast<iconv_t>(-1));
+        for (const auto &encoded : {QByteArray::fromHex("81"), QByteArray::fromHex("8120")}) {
+            const char *input = encoded.constData();
+            size_t inputSize = size_t(encoded.size());
+            QByteArray output(8, '\0');
+            char *target = output.data();
+            size_t targetSize = size_t(output.size());
+            QCOMPARE(iconv(converter.get(), &input, &inputSize, &target, &targetSize), size_t(-1));
+            QVERIFY(errno == EINVAL || errno == EILSEQ);
+            QCOMPARE(input, encoded.constData());
+            QCOMPARE(inputSize, size_t(encoded.size()));
+            QCOMPARE(target, output.data());
+            QCOMPARE(targetSize, size_t(8));
+        }
+        const QByteArray encoded = QByteArray::fromHex("d6d0cec4");
+        const char *input = encoded.constData();
+        size_t inputSize = size_t(encoded.size());
+        char output[2] = {};
+        char *target = output;
+        size_t targetSize = sizeof(output);
+        QCOMPARE(iconv(converter.get(), &input, &inputSize, &target, &targetSize), size_t(-1));
+        QCOMPARE(errno, E2BIG);
+        QCOMPARE(input, encoded.constData());
+        QCOMPARE(inputSize, size_t(encoded.size()));
+        QCOMPARE(target, output);
+        QCOMPARE(targetSize, sizeof(output));
+    }
+};
+
+QTEST_GUILESS_MAIN(LegacyDocTests)
+#include "legacy_doc_tests.moc"

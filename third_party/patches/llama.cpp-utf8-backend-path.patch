@@ -1,0 +1,8 @@
+diff --git a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
+--- a/ggml/src/ggml-backend-reg.cpp
++++ b/ggml/src/ggml-backend-reg.cpp
+@@ -393,3 +393,3 @@
+ ggml_backend_reg_t ggml_backend_load(const char * path) {
+-    return get_reg().load_backend(path, false);
++    return get_reg().load_backend(fs::u8path(path), false);
+ }

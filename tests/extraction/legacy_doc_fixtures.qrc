@@ -1,0 +1,8 @@
+<RCC>
+  <qresource prefix="/legacy-doc">
+    <file alias="footnote.doc">fixtures/legacy-doc/footnote.doc</file>
+    <file alias="simple-table.doc">fixtures/legacy-doc/simple-table.doc</file>
+    <file alias="HeaderFooterUnicode.doc">fixtures/legacy-doc/HeaderFooterUnicode.doc</file>
+    <file alias="qcopilots-original.doc">fixtures/legacy-doc/qcopilots-original.doc</file>
+  </qresource>
+</RCC>

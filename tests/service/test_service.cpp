@@ -1,0 +1,696 @@
+#include "service/ipc_protocol.h"
+#include "service/service_client.h"
+#include "service/service_server.h"
+#include "core/runtime_paths.h"
+#include "core/types.h"
+#include "core/app_settings.h"
+#include "core/file_catalog.h"
+#include "storage/index_repository.h"
+#include "support/test_environment.h"
+#include <QDir>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QFile>
+#include <QJsonDocument>
+#include <QLocalSocket>
+#include <QProcess>
+#include <QSignalSpy>
+#include <QTest>
+#include <QTimer>
+#include <QtEndian>
+#include <stdexcept>
+
+using namespace qcopilots_search;
+using namespace qcopilots_search::test;
+
+namespace {
+QJsonObject localCall(ServiceClient &client, const QString &method, const QJsonObject &params = {}) {
+    QJsonObject reply;
+    QEventLoop loop;
+    QString requestId;
+    const auto response = QObject::connect(&client, &ServiceClient::response, &loop, [&](const QString &id, const QJsonObject &result) {
+        if (id != requestId) return;
+        reply = {{"ok", true}, {"result", result}}; loop.quit();
+    });
+    const auto failure = QObject::connect(&client, &ServiceClient::failed, &loop, [&](const QString &id, const QString &code, const QString &message) {
+        if (id != requestId) return;
+        reply = {{"ok", false}, {"error", QJsonObject{{"code", code}, {"message", message}}}}; loop.quit();
+    });
+    QTimer::singleShot(10000, &loop, &QEventLoop::quit);
+    requestId = client.request(method, params, 9000);
+    loop.exec();
+    QObject::disconnect(response); QObject::disconnect(failure);
+    return reply;
+}
+
+class ServiceProcess {
+public:
+    explicit ServiceProcess(RuntimePaths value) : paths(std::move(value)) {}
+    ~ServiceProcess() {
+        if (process.state() == QProcess::NotRunning) return;
+        call(QStringLiteral("shutdown"));
+        if (!process.waitForFinished(5000)) { process.kill(); process.waitForFinished(5000); }
+    }
+    bool start() {
+        process.setProgram(qEnvironmentVariable("QCOPILOTS_SEARCH_TEST_SERVICE"));
+        process.setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir});
+        process.start();
+        if (!process.waitForStarted(5000)) { error = process.errorString(); return false; }
+        QElapsedTimer elapsed; elapsed.start();
+        while (elapsed.elapsed() < 15000) {
+            if (process.state() == QProcess::NotRunning) {
+                error = QStringLiteral("Service exited with code %1: %2").arg(process.exitCode()).arg(QString::fromUtf8(process.readAllStandardError()));
+                return false;
+            }
+            QFile tokenFile(QDir(paths.profileDir).filePath("qcopilots-search-ipc-token"));
+            if (tokenFile.open(QIODevice::ReadOnly)) { token = tokenFile.readAll(); tokenFile.close(); }
+            if (!token.isEmpty() && call("status").value("ok").toBool()) return true;
+            QTest::qWait(20);
+        }
+        error = QStringLiteral("Service startup timed out: %1").arg(QString::fromUtf8(process.readAllStandardError()));
+        return false;
+    }
+    QJsonObject call(const QString &method, const QJsonObject &params = {}, int timeout = 5000) {
+        QLocalSocket socket;
+        socket.connectToServer(paths.ipcName);
+        if (!socket.waitForConnected(500)) return {};
+        const QString id = QString::number(++counter);
+        socket.write(encodeIpcFrame({{"protocol", protocolVersion}, {"id", id}, {"token", QString::fromLatin1(token)},
+            {"method", method}, {"params", params}}));
+        socket.flush();
+        QByteArray buffer;
+        QElapsedTimer elapsed; elapsed.start();
+        while (elapsed.elapsed() < timeout) {
+            if (!socket.bytesAvailable()) socket.waitForReadyRead(qMin(100, timeout - int(elapsed.elapsed())));
+            buffer += socket.readAll();
+            QList<QJsonObject> frames;
+            if (!takeIpcFrames(buffer, frames)) return {};
+            for (const auto &frame : frames) if (frame.value("id").toString() == id) return frame;
+            if (socket.state() == QLocalSocket::UnconnectedState) return {};
+        }
+        return {};
+    }
+    QList<QJsonObject> search(const QString &query) {
+        QList<QJsonObject> result;
+        const auto response = call("search", {{"query", query}, {"semantic", false}});
+        for (const auto &hit : response.value("result").toObject().value("hits").toArray()) result.append(hit.toObject());
+        return result;
+    }
+    bool waitForHit(const QString &query, const QString &path, int timeout = 30000) {
+        QElapsedTimer elapsed; elapsed.start();
+        while (elapsed.elapsed() < timeout) {
+            for (const auto &hit : search(query)) if (QDir::cleanPath(hit.value("path").toString()) == QDir::cleanPath(path)) return true;
+            QTest::qWait(30);
+        }
+        return false;
+    }
+    RuntimePaths paths;
+    QProcess process;
+    QByteArray token;
+    QString error;
+    int counter = 0;
+};
+}
+
+class ServiceTests final : public QObject {
+    Q_OBJECT
+private slots:
+    void corruptDocumentRemainsSearchableByFilename() {
+        TestEnvironment environment("service-corrupt-filename");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QString relative = QStringLiteral("selected/corruptfilenameprobe.docx");
+        QVERIFY(environment.writeFile(relative, "This is not a ZIP document. neverindexthisbodytoken"));
+        FileRecord file;
+        QVERIFY(FileCatalog::describe(environment.path(relative), &file));
+        const auto paths = environment.runtimePaths();
+        {
+            ServiceProcess service(paths);
+            QVERIFY2(service.start(), qPrintable(service.error));
+            QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("selected")}}}).value("ok").toBool());
+            auto status = [&] { return service.call("status").value("result").toObject(); };
+            QTRY_VERIFY_WITH_TIMEOUT(status().value("failures").toObject().contains(file.path), 30000);
+            QVERIFY(service.waitForHit("corruptfilenameprobe", file.path, 5000));
+            QCOMPARE(service.search("neverindexthisbodytoken").size(), 0);
+            QTRY_COMPARE_WITH_TIMEOUT(status().value("progress").toObject().value("state").toString(), QStringLiteral("partial"), 5000);
+            QVERIFY(!status().value("failures").toObject().value(file.path).toString().isEmpty());
+            QVERIFY(service.call("index.pause").value("ok").toBool());
+        }
+        {
+            IndexRepository repository;
+            QString error;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            const auto rows = repository.fileSegments(file.path, false, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(rows.size(), 1);
+            QCOMPARE(rows.first().title, QStringLiteral("corruptfilenameprobe.docx"));
+            QCOMPARE(rows.first().kind, file.kind);
+            QVERIFY(rows.first().text.isEmpty());
+            QVERIFY(rows.first().embedding.isEmpty());
+            QVERIFY(rows.first().mediaPath.isEmpty());
+            QVERIFY(repository.fileVersion(file.path).contains("|failed:"));
+        }
+        ServiceProcess restarted(paths);
+        QVERIFY2(restarted.start(), qPrintable(restarted.error));
+        QVERIFY(restarted.waitForHit("corruptfilenameprobe", file.path, 5000));
+        QVERIFY(restarted.call("status").value("result").toObject().value("failures").toObject().contains(file.path));
+    }
+
+    void failedRetryPreservesPreviouslyPublishedPrefix() {
+        TestEnvironment environment("service-failed-prefix");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QString relative = QStringLiteral("selected/partiallyreadableprobe.docx");
+        QVERIFY(environment.writeFile(relative, "Not a ZIP container. failedattemptbodytoken"));
+        FileRecord file;
+        QVERIFY(FileCatalog::describe(environment.path(relative), &file));
+        const auto paths = environment.runtimePaths();
+        QString pipeline;
+        {
+            ServiceProcess service(paths);
+            QVERIFY2(service.start(), qPrintable(service.error));
+            pipeline = service.call("status").value("result").toObject().value("pipelineFingerprint").toString();
+            QVERIFY(!pipeline.isEmpty());
+            QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("selected")}}, {"indexingPaused", true}}).value("ok").toBool());
+        }
+        {
+            // Simulate the authoritative commit from an earlier partial extraction
+            // of this unchanged source before its remaining data failed to decode.
+            IndexRepository repository;
+            QString error;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            Segment prefix;
+            prefix.path = file.path;
+            prefix.title = QStringLiteral("partiallyreadableprobe.docx");
+            prefix.kind = file.kind;
+            prefix.modality = QStringLiteral("text");
+            prefix.text = QStringLiteral("preservedpartialprefix");
+            QVERIFY2(repository.replaceFile(file.path, file.fingerprint + '|' + pipeline + "|failed:1", {prefix}, false, &error), qPrintable(error));
+        }
+        {
+            ServiceProcess service(paths);
+            QVERIFY2(service.start(), qPrintable(service.error));
+            QVERIFY(service.waitForHit("preservedpartialprefix", file.path, 5000));
+            QVERIFY(service.call("index.resume").value("ok").toBool());
+            auto status = [&] { return service.call("status").value("result").toObject(); };
+            QTRY_VERIFY_WITH_TIMEOUT(status().value("failures").toObject().contains(file.path), 30000);
+            QVERIFY(service.waitForHit("preservedpartialprefix", file.path, 5000));
+            QVERIFY(service.waitForHit("partiallyreadableprobe", file.path, 5000));
+            QCOMPARE(service.search("failedattemptbodytoken").size(), 0);
+            QVERIFY(service.call("index.pause").value("ok").toBool());
+        }
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(paths, &error), qPrintable(error));
+        const auto rows = repository.fileSegments(file.path, false, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().text, QStringLiteral("preservedpartialprefix"));
+        QVERIFY(rows.first().embedding.isEmpty());
+        QVERIFY(repository.fileVersion(file.path).contains("|failed:"));
+    }
+
+    void pipelineFailureRollsBackAndDisablesInference() {
+        TestEnvironment environment("service-pipeline-fault");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/document.txt", "pipelinefailurekeyword"));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("selected")}; settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        FileRecord file;
+        QVERIFY(FileCatalog::describe(environment.path("selected/document.txt"), &file));
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            QVERIFY(repository.setPipelineFingerprint("initial-old-space", &error));
+            Segment segment; segment.path = file.path; segment.kind = "text"; segment.title = "document";
+            segment.text = "pipelinefailurekeyword"; segment.embedding = QVector<float>(768, 0); segment.embedding[0] = 1;
+            QVERIFY2(repository.replaceFile(file.path, file.fingerprint + "|initial-old-space", {segment}, false, &error), qPrintable(error));
+        }
+        bool available = false, failCommit = true;
+        ServiceDependencies dependencies;
+        dependencies.verifyModels = [&](QString *) { return available; };
+        dependencies.storage.faultHook = [&](const QString &phase) {
+            if (failCommit && phase == "before-pipeline-commit") throw std::runtime_error("injected pipeline disk failure");
+        };
+        {
+            ServiceServer rejected(paths, dependencies);
+            QVERIFY(!rejected.start(&error));
+            QVERIFY(error.contains("injected pipeline disk failure"));
+        }
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            QCOMPARE(repository.pipelineFingerprint(), QStringLiteral("initial-old-space"));
+            QCOMPARE(repository.fileSegments(file.path).first().embedding.size(), 768);
+        }
+        failCommit = false;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        const auto initial = localCall(client, "status").value("result").toObject();
+        const auto oldPipeline = initial.value("pipelineFingerprint").toString();
+        QVERIFY(!oldPipeline.isEmpty());
+        available = true; failCommit = true;
+        const auto failure = localCall(client, "models.reload");
+        QCOMPARE(failure.value("error").toObject().value("code").toString(), QStringLiteral("pipeline_transition_failed"));
+        const auto status = localCall(client, "status").value("result").toObject();
+        QVERIFY(!status.value("modelAvailable").toBool());
+        QCOMPARE(status.value("pipelineFingerprint").toString(), oldPipeline);
+        QVERIFY(status.value("pipelineTransitionError").toString().contains("injected pipeline disk failure"));
+        const auto search = localCall(client, "search", {{"query", "pipelinefailurekeyword"}, {"semantic", true}}).value("result").toObject();
+        QVERIFY(!search.value("semantic").toBool());
+        QCOMPARE(search.value("hits").toArray().size(), 1);
+        QVERIFY(search.value("warning").toString().contains("pipeline"));
+        QCOMPARE(localCall(client, "index.start").value("result").toObject().value("state").toString(), QStringLiteral("error"));
+        failCommit = false;
+        QVERIFY(localCall(client, "models.reload").value("ok").toBool());
+        const auto recovered = localCall(client, "status").value("result").toObject();
+        QVERIFY(recovered.value("modelAvailable").toBool());
+        QVERIFY(recovered.value("pipelineTransitionError").toString().isEmpty());
+        QVERIFY(recovered.value("pipelineFingerprint").toString() != oldPipeline);
+        client.disconnectFromService(); service.stop();
+    }
+
+    void currentFolderRulesParticipateBeforeLimit() {
+        TestEnvironment environment("service-folder-filter");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("first/needle.txt", "needle"));
+        QVERIFY(environment.writeFile("second/document.txt", "needle"));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("first"), environment.path("second")}; settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            QVERIFY(repository.setPipelineFingerprint("folder-filter-fixture", &error));
+            for (const QString &relative : {QStringLiteral("first/needle.txt"), QStringLiteral("second/document.txt")}) {
+                FileRecord file; QVERIFY(FileCatalog::describe(environment.path(relative), &file));
+                Segment segment; segment.path = file.path; segment.title = QFileInfo(file.path).fileName();
+                segment.kind = "text"; segment.text = "needle";
+                QVERIFY2(repository.replaceFile(file.path, file.fingerprint + "|folder-filter-fixture", {segment}, false, &error), qPrintable(error));
+            }
+        }
+        ServiceProcess service(paths); QVERIFY2(service.start(), qPrintable(service.error));
+        auto limited = [&] { return service.call("search", {{"query", "needle"}, {"semantic", false}, {"limit", 1}}).value("result").toObject().value("hits").toArray(); };
+        QCOMPARE(limited().size(), 1);
+        QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("first/needle.txt"));
+        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("second")}}}).value("ok").toBool());
+        QCOMPARE(limited().size(), 1);
+        QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("second/document.txt"));
+        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("first"), environment.path("second")}},
+            {"excludes", QJsonArray{environment.path("first")}}}).value("ok").toBool());
+        // An explicitly selected root overrides an equal exclusion, as in FileCatalog.
+        QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("first/needle.txt"));
+        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.root()}},
+            {"excludes", QJsonArray{environment.path("first")}}}).value("ok").toBool());
+        QCOMPARE(limited().size(), 1);
+        QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("second/document.txt"));
+        QCOMPARE(service.call("status").value("result").toObject().value("repository").toObject().value("files").toInt(), 2);
+    }
+
+    void singletonAndExplicitProfile() {
+        TestEnvironment environment("service-singleton");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ServiceProcess service(environment.runtimePaths());
+        QVERIFY2(service.start(), qPrintable(service.error));
+        const auto status = service.call("status");
+        QVERIFY(status.value("ok").toBool());
+        QVERIFY(!status.value("result").toObject().value("modelAvailable").toBool());
+        QProcess duplicate;
+        duplicate.start(service.process.program(), service.process.arguments());
+        QVERIFY(duplicate.waitForStarted(5000));
+        QVERIFY(duplicate.waitForFinished(10000));
+        QCOMPARE(duplicate.exitCode(), 0);
+        QVERIFY(duplicate.readAllStandardError().contains("already_running:"));
+        QCOMPARE(service.process.state(), QProcess::Running);
+        QVERIFY(service.call("status").value("ok").toBool());
+    }
+
+    void cappedPrefixSurvivesReconcileAndExplicitRetry() {
+        TestEnvironment environment("service-capped-prefix");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/long.txt", "Source for a persisted capped index fixture"));
+        const auto paths = environment.runtimePaths();
+        QString error, pipeline;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")}; settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        {
+            ServiceProcess initial(paths); QVERIFY2(initial.start(), qPrintable(initial.error));
+            pipeline = initial.call("status").value("result").toObject().value("pipelineFingerprint").toString();
+        }
+        FileRecord file; QVERIFY(FileCatalog::describe(environment.path("selected/long.txt"), &file));
+        QVector<Segment> prefix;
+        prefix.reserve(5000);
+        for (int i = 0; i < 5000; ++i) {
+            Segment segment; segment.path = file.path; segment.kind = "text"; segment.title = "long";
+            segment.text = i == 4999 ? QStringLiteral("cappedfinalprefixneedle") : QStringLiteral("capped prefix %1").arg(i);
+            prefix.append(std::move(segment));
+        }
+        {
+            IndexRepository repository; QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            // This legacy marker reproduces the prior restart bug. New batches
+            // persist capped:5000, and both must retain the authoritative prefix.
+            QVERIFY2(repository.replaceFile(file.path, file.fingerprint + "|" + pipeline + "|partial:5000", prefix, false, &error), qPrintable(error));
+        }
+        settings.indexingPaused = false; QVERIFY(settings.save(paths.configFile, &error));
+        ServiceProcess service(paths); QVERIFY2(service.start(), qPrintable(service.error));
+        auto status = [&] { return service.call("status").value("result").toObject(); };
+        QTRY_COMPARE_WITH_TIMEOUT(status().value("progress").toObject().value("state").toString(), QStringLiteral("partial"), 10000);
+        QVERIFY(status().value("failures").toObject().value(file.path).toString().contains("5000"));
+        for (int repetition = 0; repetition < 2; ++repetition) {
+            QVERIFY(service.call("index.reconcile").value("ok").toBool());
+            QTRY_COMPARE_WITH_TIMEOUT(status().value("progress").toObject().value("state").toString(), QStringLiteral("partial"), 10000);
+            QCOMPARE(status().value("repository").toObject().value("segments").toInteger(), 5000);
+            QVERIFY(service.waitForHit("cappedfinalprefixneedle", file.path, 5000));
+        }
+        // Process both requests in one readiness event. The scan can queue a
+        // deliberate retry, while pause prevents any worker batch publishing.
+        QLocalSocket socket; socket.connectToServer(paths.ipcName); QVERIFY(socket.waitForConnected(3000));
+        const QString token = QString::fromLatin1(service.token);
+        socket.write(encodeIpcFrame({{"protocol", 1}, {"id", "retry-cap"}, {"token", token}, {"method", "index.retry"}})
+            + encodeIpcFrame({{"protocol", 1}, {"id", "pause-cap"}, {"token", token}, {"method", "index.pause"}}));
+        socket.flush();
+        QTRY_COMPARE_WITH_TIMEOUT(status().value("queuedFiles").toInt(), 1, 10000);
+        QCOMPARE(status().value("repository").toObject().value("segments").toInteger(), 5000);
+        QVERIFY(service.waitForHit("cappedfinalprefixneedle", file.path, 5000));
+        QVERIFY(environment.writeFile("selected/long.txt", "changedsourceaftercapneedle"));
+        QVERIFY(service.call("index.resume").value("ok").toBool());
+        QVERIFY(service.waitForHit("changedsourceaftercapneedle", file.path));
+        QTRY_COMPARE_WITH_TIMEOUT(status().value("progress").toObject().value("state").toString(), QStringLiteral("idle"), 10000);
+        QCOMPARE(status().value("repository").toObject().value("segments").toInteger(), 1);
+        QVERIFY(status().value("failures").toObject().isEmpty());
+    }
+
+    void authenticationAndProtocolLimits() {
+        TestEnvironment environment("service-protocol");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ServiceProcess service(environment.runtimePaths());
+        QVERIFY2(service.start(), qPrintable(service.error));
+        QLocalSocket unauthorized;
+        unauthorized.connectToServer(service.paths.ipcName);
+        QVERIFY(unauthorized.waitForConnected(3000));
+        unauthorized.write(encodeIpcFrame({{"protocol", 1}, {"id", "bad"}, {"method", "status"}, {"token", "wrong"}}));
+        QVERIFY(unauthorized.waitForReadyRead(3000));
+        QByteArray buffer = unauthorized.readAll();
+        QList<QJsonObject> frames;
+        QVERIFY(takeIpcFrames(buffer, frames));
+        QVERIFY(!frames.isEmpty());
+        QCOMPARE(frames.first().value("error").toObject().value("code").toString(), QStringLiteral("not_authenticated"));
+        for (const QByteArray &invalid : {QByteArray::fromHex("01000001"), QByteArray::fromHex("00000000")}) {
+            QLocalSocket socket;
+            socket.connectToServer(service.paths.ipcName);
+            QVERIFY(socket.waitForConnected(3000));
+            socket.write(invalid);
+            QVERIFY(socket.waitForReadyRead(3000));
+            QByteArray bytes = socket.readAll(); QList<QJsonObject> replies;
+            QVERIFY(takeIpcFrames(bytes, replies));
+            QVERIFY(!replies.isEmpty());
+            QCOMPARE(replies.first().value("error").toObject().value("code").toString(), QStringLiteral("invalid_protocol"));
+        }
+        QLocalSocket mismatch;
+        mismatch.connectToServer(service.paths.ipcName);
+        QVERIFY(mismatch.waitForConnected(3000));
+        const auto payload = QJsonDocument(QJsonObject{{"protocol", 999}, {"id", "future"}, {"method", "status"}}).toJson(QJsonDocument::Compact);
+        QByteArray message(4, '\0'); qToBigEndian(quint32(payload.size()), message.data()); message += payload;
+        mismatch.write(message);
+        QVERIFY(mismatch.waitForReadyRead(3000));
+        QVERIFY(service.call("status").value("ok").toBool());
+        const auto unknown = service.call("does.not.exist");
+        QCOMPARE(unknown.value("error").toObject().value("code").toString(), QStringLiteral("unknown_method"));
+        const auto invalidSettings = service.call("settings.set", {{"roots", QJsonArray{"relative/path"}}});
+        QCOMPARE(invalidSettings.value("error").toObject().value("code").toString(), QStringLiteral("invalid_settings"));
+    }
+
+    void isolatedParallelProfiles() {
+        TestEnvironment first("service-profile-one"), second("service-profile-two");
+        QVERIFY(first.isValid()); QVERIFY(second.isValid());
+        ServiceProcess a(first.runtimePaths()), b(second.runtimePaths());
+        QVERIFY2(a.start(), qPrintable(a.error)); QVERIFY2(b.start(), qPrintable(b.error));
+        QVERIFY(a.paths.ipcName != b.paths.ipcName);
+        QVERIFY(a.token != b.token);
+        QVERIFY(a.call("settings.set", {{"language", "zh_CN"}}).value("ok").toBool());
+        QCOMPARE(b.call("settings.get").value("result").toObject().value("language").toString(), QStringLiteral("system"));
+        a.call("shutdown"); QVERIFY(a.process.waitForFinished(5000));
+        QVERIFY(b.call("status").value("ok").toBool());
+    }
+
+    void cancellationRejectsLateCompletion() {
+        TestEnvironment environment("service-cancel");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ServiceProcess service(environment.runtimePaths());
+        QVERIFY2(service.start(), qPrintable(service.error));
+        QLocalSocket socket;
+        socket.connectToServer(service.paths.ipcName);
+        QVERIFY(socket.waitForConnected(3000));
+        const QString token = QString::fromLatin1(service.token);
+        const auto search = encodeIpcFrame({{"protocol", 1}, {"id", "pending-search"}, {"token", token},
+            {"method", "search"}, {"params", QJsonObject{{"query", "anything"}, {"semantic", false}}}});
+        const auto cancel = encodeIpcFrame({{"protocol", 1}, {"id", "cancel-command"}, {"token", token},
+            {"method", "cancel"}, {"params", QJsonObject{{"id", "pending-search"}}}});
+        socket.write(search + cancel);
+        QByteArray buffer;
+        QList<QJsonObject> replies;
+        QElapsedTimer timer; timer.start();
+        while (timer.elapsed() < 5000 && replies.size() < 2) {
+            if (!socket.bytesAvailable()) socket.waitForReadyRead(100);
+            buffer += socket.readAll();
+            QVERIFY(takeIpcFrames(buffer, replies));
+        }
+        bool cancelled = false, acknowledged = false;
+        for (const auto &reply : replies) {
+            if (reply.value("id").toString() == "pending-search") {
+                QCOMPARE(reply.value("error").toObject().value("code").toString(), QStringLiteral("cancelled"));
+                cancelled = true;
+            }
+            if (reply.value("id").toString() == "cancel-command") acknowledged = reply.value("result").toObject().value("cancelled").toBool();
+        }
+        QVERIFY(cancelled); QVERIFY(acknowledged);
+        socket.waitForReadyRead(200);
+        buffer += socket.readAll();
+        QList<QJsonObject> late;
+        QVERIFY(takeIpcFrames(buffer, late));
+        for (const auto &reply : late) QVERIFY(reply.value("id").toString() != "pending-search");
+        QTRY_COMPARE_WITH_TIMEOUT(service.call("status").value("result").toObject().value("activeSearches").toInt(), 0, 5000);
+        QVERIFY(service.call("search", {{"query", "aftercancel"}, {"semantic", false}}).value("ok").toBool());
+
+        QByteArray flood;
+        for (int index = 0; index < 80; ++index) {
+            const QString searchId = QStringLiteral("flood-%1").arg(index);
+            flood += encodeIpcFrame({{"protocol", 1}, {"id", searchId}, {"token", token}, {"method", "search"},
+                {"params", QJsonObject{{"query", "boundedcancel"}, {"semantic", false}}}});
+            flood += encodeIpcFrame({{"protocol", 1}, {"id", QStringLiteral("stop-%1").arg(index)}, {"token", token},
+                {"method", "cancel"}, {"params", QJsonObject{{"id", searchId}}}});
+        }
+        socket.write(flood);
+        QList<QJsonObject> floodReplies;
+        timer.restart();
+        while (timer.elapsed() < 5000 && floodReplies.size() < 160) {
+            if (!socket.bytesAvailable()) socket.waitForReadyRead(100);
+            buffer += socket.readAll();
+            QVERIFY(takeIpcFrames(buffer, floodReplies));
+        }
+        bool backpressure = false;
+        for (const auto &reply : floodReplies)
+            if (reply.value("error").toObject().value("code").toString() == "busy") backpressure = true;
+        QVERIFY(backpressure);
+        QTRY_COMPARE_WITH_TIMEOUT(service.call("status").value("result").toObject().value("activeSearches").toInt(), 0, 5000);
+        QVERIFY(service.call("search", {{"query", "responsiveafterflood"}, {"semantic", false}}).value("ok").toBool());
+    }
+
+    void pipelineChangePreservesKeywordWhilePaused() {
+        TestEnvironment environment("service-pipeline-preserve");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/document.txt", "pipelinepreservedkeyword"));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("selected")};
+        settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        FileRecord file;
+        QVERIFY(FileCatalog::describe(environment.path("selected/document.txt"), &file));
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            QVERIFY(repository.setPipelineFingerprint("older-test-pipeline", &error));
+            Segment segment;
+            segment.path = file.path; segment.kind = "text"; segment.title = "document"; segment.text = "pipelinepreservedkeyword";
+            QVERIFY2(repository.replaceFile(file.path, file.fingerprint + "|older-test-pipeline", {segment}, false, &error), qPrintable(error));
+        }
+        ServiceProcess service(paths);
+        QVERIFY2(service.start(), qPrintable(service.error));
+        QVERIFY(service.waitForHit("pipelinepreservedkeyword", file.path, 5000));
+        QCOMPARE(service.call("status").value("result").toObject().value("progress").toObject().value("state").toString(), QStringLiteral("paused"));
+    }
+
+    void crashedServiceReleasesProfileOwnership() {
+        TestEnvironment environment("service-crash");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ServiceProcess original(environment.runtimePaths());
+        QVERIFY2(original.start(), qPrintable(original.error));
+        const QByteArray previousToken = original.token;
+        original.process.kill();
+        QVERIFY(original.process.waitForFinished(5000));
+        ServiceProcess recovered(environment.runtimePaths());
+        QVERIFY2(recovered.start(), qPrintable(recovered.error));
+        QVERIFY(recovered.token != previousToken);
+        QVERIFY(recovered.call("status").value("ok").toBool());
+    }
+
+    void disablingCodeRejectsInFlightResponse() {
+        TestEnvironment environment("service-code-race");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ServiceProcess service(environment.runtimePaths());
+        QVERIFY2(service.start(), qPrintable(service.error));
+        QVERIFY(service.call("settings.set", {{"includeCode", true}}).value("ok").toBool());
+        QLocalSocket socket;
+        socket.connectToServer(service.paths.ipcName);
+        QVERIFY(socket.waitForConnected(3000));
+        const QString token = QString::fromLatin1(service.token);
+        socket.write(encodeIpcFrame({{"protocol", 1}, {"id", "old-code-query"}, {"token", token}, {"method", "search"},
+            {"params", QJsonObject{{"query", "code"}, {"code", true}, {"semantic", false}}}})
+            + encodeIpcFrame({{"protocol", 1}, {"id", "disable-code"}, {"token", token}, {"method", "settings.set"},
+                {"params", QJsonObject{{"includeCode", false}}}}));
+        QByteArray buffer;
+        QList<QJsonObject> replies;
+        QElapsedTimer timer; timer.start();
+        bool rejected = false;
+        while (timer.elapsed() < 5000 && !rejected) {
+            if (!socket.bytesAvailable()) socket.waitForReadyRead(100);
+            buffer += socket.readAll();
+            replies.clear();
+            QVERIFY(takeIpcFrames(buffer, replies));
+            for (const auto &reply : replies) if (reply.value("id").toString() == "old-code-query") {
+                QCOMPARE(reply.value("error").toObject().value("code").toString(), QStringLiteral("code_search_disabled"));
+                rejected = true;
+            }
+        }
+        QVERIFY(rejected);
+    }
+
+    void indexingChangePauseExcludeAndRestart() {
+        TestEnvironment environment("service-index 中文 space");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("资料 空格/报告.txt", QByteArray("A searchable needle contract. ") + QStringLiteral("中文搜索与文档").toUtf8()));
+        QVERIFY(environment.writeFile("资料 空格/排除/hidden.txt", "needle hidden"));
+        const QString root = environment.path("资料 空格");
+        const QString document = environment.path("资料 空格/报告.txt");
+        {
+            ServiceProcess service(environment.runtimePaths());
+            QVERIFY2(service.start(), qPrintable(service.error));
+            QVERIFY(service.call("settings.set", {{"roots", QJsonArray{root}}, {"excludes", QJsonArray{environment.path("资料 空格/排除")}}}).value("ok").toBool());
+            QVERIFY2(service.waitForHit("needle", document), qPrintable(QString::fromUtf8(service.process.readAllStandardError())));
+            QCOMPARE(service.search("needle").size(), 1);
+            QVERIFY(service.waitForHit(QStringLiteral("中文"), document));
+            const auto preview = service.call("document.preview", {{"path", document}, {"maxSegments", 1}}, 30000);
+            QVERIFY2(preview.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(preview).toJson())));
+            QVERIFY(preview.value("result").toObject().value("text").toString().contains("needle"));
+            QVERIFY(environment.writeFile("outside/private.txt", "outside_selected_roots"));
+            const auto forbidden = service.call("document.preview", {{"path", environment.path("outside/private.txt")}});
+            QCOMPARE(forbidden.value("error").toObject().value("code").toString(), QStringLiteral("invalid_request"));
+            QVERIFY(service.call("index.pause").value("ok").toBool());
+            QCOMPARE(service.call("status").value("result").toObject().value("progress").toObject().value("state").toString(), QStringLiteral("paused"));
+            QVERIFY(environment.writeFile("资料 空格/报告.txt", "changednewtoken with a different byte length"));
+            // Stale source versions are rejected during query even before reconciliation.
+            QCOMPARE(service.search("needle").size(), 0);
+            QVERIFY(service.call("index.resume").value("ok").toBool());
+            QVERIFY(service.waitForHit("changednewtoken", document));
+            QVERIFY(service.call("index.pause").value("ok").toBool());
+        }
+        {
+            ServiceProcess restarted(environment.runtimePaths());
+            QVERIFY2(restarted.start(), qPrintable(restarted.error));
+            QVERIFY(restarted.waitForHit("changednewtoken", document));
+            QCOMPARE(restarted.call("settings.get").value("result").toObject().value("indexingPaused").toBool(), true);
+            QVERIFY(restarted.call("settings.set", {{"roots", QJsonArray{}}}).value("ok").toBool());
+            QCOMPARE(restarted.search("changednewtoken").size(), 0);
+        }
+    }
+
+    void codeClassificationToggle() {
+        TestEnvironment environment("service-code-toggle");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        // A valid empty repository fixture needs no installed Git executable.
+        QVERIFY(environment.writeFile("repository/.git/HEAD", "ref: refs/heads/main\n"));
+        QVERIFY(environment.writeFile("repository/.git/config", "[core]\nrepositoryformatversion = 0\nbare = false\n"));
+        QVERIFY(QDir().mkpath(environment.path("repository/.git/objects")));
+        QVERIFY(QDir().mkpath(environment.path("repository/.git/refs/heads")));
+        QVERIFY(environment.writeFile("repository/README.md", "classificationtoggleword documentation"));
+        const QString path = environment.path("repository/README.md");
+        ServiceProcess service(environment.runtimePaths());
+        QVERIFY2(service.start(), qPrintable(service.error));
+        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("repository")}}, {"includeCode", false}}).value("ok").toBool());
+        QVERIFY(service.waitForHit("classificationtoggleword", path));
+        QVERIFY(service.call("settings.set", {{"includeCode", true}}).value("ok").toBool());
+        auto codeHits = [&] {
+            return service.call("search", {{"query", "classificationtoggleword"}, {"code", true}, {"semantic", false}})
+                .value("result").toObject().value("hits").toArray();
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(codeHits().size(), 1, 30000);
+        QCOMPARE(service.search("classificationtoggleword").size(), 0);
+        QVERIFY(service.call("settings.set", {{"includeCode", false}}).value("ok").toBool());
+        QVERIFY(service.waitForHit("classificationtoggleword", path));
+        const auto disabled = service.call("search", {{"query", "classificationtoggleword"}, {"code", true}});
+        QCOMPARE(disabled.value("error").toObject().value("code").toString(), QStringLiteral("code_search_disabled"));
+    }
+
+    void continuationSurvivesMissingJournal() {
+        TestEnvironment environment("service-continuation");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QByteArray content = QByteArray("A repeatable long document with distinct paragraphs.\n").repeated(4000)
+            + QByteArray("continuationfinaltoken\n");
+        QVERIFY(environment.writeFile("selected/long.txt", content));
+        const auto paths = environment.runtimePaths();
+        const QString path = environment.path("selected/long.txt");
+        QString indexedVersion;
+        QVector<Segment> original;
+        {
+            ServiceProcess service(paths);
+            QVERIFY2(service.start(), qPrintable(service.error));
+            QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("selected")}}}).value("ok").toBool());
+            QVERIFY(service.waitForHit("continuationfinaltoken", path));
+            QVERIFY(service.call("index.pause").value("ok").toBool());
+        }
+        {
+            IndexRepository repository;
+            QString error;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            original = repository.fileSegments(path, false, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY(original.size() > 40);
+            indexedVersion = repository.fileVersion(path);
+            QVERIFY(!indexedVersion.contains("|partial:"));
+            QVERIFY2(repository.replaceFile(path, indexedVersion + "|partial:40", original.first(40), false, &error), qPrintable(error));
+        }
+        // Simulate loss of diagnostic state after the authoritative batch commit.
+        const QString journal = QDir(paths.indexDir).filePath("qcopilots-search-progress.json");
+        QVERIFY(!QFileInfo::exists(journal) || QFile::remove(journal));
+        {
+            ServiceProcess resumed(paths);
+            QVERIFY2(resumed.start(), qPrintable(resumed.error));
+            QVERIFY(resumed.call("index.resume").value("ok").toBool());
+            auto progress = [&] { return resumed.call("status").value("result").toObject().value("progress").toObject(); };
+            QTRY_COMPARE_WITH_TIMEOUT(progress().value("state").toString(), QStringLiteral("idle"), 30000);
+            QCOMPARE(progress().value("segments").toInteger(), original.size() - 40);
+            QVERIFY(resumed.waitForHit("continuationfinaltoken", path));
+        }
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(paths, &error), qPrintable(error));
+        const auto restored = repository.fileSegments(path, false, &error);
+        QCOMPARE(restored.size(), original.size());
+        QCOMPARE(repository.fileVersion(path), indexedVersion);
+        for (qsizetype index = 0; index < restored.size(); ++index) QCOMPARE(restored[index].text, original[index].text);
+    }
+};
+
+QTEST_GUILESS_MAIN(ServiceTests)
+#include "test_service.moc"

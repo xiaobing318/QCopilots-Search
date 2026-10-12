@@ -1,0 +1,7 @@
+# Hash-locked fixture bytes must survive checkout on every platform unchanged.
+assets/* -text
+assets.json text eol=lf
+topics.tsv text eol=lf
+*.cpp text eol=lf
+*.md text eol=lf
+CMakeLists.txt text eol=lf

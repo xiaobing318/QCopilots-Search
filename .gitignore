@@ -1,0 +1,10 @@
+# All generated products belong in an external build root.
+/CMakeUserPresets.json
+/CMakeCache.txt
+/CMakeFiles/
+/.vs/
+/.idea/
+__pycache__/
+*.user
+*.pyc
+aqtinstall.log
