@@ -81,6 +81,8 @@ class PathBudgetTests(unittest.TestCase):
         samples = {
             "CMakeFiles/qcs.dir/file.cpp.obj": "object",
             "CMakeFiles/qcs.dir/file.cpp.o": "object",
+            "qcs_autogen/CMakeFiles/qcs.dir/qrc_resources.cpp.obj": "object",
+            "qcs_autogen/CMakeFiles/qcs.dir/qrc_resources.cpp.o": "object",
             "qcs_autogen/mocs_compilation.cpp": "moc",
             "generated/qrc_qcs.cpp": "rcc",
             "CMakeFiles/qcs.rsp": "response",
@@ -257,19 +259,23 @@ class PathBudgetTests(unittest.TestCase):
         prefix = str(base / "obj") + os.sep
         for platform, limit in (("windows", 200), ("posix", 240)):
             for length in (200, 201, 220, 240, 241):
-                with self.subTest(platform=platform, length=length):
-                    count = length - budget.path_length(prefix, platform) - len(".obj")
-                    obj = Path(prefix + "x" * count + ".obj")
-                    with patch.object(budget, "ninja_outputs", return_value=(
-                            [budget.NinjaTarget(str(obj), obj)], "fixture")), \
-                            patch.object(budget, "ninja_responses", return_value=[]), \
-                            patch.object(budget, "scan_generated", return_value=[]):
-                        report = budget.inspect_paths(self.args(root=base, build=base, platform=platform))
-                    self.assertEqual(report["errors"], [])
-                    self.assertEqual(report["budgets"]["object"], limit)
-                    self.assertEqual(report["paths"][0]["budget"], limit)
-                    self.assertEqual(report["paths"][0]["length"], length)
-                    self.assertEqual(report["passed"], length <= limit)
+                # An RCC-generated source compiled to an object still uses the
+                # object budget. Its qrc_ prefix must not select the RCC budget.
+                for stem, suffix in (("", ".obj"), ("qrc_", ".cpp.obj"), ("qrc_", ".cpp.o")):
+                    with self.subTest(platform=platform, length=length, stem=stem, suffix=suffix):
+                        count = length - budget.path_length(prefix, platform) - len(stem + suffix)
+                        obj = Path(prefix + stem + "x" * count + suffix)
+                        with patch.object(budget, "ninja_outputs", return_value=(
+                                [budget.NinjaTarget(str(obj), obj)], "fixture")), \
+                                patch.object(budget, "ninja_responses", return_value=[]), \
+                                patch.object(budget, "scan_generated", return_value=[]):
+                            report = budget.inspect_paths(self.args(root=base, build=base, platform=platform))
+                        self.assertEqual(report["errors"], [])
+                        self.assertEqual(report["paths"][0]["category"], "object")
+                        self.assertEqual(report["budgets"]["object"], limit)
+                        self.assertEqual(report["paths"][0]["budget"], limit)
+                        self.assertEqual(report["paths"][0]["length"], length)
+                        self.assertEqual(report["passed"], length <= limit)
 
     def test_stress_is_observation_never_normal_pass(self):
         long_root = self.root / ("a" * 90) / ("b" * 90) / ("c" * 90)
