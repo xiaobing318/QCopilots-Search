@@ -58,6 +58,9 @@ WORKFLOW_POSIX_LINK_CASES = {
 }
 WORKFLOW_JUNCTION_SKIP_REASON = "Windows junction semantics require Windows"
 WORKFLOW_JUNCTION_CASE = "__main__.WorkflowTests.test_clean_rejects_windows_junction_inside_generated_tree"
+RUNNER_TEST = "qcs-tests-runner"
+RUNNER_WINDOWS_HANDLE_CASE = "__main__.TestRunner.test_real_windows_exclusive_handle_still_fails_cleanup"
+RUNNER_WINDOWS_HANDLE_SKIP_REASON = "Windows exclusive file handles require Windows"
 UNITTEST_CASE = re.compile(r"^(test\S+) \((\S+)\) \.\.\. (ok|FAIL|ERROR|expected failure|unexpected success|skipped [^\r\n]*)\r?$", re.MULTILINE)
 UNITTEST_TOTAL = re.compile(r"^Ran (\d+) tests? in [\d.]+s\r?$", re.MULTILINE)
 UNITTEST_RESULT = re.compile(r"^(OK(?: \(skipped=\d+\))?|FAILED(?: \([^\r\n]*\))?)\r?$", re.MULTILINE)
@@ -90,11 +93,15 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
                 or (program == WORKFLOW_TEST and operating_system == "Windows"
                     and identifier in WORKFLOW_POSIX_LINK_CASES and reason == WORKFLOW_POSIX_LINK_SKIP_REASON)
                 or (program == WORKFLOW_TEST and operating_system in ("Linux", "Darwin")
-                    and identifier == WORKFLOW_JUNCTION_CASE and reason == WORKFLOW_JUNCTION_SKIP_REASON))
+                    and identifier == WORKFLOW_JUNCTION_CASE and reason == WORKFLOW_JUNCTION_SKIP_REASON)
+                or (program == RUNNER_TEST and operating_system in ("Linux", "Darwin")
+                    and identifier == RUNNER_WINDOWS_HANDLE_CASE and reason == RUNNER_WINDOWS_HANDLE_SKIP_REASON))
             entry = {"program": program, "case": identifier, "reason": reason,
                      "classification": "notApplicable" if applicable else "requiredNotRun"}
             if applicable and program == WORKFLOW_TEST and identifier in WORKFLOW_POSIX_LINK_CASES:
                 entry["requiredNativePlatforms"] = ["Linux", "Darwin"]
+            if applicable and program == RUNNER_TEST and identifier == RUNNER_WINDOWS_HANDLE_CASE:
+                entry["requiredNativePlatforms"] = ["Windows"]
             skips.append(entry)
             record["reason"] = reason
             record["classification"] = entry["classification"]
@@ -122,6 +129,9 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
         executed = {record["case"] for record in records if record["status"] == "ok"}
         for identifier in sorted(required - executed):
             errors.append(f"Required native cleanup case did not pass: {identifier}")
+    if program == RUNNER_TEST and operating_system == "Windows":
+        if not any(record["case"] == RUNNER_WINDOWS_HANDLE_CASE and record["status"] == "ok" for record in records):
+            errors.append(f"Required native cleanup case did not pass: {RUNNER_WINDOWS_HANDLE_CASE}")
     return counts, records, skips, errors
 
 

@@ -1225,6 +1225,77 @@ class PythonAcceptanceRunnerEvidenceTests(PythonLicenseEvidenceTests):
 class PythonTestRunnerEvidenceTests(PythonLicenseEvidenceTests):
     program = "qcs-tests-runner"
 
+    def test_verbose_license_cases_are_counted_without_qt_totals(self):
+        output = ("test_real_windows_exclusive_handle_still_fails_cleanup "
+                  "(__main__.TestRunner.test_real_windows_exclusive_handle_still_fails_cleanup) ... ok\n"
+                  "Ran 1 test in 0.001s\n\nOK\n")
+        for system in ("Windows", "Linux", "Darwin"):
+            with self.subTest(system=system):
+                result = self.inspect(output, system)
+                self.assertTrue(result["releaseComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"]["passed"], 1)
+                self.assertFalse(result["ctestPrograms"][0]["qtTest"])
+
+
+class RunnerHandlePlatformEvidenceTests(unittest.TestCase):
+    case = "__main__.TestRunner.test_real_windows_exclusive_handle_still_fails_cleanup"
+    reason = "Windows exclusive file handles require Windows"
+
+    def inspect(self, *, system="Linux", reason=None, identifier=None, status=None,
+                omitted=False, program="qcs-tests-runner"):
+        identifier = identifier or self.case
+        status = status or "skipped " + repr(self.reason if reason is None else reason)
+        rows = ["test_other (__main__.TestRunner.test_other) ... ok"]
+        if not omitted:
+            rows.append(f"{identifier.rsplit('.', 1)[-1]} ({identifier}) ... {status}")
+        skipped = int(not omitted and status.startswith("skipped "))
+        output = "\n".join(rows) + f"\nRan {len(rows)} tests in 0.012s\n\n"
+        output += (f"OK (skipped={skipped})" if skipped else "OK") + "\n"
+        return EvidenceTests.inspect(self, output, name=program, system=system, raw=True)
+
+    def test_exact_posix_skip_is_separate_and_keeps_the_raw_reason(self):
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system=system):
+                result = self.inspect(system=system)
+                self.assertTrue(result["releaseComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"],
+                    {"run": 2, "passed": 1, "failed": 0, "skipped": 1, "notApplicable": 1})
+                self.assertEqual(result["pythonTestSkips"], [{"program": "qcs-tests-runner",
+                    "case": self.case, "reason": self.reason, "classification": "notApplicable",
+                    "requiredNativePlatforms": ["Windows"]}])
+                record = result["ctestPrograms"][0]["cases"][1]
+                self.assertEqual(record["status"], "skipped " + repr(self.reason))
+
+    def test_windows_requires_actual_pass_instead_of_skip_or_omission(self):
+        for omitted in (False, True):
+            with self.subTest(omitted=omitted):
+                result = self.inspect(system="Windows", omitted=omitted)
+                self.assertFalse(result["releaseComplete"])
+                self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+                self.assertTrue(any("Required native cleanup case" in error for error in result["errors"]))
+        result = self.inspect(system="Windows", status="ok")
+        self.assertTrue(result["releaseComplete"], result["errors"])
+        self.assertEqual(result["pythonTestTotals"]["passed"], 2)
+
+    def test_changed_skip_reason_or_identifier_is_required_not_run(self):
+        for arguments in ({"reason": "Windows handles unavailable"},
+                          {"reason": self.reason + " (unrecognized reason)"},
+                          {"identifier": "__main__.TestRunner.test_other_windows_handle"},
+                          {"identifier": "__main__.OtherTest.test_real_windows_exclusive_handle_still_fails_cleanup"}):
+            for system in ("Linux", "Darwin"):
+                with self.subTest(arguments=arguments, system=system):
+                    result = self.inspect(system=system, **arguments)
+                    self.assertFalse(result["releaseComplete"])
+                    self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+                    self.assertEqual(result["pythonTestSkips"][0]["classification"], "requiredNotRun")
+
+    def test_exception_cannot_apply_to_other_programs(self):
+        for program in ("qcs-tests-acceptance-runners", "qcs-tests-path-budget", "qcs-tests-license-materials"):
+            for system in ("Linux", "Darwin"):
+                result = self.inspect(system=system, program=program)
+                self.assertFalse(result["releaseComplete"])
+                self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+
 
 class PythonPathBudgetEvidenceTests(PythonLicenseEvidenceTests):
     program = "qcs-tests-path-budget"

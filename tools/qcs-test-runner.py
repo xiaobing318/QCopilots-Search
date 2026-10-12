@@ -64,7 +64,31 @@ def cleanup_run(root: Path, root_id: tuple[int, int], run: Path,
                 run_id: tuple[int, int]) -> None:
     """Reject replaced roots and reparse points instead of following them."""
     validate_run(root, root_id, run, run_id)
-    shutil.rmtree(run)
+
+    def remove_readonly(function, filename, failure):
+        error = failure[1]
+        path = Path(filename)
+        if not isinstance(error, PermissionError) or function not in (os.unlink, os.remove):
+            raise error
+        validate_run(root, root_id, run, run_id)
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & 0x400
+                or info.st_mode & stat.S_IWRITE or run not in path.resolve().parents):
+            raise error
+        expected = (info.st_dev, info.st_ino)
+        require_identity(root, root_id)
+        require_identity(run, run_id)
+        current = path.lstat()
+        if ((current.st_dev, current.st_ino) != expected or not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode) or getattr(current, "st_file_attributes", 0) & 0x400):
+            raise RuntimeError(f"Readonly cleanup file identity changed: {path}")
+        # Qt resource copies and Git object files can be read-only on Windows.
+        # Change only that owned file's readonly bit, never ACLs or a link target.
+        path.chmod(current.st_mode | stat.S_IWRITE)
+        function(filename)
+
+    shutil.rmtree(run, onerror=remove_readonly)
     if run.exists() or run.is_symlink():
         raise RuntimeError(f"Test directory remains after cleanup: {run}")
 

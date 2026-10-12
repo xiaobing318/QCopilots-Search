@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,71 @@ class TestRunner(unittest.TestCase):
         self.assertFalse(report["retained"])
         self.assertFalse(Path(report["runDirectory"]).exists())
         self.assertEqual(Path(report["workingDirectory"]).name, "cwd")
+
+    def test_success_with_real_readonly_artifacts_is_cleaned(self) -> None:
+        result = self.invoke("import stat; from pathlib import Path; "
+                             "p=Path('nested'); p.mkdir(); f=p/'resource.bin'; "
+                             "f.write_bytes(b'Qt resource or Git object'); f.chmod(stat.S_IREAD)")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report, = self.reports()
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["cleanup"]["succeeded"])
+        self.assertFalse(Path(report["runDirectory"]).exists())
+
+    def test_readonly_callback_cannot_chmod_or_remove_external_file(self) -> None:
+        foreign = self.base / "external.bin"
+        foreign.write_bytes(b"preserve")
+        foreign.chmod(stat.S_IREAD)
+        args = argparse.Namespace(root=str(self.root), label="readonly-boundary", keep_failed=False,
+                                  command=[sys.executable, "-c", "pass"])
+        def denied(_path, *, onerror):
+            error = PermissionError("external denial")
+            onerror(os.unlink, str(foreign), (PermissionError, error, None))
+        try:
+            with mock.patch.dict(os.environ, self.env, clear=True), \
+                    mock.patch.object(MODULE.shutil, "rmtree", side_effect=denied), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                result = MODULE.run_test(args)
+            self.assertEqual(result, MODULE.FAILURE)
+            report, = self.reports()
+            self.assertFalse(report["passed"])
+            self.assertEqual(foreign.read_bytes(), b"preserve")
+            self.assertFalse(foreign.stat().st_mode & stat.S_IWRITE)
+        finally:
+            foreign.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    @unittest.skipUnless(os.name == "nt", "Windows exclusive file handles require Windows")
+    def test_real_windows_exclusive_handle_still_fails_cleanup(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+        original = MODULE.cleanup_run
+        def locked(root, root_id, run, run_id):
+            file = run / "cwd/held.bin"
+            handle = kernel.CreateFileW(str(file), 0x80000000, 0, None, 3, 0x80, None)
+            self.assertNotEqual(handle, ctypes.c_void_p(-1).value, f"CreateFileW: {ctypes.get_last_error()}")
+            try:
+                return original(root, root_id, run, run_id)
+            finally:
+                self.assertTrue(kernel.CloseHandle(handle))
+        args = argparse.Namespace(root=str(self.root), label="actual-held-file", keep_failed=False,
+                                  command=[sys.executable, "-c", "from pathlib import Path; Path('held.bin').write_bytes(b'owned')"])
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(MODULE, "cleanup_run", side_effect=locked), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = MODULE.run_test(args)
+        self.assertEqual(result, MODULE.FAILURE)
+        report, = self.reports()
+        self.assertEqual(report["childExitCode"], 0)
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["cleanup"]["succeeded"])
+        self.assertIn("held.bin", report["cleanup"]["error"])
+        self.assertEqual((Path(report["workingDirectory"]) / "held.bin").read_bytes(), b"owned")
 
     def test_child_failure_is_propagated_and_cleaned(self) -> None:
         result = self.invoke("raise SystemExit(23)")
