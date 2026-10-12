@@ -14,7 +14,7 @@ spec.loader.exec_module(module)
 
 class ChecksumRegression(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='qcs-checksums-', dir=os.environ.get('QCOPILOTS_SEARCH_TEST_ROOT'))
+        self.temporary = tempfile.TemporaryDirectory(prefix='qcs-checksums-', dir=os.environ.get('QCOPILOTS_SEARCH_TEST_ROOT') or None)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.package = self.root / 'qcs-test.zip'

@@ -19,6 +19,7 @@ SCRIPTS = (
     "qcs-test-candidate-runner.py",
     "qcs-test-source-checksums.py",
     "qcs-test-capacity-runners.py",
+    "qcs-test-million-evidence.py",
     "qcs-test-package-runners.py",
     "qcs-test-portability-runners.py",
     "qcs-test-latency-preparation.py",

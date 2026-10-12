@@ -20,7 +20,7 @@ spec.loader.exec_module(copy)
 
 class FixtureCopyTests(unittest.TestCase):
     def setUp(self):
-        requested = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
+        requested = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
         if requested and not Path(requested).is_dir():
             raise RuntimeError("QCOPILOTS_SEARCH_TEST_ROOT must be an existing directory")
         self.temp = tempfile.TemporaryDirectory(prefix="qcs-cu-fixtures-", dir=requested)

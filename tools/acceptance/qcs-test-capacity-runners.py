@@ -35,7 +35,7 @@ CAPABILITIES = {
         "status": "available" if POWERSHELL else ("unavailable" if WINDOWS else "not_applicable"),
         "reason": "PowerShell 7 is required on Windows, optional for pure guard checks on other platforms",
         "program": POWERSHELL,
-        "registeredTests": 4 if WINDOWS or POWERSHELL else 0,
+        "registeredTests": 5 if WINDOWS else (4 if POWERSHELL else 0),
     },
 }
 
@@ -47,7 +47,7 @@ def digest(path):
 class CapacityPreflightTests(unittest.TestCase):
     def setUp(self):
         # A missing or unwritable explicit root is an error, never a fallback.
-        test_root = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
+        test_root = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
         if test_root and not Path(test_root).is_dir():
             raise RuntimeError("QCOPILOTS_SEARCH_TEST_ROOT must exist")
         self.temp = tempfile.TemporaryDirectory(prefix="qcs-capacity-", dir=test_root)
@@ -247,14 +247,15 @@ class PowerShellContractTests(unittest.TestCase):
 
     def check_guard_contract(self, name):
         pwsh = self.powershell()
-        temp_root = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
+        temp_root = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
         if temp_root and not Path(temp_root).is_dir():
             self.fail("QCOPILOTS_SEARCH_TEST_ROOT must exist")
         with tempfile.TemporaryDirectory(prefix="qcs-cwd-", dir=temp_root) as root:
             cwd = Path(root) / "其他 cwd"
             cwd.mkdir()
+            filename = "qcs-test-million-report-root.ps1" if name == "report-root" else f"qcs-test-million-guard-{name}.ps1"
             result = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File",
-                                     str(HERE / f"qcs-test-million-guard-{name}.ps1")],
+                                     str(HERE / filename)],
                                     cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=90)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             report = json.loads(result.stdout)
@@ -276,9 +277,12 @@ class PowerShellContractTests(unittest.TestCase):
             self.check_guard_contract("process")
 
     if WINDOWS:
+        def test_report_root_boundaries_from_unrelated_cwd(self):
+            self.check_guard_contract("report-root")
+
         def test_invalid_candidate_cannot_launch_or_create_outputs(self):
             pwsh = self.powershell()
-            with tempfile.TemporaryDirectory(prefix="qcs-refuse-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")) as root_name:
+            with tempfile.TemporaryDirectory(prefix="qcs-refuse-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as root_name:
                 root = Path(root_name)
                 source, build, qt = (root / part for part in ("source space", "build 中文", "Qt SDK"))
                 for directory in (source, build, qt / "bin"):

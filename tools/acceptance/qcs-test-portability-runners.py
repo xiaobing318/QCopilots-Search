@@ -31,7 +31,7 @@ launcher = load("qcs-launch-portability-sentinel")
 class PortabilityContracts(unittest.TestCase):
     def setUp(self):
         # A caller-supplied root must already exist. An invalid root fails here.
-        self.temporary = tempfile.TemporaryDirectory(prefix="qcs-pr-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT"))
+        self.temporary = tempfile.TemporaryDirectory(prefix="qcs-pr-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
         self.root = Path(self.temporary.name)
 
     def tearDown(self):

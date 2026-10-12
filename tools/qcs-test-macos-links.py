@@ -32,7 +32,7 @@ def commands(*entries):
 
 class LinkTests(unittest.TestCase):
     def setUp(self):
-        root = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
+        root = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
         if root:
             Path(root).mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix="qcs-links-", dir=root)

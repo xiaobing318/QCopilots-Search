@@ -46,7 +46,7 @@ Write-Output $qcsBuildRecord
 |---|---|---|
 | 完整本机 CTest | `qcs-candidate-ctest-run.py` | `--head`、`--source-tree`、`--build-record`、`--expected-tests`、`--extraction-prefix`、`--build-root`、`--qt-root`、`--qt-prefix`、`--launch-cwd`、`--report-parent`。校验全部用例、18 条 Windows 双后端参考向量和完整语义语料 |
 | 安装包阶段一 | `qcs-package-phase1.py` 或同名 `.ps1` | 完整构建及 CTest 记录、语义报告和 SHA-256、Qt、模型及外置输出根。生成 ZIP、NSIS 和包级验证，必须传 `--defer-source-bundle`，整体 `passed` 保持 false |
-| 百万向量 | `qcs-run-million.ps1` | `-BenchmarkExe`、`-ExternalRoot`、`-QtBin`、`-ExpectedCommit`、`-BuildRecord`、`-Python`。默认 `-Mode Validate`，真实执行使用 `-Mode Run`，保留 7 GiB 产物预算和 3 GiB 空闲默认值 |
+| 百万向量 | `qcs-run-million.ps1` | 默认 `-Mode Validate`。正式验收通过下方 `run-local` 命令传入 `-Mode Run` 和 `-ReportRoot {evidence}`，将原始监视器文件与构建证明一同封装，保留 7 GiB 产物预算和 3 GiB 空闲默认值 |
 | 十万物理文件 | `qcs-run-physical.ps1` | `-ExpectedCommit`、`-BuildRecord`、`-BuildRoot`、`-QtPrefix`、`-Python`。真实执行添加 `-Execute` |
 | 安装包阶段二 | `qcs-package-phase2.py` 或同名 `.ps1` | `--phase1-summary` 及其 `--phase1-summary-sha256`。重新核对候选身份和阶段一产物，再创建和验证源码材料，不能仅凭阶段一声明完整交付 |
 | 服务端延迟 | `qcs-service-latency.py` | `--semantic-report`、`--source`、`--expected-commit`、`--package-candidate`、`--app-dir`、`--model-dir`、`--working-directory`、`--artifact-root`、`--report`。真实运行创建独立 profile 和 cwd |
@@ -58,6 +58,44 @@ Python 执行型入口默认只检查或展示计划，添加 `--execute` 才实
 `qcs-physical-preflight.py`、`qcs-portability-sentinel.py` 和 `qcs_owned_processes.py` 为共享实现。它们分别验证候选及产物、观察普通应用身份、限定本次创建的 Windows 子进程。不得通过运行器的报告参数加载外部任意 Python 实现。
 
 候选 CTest 记录还保存 `tests/support/temp_paths.py` 的原始副本和 SHA-256，并在执行结束后再次校验。该共享临时路径 helper 同时属于完整源码提交身份，不能在冻结候选测试期间修改。
+
+## 百万验收的完整执行记录
+
+沿用上面的 `$qcsSource`、`$qcsBuildRoot`、`$qcsPython`、`$qcsPowerShell` 和 `$qcsBuildRecord`。另将 `$qcsQtPrefix` 设置为具体的 Qt kit 目录，例如本机 Qt 安装根内的 `6.12.0/msvc2022_64`。必须先结束构建、CTest、其他容量运行和产品进程。默认需要至少 10.375 GiB 可用空间，包括监视器的缓冲预算。
+
+```powershell
+$qcsQtPrefix = (Resolve-Path '<具体Qt kit绝对路径>').Path
+$qcsBuildProof = Get-Content -LiteralPath $qcsBuildRecord -Raw | ConvertFrom-Json
+if ($qcsBuildProof.passed -ne $true) { throw '必须使用本轮成功构建的证明' }
+$qcsMillionArgs = @(
+    '-B', (Join-Path $qcsSource 'tools/qcs-release-evidence.py'), 'run-local',
+    '--build-record', $qcsBuildRecord,
+    '--output-root', (Join-Path $qcsBuildRoot 'reports'),
+    '--working-directory', $qcsBuildRoot,
+    '--kind', 'million', '--program-name', 'qcs-benchmark',
+    '--report', '*.monitor.json',
+    '--input', (Join-Path $qcsSource 'tools/acceptance/qcs-run-million.ps1'),
+    '--input', (Join-Path $qcsSource 'tools/acceptance/qcs-physical-preflight.py'),
+    '--', $qcsPowerShell, '-NoProfile', '-File',
+    (Join-Path $qcsSource 'tools/acceptance/qcs-run-million.ps1'),
+    '-Source', $qcsSource, '-ExternalRoot', $qcsBuildRoot,
+    '-ReportRoot', '{evidence}', '-BenchmarkExe', '{program}',
+    '-QtBin', (Join-Path $qcsQtPrefix 'bin'),
+    '-BuildRecord', $qcsBuildRecord,
+    '-ExpectedCommit', $qcsBuildProof.identity.checkoutCommit,
+    '-Python', $qcsPython, '-BudgetGiB', '7', '-ReserveGiB', '3', '-Mode', 'Run'
+)
+$qcsMillionRecorded = & $qcsPython @qcsMillionArgs
+if ($LASTEXITCODE -ne 0) { throw '百万验收失败，保留本次原始记录用于检查' }
+$qcsMillionReceipt = $qcsMillionRecorded | ConvertFrom-Json
+if ($qcsMillionReceipt.passed -ne $true) { throw '没有成功的百万执行记录' }
+$qcsMillionRecord = $qcsMillionReceipt.record
+Write-Output $qcsMillionRecord
+```
+
+`ExternalRoot` 始终是六个 producer 所属的真实构建根。`ReportRoot` 是 `run-local` 原子创建的证据目录，必须已经存在并位于 `<build-root>/reports` 内，目录及祖先不能包含重定向。五份原始文件从执行开始直接写入其中，包括 benchmark JSON、monitor JSON、独立采样 JSONL 和两份输出日志。执行证明同时绑定这些文件的原始路径和 SHA-256，不移动文件后重新解释来源。
+
+`run-local` 最后返回的 `record` 用于最终 `collect-local --million`。监视器单独运行产生的 raw JSON 不能替代该执行证明。完整发布预检继续检查全部百万质量、延迟、恢复、磁盘、源文件和 producer 约束。
 
 ## Computer Use 记录
 
@@ -77,4 +115,6 @@ python -B tools/acceptance/qcs-test-runners.py
 
 测试包含候选身份与文件哈希篡改、越界路径、短名产物清单、CTest 隔离 wrapper、阶段一与最终门槛区别、源包校验、容量监视器负例、真实目录链接边界和自有进程清理。Windows 用真实 NTFS junction 验证目录重定向，POSIX 用真实符号链接。文件符号链接用例在 POSIX 注册，Windows 独立报告该权限能力不适用，不把模拟分支声明为真实文件符号链接通过。平台能力清单以 `QCS_ACCEPTANCE_TEST_CAPABILITIES` 行输出。
 
-快速测试中的合成 CU 通过数据仅在临时目录中用于校验记录器与发布验证器的接口，测试退出时必须删除，永远不作为真实验收材料。
+百万记录回归使用真实构建记录器、独立 Python 子进程、执行记录器和完整发布验证器，验证五份原始文件的路径、哈希、producer 与时间绑定。数值和容量数据明确标为合成，仅用于接口与拒绝分支验证。报告目录测试检查默认目录、中文空格、同前缀兄弟目录、父目录逃逸和真实目录联接，验证阶段不创建产品 profile。
+
+快速测试中的合成容量和 CU 通过数据仅在临时目录中用于校验记录器与发布验证器的接口，测试退出时必须删除，永远不作为真实验收材料。

@@ -84,7 +84,7 @@ class RecordingRunner:
 
 class SigningTests(unittest.TestCase):
     def setUp(self):
-        configured = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
+        configured = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
         if configured:
             Path(configured).mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix="qcs-signing-", dir=configured)

@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 
-OBJECT_BUDGET = 200
+WINDOWS_OBJECT_BUDGET = 200
 GENERATED_BUDGET = 240
 NinjaTarget = namedtuple("NinjaTarget", ("name", "path"))
 SKIP_DIRECTORIES = frozenset({
@@ -210,6 +210,7 @@ def scan_generated(root: Path, *, installed: bool = False) -> list[Path]:
 
 def inspect_paths(args: argparse.Namespace) -> dict:
     platform = args.platform
+    object_budget = WINDOWS_OBJECT_BUDGET if platform == "windows" else GENERATED_BUDGET
     roots = {
         key: Path(value).expanduser().resolve()
         for key in ("source", "root", "build", "stage", "package_root")
@@ -218,7 +219,7 @@ def inspect_paths(args: argparse.Namespace) -> dict:
     report = {
         "schemaVersion": 1, "kind": "qcs-path-budget", "platform": platform,
         "lengthUnit": "utf16-code-units" if platform == "windows" else "filesystem-bytes",
-        "budgets": {"object": OBJECT_BUDGET, "generated": GENERATED_BUDGET},
+        "budgets": {"object": object_budget, "generated": GENERATED_BUDGET},
         "configured": False, "status": "not-configured", "passed": None,
         "roots": {}, "paths": [], "offenders": [], "warnings": [], "errors": [],
         "excludedDirectoryNames": sorted(SKIP_DIRECTORIES), "ninja": None, "outputs": {},
@@ -230,7 +231,7 @@ def inspect_paths(args: argparse.Namespace) -> dict:
         if key != "source" and length > GENERATED_BUDGET:
             report["offenders"].append({"path": str(root), "category": "root", "root": key,
                                         "length": length, "budget": GENERATED_BUDGET})
-        if key == "build" and length + 40 > OBJECT_BUDGET:
+        if key == "build" and length + 40 > object_budget:
             report["warnings"].append(
                 "Build root leaves fewer than 40 characters for object paths. "
                 "Choose a shorter external build root if configured targets exceed the budget."
@@ -274,7 +275,7 @@ def inspect_paths(args: argparse.Namespace) -> dict:
 
     for path, context, origins in paths.values():
         category = classify(path, context)
-        budget = OBJECT_BUDGET if category == "object" else GENERATED_BUDGET
+        budget = object_budget if category == "object" else GENERATED_BUDGET
         length = path_length(path, platform)
         containing = [(key, root) for key, root in roots.items() if path == root or root in path.parents]
         key, root = max(containing, key=lambda item: len(str(item[1])), default=(None, None))

@@ -62,6 +62,10 @@ qcopilots_search_add_test(NAME qcs-tests-runner
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-runner-tests.py")
 qcopilots_search_add_test(NAME qcs-tests-path-budget
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-path-budget.py")
+if(CMAKE_GENERATOR MATCHES "Ninja")
+  set_property(TEST qcs-tests-path-budget APPEND PROPERTY ENVIRONMENT
+    "QCOPILOTS_SEARCH_NINJA=${CMAKE_MAKE_PROGRAM}")
+endif()
 set_tests_properties(qcs-tests-runner qcs-tests-path-budget PROPERTIES LABELS "unit;tooling" TIMEOUT 120)
 qcopilots_search_add_test(NAME qcs-tests-temp-paths
   COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/support/temp_paths_test.py")

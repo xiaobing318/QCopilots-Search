@@ -313,11 +313,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "clean"])
     default_root = SOURCE.parent.parent / (SOURCE.parent.name + "-compilations") / PRODUCT
-    parser.add_argument("--build-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_BUILD_ROOT", default_root))
-    parser.add_argument("--qt-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_QT_ROOT"))
+    parser.add_argument("--build-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_BUILD_ROOT") or default_root)
+    parser.add_argument("--qt-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_QT_ROOT") or None)
     parser.add_argument("--config", choices=["Release", "Debug", "RelWithDebInfo"], default="Release")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 2))
-    parser.add_argument("--model-dir", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_MODEL_DIR"))
+    parser.add_argument("--model-dir", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_MODEL_DIR") or None)
     parser.add_argument("--keyword-only", action="store_true", help="Partial verify-package without models, insufficient for release")
     parser.add_argument("--test-label")
     parser.add_argument("--fail-fast", action="store_true",

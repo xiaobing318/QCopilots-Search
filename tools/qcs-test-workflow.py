@@ -31,7 +31,7 @@ response_spec.loader.exec_module(msvc_response)
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
-        configured = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
+        configured = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
         if configured:
             Path(configured).mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix="qcs-workflow-", dir=configured)
@@ -44,6 +44,57 @@ class WorkflowTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, arguments)], cwd=self.root,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                               encoding="utf-8", errors="replace", timeout=30)
+
+    def test_empty_temporary_root_never_uses_working_directory(self):
+        fixtures = [("qcs-test-workflow.py", "WorkflowTests"),
+                    ("qcs-test-license-materials.py", "LicenseMaterialsTests"),
+                    ("qcs-test-macos-signing.py", "SigningTests"),
+                    ("qcs-test-macos-links.py", "LinkTests")]
+        program = '''
+import importlib.util, json, pathlib, sys, tempfile
+spec = importlib.util.spec_from_file_location("qcs_empty_root_fixture", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+case = getattr(module, sys.argv[2])()
+try:
+    case.setUp()
+    generated = pathlib.Path(case.temporary.name).resolve()
+    print(json.dumps({"directory": str(generated), "systemRoot": str(pathlib.Path(tempfile.gettempdir()).resolve()), "cwd": str(pathlib.Path.cwd().resolve())}))
+finally:
+    case.tearDown()
+    if not case.doCleanups():
+        raise RuntimeError("Nested fixture cleanup failed")
+'''
+        environment = dict(os.environ, QCOPILOTS_SEARCH_TEST_ROOT="", PYTHONDONTWRITEBYTECODE="1")
+        for filename, name in fixtures:
+            with self.subTest(fixture=name):
+                result = subprocess.run([sys.executable, "-B", "-c", program,
+                                         str(SCRIPT.with_name(filename)), name], cwd=self.root,
+                                        env=environment, capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = json.loads(result.stdout)
+                generated = Path(report["directory"])
+                self.assertEqual(generated.parent, Path(report["systemRoot"]))
+                self.assertNotEqual(generated.parent, Path(report["cwd"]))
+                self.assertFalse(generated.exists(), "Nested fixture must clean its real temporary directory")
+                self.assertEqual(list(self.root.iterdir()), [], "Empty override must never write into cwd")
+
+    def test_empty_developer_path_environment_uses_defaults(self):
+        empty = {name: "" for name in ("QCOPILOTS_SEARCH_BUILD_ROOT", "QCOPILOTS_SEARCH_QT_ROOT",
+                                      "QCOPILOTS_SEARCH_MODEL_DIR")}
+        expected = (workflow.SOURCE.parent.parent /
+                    (workflow.SOURCE.parent.name + "-compilations") / "qcs").resolve()
+        # Exercise the real argparse/default handling, then stop before root
+        # initialization so this regression never modifies a developer build.
+        with patch.dict(os.environ, empty), patch.object(sys, "argv", [str(SCRIPT), "doctor"]), \
+                patch.object(workflow, "protect_input_paths") as protect, \
+                patch.object(workflow, "initialize_root", side_effect=RuntimeError("captured defaults")) as initialize:
+            with self.assertRaisesRegex(RuntimeError, "captured defaults"):
+                workflow.main()
+        initialize.assert_called_once_with(expected)
+        protect.assert_called_once_with(expected, None, None)
 
     def test_source_tree_and_descendant_rejected(self):
         for path in (workflow.SOURCE, workflow.SOURCE / "nested output"):

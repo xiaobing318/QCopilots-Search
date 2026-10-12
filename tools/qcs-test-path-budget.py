@@ -23,7 +23,7 @@ SPEC.loader.exec_module(budget)
 
 class PathBudgetTests(unittest.TestCase):
     def setUp(self):
-        configured = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT")
+        configured = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
         if configured:
             Path(configured).mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix="qcs-pb-", dir=configured)
@@ -32,6 +32,18 @@ class PathBudgetTests(unittest.TestCase):
     def tearDown(self):
         # Cleanup errors deliberately fail the test instead of becoming warnings.
         self.temporary.cleanup()
+
+    def test_empty_temporary_root_uses_system_default_not_cwd(self):
+        nested = PathBudgetTests("test_classification")
+        with patch.dict(os.environ, {"QCOPILOTS_SEARCH_TEST_ROOT": ""}), \
+                patch.object(tempfile, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as create:
+            nested.setUp()
+            try:
+                self.assertIsNone(create.call_args.kwargs["dir"])
+                self.assertEqual(nested.root.parent.resolve(), Path(tempfile.gettempdir()).resolve())
+                self.assertNotEqual(nested.root.parent.resolve(), SCRIPT.parent.resolve())
+            finally:
+                nested.tearDown()
 
     def args(self, **kwargs):
         values = dict(source=None, root=self.root, build=None, stage=None, package_root=None,
@@ -237,6 +249,27 @@ class PathBudgetTests(unittest.TestCase):
         self.assertIn(obj_row, report["offenders"])
         if desired <= 240:
             self.assertEqual(len(report["offenders"]), 1)
+
+    def test_object_budgets_match_platform_boundaries(self):
+        # Pure path data: no filesystem operation depends on this short root,
+        # including when the actual isolated test directory is itself very long.
+        base = Path(self.root.anchor) / "qcs-budget"
+        prefix = str(base / "obj") + os.sep
+        for platform, limit in (("windows", 200), ("posix", 240)):
+            for length in (200, 201, 220, 240, 241):
+                with self.subTest(platform=platform, length=length):
+                    count = length - budget.path_length(prefix, platform) - len(".obj")
+                    obj = Path(prefix + "x" * count + ".obj")
+                    with patch.object(budget, "ninja_outputs", return_value=(
+                            [budget.NinjaTarget(str(obj), obj)], "fixture")), \
+                            patch.object(budget, "ninja_responses", return_value=[]), \
+                            patch.object(budget, "scan_generated", return_value=[]):
+                        report = budget.inspect_paths(self.args(root=base, build=base, platform=platform))
+                    self.assertEqual(report["errors"], [])
+                    self.assertEqual(report["budgets"]["object"], limit)
+                    self.assertEqual(report["paths"][0]["budget"], limit)
+                    self.assertEqual(report["paths"][0]["length"], length)
+                    self.assertEqual(report["passed"], length <= limit)
 
     def test_stress_is_observation_never_normal_pass(self):
         long_root = self.root / ("a" * 90) / ("b" * 90) / ("c" * 90)

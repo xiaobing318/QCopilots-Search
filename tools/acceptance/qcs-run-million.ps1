@@ -3,6 +3,7 @@
 param(
     [Parameter(Mandatory = $true)][string] $BenchmarkExe,
     [Parameter(Mandatory = $true)][string] $ExternalRoot,
+    [string] $ReportRoot = '',
     [Parameter(Mandatory = $true)][string] $QtBin,
     [ValidateSet('Validate', 'Run')][string] $Mode = 'Validate',
     [string] $Source = (Join-Path $PSScriptRoot '../..'),
@@ -34,6 +35,41 @@ function Resolve-ExistingPath([string] $Path, [bool] $Directory) {
     if ($Directory -and -not $item.PSIsContainer) { throw "Not a directory: $Path" }
     if (-not $Directory -and $item.PSIsContainer) { throw "Not a file: $Path" }
     return [System.IO.Path]::GetFullPath($item.FullName)
+}
+
+function Resolve-ReportRoot([string] $ExternalRoot, [string] $ReportRoot = '') {
+    # Read-only validation. Only the default reports directory may be absent.
+    # Always return the canonical path that subsequent report writes must use.
+    $external = [IO.Path]::GetFullPath($ExternalRoot)
+    if (-not [IO.Directory]::Exists($external)) { throw 'ExternalRoot must already exist as a directory' }
+    $boundary = [IO.Path]::GetFullPath([IO.Path]::Combine($external, 'reports'))
+    $explicit = -not [string]::IsNullOrWhiteSpace($ReportRoot)
+    $selected = if ($explicit) { [IO.Path]::GetFullPath($ReportRoot) } else { $boundary }
+    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $boundary = $boundary.TrimEnd($separators)
+    $selected = $selected.TrimEnd($separators)
+    $comparison = if ([OperatingSystem]::IsWindows()) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if (-not [string]::Equals($selected, $boundary, $comparison) -and
+        -not $selected.StartsWith($boundary + [IO.Path]::DirectorySeparatorChar, $comparison)) {
+        throw 'ReportRoot must remain inside ExternalRoot/reports'
+    }
+    if ($explicit -and -not [IO.Directory]::Exists($selected)) { throw 'Explicit ReportRoot must already exist as a directory' }
+    if ([IO.File]::Exists($selected)) { throw 'ReportRoot must identify a directory, not a file' }
+    $ancestor = [IO.DirectoryInfo]::new($selected)
+    while ($null -ne $ancestor) {
+        # Get-Item examines the directory entry, including a dangling link.
+        $item = $null
+        try { $item = Get-Item -LiteralPath $ancestor.FullName -Force -ErrorAction Stop }
+        catch [Management.Automation.ItemNotFoundException] { }
+        if ($null -ne $item) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'ReportRoot and all ancestors must not redirect writes through a reparse point'
+            }
+            if (-not $item.PSIsContainer) { throw 'ReportRoot ancestors must be directories' }
+        }
+        $ancestor = $ancestor.Parent
+    }
+    return $selected
 }
 
 function Get-HeavyProcessState {
@@ -354,7 +390,7 @@ $volume = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($resolvedExte
 if (-not $volume.IsReady) { throw 'ExternalRoot volume is not ready' }
 $runId = 'qcs-million-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
 $runParent = [System.IO.Path]::Combine($resolvedExternalRoot, 'runs', $runId)
-$reportsDir = [System.IO.Path]::Combine($resolvedExternalRoot, 'reports')
+$reportsDir = Resolve-ReportRoot $resolvedExternalRoot $ReportRoot
 $benchmarkReport = [System.IO.Path]::Combine($reportsDir, $runId + '.benchmark.json')
 $monitorReport = [System.IO.Path]::Combine($reportsDir, $runId + '.monitor.json')
 $sampleLog = [System.IO.Path]::Combine($reportsDir, $runId + '.samples.jsonl')
@@ -417,6 +453,7 @@ $plan = [ordered]@{
     preflightSha256 = (Get-FileHash -LiteralPath $preflightTool -Algorithm SHA256).Hash.ToLowerInvariant()
     expectedAnnEfSearch = $expectedAnnEfSearch
     externalRoot = $resolvedExternalRoot
+    reportRoot = $reportsDir
     qtBin = $resolvedQtBin
     runParent = $runParent
     arguments = $arguments
@@ -462,6 +499,10 @@ if ($launchBlockers.Count -ne 0 -or $startingFree -lt $requiredStartingFree) {
 }
 $plan.heavyProcesses = $launchProcesses
 $plan.availableFreeBytes = $startingFree
+# Revalidate after the launch checks and before creating any profile/evidence.
+if ((Resolve-ReportRoot $resolvedExternalRoot $ReportRoot) -cne $reportsDir) {
+    throw 'ReportRoot changed after the read-only launch preflight'
+}
 # Atomically reserve a new run directory. The identifier may be retried but
 # existing profiles/evidence are never opened for writes or overwritten.
 $runBase = Join-Path $resolvedExternalRoot 'runs'
