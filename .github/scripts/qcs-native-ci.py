@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import importlib.util
 import json
 import os
@@ -12,6 +13,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -214,6 +216,146 @@ def test_evidence(*, require_complete=False):
         command.append("--require-complete")
     run(command)
     return json.loads((REPORTS / "tests/qt-test-cases.json").read_text(encoding="utf-8"))
+
+
+def collect_test_wrappers():
+    """Archive this CTest invocation's bounded raw wrapper reports, never its data."""
+    result = {"schemaVersion": 1, "kind": "qcs-test-wrapper-diagnostics",
+              "scope": "Current CTest invocation only. Diagnostics do not replace test acceptance.",
+              "files": [], "errors": [], "missingLabels": [], "bytes": 0, "collectionComplete": False}
+    destination = REPORTS / "wrappers"
+    directory_ids = {}
+
+    def ordinary(path, *, directory):
+        info = path.lstat()
+        expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+        if (not expected_type(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & 0x400):
+            raise RuntimeError(f"Not an ordinary {'directory' if directory else 'file'}: {path}")
+        return info
+
+    def remember(path):
+        info = ordinary(path, directory=True)
+        directory_ids[path] = (info.st_dev, info.st_ino)
+
+    def unchanged():
+        for path, identity in directory_ids.items():
+            info = ordinary(path, directory=True)
+            if (info.st_dev, info.st_ino) != identity:
+                raise RuntimeError(f"Diagnostic directory identity changed: {path}")
+
+    def bounded_read(path, limit):
+        unchanged()
+        before = ordinary(path, directory=False)
+        if before.st_size > limit:
+            raise RuntimeError(f"Diagnostic exceeds {limit}-byte limit: {path}")
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeError(f"Diagnostic file identity changed: {path}")
+            raw = stream.read(limit + 1)
+        unchanged()
+        after = ordinary(path, directory=False)
+        if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                or len(raw) > limit):
+            raise RuntimeError(f"Diagnostic file changed while reading: {path}")
+        return raw
+
+    try:
+        remember(ROOT)
+        remember(REPORTS)
+        destination.mkdir(exist_ok=True)
+        remember(destination)
+        latest = json.loads(bounded_read(REPORTS / "latest-test-run.json", 65536))
+        result["runId"] = latest["runId"]
+        runs = ROOT / "runs"
+        remember(runs)
+        selected = Path(latest["testRoot"])
+        if not selected.is_absolute():
+            raise RuntimeError("Wrapper test root must be absolute")
+        # Canonical system ancestors such as macOS /var are permitted, but the
+        # selected run directory itself must never be a link or reparse point.
+        ordinary(selected, directory=True)
+        selected = selected.resolve()
+        if selected.parent != runs or not selected.name.startswith("qcs-t-"):
+            raise RuntimeError("Wrapper test root is outside this job's direct runs directory")
+        remember(selected)
+        report_directory = selected / "reports"
+        remember(report_directory)
+        result["testRoot"] = selected.relative_to(ROOT).as_posix()
+        candidates = sorted(report_directory.glob("qcs-t-*.json"))
+        if len(candidates) > 512:
+            raise RuntimeError("Wrapper report count exceeds the 512-file collection limit")
+        if not candidates:
+            raise RuntimeError("No wrapper reports were produced by this test invocation")
+        for path in candidates:
+            source = path.relative_to(ROOT).as_posix()
+            try:
+                raw = bounded_read(path, 1024 * 1024)
+                if result["bytes"] + len(raw) > 8 * 1024 * 1024:
+                    raise RuntimeError("Wrapper reports exceed the 8 MiB collection limit")
+                digest = hashlib.sha256(raw).hexdigest()
+                target = destination / (digest + ".json")
+                unchanged()
+                if target.exists() or target.is_symlink():
+                    if bounded_read(target, 1024 * 1024) != raw:
+                        raise RuntimeError("Archived wrapper content differs from its hash identity")
+                else:
+                    with target.open("xb") as output:
+                        output.write(raw)
+                    unchanged()
+                record = {"source": source, "path": target.relative_to(REPORTS).as_posix(),
+                          "bytes": len(raw), "sha256": digest}
+                result["files"].append(record)
+                result["bytes"] += len(raw)
+                # Keep bounded raw diagnostics even when interrupted writes left
+                # invalid JSON, while making the failed validation explicit.
+                document = json.loads(raw)
+                if (not isinstance(document, dict) or document.get("schemaVersion") != 1
+                        or document.get("kind") != "qcs-test-run"
+                        or not isinstance(document.get("label"), str)
+                        or not document["label"].startswith("qcs-tests-")
+                        or document.get("runId") != path.stem
+                        or Path(document.get("root", "")).resolve() != selected
+                        or not isinstance(document.get("cleanup"), dict)):
+                    raise RuntimeError("Wrapper report identity or schema does not match its source")
+                record.update({"label": document["label"],
+                    "runId": document["runId"], "exitCode": document.get("exitCode"),
+                    "childExitCode": document.get("childExitCode"), "cleanup": document["cleanup"],
+                    "error": document.get("error"), "reportError": document.get("reportError")})
+            except (OSError, ValueError, TypeError, RuntimeError) as error:
+                result["errors"].append({"source": source, "error": str(error)})
+        junit = REPORTS / "tests/ctest.xml"
+        if junit.parent.exists() or junit.parent.is_symlink():
+            remember(junit.parent)
+        if junit.is_file():
+            executed = {case.get("name") for case in ET.fromstring(bounded_read(junit, 32 * 1024 * 1024)).iter("testcase")
+                        if case.find("skipped") is None and case.get("status") != "notrun" and case.get("name")}
+            collected = {record.get("label") for record in result["files"]}
+            result["missingLabels"] = sorted(executed - collected)
+            if result["missingLabels"]:
+                result["errors"].append({"source": "tests/ctest.xml",
+                    "error": "Executed tests have no archived wrapper JSON. See raw CTest output for report-write errors."})
+        result["collectionComplete"] = not result["errors"]
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, ET.ParseError) as error:
+        result["errors"].append({"error": str(error)})
+    try:
+        # A best-effort index must survive failure before any test was launched.
+        unchanged()
+        ordinary(destination, directory=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".qcs-", suffix=".json", dir=destination)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(result, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+        unchanged()
+        os.replace(temporary, destination / "index.json")
+    except (OSError, RuntimeError) as error:
+        result["collectionComplete"] = False
+        result["errors"].append({"error": f"Could not write wrapper diagnostic index: {error}"})
+    if result["errors"]:
+        print("Wrapper diagnostic collection: " + json.dumps(result["errors"], ensure_ascii=False), file=sys.stderr)
+    return result
 
 
 def signature_evidence(stage: Path, *, system: str | None = None):
@@ -492,6 +634,9 @@ def doctor():
 
 
 def report():
+    # Run before any other report parser so failed or interrupted tests retain
+    # their cleanup diagnosis even when subsequent acceptance evidence is absent.
+    wrappers = collect_test_wrappers()
     case_evidence = test_evidence()
     signature = signature_evidence(ROOT / "stage")
     evidence = release_evidence()
@@ -518,6 +663,9 @@ def report():
                 "signature": signature["status"], "signatureEvidence": signature, "published": False,
                 "crashDiagnostics": diagnostics,
                 "testReportPresent": (REPORTS / "tests/ctest.xml").is_file(),
+                "testWrapperDiagnostics": {"index": "wrappers/index.json",
+                    "collectionComplete": wrappers["collectionComplete"],
+                    "files": len(wrappers["files"]), "errors": wrappers["errors"]},
                 "testCasesComplete": case_evidence["releaseComplete"],
                 "testInventoryVerified": case_evidence["inventoryVerified"],
                 "qtTestTotals": case_evidence["qtTestTotals"],
@@ -583,7 +731,7 @@ def main():
         os.environ["QCOPILOTS_SEARCH_SEMANTIC_REPORT"] = str(REPORTS / "semantic-quality.json")
         os.environ["QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT"] = str(REPORTS / "physical-files-ci.json")
         try:
-            dev(action, "--fail-fast", "--keep-failed-tests", "--report-dir", str(REPORTS / "tests"), display=True)
+            dev(action, "--keep-failed-tests", "--report-dir", str(REPORTS / "tests"), display=True)
         except subprocess.CalledProcessError:
             diagnostics = gui_failure_diagnostics(REPORTS / "tests/ctest.xml", REPORTS / "mac-gui-debug")
             (REPORTS / "gui-failure-diagnostics.json").write_text(
@@ -592,6 +740,10 @@ def main():
             (REPORTS / "linux-loader-diagnostics.json").write_text(
                 json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
             raise
+        finally:
+            wrappers = collect_test_wrappers()
+        if not wrappers["collectionComplete"]:
+            raise RuntimeError("Test wrapper diagnostic collection is incomplete. See reports/wrappers/index.json")
         test_evidence(require_complete=True)
     elif action == "capacity":
         capacity()

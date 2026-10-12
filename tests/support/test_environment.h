@@ -14,6 +14,25 @@ namespace qcopilots_search::test {
 void recordCleanupFailure(const QString &error);
 QString takeCleanupErrors();
 
+#ifdef Q_OS_UNIX
+// Remove only the link created by this fixture, including on early QtTest
+// assertion returns. Retained artifact directories must not retain links.
+class TestSymbolicLink {
+public:
+    TestSymbolicLink() = default;
+    ~TestSymbolicLink();
+    TestSymbolicLink(const TestSymbolicLink &) = delete;
+    TestSymbolicLink &operator=(const TestSymbolicLink &) = delete;
+    bool create(const QString &link, const QString &target, QString *error = nullptr);
+    bool remove(QString *error = nullptr);
+private:
+    QString link_;
+    QString parent_;
+    QByteArray parentIdentity_;
+    QByteArray identity_;
+};
+#endif
+
 class TestTemporaryDir : public QTemporaryDir {
 public:
     explicit TestTemporaryDir(const QString &pathTemplate);

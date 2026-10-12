@@ -8,7 +8,6 @@
 #include <QSet>
 #include <QStandardPaths>
 #include <QtTest>
-#include <filesystem>
 #include <git2.h>
 #include <memory>
 
@@ -433,16 +432,11 @@ private slots:
         QVERIFY(QFileInfo(root + "/loop").isJunction());
         qInfo("Native link coverage: Windows directory junctions (outside target and loop)");
 #else
-        const auto native = [](const QString &path) {
-            return std::filesystem::path(path.toStdString());
-        };
-        std::error_code error;
-        std::filesystem::create_directory_symlink(native(outside), native(root + "/outside-link"), error);
-        QVERIFY2(!error, error.message().c_str());
-        std::filesystem::create_directory_symlink(native(root), native(root + "/loop"), error);
-        QVERIFY2(!error, error.message().c_str());
-        std::filesystem::create_symlink(native(outside + "/outside.txt"), native(root + "/file-link.txt"), error);
-        QVERIFY2(!error, error.message().c_str());
+        TestSymbolicLink outsideLink, loopLink, fileLink;
+        QString linkError;
+        QVERIFY2(outsideLink.create(root + "/outside-link", outside, &linkError), qPrintable(linkError));
+        QVERIFY2(loopLink.create(root + "/loop", root, &linkError), qPrintable(linkError));
+        QVERIFY2(fileLink.create(root + "/file-link.txt", outside + "/outside.txt", &linkError), qPrintable(linkError));
         qInfo("Native link coverage: POSIX directory and file symbolic links");
 #endif
         QVERIFY(!isPathWithin(root + "/outside-link/does-not-exist.txt", root));
@@ -457,11 +451,22 @@ private slots:
         QCOMPARE(linkedRoot.errors.size(), 1);
 #ifdef Q_OS_WIN
         QVERIFY2(junctions.removeAll(&junctionError), qPrintable(junctionError));
+#else
+        QVERIFY2(fileLink.remove(&linkError), qPrintable(linkError));
+        QVERIFY2(loopLink.remove(&linkError), qPrintable(linkError));
+        QVERIFY2(outsideLink.remove(&linkError), qPrintable(linkError));
+        QVERIFY(!QFileInfo(root + "/file-link.txt").isSymLink());
+        QVERIFY(!QFileInfo::exists(root + "/file-link.txt"));
+#endif
+        QVERIFY(!QFileInfo(root + "/outside-link").isSymLink());
+        QVERIFY(!QFileInfo(root + "/loop").isSymLink());
         QVERIFY(!QFileInfo::exists(root + "/outside-link"));
         QVERIFY(!QFileInfo::exists(root + "/loop"));
-        QVERIFY(QFileInfo::exists(root + "/inside.txt"));
-        QVERIFY(QFileInfo::exists(outside + "/outside.txt"));
-#endif
+        for (const auto &target : {root + "/inside.txt", outside + "/outside.txt"}) {
+            QFile preserved(target);
+            QVERIFY(preserved.open(QIODevice::ReadOnly));
+            QCOMPARE(preserved.readAll(), QByteArray("catalog test"));
+        }
     }
 
     void typescriptIsNotMistakenForVideo()

@@ -162,6 +162,8 @@ class SourceIntegrityTests(unittest.TestCase):
         link = self.source / "outside-source"
         target = self.root / "outside"
         target.mkdir()
+        marker = target / "marker.txt"
+        marker.write_bytes(b"Preserve the external link target")
         junction = False
         try:
             link.symlink_to(target, target_is_directory=True)
@@ -186,6 +188,9 @@ class SourceIntegrityTests(unittest.TestCase):
                 link.rmdir()
             else:
                 link.unlink()
+            self.assertFalse(link.exists())
+            self.assertFalse(link.is_symlink())
+            self.assertEqual(marker.read_bytes(), b"Preserve the external link target")
 
     def test_10_reject_wrong_git_commit(self):
         source = self.root / "foreign checkout"

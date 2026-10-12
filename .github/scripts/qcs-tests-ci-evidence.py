@@ -454,7 +454,7 @@ class PythonCleanupPlatformEvidenceTests(unittest.TestCase):
 
 
 class NativeTestFlowTests(unittest.TestCase):
-    def run_test_action(self, failure=None):
+    def run_test_action(self, failure=None, *, collection_complete=True):
         with tempfile.TemporaryDirectory(prefix="qcs-ci-test-flow-",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
             root = Path(temporary)
@@ -469,13 +469,19 @@ class NativeTestFlowTests(unittest.TestCase):
                         "QCOPILOTS_SEARCH_MODEL_DIR": str(root / "models")}), \
                     mock.patch.object(native, "run", return_value=native.subprocess.CompletedProcess([], 0, stdout=inventory)), \
                     mock.patch.object(native, "dev", side_effect=failure) as dev, \
+                    mock.patch.object(native, "collect_test_wrappers", return_value={"collectionComplete": collection_complete}) as wrappers, \
                     mock.patch.object(native, "test_evidence") as acceptance, \
                     mock.patch.object(native, "gui_failure_diagnostics", return_value={"attempts": []}) as gui_diagnostics, \
                     mock.patch.object(native, "linux_failure_diagnostics", return_value={"commands": []}) as linux_diagnostics, \
                     mock.patch.object(native.subprocess, "Popen") as spawn:
                 if failure is None:
-                    native.main()
-                    acceptance.assert_called_once_with(require_complete=True)
+                    if collection_complete:
+                        native.main()
+                        acceptance.assert_called_once_with(require_complete=True)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "diagnostic collection is incomplete"):
+                            native.main()
+                        acceptance.assert_not_called()
                     gui_diagnostics.assert_not_called()
                     linux_diagnostics.assert_not_called()
                 else:
@@ -488,18 +494,213 @@ class NativeTestFlowTests(unittest.TestCase):
                 dev.assert_called_once()
                 arguments = dev.call_args.args
                 self.assertEqual(arguments[0], "test")
-                self.assertEqual(arguments.count("--fail-fast"), 1)
+                self.assertNotIn("--fail-fast", arguments)
                 self.assertIn("--keep-failed-tests", arguments)
                 self.assertEqual(arguments[arguments.index("--report-dir") + 1], str(reports / "tests"))
                 self.assertTrue(dev.call_args.kwargs["display"])
+                wrappers.assert_called_once_with()
                 spawn.assert_not_called()
             self.assertEqual((reports / "tests/ctest-inventory.json").read_text(encoding="utf-8"), inventory)
 
-    def test_fail_fast_invocation_still_requires_complete_evidence_after_success(self):
+    def test_complete_suite_invocation_still_requires_complete_evidence_after_success(self):
         self.run_test_action()
 
-    def test_fail_fast_failure_preserves_original_error_without_acceptance_success(self):
+    def test_complete_suite_failure_preserves_original_error_without_acceptance_success(self):
         self.run_test_action(native.subprocess.CalledProcessError(17, ["synthetic-dev", "test"]))
+
+    def test_diagnostic_failure_preserves_original_test_failure(self):
+        self.run_test_action(native.subprocess.CalledProcessError(17, ["synthetic-dev", "test"]),
+                             collection_complete=False)
+
+    def test_successful_test_cannot_hide_incomplete_wrapper_collection(self):
+        self.run_test_action(collection_complete=False)
+
+
+class WrapperDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="qcs-wrap-中文 ",
+            dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.reports = self.root / "reports"
+        self.selected = self.root / "runs/qcs-t-fixture"
+        self.inputs = self.selected / "reports"
+        self.inputs.mkdir(parents=True)
+        self.reports.mkdir()
+        for name, value in (("ROOT", self.root), ("REPORTS", self.reports)):
+            patcher = mock.patch.object(native, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.latest = self.reports / "latest-test-run.json"
+        self.latest.write_text(json.dumps({"runId": "fixture-full-run-identity",
+            "testRoot": str(self.selected)}), encoding="utf-8")
+
+    def wrapper(self, label="qcs-tests-core", *, suffix="fixture", cleanup_error=None):
+        run_id = "qcs-t-" + suffix
+        path = self.inputs / (run_id + ".json")
+        path.write_text(json.dumps({"schemaVersion": 1, "kind": "qcs-test-run", "label": label,
+            "runId": run_id, "root": str(self.selected), "childExitCode": 0,
+            "exitCode": 125 if cleanup_error else 0, "passed": not cleanup_error,
+            "cleanup": {"attempted": True, "succeeded": not cleanup_error, "error": cleanup_error}},
+            ensure_ascii=False, indent=3) + "\n", encoding="utf-8")
+        return path
+
+    def junit(self, *labels):
+        directory = self.reports / "tests"
+        directory.mkdir(exist_ok=True)
+        suite = ET.Element("testsuite")
+        for label in labels:
+            ET.SubElement(suite, "testcase", name=label, status="run")
+        ET.ElementTree(suite).write(directory / "ctest.xml", encoding="utf-8")
+
+    def collect(self):
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            result = native.collect_test_wrappers()
+        self.assertEqual(json.loads((self.reports / "wrappers/index.json").read_text(encoding="utf-8")), result)
+        return result
+
+    def test_success_and_cleanup_failure_preserve_raw_bytes_and_hashes(self):
+        sources = [self.wrapper(suffix="ok"), self.wrapper("qcs-tests-ipc", suffix="bad",
+            cleanup_error="Refusing cleanup across a link: 中文")]
+        self.junit("qcs-tests-core", "qcs-tests-ipc")
+        result = self.collect()
+        self.assertTrue(result["collectionComplete"])
+        self.assertEqual(len(result["files"]), 2)
+        for record in result["files"]:
+            raw = (self.root / record["source"]).read_bytes()
+            self.assertEqual((self.reports / record["path"]).read_bytes(), raw)
+            self.assertEqual(record["sha256"], native.hashlib.sha256(raw).hexdigest())
+            self.assertEqual(record["bytes"], len(raw))
+        failed = next(record for record in result["files"] if record["exitCode"] == 125)
+        self.assertEqual(failed["childExitCode"], 0)
+        self.assertIn("Refusing cleanup", failed["cleanup"]["error"])
+        self.assertTrue(all(path.is_file() for path in sources))
+        self.assertEqual(self.collect(), result)
+        self.assertEqual(len(list((self.reports / "wrappers").iterdir())), 3)
+
+    def test_only_direct_current_run_reports_are_copied(self):
+        self.wrapper()
+        for directory in (self.inputs / "nested", self.selected / "models", self.selected / "retained",
+                          self.root / "runs/qcs-t-other/reports"):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "qcs-t-unrelated.json").write_text("unrelated content", encoding="utf-8")
+        (self.inputs / "index.sqlite3").write_bytes(b"not diagnostic JSON")
+        self.junit("qcs-tests-core")
+        result = self.collect()
+        self.assertTrue(result["collectionComplete"])
+        self.assertEqual(len(result["files"]), 1)
+        self.assertEqual(result["missingLabels"], [])
+
+    def test_missing_executed_wrapper_is_explicit_without_inventing_raw_report(self):
+        self.wrapper()
+        self.junit("qcs-tests-core", "qcs-tests-ipc")
+        result = self.collect()
+        self.assertFalse(result["collectionComplete"])
+        self.assertEqual(result["missingLabels"], ["qcs-tests-ipc"])
+        self.assertEqual(len(result["files"]), 1)
+
+    def test_malformed_json_is_archived_with_explicit_validation_error(self):
+        path = self.inputs / "qcs-t-broken.json"
+        path.write_bytes(b'{"interrupted":')
+        result = self.collect()
+        self.assertFalse(result["collectionComplete"])
+        self.assertEqual(len(result["files"]), 1)
+        self.assertEqual((self.reports / result["files"][0]["path"]).read_bytes(), path.read_bytes())
+        self.assertTrue(result["errors"])
+
+    def test_missing_test_invocation_is_not_reported_as_collected(self):
+        self.latest.unlink()
+        result = self.collect()
+        self.assertFalse(result["collectionComplete"])
+        self.assertEqual(result["files"], [])
+
+    def test_root_outside_this_jobs_runs_directory_is_rejected(self):
+        self.latest.write_text(json.dumps({"runId": "fixture", "testRoot": str(self.root)}), encoding="utf-8")
+        result = self.collect()
+        self.assertFalse(result["collectionComplete"])
+        self.assertIn("outside", str(result["errors"]))
+
+    def test_link_or_reparse_diagnostic_is_rejected_before_reading(self):
+        path = self.wrapper()
+        real_stat = Path.lstat
+
+        def reparse(candidate, *args, **kwargs):
+            result = real_stat(candidate, *args, **kwargs)
+            if candidate == path:
+                result = mock.Mock(st_mode=result.st_mode, st_file_attributes=0x400)
+            return result
+
+        with mock.patch.object(Path, "lstat", reparse):
+            result = self.collect()
+        self.assertFalse(result["collectionComplete"])
+        self.assertEqual(result["files"], [])
+        self.assertIn("Not an ordinary file", str(result["errors"]))
+
+    def test_oversize_report_is_rejected_without_copying_data(self):
+        path = self.inputs / "qcs-t-large.json"
+        with path.open("wb") as output:
+            output.truncate(1024 * 1024 + 1)
+        result = self.collect()
+        self.assertFalse(result["collectionComplete"])
+        self.assertEqual(result["files"], [])
+        self.assertIn("limit", str(result["errors"]))
+
+    def test_junit_parent_link_is_rejected_and_explicitly_removed(self):
+        self.wrapper()
+        link = self.reports / "tests"
+        with tempfile.TemporaryDirectory(prefix="qcs-outside-中文 ", dir=self.root.parent) as temporary:
+            target = Path(temporary)
+            xml = target / "ctest.xml"
+            original = b'<testsuite><testcase name="qcs-tests-external" /></testsuite>'
+            xml.write_bytes(original)
+            try:
+                if os.name == "nt":
+                    environment = os.environ.copy()
+                    environment.update(QCOPILOTS_SEARCH_FIXTURE_LINK=str(link),
+                                       QCOPILOTS_SEARCH_FIXTURE_TARGET=str(target))
+                    native.subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        "$ErrorActionPreference = 'Stop'; "
+                        "$null = New-Item -ItemType Junction -Path $env:QCOPILOTS_SEARCH_FIXTURE_LINK "
+                        "-Target $env:QCOPILOTS_SEARCH_FIXTURE_TARGET"],
+                        env=environment, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        timeout=30, check=True)
+                else:
+                    link.symlink_to(target, target_is_directory=True)
+                with mock.patch.object(native.ET, "fromstring") as parse_xml:
+                    result = self.collect()
+                self.assertFalse(result["collectionComplete"])
+                self.assertIn("Not an ordinary directory", str(result["errors"]))
+                parse_xml.assert_not_called()
+                self.assertEqual(xml.read_bytes(), original)
+            finally:
+                # Remove only the redirect itself. Never let the outer test
+                # runner encounter a retained junction or symbolic link.
+                if link.exists() or link.is_symlink():
+                    link.rmdir() if os.name == "nt" else link.unlink()
+            self.assertFalse(link.exists() or link.is_symlink())
+            self.assertEqual(xml.read_bytes(), original)
+
+    def test_real_test_runner_report_is_collected_after_child_exit(self):
+        environment = os.environ.copy()
+        environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(self.selected)
+        result = native.subprocess.run([sys.executable, "-B", str(native.SOURCE / "tools/qcs-test-runner.py"),
+            "--root", str(self.selected), "--label", "qcs-tests-collector", "--",
+            sys.executable, "-B", "-c", "print('real wrapper fixture')"],
+            cwd=self.root, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.junit("qcs-tests-collector")
+        collected = self.collect()
+        self.assertTrue(collected["collectionComplete"])
+        self.assertEqual(collected["files"][0]["cleanup"], {"attempted": True, "succeeded": True, "error": None})
+
+    def test_report_archives_wrappers_before_missing_acceptance_evidence_raises(self):
+        self.wrapper()
+        failure = RuntimeError("Missing acceptance fixture")
+        with mock.patch.object(native, "test_evidence", side_effect=failure):
+            with self.assertRaises(RuntimeError) as caught:
+                native.report()
+        self.assertIs(caught.exception, failure)
+        self.assertTrue((self.reports / "wrappers/index.json").is_file())
 
 
 class PackageModelFlowTests(unittest.TestCase):

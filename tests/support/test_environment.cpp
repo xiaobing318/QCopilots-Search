@@ -14,7 +14,9 @@
 #include "core/native_lock_path.h"
 #include <windows.h>
 #else
+#include <cerrno>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace qcopilots_search::test {
@@ -54,6 +56,66 @@ QString takeCleanupErrors()
 {
     return std::exchange(cleanupErrors, {}).join(QLatin1Char('\n'));
 }
+
+#ifdef Q_OS_UNIX
+TestSymbolicLink::~TestSymbolicLink()
+{
+    QString error;
+    if (!remove(&error)) recordCleanupFailure(error);
+}
+
+bool TestSymbolicLink::create(const QString &link, const QString &target, QString *error)
+{
+    const auto parent = QFileInfo(link).absolutePath();
+    const auto parentIdentity = directoryIdentity(parent);
+    if (!link_.isEmpty() || !QDir::isAbsolutePath(link) || parentIdentity.isEmpty()
+        || ::symlink(QFile::encodeName(target).constData(), QFile::encodeName(link).constData()) != 0) {
+        if (error) *error = QStringLiteral("Cannot create owned symbolic link: %1").arg(link);
+        return false;
+    }
+    link_ = link;
+    parent_ = QFileInfo(parent).canonicalFilePath();
+    parentIdentity_ = parentIdentity;
+    struct stat state{};
+    if (::lstat(QFile::encodeName(link_).constData(), &state) != 0 || !S_ISLNK(state.st_mode)) {
+        if (error) *error = QStringLiteral("Cannot establish symbolic link ownership: %1").arg(link_);
+        return false;
+    }
+    identity_ = QByteArray::number(qulonglong(state.st_dev)) + ':' + QByteArray::number(qulonglong(state.st_ino));
+    return true;
+}
+
+bool TestSymbolicLink::remove(QString *error)
+{
+    if (link_.isEmpty()) return true;
+    const auto parent = QFileInfo(link_).absolutePath();
+    if (identity_.isEmpty() || QFileInfo(parent).canonicalFilePath() != parent_
+        || directoryIdentity(parent) != parentIdentity_) {
+        if (error) *error = QStringLiteral("Refusing to clean replaced symbolic link parent: %1").arg(link_);
+        return false;
+    }
+    struct stat state{};
+    if (::lstat(QFile::encodeName(link_).constData(), &state) != 0) {
+        if (errno == ENOENT) {
+            link_.clear();
+            return true;
+        }
+        if (error) *error = QStringLiteral("Cannot inspect owned symbolic link: %1").arg(link_);
+        return false;
+    }
+    const auto identity = QByteArray::number(qulonglong(state.st_dev)) + ':' + QByteArray::number(qulonglong(state.st_ino));
+    if (!S_ISLNK(state.st_mode) || identity != identity_) {
+        if (error) *error = QStringLiteral("Refusing to clean replaced symbolic link: %1").arg(link_);
+        return false;
+    }
+    if (::unlink(QFile::encodeName(link_).constData()) != 0) {
+        if (error) *error = QStringLiteral("Cannot unlink owned symbolic link: %1").arg(link_);
+        return false;
+    }
+    link_.clear();
+    return true;
+}
+#endif
 
 TestTemporaryDir::TestTemporaryDir(const QString &pathTemplate) : QTemporaryDir(pathTemplate)
 {

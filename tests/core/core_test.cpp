@@ -13,6 +13,7 @@
 #include <QJsonDocument>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QScopeGuard>
 #include <QtTest>
 #include <limits>
 #ifdef Q_OS_WIN
@@ -41,6 +42,10 @@ private slots:
     void ipcIgnoresLongTemporaryDirectory();
 #ifdef Q_OS_UNIX
     void privateIpcDirectoryRejectsUnsafeEntries();
+    void retainedSymbolicLinksAreExplicitlyRemoved_data();
+    void retainedSymbolicLinksAreExplicitlyRemoved();
+    void symbolicLinkCreationFailurePreservesExistingFile();
+    void symbolicLinkCleanupRejectsReplacement();
 #endif
     void environmentOverrides();
     void workingDirectoryIndependence();
@@ -181,8 +186,10 @@ void CoreTest::privateIpcDirectoryRejectsUnsafeEntries()
     QVERIFY(::lstat(QFile::encodeName(directory).constData(), &state) == 0);
     QCOMPARE(state.st_mode & 0777, mode_t(0755)); // Never silently chmod existing directories.
     QVERIFY(::chmod(QFile::encodeName(directory).constData(), 0700) == 0);
+    QVERIFY(env.writeFile("private-ipc/marker", "preserve link target"));
     const auto link = env.path("private-link");
-    QVERIFY(::symlink(QFile::encodeName(directory).constData(), QFile::encodeName(link).constData()) == 0);
+    TestSymbolicLink ownedLink;
+    QVERIFY2(ownedLink.create(link, directory, &error), qPrintable(error));
     QVERIFY(!detail::preparePrivateIpcDirectory(link, false, &error));
     QVERIFY(!detail::preparePrivateIpcDirectory(link, true, &error));
     QVERIFY(QFileInfo(link).isSymLink());
@@ -191,6 +198,106 @@ void CoreTest::privateIpcDirectoryRejectsUnsafeEntries()
     QFile regular(env.path("not-directory"));
     QVERIFY(regular.open(QIODevice::ReadOnly));
     QCOMPARE(regular.readAll(), QByteArray("preserve existing file"));
+    QVERIFY2(ownedLink.remove(&error), qPrintable(error));
+    QVERIFY(!QFileInfo(link).isSymLink());
+    QVERIFY(!QFileInfo::exists(link));
+    QFile marker(env.path("private-ipc/marker"));
+    QVERIFY(marker.open(QIODevice::ReadOnly));
+    QCOMPARE(marker.readAll(), QByteArray("preserve link target"));
+}
+
+void CoreTest::retainedSymbolicLinksAreExplicitlyRemoved_data()
+{
+    QTest::addColumn<int>("cleanupMode");
+    QTest::newRow("explicit-unlink") << 0;
+    QTest::newRow("scope-exit") << 1;
+    QTest::newRow("early-return") << 2;
+}
+
+void CoreTest::retainedSymbolicLinksAreExplicitlyRemoved()
+{
+    QFETCH(int, cleanupMode);
+    ScopedEnvironment retain("QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS", "1");
+    TestEnvironment target("link-target");
+    QVERIFY2(target.isValid(), qPrintable(target.error()));
+    QVERIFY(target.writeFile("marker", "outside target survives"));
+    QString root, link, error;
+    {
+        TestEnvironment fixture("retained-link");
+        QVERIFY2(fixture.isValid(), qPrintable(fixture.error()));
+        root = fixture.root();
+        link = fixture.path("outside-link");
+        const auto exercise = [&]() -> bool {
+            TestSymbolicLink ownedLink;
+            if (!ownedLink.create(link, target.root(), &error)) return false;
+            if (cleanupMode == 2) return true; // Simulates an assertion's early return.
+            if (cleanupMode == 0 && (!ownedLink.remove(&error) || !ownedLink.remove(&error))) return false;
+            return true;
+        };
+        QVERIFY2(exercise(), qPrintable(error));
+    }
+    QVERIFY(QFileInfo(root).isDir()); // Preservation was active, not bypassed.
+    QVERIFY(!QFileInfo(link).isSymLink());
+    QVERIFY(!QFileInfo::exists(link));
+    QFile marker(target.path("marker"));
+    QVERIFY(marker.open(QIODevice::ReadOnly));
+    QCOMPARE(marker.readAll(), QByteArray("outside target survives"));
+}
+
+void CoreTest::symbolicLinkCreationFailurePreservesExistingFile()
+{
+    TestEnvironment env("link-create");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    QVERIFY(env.writeFile("occupied", "original contents"));
+    TestSymbolicLink link;
+    QString error;
+    QVERIFY(!link.create(env.path("occupied"), env.path("missing-target"), &error));
+    QVERIFY(!error.isEmpty());
+    QVERIFY2(link.remove(&error), qPrintable(error));
+    QVERIFY2(link.remove(&error), qPrintable(error));
+    QVERIFY2(link.create(env.path("dangling-link"), env.path("missing-target"), &error), qPrintable(error));
+    QVERIFY(QFileInfo(env.path("dangling-link")).isSymLink());
+    QVERIFY2(link.remove(&error), qPrintable(error));
+    QVERIFY2(link.remove(&error), qPrintable(error));
+    QVERIFY(!QFileInfo(env.path("dangling-link")).isSymLink());
+    QFile original(env.path("occupied"));
+    QVERIFY(original.open(QIODevice::ReadOnly));
+    QCOMPARE(original.readAll(), QByteArray("original contents"));
+}
+
+void CoreTest::symbolicLinkCleanupRejectsReplacement()
+{
+    TestEnvironment env("link-replaced");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    const auto path = env.path("link");
+    const auto original = env.path("original-link");
+    TestSymbolicLink link;
+    QString error;
+    QVERIFY(env.writeFile("target", "target survives replacement"));
+    QVERIFY2(link.create(path, env.path("target"), &error), qPrintable(error));
+    const auto restore = qScopeGuard([&] {
+        if (!QFileInfo(original).isSymLink()) return;
+        // Restore the deliberately displaced fixture before its owner exits,
+        // including if an assertion above the explicit restore returns early.
+        if ((QFileInfo::exists(path) && !QFile::remove(path)) || !QFile::rename(original, path))
+            recordCleanupFailure(QStringLiteral("Cannot restore displaced test link: %1").arg(path));
+    });
+    QVERIFY(QFile::rename(path, original));
+    QVERIFY(env.writeFile("link", "replacement survives"));
+    QVERIFY(!link.remove(&error));
+    QVERIFY(error.contains("replaced symbolic link"));
+    QFile replacement(path);
+    QVERIFY(replacement.open(QIODevice::ReadOnly));
+    QCOMPARE(replacement.readAll(), QByteArray("replacement survives"));
+    replacement.close();
+    QVERIFY(QFile::remove(path));
+    QVERIFY(QFile::rename(original, path));
+    QVERIFY2(link.remove(&error), qPrintable(error));
+    QVERIFY2(link.remove(&error), qPrintable(error));
+    QVERIFY(!QFileInfo(path).isSymLink());
+    QFile target(env.path("target"));
+    QVERIFY(target.open(QIODevice::ReadOnly));
+    QCOMPARE(target.readAll(), QByteArray("target survives replacement"));
 }
 #endif
 

@@ -178,14 +178,20 @@ private slots:
         const QByteArray marker("Never delete this test-owned non-socket file.");
         const QString target = environment.path(QStringLiteral("marker"));
         QVERIFY(environment.writeFile("marker", marker));
+        TestSymbolicLink ownedLink;
+        bool regularLeafCreated = false;
+        const auto cleanup = qScopeGuard([&] {
+            if (regularLeafCreated && !QFile::remove(paths.ipcName))
+                recordCleanupFailure(QStringLiteral("Cannot remove test-owned IPC leaf: %1").arg(paths.ipcName));
+        });
         if (symbolicLink) {
-            QVERIFY(QFile::link(target, paths.ipcName));
+            QVERIFY2(ownedLink.create(paths.ipcName, target, &error), qPrintable(error));
         } else {
             QFile leaf(paths.ipcName);
             QVERIFY(leaf.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+            regularLeafCreated = true;
             QCOMPARE(leaf.write(marker), marker.size());
         }
-        const auto cleanup = qScopeGuard([&] { QFile::remove(paths.ipcName); });
         ServiceProcess service(paths);
         QVERIFY(!service.start());
         QVERIFY2(service.error.contains(QStringLiteral("Refusing to remove")), qPrintable(service.error));
@@ -194,6 +200,14 @@ private slots:
         QVERIFY(leaf.open(QIODevice::ReadOnly));
         QCOMPARE(leaf.readAll(), marker);
         leaf.close();
+        if (symbolicLink) {
+            QVERIFY2(ownedLink.remove(&error), qPrintable(error));
+        } else {
+            QVERIFY(QFile::remove(paths.ipcName));
+            regularLeafCreated = false;
+        }
+        QVERIFY(!QFileInfo(paths.ipcName).isSymLink());
+        QVERIFY(!QFileInfo::exists(paths.ipcName));
         QFile original(target);
         QVERIFY(original.open(QIODevice::ReadOnly));
         QCOMPARE(original.readAll(), marker);
