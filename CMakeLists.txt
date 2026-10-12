@@ -35,6 +35,7 @@ if(MSVC)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+include(QCopilotsSearchMsvcResponse)
 include(GNUInstallDirs)
 if(APPLE)
   # A user drags one .app out of the DMG. All helpers, libraries and data must

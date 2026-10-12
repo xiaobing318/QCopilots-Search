@@ -23,6 +23,10 @@ spec.loader.exec_module(workflow)
 package_spec = importlib.util.spec_from_file_location("qcopilots_search_verify_package", SCRIPT.with_name("qcopilots-search-verify-package.py"))
 package_verifier = importlib.util.module_from_spec(package_spec)
 package_spec.loader.exec_module(package_verifier)
+response_spec = importlib.util.spec_from_file_location(
+    "qcopilots_search_msvc_response", SCRIPT.with_name("qcopilots-search-msvc-response.py"))
+msvc_response = importlib.util.module_from_spec(response_spec)
+response_spec.loader.exec_module(msvc_response)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -163,17 +167,193 @@ include(CPack)
                 self.assertFalse((self.root / "escaped.txt").exists())
 
     def test_release_package_requires_models_before_launching(self):
+        import contextlib
+        import io
         report = self.root / "missing-model-report"
+        output = io.StringIO()
         with patch.object(package_verifier.subprocess, "Popen") as launch, \
-                patch.object(package_verifier.shutil, "which", return_value=None):
+                patch.object(package_verifier.shutil, "which", return_value=None), \
+                contextlib.redirect_stdout(output):
             with self.assertRaisesRegex(RuntimeError, "requires --model-dir"):
                 package_verifier.verify(None, self.root / "build", report, self.root / "installed")
         launch.assert_not_called()
         evidence = json.loads((report / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(output.getvalue()), evidence)
         self.assertFalse(evidence["passed"])
         self.assertFalse(evidence["releaseComplete"])
         self.assertTrue(evidence["realModelRequired"])
         self.assertEqual(evidence["verificationScope"], "release")
+
+    def test_jpeg_contract_uses_consumer_build_directory_and_header_order(self):
+        project = self.root / "源码 source"
+        vendor = self.root / "依赖 sources"
+        build = self.root / "构建 output"
+        project.mkdir()
+        vendor.mkdir()
+        for name in ("qcopilots-search-native-images.cmake", "qcopilots-search-jpeg-contract.c"):
+            shutil.copyfile(workflow.SOURCE / "cmake" / name, project / name)
+        (project / "cmake").mkdir()
+        (project / "tools").mkdir()
+        shutil.copyfile(workflow.SOURCE / "cmake/QCopilotsSearchMsvcResponse.cmake",
+                        project / "cmake/QCopilotsSearchMsvcResponse.cmake")
+        shutil.copyfile(SCRIPT.with_name("qcopilots-search-msvc-response.py"),
+                        project / "tools/qcopilots-search-msvc-response.py")
+        python = Path(sys.executable)
+        if os.name == "nt":
+            import venv
+            interpreter_root = self.root / "Python 空格"
+            venv.EnvBuilder(with_pip=False).create(interpreter_root)
+            python = interpreter_root / "Scripts/python.exe"
+        (vendor / "unit.cpp").write_text(
+            'extern "C"\n#ifdef _WIN32\n__declspec(dllexport)\n#endif\n'
+            "int fixture_value() { return 42; }\n", encoding="utf-8")
+        (vendor / "export.c").write_text(
+            "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nint fixture_value(void) { return 42; }\n",
+            encoding="utf-8")
+        (vendor / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        # Enough objects exercise an actual MSVC link response file, without
+        # rebuilding the full codecs. Every generated file stays in this run.
+        for index in range(100):
+            (vendor / f"unit{index:03}.c").write_text(
+                f"int fixture_{index}(void) {{ return {index}; }}\n", encoding="utf-8")
+        (vendor / "CMakeLists.txt").write_text('''
+project(qcopilots-search-codec-fixture LANGUAGES C CXX)
+file(GLOB units "${CMAKE_CURRENT_SOURCE_DIR}/unit*.c")
+add_library(qcopilots-search-contract-objects OBJECT ${units})
+set(objects "$<TARGET_OBJECTS:qcopilots-search-contract-objects>")
+add_library(qcopilots-search-contract-consumer SHARED unit.cpp ${objects})
+target_link_libraries(qcopilots-search-contract-consumer PRIVATE jpeg-headers)
+qcopilots_search_add_jpeg_contract(qcopilots-search-contract-consumer)
+add_library(qcopilots-search-contract-c SHARED export.c ${objects})
+target_link_libraries(qcopilots-search-contract-c PRIVATE jpeg-headers)
+qcopilots_search_add_jpeg_contract(qcopilots-search-contract-c)
+add_executable(qcopilots-search-contract-exe main.c ${objects})
+foreach(kind IN ITEMS c cpp)
+  if(kind STREQUAL "c")
+    set(source export.c)
+  else()
+    set(source unit.cpp)
+  endif()
+  add_library(qcopilots-search-archive-${kind} STATIC ${source} ${objects})
+  if(MSVC)
+    add_library(qcopilots-search-archive-${kind}-ipo STATIC ${source} ${objects})
+    set_property(TARGET qcopilots-search-archive-${kind}-ipo PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  endif()
+endforeach()
+''', encoding="utf-8")
+        (project / "CMakeLists.txt").write_text('''
+cmake_minimum_required(VERSION 3.28)
+project(qcopilots-search-jpeg-contract-test LANGUAGES C CXX)
+include("${CMAKE_CURRENT_SOURCE_DIR}/qcopilots-search-native-images.cmake")
+set(CMAKE_C_LINKER_LAUNCHER "${CMAKE_COMMAND};-E;env")
+set(CMAKE_CXX_LINKER_LAUNCHER "${CMAKE_COMMAND};-E;env")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/QCopilotsSearchMsvcResponse.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/QCopilotsSearchMsvcResponse.cmake")
+add_library(jpeg-headers INTERFACE)
+target_include_directories(jpeg-headers INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/consumer")
+''', encoding="utf-8")
+        for layout in ("default", "external"):
+            with self.subTest(layout=layout):
+                current_build = build / layout
+                native = (current_build / "native-dependencies" if layout == "default"
+                          else self.root / "独立 native output")
+                (project / "jpeglib.h").write_text(
+                    "#define JPEG_LIB_VERSION 62\n#define LIBJPEG_TURBO_VERSION_NUMBER 3001004\n",
+                    encoding="utf-8")
+                configure_command = ["cmake", "-S", str(project), "-B", str(current_build), "-G", "Ninja",
+                     "-DCMAKE_BUILD_TYPE=Release", f"-DVENDOR_SOURCE={vendor.as_posix()}",
+                     f"-DQCOPILOTS_SEARCH_NATIVE_BINARY_ROOT={native.as_posix()}",
+                     f"-DPython3_EXECUTABLE={python}"]
+                for _ in range(2):
+                    configure = subprocess.run(configure_command, cwd=self.root, capture_output=True,
+                        text=True, encoding="utf-8", errors="replace", timeout=60)
+                    self.assertEqual(configure.returncode, 0, configure.stdout + configure.stderr)
+                copied = (native / "consumer/qcopilots-search-contracts"
+                          / "qcopilots-search-contract-consumer/qcopilots-search-jpeg-contract.c")
+                self.assertEqual(copied.read_bytes(), (project / "qcopilots-search-jpeg-contract.c").read_bytes())
+                command = ["cmake", "--build", str(current_build), "--parallel", "2", "--", "-d", "keeprsp"]
+                compiled = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
+                                          encoding="utf-8", errors="replace", timeout=120)
+                self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+                application = native / "consumer" / ("qcopilots-search-contract-exe" + (".exe" if os.name == "nt" else ""))
+                launched = subprocess.run([str(application)], cwd=self.root, capture_output=True, timeout=30)
+                self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
+                if os.name == "nt":
+                    response = current_build / "CMakeFiles/qcopilots-search-contract-consumer.rsp"
+                    self.assertTrue(response.is_file(), "The Windows regression must exercise the linker response file")
+                    self.assertIn("qcopilots-search-jpeg-contract.c.obj", response.read_text(encoding="utf-8"))
+                    self.assertNotIn("源码", response.read_text(encoding="utf-8"))
+                    for kind in ("c", "cpp", "c-ipo", "cpp-ipo"):
+                        self.assertTrue((native / "consumer" / f"qcopilots-search-archive-{kind}.lib").is_file())
+                    rules = (current_build / "CMakeFiles/rules.ninja").read_text(encoding="utf-8")
+                    launcher_lines = [line for line in rules.splitlines()
+                                      if "command =" in line and "qcopilots-search-msvc-response.py" in line]
+                    self.assertTrue(launcher_lines)
+                    self.assertTrue(all(line.count("qcopilots-search-msvc-response.py") == 1 for line in launcher_lines))
+                    self.assertEqual(list(current_build.rglob("qcopilots-search-msvc-*.rsp")), [])
+                # The copied unit must still use the actual consumer headers.
+                (project / "jpeglib.h").write_text(
+                    "#define JPEG_LIB_VERSION 80\n#define LIBJPEG_TURBO_VERSION_NUMBER 3001004\n",
+                    encoding="utf-8")
+                rejected = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
+                                          encoding="utf-8", errors="replace", timeout=120)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("requires the pinned libjpeg API 62", rejected.stdout + rejected.stderr)
+
+    def test_msvc_response_encoding_exit_cleanup_and_parallel_calls(self):
+        import codecs
+        import concurrent.futures
+        import threading
+        directory = self.root / "响应 文件"
+        directory.mkdir()
+        content = '"路径 with space\\one.obj"\n"quoted\\two.obj"\r\n/LIBPATH:"a b"\n'
+        responses = []
+        for name, encoded in (
+            ("utf8", content.encode("utf-8")),
+            ("utf8-bom", codecs.BOM_UTF8 + content.encode("utf-8")),
+            ("utf16-le", codecs.BOM_UTF16_LE + content.encode("utf-16-le")),
+            ("utf16-be", codecs.BOM_UTF16_BE + content.encode("utf-16-be")),
+        ):
+            path = directory / (name + " 空格.rsp")
+            path.write_bytes(encoded)
+            responses.append(path)
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in responses]
+        arguments = ["tool", 'untouched "quotes"', *("@" + str(path) for path in responses)]
+        with msvc_response.response_arguments(arguments) as converted:
+            self.assertEqual(converted[:2], arguments[:2])
+            replacement = Path(converted[2][1:])
+            self.assertNotEqual(replacement, responses[0])
+            self.assertEqual(replacement.read_bytes(), codecs.BOM_UTF16_LE + content.encode("utf-16-le"))
+            self.assertEqual(converted[3:], arguments[3:])
+        self.assertFalse(replacement.exists())
+        self.assertEqual(before, [(path.read_bytes(), path.stat().st_mtime_ns) for path in responses])
+        with msvc_response.response_arguments(["tool", "@" + str(responses[0]), "@" + str(responses[0])]) as copied:
+            self.assertNotEqual(copied[1], copied[2])
+        for code in (0, 23):
+            self.assertEqual(msvc_response.main(
+                [sys.executable, "-c", f"import sys; sys.exit({code})", "@" + str(responses[0])]), code)
+            self.assertEqual(list(directory.glob("qcopilots-search-msvc-*.rsp")), [])
+        with self.assertRaises(OSError):
+            msvc_response.main([str(directory / "missing-tool"), "@" + str(responses[0])])
+        malformed = directory / "not-utf8.rsp"
+        malformed.write_bytes(b"\xffinvalid")
+        with self.assertRaises(UnicodeError), patch.object(msvc_response.subprocess, "call") as invoke:
+            msvc_response.main(["tool", "@" + str(responses[0]), "@" + str(malformed)])
+        invoke.assert_not_called()
+        self.assertEqual(list(directory.glob("qcopilots-search-msvc-*.rsp")), [])
+        barrier = threading.Barrier(4)
+        def concurrent_copy(_):
+            with msvc_response.response_arguments(["tool", "@" + str(responses[0])]) as command:
+                temporary = Path(command[1][1:])
+                barrier.wait(timeout=10)
+                self.assertTrue(temporary.is_file())
+                return temporary
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            copies = list(executor.map(concurrent_copy, range(4)))
+        self.assertEqual(len(set(copies)), 4)
+        self.assertTrue(all(not path.exists() for path in copies))
+        self.assertEqual(list(directory.glob("qcopilots-search-msvc-*.rsp")), [])
 
     def test_license_inventory_cannot_be_omitted_or_satisfied_by_unrelated_files(self):
         binary = self.root / "app/bin"

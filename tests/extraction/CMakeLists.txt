@@ -35,6 +35,7 @@ set_target_properties(qcopilots-search-tests-extraction-image PROPERTIES AUTORCC
 add_executable(qcopilots-search-tests-jpeg-probe jpeg_probe.cpp)
 target_link_libraries(qcopilots-search-tests-jpeg-probe PRIVATE
     Qt6::Core qcopilots-search::raw JPEG::JPEG ${CMAKE_DL_LIBS})
+qcopilots_search_add_jpeg_contract(qcopilots-search-tests-jpeg-probe)
 target_compile_features(qcopilots-search-tests-jpeg-probe PRIVATE cxx_std_20)
 target_compile_definitions(qcopilots-search-tests-extraction-image PRIVATE
     QCOPILOTS_SEARCH_TEST_JPEG_PROBE_PATH="$<TARGET_FILE:qcopilots-search-tests-jpeg-probe>"

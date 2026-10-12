@@ -182,6 +182,7 @@ function(qcopilots_search_add_ocr_dependencies)
     set(CMAKE_DISABLE_FIND_PACKAGE_PkgConfig TRUE)
     add_subdirectory("${qcopilots_search_leptonica_SOURCE_DIR}"
                      "${qcopilots_search_leptonica_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    qcopilots_search_add_jpeg_contract(leptonica)
     # Expose only the generated public header. The private config_auto.h has
     # the same basename as Tesseract's and must not shadow its configuration.
     set(leptonica_public_config_dir "${qcopilots_search_leptonica_BINARY_DIR}/qcopilots-search-include")

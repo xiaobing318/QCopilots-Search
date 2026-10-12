@@ -1,5 +1,17 @@
 include_guard(GLOBAL)
 
+function(qcopilots_search_add_jpeg_contract target)
+    # A source outside a dependency's source/build trees becomes an absolute
+    # object name. MSVC's link response file can misread its Unicode prefix.
+    # Keep this translation unit in each consumer's own binary directory while
+    # retaining that consumer's actual JPEG include search order.
+    get_target_property(consumer_binary "${target}" BINARY_DIR)
+    set(contract "${consumer_binary}/qcopilots-search-contracts/${target}/qcopilots-search-jpeg-contract.c")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcopilots-search-jpeg-contract.c"
+                   "${contract}" COPYONLY)
+    target_sources("${target}" PRIVATE "${contract}")
+endfunction()
+
 function(qcopilots_search_add_image_codec_dependencies)
     if(TARGET qcopilots-search::zlib AND TARGET qcopilots-search::jpeg)
         return()
@@ -122,9 +134,6 @@ function(qcopilots_search_add_image_codec_dependencies)
     set_target_properties(qcopilots-search-native-jpeg PROPERTIES
         SYSTEM FALSE
         INTERFACE_INCLUDE_DIRECTORIES "${jpeg_include}"
-        # Compile the ABI contract with each actual consumer's include search
-        # path, including C consumers such as Leptonica, without forced headers.
-        INTERFACE_SOURCES "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcopilots-search-jpeg-contract.c"
         IMPORTED_LOCATION "${jpeg_stage}/Release/${jpeg_runtime}")
     if(WIN32)
         set_target_properties(qcopilots-search-native-jpeg PROPERTIES
@@ -286,6 +295,7 @@ function(qcopilots_search_add_image_dependencies)
         USE_JPEG USE_JPEG8 USE_ZLIB)
     target_link_libraries(qcopilots-search-libraw PRIVATE
         Threads::Threads JPEG::JPEG ZLIB::ZLIB)
+    qcopilots_search_add_jpeg_contract(qcopilots-search-libraw)
     target_include_directories(qcopilots-search-libraw PUBLIC
         "$<BUILD_INTERFACE:${qcopilots_search_libraw_SOURCE_DIR}>"
         "$<INSTALL_INTERFACE:include>"
