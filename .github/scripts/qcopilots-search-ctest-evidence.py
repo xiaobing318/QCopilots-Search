@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 from pathlib import Path
 import re
@@ -14,6 +15,7 @@ NON_QT_TESTS = {
     "qcopilots-search-tests-semantic",
     "qcopilots-search-tests-workflow",
     "qcopilots-search-tests-inference-install-layout",
+    "qcopilots-search-tests-macos-signing",
 }
 TOTALS = re.compile(r"^Totals:\s+(\d+) passed,\s+(\d+) failed,\s+(\d+) skipped,\s+(\d+) blacklisted", re.MULTILINE)
 SKIP = re.compile(r"^SKIP\s*:\s*(\S+)\s+(.*)$", re.MULTILINE)
@@ -26,11 +28,69 @@ PLATFORM_EXCLUSIONS = {
      "IndexRepositoryRegressionTest::rootFilterRespectsCaseSensitivePlatformKeys()"):
         "Non-Windows path keys are case-sensitive. Windows intentionally folds path keys.",
 }
+SIGNING_TEST = "qcopilots-search-tests-macos-signing"
+SIGNING_WINDOWS_SKIP_REASON = "Windows lacks symbolic-link creation privilege (WinError 1314). Native CI must run this case."
+SIGNING_WINDOWS_SKIPS = {
+    "__main__.SigningTests." + name for name in (
+        "test_directory_symlink_is_not_recursed", "test_external_directory_symlink_is_rejected",
+        "test_external_file_symlink_is_rejected", "test_internal_library_symlink_is_not_signed_twice")
+}
+UNITTEST_CASE = re.compile(r"^(test\S+) \((\S+)\) \.\.\. (ok|FAIL|ERROR|expected failure|unexpected success|skipped [^\r\n]*)\r?$", re.MULTILINE)
+UNITTEST_TOTAL = re.compile(r"^Ran (\d+) tests? in [\d.]+s\r?$", re.MULTILINE)
+UNITTEST_RESULT = re.compile(r"^(OK(?: \(skipped=\d+\))?|FAILED(?: \([^\r\n]*\))?)\r?$", re.MULTILINE)
+
+
+def inspect_signing_unittest(output, operating_system):
+    errors, records, skips = [], [], []
+    counts = {"run": 0, "passed": 0, "failed": 0, "skipped": 0, "notApplicable": 0}
+    for method, identifier, status in UNITTEST_CASE.findall(output):
+        record = {"case": identifier, "status": status}
+        records.append(record)
+        if not identifier.endswith("." + method):
+            errors.append("Python unittest method and case identity disagree")
+        if status == "ok":
+            counts["passed"] += 1
+        elif status.startswith("skipped "):
+            counts["skipped"] += 1
+            try:
+                reason = ast.literal_eval(status.removeprefix("skipped "))
+                if not isinstance(reason, str):
+                    raise ValueError("Skip reason is not text")
+            except (ValueError, SyntaxError):
+                reason = status.removeprefix("skipped ")
+                errors.append("Python unittest skip reason is malformed")
+            applicable = (operating_system == "Windows" and identifier in SIGNING_WINDOWS_SKIPS
+                          and reason == SIGNING_WINDOWS_SKIP_REASON)
+            entry = {"program": SIGNING_TEST, "case": identifier, "reason": reason,
+                     "classification": "notApplicable" if applicable else "requiredNotRun"}
+            skips.append(entry)
+            record["reason"] = reason
+            record["classification"] = entry["classification"]
+            if applicable:
+                counts["notApplicable"] += 1
+            else:
+                errors.append(f"Required Python unittest case did not run: {identifier}")
+        else:
+            counts["failed"] += 1
+    totals, conclusions = UNITTEST_TOTAL.findall(output), UNITTEST_RESULT.findall(output)
+    if len(totals) != 1 or int(totals[0]) != len(records):
+        errors.append("Python unittest total does not match complete individual case records")
+    counts["run"] = int(totals[0]) if len(totals) == 1 else len(records)
+    identifiers = [record["case"] for record in records]
+    if len(set(identifiers)) != len(identifiers):
+        errors.append("Python unittest contains duplicate case records")
+    expected_conclusion = f"OK (skipped={counts['skipped']})" if counts["skipped"] else "OK"
+    if conclusions != [expected_conclusion] or counts["failed"]:
+        errors.append("Python unittest conclusion or skipped total disagrees with successful case records")
+    if counts["passed"] + counts["failed"] == 0:
+        errors.append("Python unittest report contains no executed cases")
+    return counts, records, skips, errors
 
 
 def inspect_junit(path: Path, operating_system: str, inventory: Path | None = None) -> dict:
     document = {"schemaVersion": 1, "platform": operating_system, "source": str(path),
-                "releaseComplete": False, "ctestPrograms": [], "qtTestSkips": [],
+                "releaseComplete": False, "ctestPrograms": [], "qtTestSkips": [], "pythonTestSkips": [],
+                "pythonTestTotals": {"run": 0, "passed": 0, "failed": 0, "skipped": 0, "notApplicable": 0},
                 "inventoryVerified": False, "expectedPrograms": [],
                 "errors": [], "qtTestTotals": {"passed": 0, "failed": 0,
                     "skipped": 0, "blacklisted": 0, "notApplicable": 0}}
@@ -78,7 +138,7 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
             errors.append("CTest truncated captured output, so individual case evidence is incomplete")
         totals = [tuple(map(int, match)) for match in TOTALS.findall(output)]
         skips = SKIP.findall(output)
-        is_qt_test = name not in NON_QT_TESTS or "Start testing of " in output
+        is_qt_test = name != SIGNING_TEST and (name not in NON_QT_TESTS or "Start testing of " in output)
         summary = {"name": name, "qtTest": is_qt_test, "errors": errors}
         if is_qt_test:
             if not totals:
@@ -115,6 +175,15 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
                     document["qtTestTotals"]["notApplicable"] += 1
                 else:
                     errors.append(f"Required QtTest case did not run: {identifier}")
+        elif name == SIGNING_TEST:
+            counts, records, python_skips, python_errors = inspect_signing_unittest(output, operating_system)
+            summary.update({"pythonTest": True, "pythonTestTotals": counts, "cases": records})
+            errors.extend(python_errors)
+            document["pythonTestSkips"].extend(python_skips)
+            for key, value in counts.items():
+                document["pythonTestTotals"][key] += value
+            if totals or skips:
+                errors.append("Unexpected QtTest output in the Python signing test")
         elif totals or skips:
             errors.append("Unexpected QtTest output in a non-QtTest program")
         document["ctestPrograms"].append(summary)

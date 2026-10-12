@@ -1,5 +1,19 @@
 include_guard(GLOBAL)
 
+function(qcopilots_search_sign_macos_bundle bundle python helper report identity entitlements_map)
+    set(arguments "${python}" -B "${helper}" --bundle "${bundle}"
+        "--identity=${identity}" --report "${report}")
+    if(NOT entitlements_map STREQUAL "")
+        list(APPEND arguments --entitlements-map "${entitlements_map}")
+    endif()
+    execute_process(COMMAND ${arguments} RESULT_VARIABLE signing_result
+        OUTPUT_VARIABLE signing_output ERROR_VARIABLE signing_errors)
+    message("${signing_output}")
+    if(NOT signing_result STREQUAL "0")
+        message(FATAL_ERROR "Final bundle signing failed: ${signing_errors}")
+    endif()
+endfunction()
+
 function(qcopilots_search_verify_deploy_rpath binary library_directory)
     find_program(QCOPILOTS_SEARCH_OTOOL otool REQUIRED)
     execute_process(COMMAND "${QCOPILOTS_SEARCH_OTOOL}" -l "${binary}"

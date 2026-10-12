@@ -58,12 +58,25 @@ if(TARGET qcopilots-search AND QCOPILOTS_SEARCH_DEPLOY_QT)
     endif()
   endforeach()
   if(APPLE)
+    find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+    set(QCOPILOTS_SEARCH_MACOS_CODESIGN_IDENTITY "-" CACHE STRING
+      "macOS signing identity, '-' for ad-hoc or an explicit certificate identity")
+    set(QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP "" CACHE FILEPATH
+      "Optional JSON mapping of bundle-relative executable paths to entitlement plist files")
+    if(QCOPILOTS_SEARCH_MACOS_CODESIGN_IDENTITY STREQUAL "")
+      message(FATAL_ERROR "A macOS signing identity must be explicitly selected")
+    endif()
+    set(_qcopilots_identity "${QCOPILOTS_SEARCH_MACOS_CODESIGN_IDENTITY}")
+    string(REPLACE "\\" "\\\\" _qcopilots_identity "${_qcopilots_identity}")
+    string(REPLACE "\"" "\\\"" _qcopilots_identity "${_qcopilots_identity}")
+    string(REPLACE "$" "\\$" _qcopilots_identity "${_qcopilots_identity}")
+    set(_qcopilots_runtime_options "DEPLOY_TOOL_OPTIONS -no-codesign")
     set(_qcopilots_deploy_executable "qcopilots-search.app")
     # Imported library SONAME metadata gives each source library its correct
     # build rpaths. macdeployqt then resolves those libraries and removes the
-    # paths before signing. No executable-only temporary path is injected.
+    # paths before the final inventory-based signing pass.
     set(_qcopilots_deploy_prepare "include(\"${CMAKE_CURRENT_LIST_DIR}/QCopilotsSearchCheckedDeploy.cmake\")\n")
-    set(_qcopilots_deploy_finish "\nqcopilots_search_verify_deploy_rpath(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app/Contents/MacOS/qcopilots-search\" \"$<TARGET_FILE_DIR:qcopilots-search-native-jpeg>\")\nqcopilots_search_verify_bundle_signature(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\")\n")
+    set(_qcopilots_deploy_finish "\nqcopilots_search_verify_deploy_rpath(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app/Contents/MacOS/qcopilots-search\" \"$<TARGET_FILE_DIR:qcopilots-search-native-jpeg>\")\nqcopilots_search_sign_macos_bundle(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\" \"${Python3_EXECUTABLE}\" \"${PROJECT_SOURCE_DIR}/tools/qcopilots-search-sign-macos.py\" \"${CMAKE_BINARY_DIR}/../reports/qcopilots-search-macos-signing-$<CONFIG>.json\" \"${_qcopilots_identity}\" \"${QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP}\")\nqcopilots_search_verify_bundle_signature(\"\${QT_DEPLOY_PREFIX}/qcopilots-search.app\")\n")
   else()
     set(_qcopilots_deploy_executable "$<TARGET_FILE:qcopilots-search>")
     set(_qcopilots_deploy_prepare "")
@@ -94,7 +107,7 @@ if(EXISTS "${PROJECT_SOURCE_DIR}/third_party")
 endif()
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/docs/" DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/qcopilots-search")
 if(APPLE AND DEFINED _qcopilots_checked_deploy)
-  # macdeployqt signs the finished bundle, including its resource manifest.
+  # Deploy and sign only after every program and resource has been installed.
   install(CODE "${_qcopilots_checked_deploy}")
 endif()
 set(CPACK_PACKAGE_NAME "qcopilots-search")
@@ -109,7 +122,7 @@ set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/../packages")
 set(CPACK_PACKAGE_FILE_NAME "qcopilots-search-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_STRIP_FILES TRUE)
 if(APPLE)
-  # macdeployqt strips before ad-hoc signing. Never strip signed Mach-O again.
+  # Qt strips before the final signing pass. Never strip signed Mach-O again.
   set(CPACK_STRIP_FILES FALSE)
 endif()
 set(CPACK_PROJECT_CONFIG_FILE "${PROJECT_SOURCE_DIR}/cmake/QCopilotsSearchCPackConfig.cmake")

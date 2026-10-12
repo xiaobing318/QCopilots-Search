@@ -558,6 +558,87 @@ private slots:
         QVERIFY(!QFileInfo::exists(oldFile));
     }
 
+    void buildObserversDescribeOnlyActualGraphConstruction()
+    {
+        QTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        QStringList observed;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) {
+            observed.append(point);
+        });
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, {{16, basis(0)}, {32, basis(1)}}, &error), qPrintable(error));
+        QCOMPARE(observed, QStringList({QStringLiteral("ann-build-started"),
+                                       QStringLiteral("ann-build-completed"),
+                                       QStringLiteral("ann-file-saved-before-manifest")}));
+        const auto matches = index.search(index.snapshot(), basis(0), 2, nullptr, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(matches.size(), qsizetype(2));
+        QCOMPARE(matches.first().id, qint64(16));
+
+        observed.clear();
+        QVERIFY(!index.rebuildShard(0, 1, {{48, basis(2)}}, &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(observed.isEmpty());
+        QVERIFY2(index.rebuildShard(0, 2, {}, &error), qPrintable(error));
+        QVERIFY(observed.isEmpty());
+        QCOMPARE(index.snapshot()->size(), qsizetype(0));
+        QVERIFY2(index.loadManifest(&error), qPrintable(error));
+        QVERIFY(observed.isEmpty());
+    }
+
+    void failedBuildDoesNotEmitCompletion()
+    {
+        QTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        QStringList observed;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) {
+            observed.append(point);
+        });
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, {{16, basis(0)}}, &error), qPrintable(error));
+        const auto originalFiles = filesBelow(temporary.path());
+        observed.clear();
+        // One point is inserted before the second record fails validation.
+        QVERIFY(!index.rebuildShard(0, 2, {{32, basis(1)}, {48, QVector<float>(4, 0.0f)}}, &error));
+        QVERIFY(!error.isEmpty());
+        QCOMPARE(observed, QStringList({QStringLiteral("ann-build-started")}));
+        QCOMPARE(index.snapshot()->generation(), quint64(1));
+        QCOMPARE(filesBelow(temporary.path()), originalFiles);
+    }
+
+    void buildObserverExceptionsDoNotPublishOrLeak()
+    {
+        QTemporaryDir temporary(temporaryTemplate());
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.errorString()));
+        QString failurePoint;
+        QStringList observed;
+        VectorIndex index(temporary.path(), 4, [&](const QString &point) {
+            observed.append(point);
+            if (point == failurePoint)
+                throw std::runtime_error("Injected build observer failure");
+        });
+        QString error;
+        QVERIFY2(index.rebuildShard(0, 1, {{16, basis(0)}}, &error), qPrintable(error));
+        const auto originalFiles = filesBelow(temporary.path());
+        for (const auto &point : {QStringLiteral("ann-build-started"), QStringLiteral("ann-build-completed")}) {
+            failurePoint = point;
+            observed.clear();
+            QVERIFY(!index.rebuildShard(0, 2, {{32, basis(1)}}, &error));
+            QVERIFY(error.contains(QStringLiteral("Injected build observer failure")));
+            QCOMPARE(observed.first(), QStringLiteral("ann-build-started"));
+            QCOMPARE(observed.last(), failurePoint);
+            QCOMPARE(observed.count(QStringLiteral("ann-build-completed")),
+                     failurePoint == QStringLiteral("ann-build-completed") ? 1 : 0);
+            QVERIFY(!observed.contains(QStringLiteral("ann-file-saved-before-manifest")));
+            QCOMPARE(index.snapshot()->generation(), quint64(1));
+            QCOMPARE(filesBelow(temporary.path()), originalFiles);
+        }
+        failurePoint.clear();
+        QVERIFY2(index.rebuildShard(0, 2, {{32, basis(1)}}, &error), qPrintable(error));
+        QCOMPARE(index.search(index.snapshot(), basis(1), 1).first().id, qint64(32));
+    }
+
     void exceptionBeforeManifestDoesNotPublishOrLeak()
     {
         QTemporaryDir temporary(temporaryTemplate());
@@ -565,7 +646,7 @@ private slots:
         bool inject = false;
         QString faultPoint;
         VectorIndex index(temporary.path(), 4, [&](const QString &point) {
-            if (inject) {
+            if (inject && point == QStringLiteral("ann-file-saved-before-manifest")) {
                 faultPoint = point;
                 throw std::runtime_error("Injected pre-manifest failure");
             }

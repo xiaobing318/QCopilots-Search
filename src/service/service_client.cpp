@@ -2,6 +2,7 @@
 
 #include "core/types.h"
 #include "ipc_protocol.h"
+#include "ipc_security.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -106,6 +107,15 @@ void ServiceClient::attemptConnection()
     intentionalDisconnect_ = false;
     incoming_.clear();
     token_.clear();
+    QString error;
+    if (!paths_.validateIpcDirectory(&error)) {
+        lastConnectionError_ = error;
+        connectionDeadline_.stop();
+        retryTimer_.stop();
+        ensureMode_ = false;
+        failPending(QStringLiteral("ipc_directory_unavailable"), error);
+        return;
+    }
     socket_.connectToServer(paths_.ipcName, QIODevice::ReadWrite);
 }
 
@@ -142,6 +152,17 @@ bool ServiceClient::readToken(QString *error)
 void ServiceClient::socketConnected()
 {
     QString error;
+    if (!ipcPeerIsCurrentUser(socket_.socketDescriptor(), &error)) {
+        lastConnectionError_ = error;
+        connectionDeadline_.stop();
+        retryTimer_.stop();
+        ensureMode_ = false;
+        intentionalDisconnect_ = true;
+        socket_.abort();
+        intentionalDisconnect_ = false;
+        failPending(QStringLiteral("peer_identity_mismatch"), error);
+        return;
+    }
     if (!readToken(&error)) {
         lastConnectionError_ = error;
         intentionalDisconnect_ = true;

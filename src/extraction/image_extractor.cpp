@@ -55,6 +55,40 @@ QImage opaqueOnWhite(const QImage &source)
     return image;
 }
 
+bool largeSingleLine(const QImage &image)
+{
+    // Restrict the scale retry to one horizontal ink band. Its geometry is
+    // independent of OCR confidence, which can be high for a wrong CJK glyph.
+    // Separate lines/columns retain the normal automatic-page-layout path.
+    int top = -1, bottom = -1, left = image.width(), right = -1;
+    int gap = 0;
+    qint64 inkPixels = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        const auto *row = image.constScanLine(y);
+        int count = 0, rowLeft = image.width(), rowRight = -1;
+        for (int x = 0; x < image.width(); ++x) {
+            if (row[x] < 128) { ++count; rowLeft = qMin(rowLeft, x); rowRight = x; }
+        }
+        if (count < 3) { if (top >= 0) ++gap; continue; }
+        if (top < 0) top = y;
+        else if (gap > 2) return false;
+        gap = 0; bottom = y;
+        inkPixels += count;
+        left = qMin(left, rowLeft); right = qMax(right, rowRight);
+    }
+    const int height = bottom - top + 1;
+    const int width = right - left + 1;
+    return top >= 0 && height >= 64 && width >= 2 * height && 2 * inkPixels < qint64(width) * height;
+}
+
+QString lettersAndNumbers(const QString &text)
+{
+    QString result;
+    for (const char32_t character : text.toUcs4())
+        if (QChar::isLetterOrNumber(character)) result += QString::fromUcs4(&character, 1);
+    return result;
+}
+
 bool meaningfulNativePdfText(const QString &text)
 {
     int letters = 0;
@@ -172,23 +206,25 @@ QImage decodeRaw(const QString &path, QString *error, const ExtractionOptions *o
 {
     QByteArray bytes = readBoundedImage(path, error);
     if (bytes.isEmpty()) return {};
-    LibRaw decoder;
-    if (options) decoder.set_progress_handler([](void *context, LibRaw_progress, int, int) {
+    // LibRaw embeds hundreds of KiB of decoder state. macOS worker threads may
+    // have only a 512 KiB stack, even when this branch is inlined with PNG code.
+    auto decoder = std::make_unique<LibRaw>();
+    if (options) decoder->set_progress_handler([](void *context, LibRaw_progress, int, int) {
         return cancelled(*static_cast<const ExtractionOptions *>(context)) ? 1 : 0;
     }, const_cast<ExtractionOptions *>(options));
-    decoder.imgdata.params.half_size = 1;
-    decoder.imgdata.params.output_bps = 8;
-    decoder.imgdata.params.output_color = 1;
-    decoder.imgdata.params.use_camera_wb = 1;
-    int status = decoder.open_buffer(bytes.data(), size_t(bytes.size()));
+    decoder->imgdata.params.half_size = 1;
+    decoder->imgdata.params.output_bps = 8;
+    decoder->imgdata.params.output_color = 1;
+    decoder->imgdata.params.use_camera_wb = 1;
+    int status = decoder->open_buffer(bytes.data(), size_t(bytes.size()));
     if (status != LIBRAW_SUCCESS) { *error = QString::fromLatin1(libraw_strerror(status)); return {}; }
-    if (qint64(decoder.imgdata.sizes.raw_width) * decoder.imgdata.sizes.raw_height > pixelLimit) {
+    if (qint64(decoder->imgdata.sizes.raw_width) * decoder->imgdata.sizes.raw_height > pixelLimit) {
         *error = QStringLiteral("RAW dimensions exceed the decoder limit"); return {};
     }
-    status = decoder.unpack();
-    if (status == LIBRAW_SUCCESS) status = decoder.dcraw_process();
+    status = decoder->unpack();
+    if (status == LIBRAW_SUCCESS) status = decoder->dcraw_process();
     if (status != LIBRAW_SUCCESS) { *error = QString::fromLatin1(libraw_strerror(status)); return {}; }
-    libraw_processed_image_t *rawImage = decoder.dcraw_make_mem_image(&status);
+    libraw_processed_image_t *rawImage = decoder->dcraw_make_mem_image(&status);
     std::unique_ptr<libraw_processed_image_t, decltype(&LibRaw::dcraw_clear_mem)> image(rawImage, &LibRaw::dcraw_clear_mem);
     if (!image || status != LIBRAW_SUCCESS) { *error = QString::fromLatin1(libraw_strerror(status)); return {}; }
     if (image->type != LIBRAW_IMAGE_BITMAP || image->bits != 8 || image->colors != 3
@@ -331,24 +367,32 @@ QString recognizeText(const QImage &source, const ExtractionOptions &options, QS
     QString text;
     int confidence = 0;
     if (!recognize(image, tesseract::PSM_AUTO, &text, &confidence)) return {};
+    const bool largeLine = largeSingleLine(image);
     // Automatic page layout can mistake a short CJK sign for Latin fragments
     // or discard it entirely. A bounded block-layout retry recovers those
     // images without changing confident recognition of multi-column pages.
-    if (text.isEmpty() || confidence < 70) {
+    if (text.isEmpty() || confidence < 70 || largeLine) {
         QString alternative;
         int alternativeConfidence = 0;
         if (!recognize(image, tesseract::PSM_SINGLE_BLOCK, &alternative, &alternativeConfidence)) return {};
         if (!alternative.isEmpty() && (text.isEmpty() || alternativeConfidence > confidence)) {
             text = alternative; confidence = alternativeConfidence;
         }
-        // Large glyphs can still normalize poorly in the LSTM recognizer.
-        // Try one smaller scale only while the best result remains uncertain.
-        if ((text.isEmpty() || confidence < 70) && qMin(image.width(), image.height()) >= 64) {
+        // Large glyphs can still normalize poorly with high LSTM confidence.
+        // A confirmed single large ink band gets the same bounded scale retry
+        // as an uncertain result. Multiple rows keep automatic page layout.
+        if ((text.isEmpty() || confidence < 70 || largeLine) && qMin(image.width(), image.height()) >= 64) {
             const QImage smaller = image.scaled(qMax(1, image.width() / 2), qMax(1, image.height() / 2),
                 Qt::KeepAspectRatio, Qt::SmoothTransformation);
             if (smaller.isNull()) { *error = QStringLiteral("Cannot allocate OCR retry image"); return {}; }
             if (!recognize(smaller, tesseract::PSM_SINGLE_BLOCK, &alternative, &alternativeConfidence)) return {};
-            if (!alternative.isEmpty() && (text.isEmpty() || alternativeConfidence > confidence)) text = alternative;
+            const auto currentLetters = lettersAndNumbers(text);
+            const auto alternativeLetters = lettersAndNumbers(alternative);
+            const bool completesCurrentLine = largeLine && alternativeConfidence == confidence
+                && !currentLetters.isEmpty() && alternativeLetters.size() > currentLetters.size()
+                && alternativeLetters.contains(currentLetters);
+            if (!alternative.isEmpty() && (text.isEmpty() || alternativeConfidence > confidence || completesCurrentLine))
+                text = alternative;
         }
     }
     return text;
@@ -418,7 +462,10 @@ ExtractionResult extractPdf(const QString &path, const ExtractionOptions &option
         segment.imageBudget = 280;
         segment.page = index + 1;
         segment.title = title;
-        segment.text = document.getAllText(index).text().trimmed();
+        // PDF font ToUnicode tables can map visible CJK letters to compatibility
+        // radicals (for example U+2F4A instead of 木). Canonicalize these and
+        // ligatures before both semantic encoding and the short-page decision.
+        segment.text = document.getAllText(index).text().normalized(QString::NormalizationForm_KC).trimmed();
         segment.modality = QStringLiteral("text");
         if (segment.text.size() < 200 && !meaningfulNativePdfText(segment.text)) {
             const QSizeF points = document.pagePointSize(index);

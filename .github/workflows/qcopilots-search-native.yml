@@ -87,7 +87,7 @@ jobs:
             libglib2.0-dev libdbus-1-dev libx11-xcb-dev libxcb-cursor0 \
             libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
             libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxkbcommon-x11-0 \
-            xvfb xauth dpkg-dev patchelf fonts-noto-cjk fonts-dejavu-core
+            libpulse0 xvfb xauth dpkg-dev patchelf fonts-noto-cjk fonts-dejavu-core
       - name: Install macOS build tools
         if: runner.os == 'macOS'
         run: brew install ninja
@@ -141,6 +141,7 @@ jobs:
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/Testing/Temporary
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/CMakeFiles/CMakeConfigureLog.yaml
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/tests/**/qcopilots-search-tests-*.xml
+            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/test-runs/**/qcopilots-search-image-*/**
 
   required:
     name: qcopilots-search all native combinations

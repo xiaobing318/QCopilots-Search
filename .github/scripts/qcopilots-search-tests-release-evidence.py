@@ -33,6 +33,19 @@ def capacity_fixture():
               "generation": 11, "pendingShards": 0, "segments": 10000,
               "vectors": 10000, "recoveryWarning": "", "maintenanceWarning": "",
               "schemaVersion": 2, "pipelineFingerprint": "synthetic-capacity-768-v1"}
+    faults = []
+    for i, name in enumerate(("committed-before-ann", "uncommitted-sqlite",
+                             "ann-file-saved-before-manifest", "ann-manifest-published-before-outbox-cleanup")):
+        version = 0 if i == 1 else i
+        faults.append({"faultPoint": name, "childExitCode": 73, "passed": True,
+                       "expectedVersion": f"validator-version-{version}", "observedVersion": f"validator-version-{version}",
+                       "expectedToken": f"validator-token-{version}", "observedToken": f"validator-token-{version}",
+                       "expectedVectorDimension": 700 + version, "observedVectorDimension": 700 + version,
+                       "observedVectorCosine": 1.0, "vectorMatched": True,
+                       "previousSegmentId": (0, 1, 1, 2)[i], "observedSegmentId": (1, 1, 2, 3)[i],
+                       "staleVersionHits": 0, "oldKeywordHits": 0, "uncommittedCorruptionRows": 0})
+    faults[-1].update(injectedSameShardEvents=2048, postRecoveryWritePassed=True,
+                      postRecoveryWriteMilliseconds=10, stalePublishedOutboxEvents=0)
     return {
         "formatVersion": 1, "benchmark": "synthetic-capacity", "passed": True,
         "dimensions": 768, "segments": 10000, "files": 1000,
@@ -58,22 +71,31 @@ def capacity_fixture():
                     for percent, rows in ((10, 1000), (1, 100), (0.1, 10))],
         "filtersPassed": True, "unfilteredHundredPercentCoveredByBaseline": True,
         "concurrentRebuildEvaluated": True,
-        "concurrentRebuild": {"overlappingQueries": 1, "p50Milliseconds": 100.0,
-                              "p95Milliseconds": 100.0, "p99Milliseconds": 100.0,
+        "concurrentRebuild": {"overlappingQueries": 2, "p50Milliseconds": 100.0,
+                              "p95Milliseconds": 200.0, "p99Milliseconds": 200.0,
                               "passed": True, "rebuildMilliseconds": 200,
-                              "singleShard": True},
+                              "singleShard": True, "timingClock": "steady-clock-relative-nanoseconds",
+                              "observedBuilds": 1, "measuredQueries": 3,
+                              "buildIntervals": [{"startNanoseconds": 100000000, "endNanoseconds": 300000000}],
+                              "queryIntervals": [{"startNanoseconds": start, "endNanoseconds": end,
+                                                   "durationMilliseconds": (end - start) / 1000000,
+                                                   "overlapsBuild": overlap}
+                                                  for start, end, overlap in ((0, 100000000, False),
+                                                      (100000000, 200000000, True), (200000000, 400000000, True))]},
         "mutations": {"filesPerPhase": 1000, "vectorsPerPhase": 10000,
                       "passed": True, "addMilliseconds": 10, "updateMilliseconds": 10,
-                      "deleteMilliseconds": 10},
+                      "deleteMilliseconds": 10, "queryScope": "filtered-exact-file-plus-global-production-search-sample",
+                      "phases": [{"phase": phase, "passed": True, "filesChecked": 1000,
+                                  "keywordQueries": 1000, "vectorQueries": 1000, "staleHitCount": 0,
+                                  "retiredSegmentIdsChecked": 0 if phase == "add" else 10000,
+                                  "retiredSegmentIdsRemaining": 0, "globalSearchQueries": 16,
+                                  "globalSearchCheckedHits": 1, "globalSearchStaleHitCount": 0,
+                                  "globalSearchVectorCount": 10000 if phase == "delete" else 20000,
+                                  "globalSearchBackend": "exact-subset"}
+                                 for phase in ("add", "update", "delete")]},
         "recoveryFaultInjectionEvaluated": True, "annManifestInterruptionEvaluated": True,
         "publishedManifestOutboxInterruptionEvaluated": True,
-        "recoveryFaults": [{"faultPoint": name, "childExitCode": 73, "passed": True}
-                           for name in ("committed-before-ann", "uncommitted-sqlite",
-                                        "ann-file-saved-before-manifest")]
-                          + [{"faultPoint": "ann-manifest-published-before-outbox-cleanup",
-                              "childExitCode": 73, "passed": True,
-                              "injectedSameShardEvents": 2048, "postRecoveryWritePassed": True,
-                              "postRecoveryWriteMilliseconds": 10, "stalePublishedOutboxEvents": 0}],
+        "recoveryFaults": faults,
         "minimumFreeBytes": 3 * 1024**3, "minimumObservedFreeBytes": 5 * 1024**3,
         "directoryBudgetBytes": 7 * 1024**3, "sampledDirectoryPeakBytes": 100 * 1024**2,
         "projectedBytesIncludingTenPercentHeadroom": 110 * 1024**2,
@@ -183,6 +205,102 @@ class CapacityEvidenceTests(unittest.TestCase):
         doc = capacity_fixture()
         doc["concurrentRebuild"]["overlappingQueries"] = 0
         self.assertTrue(self.inspect(doc))
+
+    def test_reported_overlap_requires_real_interval_intersection(self):
+        doc = capacity_fixture()
+        doc["concurrentRebuild"]["buildIntervals"] = [{"startNanoseconds": 500000000, "endNanoseconds": 700000000}]
+        self.assertTrue(self.inspect(doc))
+
+    def test_concurrent_percentiles_and_durations_must_match_raw_intervals(self):
+        for field in ("p50Milliseconds", "p95Milliseconds", "p99Milliseconds"):
+            doc = capacity_fixture()
+            doc["concurrentRebuild"][field] = 150.0
+            self.assertTrue(self.inspect(doc))
+        doc = capacity_fixture()
+        doc["concurrentRebuild"]["queryIntervals"][1]["durationMilliseconds"] = 50.0
+        self.assertTrue(self.inspect(doc))
+
+    def test_concurrent_build_count_and_interval_boundary_are_enforced(self):
+        doc = capacity_fixture()
+        doc["concurrentRebuild"]["buildIntervals"] *= 2
+        doc["concurrentRebuild"]["observedBuilds"] = 2
+        self.assertTrue(self.inspect(doc))
+        doc = capacity_fixture()
+        doc["concurrentRebuild"]["queryIntervals"][0]["overlapsBuild"] = True
+        self.assertTrue(self.inspect(doc))
+
+    def test_mutation_phases_require_full_queries_and_retired_id_checks(self):
+        for phase in range(3):
+            for field, value in (("filesChecked", 999), ("keywordQueries", 999), ("vectorQueries", 999),
+                                 ("globalSearchQueries", 15), ("globalSearchCheckedHits", 0), ("staleHitCount", 1),
+                                 ("retiredSegmentIdsRemaining", 1), ("globalSearchStaleHitCount", 1),
+                                 ("retiredSegmentIdsChecked", 1 if phase == 0 else 9999)):
+                with self.subTest(phase=phase, field=field):
+                    doc = capacity_fixture()
+                    doc["mutations"]["phases"][phase][field] = value
+                    self.assertTrue(self.inspect(doc))
+        doc = capacity_fixture()
+        doc["mutations"]["phases"][1] = deepcopy(doc["mutations"]["phases"][0])
+        self.assertTrue(self.inspect(doc))
+
+    def test_small_global_search_cannot_claim_ann_at_or_below_20000_vectors(self):
+        for phase in range(3):
+            doc = capacity_fixture()
+            doc["mutations"]["phases"][phase]["globalSearchBackend"] = "ann"
+            self.assertTrue(self.inspect(doc))
+
+    def test_large_global_search_requires_ann_for_every_mutation_phase(self):
+        doc = capacity_fixture()
+        doc.update(segments=30000, files=3000, oracleRows=30000)
+        for name in ("builtStatus", "reopenedStatus"):
+            doc[name].update(segments=30000, vectors=30000, annVectors=30000, files=3000)
+        for filtered in doc["filters"]:
+            filtered["corpusFiles"] = 3000
+            filtered["oracleRows"] *= 3
+        for phase in doc["mutations"]["phases"]:
+            phase["globalSearchVectorCount"] = 30000 if phase["phase"] == "delete" else 40000
+            phase["globalSearchBackend"] = "ann"
+        self.assertEqual(self.inspect(doc), [])
+        for phase in range(3):
+            incorrect = deepcopy(doc)
+            incorrect["mutations"]["phases"][phase]["globalSearchBackend"] = "exact-subset"
+            self.assertTrue(self.inspect(incorrect))
+
+    def test_global_search_vector_count_must_match_committed_phase(self):
+        for phase in range(3):
+            doc = capacity_fixture()
+            doc["mutations"]["phases"][phase]["globalSearchVectorCount"] -= 1
+            self.assertTrue(self.inspect(doc))
+
+    def test_recovery_requires_distinct_committed_versions_and_tokens(self):
+        for key in ("Version", "Token"):
+            doc = capacity_fixture()
+            for prefix in ("expected", "observed"):
+                doc["recoveryFaults"][2][prefix + key] = doc["recoveryFaults"][0][prefix + key]
+            self.assertTrue(self.inspect(doc))
+
+    def test_recovery_rejects_old_or_broken_segment_identity_chain(self):
+        for phase, field, value in ((0, "previousSegmentId", 1), (2, "observedSegmentId", 1),
+                                    (3, "previousSegmentId", 1), (1, "observedSegmentId", 2)):
+            doc = capacity_fixture()
+            doc["recoveryFaults"][phase][field] = value
+            self.assertTrue(self.inspect(doc))
+
+    def test_rollback_cannot_publish_uncommitted_values_or_leave_corruption(self):
+        for field in ("staleVersionHits", "oldKeywordHits", "uncommittedCorruptionRows"):
+            doc = capacity_fixture()
+            doc["recoveryFaults"][1][field] = 1
+            self.assertTrue(self.inspect(doc))
+        doc = capacity_fixture()
+        doc["recoveryFaults"][1].update(expectedVersion="uncommitted", observedVersion="uncommitted")
+        self.assertTrue(self.inspect(doc))
+
+    def test_recovery_vector_observation_must_match_expected_basis(self):
+        for field, value in (("observedVectorDimension", 701), ("observedVectorCosine", 0.998),
+                             ("observedVectorCosine", float("nan")), ("vectorMatched", False)):
+            doc = capacity_fixture()
+            doc["recoveryFaults"][0][field] = value
+            self.assertTrue(self.inspect(doc))
 
     def test_unexecuted_recovery_fault_rejected(self):
         doc = capacity_fixture()

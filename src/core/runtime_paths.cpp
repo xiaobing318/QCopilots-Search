@@ -1,4 +1,5 @@
 #include "runtime_paths.h"
+#include "ipc_directory.h"
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -12,6 +13,11 @@
 #include <windows.h>
 #include <sddl.h>
 #else
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 #endif
 
@@ -65,6 +71,82 @@ QString currentUserIdentity()
     return QString::number(static_cast<qulonglong>(geteuid()));
 #endif
 }
+
+#ifndef Q_OS_WIN
+bool checkIpcEndpoint(const QString &endpoint, QString *error)
+{
+    const sockaddr_un address{};
+    const QByteArray encoded = QFile::encodeName(endpoint);
+    // Qt reserves two bytes on Linux for abstract namespace compatibility,
+    // even though this application uses a filesystem socket on every Unix.
+#ifdef Q_OS_LINUX
+    constexpr int terminators = 2;
+#else
+    constexpr int terminators = 1;
+#endif
+    if (!QDir::isAbsolutePath(endpoint) || encoded.contains('\0')
+        || encoded.size() + terminators > qsizetype(sizeof(address.sun_path))) {
+        if (error) *error = QStringLiteral("Invalid local IPC endpoint (%1 encoded bytes): %2")
+            .arg(encoded.size()).arg(endpoint);
+        return false;
+    }
+    return true;
+}
+#endif
+}
+
+bool detail::preparePrivateIpcDirectory(const QString &directory, bool create, QString *error)
+{
+    if (error) error->clear();
+#ifdef Q_OS_WIN
+    Q_UNUSED(directory);
+    Q_UNUSED(create);
+    return true;
+#else
+    const QFileInfo target(directory);
+    if (!QDir::isAbsolutePath(directory) || target.fileName().isEmpty()
+        || target.fileName() == "." || target.fileName() == "..") {
+        if (error) *error = QStringLiteral("An absolute private IPC directory is required: %1").arg(directory);
+        return false;
+    }
+    // /tmp is a system symlink to /private/tmp on macOS. Resolve this parent,
+    // then open it without following a replacement final component.
+    const QString parentPath = QFileInfo(target.absolutePath()).canonicalFilePath();
+    const int parent = ::open(QFile::encodeName(parentPath).constData(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (parent < 0) {
+        if (error) *error = QStringLiteral("Cannot open IPC parent directory %1: %2")
+            .arg(target.absolutePath(), QString::fromLocal8Bit(std::strerror(errno)));
+        return false;
+    }
+    struct CloseDescriptor { int fd; ~CloseDescriptor() { ::close(fd); } } closeParent{parent};
+    struct stat parentState{};
+    if (::fstat(parent, &parentState) != 0 || !S_ISDIR(parentState.st_mode)
+        || (parentState.st_uid != 0 && parentState.st_uid != ::geteuid())
+        || ((parentState.st_mode & (S_IWGRP | S_IWOTH)) && !(parentState.st_mode & S_ISVTX))) {
+        if (error) *error = QStringLiteral("IPC parent must be owned by this user or root and protect directory entries: %1").arg(parentPath);
+        return false;
+    }
+    const auto name = QFile::encodeName(target.fileName());
+    if (create && ::mkdirat(parent, name.constData(), 0700) != 0 && errno != EEXIST) {
+        if (error) *error = QStringLiteral("Cannot create private IPC directory %1: %2")
+            .arg(directory, QString::fromLocal8Bit(std::strerror(errno)));
+        return false;
+    }
+    const int child = ::openat(parent, name.constData(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (child < 0) {
+        if (error) *error = QStringLiteral("Cannot open private IPC directory without following links %1: %2")
+            .arg(directory, QString::fromLocal8Bit(std::strerror(errno)));
+        return false;
+    }
+    CloseDescriptor closeChild{child};
+    struct stat state{};
+    if (::fstat(child, &state) != 0 || !S_ISDIR(state.st_mode)
+        || state.st_uid != ::geteuid() || (state.st_mode & 0777) != 0700) {
+        if (error) *error = QStringLiteral("Private IPC directory must belong to this user with permissions 0700: %1").arg(directory);
+        return false;
+    }
+    return true;
+#endif
 }
 
 RuntimePaths RuntimePaths::resolve(const QString &profile, const QString &models)
@@ -101,7 +183,35 @@ RuntimePaths RuntimePaths::resolve(const QString &profile, const QString &models
     paths.ipcName = QStringLiteral("qcopilots-search-")
         + QString::fromLatin1(QCryptographicHash::hash(identity, QCryptographicHash::Sha256)
                                  .toHex().left(40));
+#ifndef Q_OS_WIN
+    // Socket addresses have a much smaller byte budget than filesystem paths.
+    // Never derive this location from TMPDIR, the profile or the current cwd.
+    const QString ipcRoot = QStringLiteral("/tmp/qcopilots-search-%1").arg(currentUserIdentity());
+    paths.ipcName = QDir(ipcRoot).filePath(paths.ipcName);
+#endif
     return paths;
+}
+
+bool RuntimePaths::ensureIpcDirectory(QString *error) const
+{
+    if (error) error->clear();
+#ifdef Q_OS_WIN
+    return true;
+#else
+    return checkIpcEndpoint(ipcName, error)
+        && detail::preparePrivateIpcDirectory(QFileInfo(ipcName).absolutePath(), true, error);
+#endif
+}
+
+bool RuntimePaths::validateIpcDirectory(QString *error) const
+{
+    if (error) error->clear();
+#ifdef Q_OS_WIN
+    return true;
+#else
+    return checkIpcEndpoint(ipcName, error)
+        && detail::preparePrivateIpcDirectory(QFileInfo(ipcName).absolutePath(), false, error);
+#endif
 }
 
 bool RuntimePaths::ensure(QString *error) const
@@ -150,7 +260,7 @@ bool RuntimePaths::ensure(QString *error) const
             return false;
         }
     }
-    return true;
+    return ensureIpcDirectory(error);
 }
 
 QString RuntimePaths::databaseFile() const

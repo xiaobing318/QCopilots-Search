@@ -1,5 +1,6 @@
 #include "service_server.h"
 #include "ipc_protocol.h"
+#include "ipc_security.h"
 #include "core/app_settings.h"
 #include "core/file_catalog.h"
 #include "core/model_files.h"
@@ -165,6 +166,9 @@ public:
                 : QStringLiteral("Cannot acquire the profile lock (error %1): %2").arg(int(lock.error())).arg(paths.lockFile);
             return false;
         }
+        // Only the authoritative profile-lock holder may remove a stale socket.
+        // Reject symlinks and ordinary files instead of unlinking arbitrary data.
+        if (!removeStaleIpcSocket(paths, error)) { lock.unlock(); return false; }
         if (!repository.open(paths, error)) { lock.unlock(); return false; }
         if (!refreshModels(error)) { lock.unlock(); return false; }
         token.resize(32);
@@ -181,11 +185,10 @@ public:
             lock.unlock();
             return false;
         }
-        // QLockFile is authoritative. Only its holder may unlink a stale Unix socket.
-        QLocalServer::removeServer(paths.ipcName);
         server.setSocketOptions(QLocalServer::UserAccessOption);
         if (!server.listen(paths.ipcName)) {
-            if (error) *error = server.errorString();
+            if (error) *error = QStringLiteral("%1 (endpoint %2, %3 encoded bytes)")
+                .arg(server.errorString(), paths.ipcName).arg(QFile::encodeName(paths.ipcName).size());
             lock.unlock();
             return false;
         }
@@ -256,6 +259,11 @@ public:
     void accept() {
         while (auto *socket = server.nextPendingConnection()) {
             if (buffers.size() >= 32) { socket->abort(); socket->deleteLater(); continue; }
+            QString peerError;
+            if (!ipcPeerIsCurrentUser(socket->socketDescriptor(), &peerError)) {
+                log(peerError);
+                socket->abort(); socket->deleteLater(); continue;
+            }
             buffers.insert(socket, {});
             socket->setReadBufferSize(maxMessageBytes + 4);
             QObject::connect(socket, &QLocalSocket::readyRead, q, [this, socket] {

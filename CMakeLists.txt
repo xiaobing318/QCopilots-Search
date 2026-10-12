@@ -93,6 +93,11 @@ if(QCOPILOTS_SEARCH_BUILD_TESTS)
   set_tests_properties(qcopilots-search-tests-workflow PROPERTIES
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" LABELS "unit;portability;workflow"
     ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+  add_test(NAME qcopilots-search-tests-macos-signing COMMAND "${Python3_EXECUTABLE}" -B
+    "${PROJECT_SOURCE_DIR}/tools/qcopilots-search-test-macos-signing.py")
+  set_tests_properties(qcopilots-search-tests-macos-signing PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" LABELS "unit;portability;package"
+    ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 endif()
 include(QCopilotsSearchDevelopment)
 include(QCopilotsSearchPackaging)

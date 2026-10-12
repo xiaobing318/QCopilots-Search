@@ -15,7 +15,7 @@
 
 Qt 6.12.0 和独立 Qt PDF 6.140.0 由 bootstrap 安装。官方 SDK 包按下载校验值锁定。其他依赖通过 CMake 下载到外置依赖目录，不修改系统包的源码，也不在仓库中展开第三方源码。
 
-Linux 主机还需要 Qt 使用的图形、字体、XCB、DBus 和多媒体运行依赖。无显示服务器的 CI 在 Xvfb 中执行 GUI 用例。平台依赖安装命令以 `.github/workflows/qcopilots-search-native.yml` 为可执行参考，`doctor` 输出用于检查当前主机。
+Linux 主机还需要 Qt 使用的图形、字体、XCB、DBus 和多媒体运行依赖。Qt Multimedia 的 PulseAudio 客户端动态库由 `libpulse0` 提供，构建和运行都需要该库，不要求安装开发头文件或启动音频服务。无显示服务器的 CI 在 Xvfb 中执行 GUI 用例。平台依赖安装命令以 `.github/workflows/qcopilots-search-native.yml` 为可执行参考，`doctor` 输出用于检查当前主机。
 
 ## 目录布局
 

@@ -22,6 +22,7 @@ constexpr int schemaVersion = 2;
 constexpr int shardCount = 16;
 constexpr qint64 exactSubsetLimit = 20000;
 constexpr qint64 deltaLimit = 2048;
+constexpr int sqliteBusyTimeoutMs = 5000;
 
 [[noreturn]] void fail(sqlite3 *db, const char *context) {
   throw std::runtime_error(std::string(context) + ": " + sqlite3_errmsg(db));
@@ -49,7 +50,7 @@ struct Connection {
                                  : SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
                         nullptr) != SQLITE_OK)
       fail(db, "Open database");
-    sqlite3_busy_timeout(db, 5000);
+    sqlite3_busy_timeout(db, sqliteBusyTimeoutMs);
     execute(db, "PRAGMA foreign_keys=ON");
     if (!writable)
       execute(db, "PRAGMA query_only=ON");
@@ -308,13 +309,32 @@ public:
   void checkpoint() {
     int log = 0, checkpointed = 0;
     const int rc = sqlite3_wal_checkpoint_v2(
-        writer.db, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &checkpointed);
+        writer.db, "main", SQLITE_CHECKPOINT_PASSIVE, &log, &checkpointed);
     if (rc != SQLITE_OK && rc != SQLITE_BUSY)
       fail(writer.db, "Checkpoint");
-    if (QFileInfo(paths.databaseFile() + QStringLiteral("-wal")).size() >
-        256LL * 1024 * 1024)
-      throw std::runtime_error("Index write paused because a reader is "
-                               "retaining more than 256 MiB of WAL");
+    const QString walPath = paths.databaseFile() + QStringLiteral("-wal");
+    if (QFileInfo(walPath).size() <= options.maxWalBytes)
+      return;
+    if (rc == SQLITE_OK && log >= 0 && checkpointed == log) {
+      // PASSIVE copies frames but does not shrink the physical WAL. Without
+      // this attempt, a fully checkpointed oversized file would block every
+      // future write before SQLite gets a chance to reuse or reset it.
+      // A current-snapshot reader can still prevent TRUNCATE even when all
+      // frames were copied. Never wait for it while holding publication.
+      struct RestoreBusyTimeout {
+        sqlite3 *db;
+        ~RestoreBusyTimeout() { sqlite3_busy_timeout(db, sqliteBusyTimeoutMs); }
+      } restore{writer.db};
+      sqlite3_busy_timeout(writer.db, 0);
+      const int truncateRc = sqlite3_wal_checkpoint_v2(
+          writer.db, "main", SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+      if (truncateRc != SQLITE_OK && truncateRc != SQLITE_BUSY)
+        fail(writer.db, "Truncate checkpoint");
+    }
+    if (QFileInfo(walPath).size() > options.maxWalBytes)
+      throw std::runtime_error(
+          "Index write paused because readers or a busy checkpoint are "
+          "retaining WAL above the configured byte budget");
   }
   bool buildShard(int shard, QString *error) {
     QVector<VectorRecord> records;
@@ -387,6 +407,8 @@ bool IndexRepository::open(const RuntimePaths &paths, QString *error) {
       throw std::runtime_error("Index repository is already open");
     if (d->options.diskReserveBytes < 0)
       throw std::runtime_error("Disk reserve must not be negative");
+    if (d->options.maxWalBytes <= 0)
+      throw std::runtime_error("WAL byte budget must be positive");
     if (!paths.ensure(error))
       return false;
     d->paths = paths;

@@ -4,5 +4,9 @@
     <file alias="generated-uncompressed.dng">fixtures/images/generated-uncompressed.dng</file>
     <file alias="generated-deflate.dng">fixtures/images/generated-deflate.dng</file>
     <file alias="generated-jpeg.dng">fixtures/images/generated-jpeg.dng</file>
+    <file alias="qcopilots-search-ocr-simplified-40px.png">fixtures/images/qcopilots-search-ocr-simplified-40px.png</file>
+    <file alias="qcopilots-search-ocr-simplified-80px.png">fixtures/images/qcopilots-search-ocr-simplified-80px.png</file>
+    <file alias="qcopilots-search-ocr-traditional-40px.png">fixtures/images/qcopilots-search-ocr-traditional-40px.png</file>
+    <file alias="qcopilots-search-ocr-traditional-80px.png">fixtures/images/qcopilots-search-ocr-traditional-80px.png</file>
   </qresource>
 </RCC>

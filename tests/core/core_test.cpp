@@ -1,5 +1,6 @@
 #include "core/app_settings.h"
 #include "core/runtime_paths.h"
+#include "core/ipc_directory.h"
 #include "core/pipeline_manifest.h"
 #include "core/model_files.h"
 #include "core/types.h"
@@ -9,8 +10,15 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QtTest>
 #include <limits>
+#ifdef Q_OS_UNIX
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
 
 using namespace qcopilots_search;
 using namespace qcopilots_search::test;
@@ -20,6 +28,10 @@ class CoreTest : public QObject {
 private slots:
     void explicitRuntimePaths();
     void runtimePathIdentity();
+    void ipcIgnoresLongTemporaryDirectory();
+#ifdef Q_OS_UNIX
+    void privateIpcDirectoryRejectsUnsafeEntries();
+#endif
     void environmentOverrides();
     void workingDirectoryIndependence();
     void longAndUnicodePaths();
@@ -59,9 +71,87 @@ void CoreTest::explicitRuntimePaths()
     QVERIFY(QFileInfo(paths.logDir).isDir());
     QCOMPARE(QFileInfo(paths.configFile).absolutePath(), paths.profileDir);
     QCOMPARE(QFileInfo(paths.databaseFile()).absolutePath(), paths.indexDir);
-    QVERIFY(paths.ipcName.startsWith(QStringLiteral("qcopilots-search-")));
+    QVERIFY(QFileInfo(paths.ipcName).fileName().startsWith(QStringLiteral("qcopilots-search-")));
     QVERIFY(paths.ipcName.size() < 100);
+#ifdef Q_OS_UNIX
+    QVERIFY(QDir::isAbsolutePath(paths.ipcName));
+    const sockaddr_un address{};
+    QVERIFY(QFile::encodeName(paths.ipcName).size() + 2 <= qsizetype(sizeof(address.sun_path)));
+#endif
 }
+
+void CoreTest::ipcIgnoresLongTemporaryDirectory()
+{
+    TestEnvironment env(QStringLiteral("ipc-long-temp"));
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    const auto paths = env.runtimePaths();
+    const auto firstTemp = env.path(QStringLiteral("temporary path 中文/") + QString(70, u'a') + u'/' + QString(70, u'b'));
+    const auto secondTemp = env.path(QStringLiteral("other temporary path 中文/") + QString(70, u'c'));
+    QVERIFY(QDir().mkpath(firstTemp));
+    QVERIFY(QDir().mkpath(secondTemp));
+    ScopedEnvironment first("TMPDIR", firstTemp.toUtf8());
+    QCOMPARE(env.runtimePaths().ipcName, paths.ipcName);
+    QString error;
+    QVERIFY2(paths.ensure(&error), qPrintable(error));
+    QLocalServer server;
+    server.setSocketOptions(QLocalServer::UserAccessOption);
+    QVERIFY2(server.listen(paths.ipcName), qPrintable(server.errorString()));
+#ifdef Q_OS_UNIX
+    QCOMPARE(server.fullServerName(), paths.ipcName);
+#endif
+    ScopedEnvironment second("TMPDIR", secondTemp.toUtf8());
+    QCOMPARE(env.runtimePaths().ipcName, paths.ipcName);
+    QLocalSocket client;
+    client.connectToServer(paths.ipcName);
+    QVERIFY2(client.waitForConnected(3000), qPrintable(client.errorString()));
+    QVERIFY(server.waitForNewConnection(3000));
+    auto *peer = server.nextPendingConnection();
+    QVERIFY(peer);
+    const QByteArray payload("qcopilots-search-ipc");
+    QCOMPARE(client.write(payload), payload.size());
+    client.flush();
+    QVERIFY(peer->waitForReadyRead(3000));
+    QCOMPARE(peer->readAll(), payload);
+    client.abort();
+    peer->abort();
+    delete peer;
+    server.close();
+}
+
+#ifdef Q_OS_UNIX
+void CoreTest::privateIpcDirectoryRejectsUnsafeEntries()
+{
+    TestEnvironment env(QStringLiteral("ipc-permissions"));
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    const auto directory = env.path("private-ipc");
+    QString error;
+    QVERIFY(!detail::preparePrivateIpcDirectory(directory, false, &error));
+    QVERIFY(!QFileInfo::exists(directory));
+    QVERIFY2(detail::preparePrivateIpcDirectory(directory, true, &error), qPrintable(error));
+    QVERIFY(detail::preparePrivateIpcDirectory(directory, false, &error));
+    struct stat state{};
+    QVERIFY(::lstat(QFile::encodeName(directory).constData(), &state) == 0);
+    QCOMPARE(state.st_uid, ::geteuid());
+    QCOMPARE(state.st_mode & 0777, mode_t(0700));
+    QVERIFY(::chmod(QFile::encodeName(directory).constData(), 0755) == 0);
+    QVERIFY(!detail::preparePrivateIpcDirectory(directory, false, &error));
+    QVERIFY(error.contains("0700"));
+    QVERIFY(!detail::preparePrivateIpcDirectory(directory, true, &error));
+    QVERIFY(::lstat(QFile::encodeName(directory).constData(), &state) == 0);
+    QCOMPARE(state.st_mode & 0777, mode_t(0755)); // Never silently chmod existing directories.
+    QVERIFY(::chmod(QFile::encodeName(directory).constData(), 0700) == 0);
+    const auto link = env.path("private-link");
+    QVERIFY(::symlink(QFile::encodeName(directory).constData(), QFile::encodeName(link).constData()) == 0);
+    QVERIFY(!detail::preparePrivateIpcDirectory(link, false, &error));
+    QVERIFY(!detail::preparePrivateIpcDirectory(link, true, &error));
+    QVERIFY(QFileInfo(link).isSymLink());
+    QVERIFY(env.writeFile("not-directory", "preserve existing file"));
+    QVERIFY(!detail::preparePrivateIpcDirectory(env.path("not-directory"), true, &error));
+    QFile regular(env.path("not-directory"));
+    QVERIFY(regular.open(QIODevice::ReadOnly));
+    QCOMPARE(regular.readAll(), QByteArray("preserve existing file"));
+}
+#endif
 
 void CoreTest::runtimePathIdentity()
 {

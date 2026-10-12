@@ -433,10 +433,62 @@ private slots:
         const QString path = env.path("picture 中文.png"); QImage image(64, 64, QImage::Format_RGB32); image.fill(Qt::blue); QVERIFY(image.save(path));
         PreviewPanel preview; SearchHit hit; hit.path = path; hit.kind = "image";
         preview.showHit(hit); QVERIFY(preview.findChild<QPushButton *>("openResultButton")->isEnabled());
-        QTRY_VERIFY(preview.findChild<QLabel *>("imagePreview")->text().isEmpty());
+        QTRY_VERIFY(!preview.findChild<QLabel *>("imagePreview")->pixmap().isNull());
         preview.clear(); QVERIFY(QFile::remove(path));
         preview.showHit(hit); QVERIFY(!preview.findChild<QPushButton *>("openResultButton")->isEnabled());
         QVERIFY(!preview.findChild<QLabel *>("previewError")->text().isEmpty());
+    }
+    void pdfImageAndTextSwitchingReleasesResources() {
+        TestEnvironment env("gui-preview-switching"); QVERIFY(env.isValid());
+        const QString pdfPath = env.path("two pages 中文.pdf");
+        { QPdfWriter writer(pdfPath); QPainter painter(&writer); painter.drawText(100, 200, "first page"); writer.newPage(); painter.drawText(100, 200, "second page"); }
+        const QString imagePath = env.path("green image 中文.png");
+        QImage pixels(240, 120, QImage::Format_RGB32); pixels.fill(Qt::green); QVERIFY(pixels.save(imagePath));
+        QVERIFY(env.writeFile("plain text.txt", "The currently selected document"));
+        SearchHit pdf; pdf.path = pdfPath; pdf.kind = "pdf"; pdf.page = 2;
+        SearchHit image; image.path = imagePath; image.kind = "image";
+        SearchHit text; text.path = env.path("plain text.txt"); text.kind = "text"; text.text = "The currently selected document";
+        PreviewPanel preview; preview.resize(640, 480); preview.show();
+        auto *imageLabel = preview.findChild<QLabel *>("imagePreview");
+        auto *textPreview = preview.findChild<QTextBrowser *>("textPreview");
+        for (int pass = 0; pass < 4; ++pass) {
+            preview.showHit(pdf);
+            QCOMPARE(preview.findChild<QSpinBox *>("pdfPageNumber")->value(), 2);
+            // Let the visible PDF submit rendering work before changing its source.
+            QCoreApplication::processEvents();
+            preview.showHit(image);
+            preview.showHit(text);
+            QCoreApplication::processEvents();
+            QCOMPARE(preview.currentHit().path, text.path);
+            QCOMPARE(textPreview->toPlainText(), text.text);
+            preview.showHit(image);
+            QTRY_VERIFY_WITH_TIMEOUT(!imageLabel->pixmap().isNull(), 10000);
+            QCOMPARE(imageLabel->pixmap().toImage().pixelColor(0, 0), QColor(Qt::green));
+            QCOMPARE(preview.currentHit().path, imagePath);
+            preview.clear();
+        }
+        QVERIFY(QFile::remove(pdfPath));
+        QVERIFY(QFile::remove(imagePath));
+        QVERIFY(QFile::remove(text.path));
+    }
+    void imagePreviewResizeRemainsBounded() {
+        TestEnvironment env("gui-image-resize"); QVERIFY(env.isValid());
+        const QString path = env.path("wide image.png");
+        QImage pixels(1200, 300, QImage::Format_RGB32); pixels.fill(Qt::blue); QVERIFY(pixels.save(path));
+        PreviewPanel preview; preview.resize(760, 560); preview.show();
+        SearchHit hit; hit.path = path; hit.kind = "image"; preview.showHit(hit);
+        auto *image = preview.findChild<QLabel *>("imagePreview");
+        QTRY_VERIFY_WITH_TIMEOUT(!image->pixmap().isNull(), 10000);
+        for (const QSize size : {QSize(760, 560), QSize(600, 460), QSize(900, 620), QSize(620, 480)}) {
+            preview.resize(size);
+            QCoreApplication::processEvents();
+            const QSize settled = preview.size();
+            for (int pass = 0; pass < 3; ++pass) QCoreApplication::processEvents();
+            QCOMPARE(preview.size(), settled);
+            QVERIFY(!image->pixmap().isNull());
+            QVERIFY(image->pixmap().width() <= image->width());
+            QVERIFY(image->pixmap().height() <= image->height());
+        }
     }
     void audioHitSeeksAndSwitchingReleasesFile() {
         TestEnvironment env("gui-audio"); QVERIFY(env.isValid());

@@ -1,14 +1,22 @@
 #include "extraction/extractor.h"
 #include "extraction/image_extractor.h"
 #include <QDir>
+#include <QCryptographicHash>
 #include <QFile>
 #include <QFontDatabase>
 #include <QFontMetrics>
 #include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPainter>
 #include <QPdfWriter>
-#include <QRawFont>
+#include <QPdfDocument>
+#include <QPdfSelection>
+#include <QProcess>
+#include <QProcessEnvironment>
 #include <QStandardPaths>
+#include <QThread>
+#include <memory>
 #include "test_directory.h"
 #include <QtTest>
 
@@ -122,6 +130,47 @@ private slots:
         QString error; const auto preview = loadPreviewImage(path, 512, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error)); QCOMPARE(preview.size(), size);
         QVERIFY(preview.pixelColor(1, 1) != preview.pixelColor(preview.width() - 2, preview.height() - 2));
+    }
+    void imageDecodeFitsSmallWorkerStack()
+    {
+        // Isolate a native stack overflow so it is reported as a failing case,
+        // not a crash that erases the remainder of this extraction suite.
+        if (qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_IMAGE_STACK_CHILD") != 1) {
+            QProcess child;
+            auto environment = QProcessEnvironment::systemEnvironment();
+            environment.insert(QStringLiteral("QCOPILOTS_SEARCH_IMAGE_STACK_CHILD"), QStringLiteral("1"));
+            child.setProcessEnvironment(environment);
+            child.start(QCoreApplication::applicationFilePath(), {QStringLiteral("imageDecodeFitsSmallWorkerStack"),
+                QStringLiteral("-o"), QStringLiteral("-,txt")});
+            QVERIFY2(child.waitForStarted(), qPrintable(child.errorString()));
+            if (!child.waitForFinished(30'000)) { child.kill(); child.waitForFinished(); QFAIL("Small-stack decode child timed out"); }
+            const QByteArray output = child.readAllStandardOutput() + child.readAllStandardError();
+            QVERIFY2(child.exitStatus() == QProcess::NormalExit, output.constData());
+            QVERIFY2(child.exitCode() == 0, output.constData());
+            return;
+        }
+        qcopilots_search::test::ExtractionDirectory temporary(testTemplate()); QVERIFY(temporary.isValid());
+        QStringList paths;
+        for (const QString &name : {QStringLiteral("qcopilots-search-ocr-simplified-40px.png"),
+                QStringLiteral("generated-uncompressed.dng"), QStringLiteral("generated-deflate.dng"),
+                QStringLiteral("generated-jpeg.dng")}) {
+            const auto path = QDir(temporary.path()).filePath(name);
+            QVERIFY(QFile::copy(QStringLiteral(":/images/") + name, path)); paths.append(path);
+        }
+        QString failure;
+        int decoded = 0;
+        std::unique_ptr<QThread> thread(QThread::create([&] {
+            for (const auto &path : paths) {
+                QString error;
+                if (loadPreviewImage(path, 512, &error).isNull() || !error.isEmpty()) {
+                    failure = QStringLiteral("%1: %2").arg(path, error); return;
+                }
+                ++decoded;
+            }
+        }));
+        thread->setStackSize(256 * 1024); thread->start();
+        QVERIFY(thread->wait(20'000)); QVERIFY2(failure.isEmpty(), qPrintable(failure));
+        QCOMPARE(decoded, paths.size());
     }
     void invalidImageAndTemp()
     {
@@ -253,6 +302,45 @@ private slots:
         QVERIFY(white > qint64(prepared.width()) * prepared.height() / 2); QVERIFY(dark > 1000);
         QCOMPARE(result.next, 1); QVERIFY(result.complete);
     }
+    void nativePdfCompatibilityCharactersAreNormalized()
+    {
+        qcopilots_search::test::ExtractionDirectory temporary(testTemplate()); QVERIFY(temporary.isValid());
+        const auto path = QDir(temporary.path()).filePath(QStringLiteral("font unicode compatibility.pdf"));
+        // An explicit PDF ToUnicode map makes this input independent of installed
+        // fonts. The visible base-font glyph maps to the same Kangxi radical
+        // observed in macOS PDFs, while another maps to a Latin ligature.
+        const QByteArray stream("BT /F1 18 Tf 50 750 Td (A wooden chair is repaired in the community workshop: XY) Tj ET\n");
+        const QByteArray map("/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+            "/CMapName /Compatibility def /CMapType 2 def\n1 begincodespacerange <00> <FF> endcodespacerange\n"
+            "2 beginbfchar <58> <2F4A> <59> <FB01> endbfchar\nendcmap CMapName currentdict /CMap defineresource pop end end\n");
+        const QList<QByteArray> objects{
+            "<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
+            "<< /Length " + QByteArray::number(stream.size()) + " >>\nstream\n" + stream + "endstream",
+            "<< /Length " + QByteArray::number(map.size()) + " >>\nstream\n" + map + "endstream"};
+        QByteArray pdf("%PDF-1.4\n"); QList<qsizetype> offsets;
+        for (qsizetype index = 0; index < objects.size(); ++index) {
+            offsets.append(pdf.size()); pdf += QByteArray::number(index + 1) + " 0 obj\n" + objects[index] + "\nendobj\n";
+        }
+        const auto xref = pdf.size(); pdf += "xref\n0 7\n0000000000 65535 f \n";
+        for (const auto offset : offsets) pdf += QByteArray::number(offset).rightJustified(10, '0') + " 00000 n \n";
+        pdf += "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n" + QByteArray::number(xref) + "\n%%EOF\n";
+        QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); QCOMPARE(file.write(pdf), pdf.size()); file.close();
+        QPdfDocument raw; QCOMPARE(raw.load(path), QPdfDocument::Error::None);
+        const auto nativeText = raw.getAllText(0).text();
+        // PDFium may itself expand the Latin ligature, but the compatibility
+        // CJK radical must reach the production boundary unchanged in this test.
+        QVERIFY2(nativeText.contains(QChar(0x2f4a)), qPrintable(nativeText));
+        ExtractionOptions options; options.enableOcr = false; options.tempDir = QDir(temporary.path()).filePath("media");
+        const auto result = Extractor::extract(path, options);
+        QVERIFY2(result.error.isEmpty(), qPrintable(result.error)); QCOMPARE(result.segments.size(), 1);
+        const auto &segment = result.segments.first(); QCOMPARE(segment.modality, QStringLiteral("text"));
+        QCOMPARE(segment.page, 1); QVERIFY(segment.mediaPath.isEmpty());
+        QVERIFY2(segment.text.contains(QStringLiteral("木fi")), qPrintable(segment.text));
+        QVERIFY(!segment.text.contains(QChar(0x2f4a))); QVERIFY(!segment.text.contains(QChar(0xfb01)));
+    }
     void missingOcrIsExplicitFailure()
     {
         qcopilots_search::test::ExtractionDirectory temporary(testTemplate()); QVERIFY(temporary.isValid());
@@ -278,16 +366,17 @@ private slots:
     }
     void realChineseOcr_data()
     {
-        QTest::addColumn<QString>("phrase");
+        QTest::addColumn<QString>("fixture");
         QTest::addColumn<QString>("expected");
-        QTest::addColumn<int>("writingSystem");
-        QTest::addColumn<int>("pixelSize");
-        for (const int size : {40, 80}) {
-            QTest::newRow(qPrintable(QStringLiteral("simplified-%1px").arg(size))) << QStringLiteral("安全出口 禁止吸烟")
-                << QStringLiteral("安全出口禁止吸烟") << int(QFontDatabase::SimplifiedChinese) << size;
-            QTest::newRow(qPrintable(QStringLiteral("traditional-%1px").arg(size))) << QStringLiteral("社區會議 歡迎參加")
-                << QStringLiteral("社區會議歡迎參加") << int(QFontDatabase::TraditionalChinese) << size;
-        }
+        QTest::addColumn<QByteArray>("sha256");
+        QTest::newRow("simplified-40px") << QStringLiteral("qcopilots-search-ocr-simplified-40px.png") << QStringLiteral("安全出口禁止吸烟")
+            << QByteArray("ae4b3d8ee1005c86284094fb4ff35e819b1e0b56dc19954b67d6e36e25bfb020");
+        QTest::newRow("traditional-40px") << QStringLiteral("qcopilots-search-ocr-traditional-40px.png") << QStringLiteral("社區會議歡迎參加")
+            << QByteArray("d27525c909c530515762aa4d2261c7b4aef7aeb8c43205151a2a27bb1e4e73b4");
+        QTest::newRow("simplified-80px") << QStringLiteral("qcopilots-search-ocr-simplified-80px.png") << QStringLiteral("安全出口禁止吸烟")
+            << QByteArray("ded33620494a47bb0222bf0400cdd5bd38bbcaf1cee9c7256fc6cf928d06b299");
+        QTest::newRow("traditional-80px") << QStringLiteral("qcopilots-search-ocr-traditional-80px.png") << QStringLiteral("社區會議歡迎參加")
+            << QByteArray("3fe4e737f53fd2e9766971f137b163b3d9c8d49cba4f506045b6dd475fdef25f");
     }
     void ocrKeepsBlankImagesEmptyAndHonorsCancellation()
     {
@@ -320,45 +409,45 @@ private slots:
     }
     void realChineseOcr()
     {
-        QFETCH(QString, phrase); QFETCH(QString, expected); QFETCH(int, writingSystem); QFETCH(int, pixelSize);
+        QFETCH(QString, fixture); QFETCH(QString, expected); QFETCH(QByteArray, sha256);
         qcopilots_search::test::ExtractionDirectory temporary(testTemplate()); QVERIFY(temporary.isValid());
-        const auto script = QFontDatabase::WritingSystem(writingSystem);
-        const QStringList installed = QFontDatabase::families(script);
-        QStringList families{QStringLiteral("Noto Sans CJK SC"), QStringLiteral("Noto Sans CJK TC"),
-            QStringLiteral("Microsoft YaHei"), QStringLiteral("Microsoft JhengHei"),
-            QStringLiteral("PingFang SC"), QStringLiteral("PingFang TC"), QStringLiteral("DengXian")};
-        families.append(installed); families.removeDuplicates();
-        QFont font;
-        bool supportsPhrase = false;
-        for (const QString &family : families) {
-            if (!installed.contains(family, Qt::CaseInsensitive)) continue;
-            QFont candidate(family); candidate.setPixelSize(pixelSize); candidate.setWeight(QFont::Normal);
-            const QRawFont raw = QRawFont::fromFont(candidate);
-            if (!raw.isValid()) continue;
-            bool complete = true;
-            for (const char32_t character : expected.toUcs4())
-                if (!raw.supportsCharacter(character)) { complete = false; break; }
-            if (complete) { font = candidate; supportsPhrase = true; break; }
-        }
-        QVERIFY2(supportsPhrase, qPrintable(QStringLiteral("No installed CJK font covers every glyph in '%1'. "
-            "Install the platform Chinese fonts, such as fonts-noto-cjk on Linux. This OCR requirement cannot be skipped.").arg(expected)));
-        const QFontMetrics metrics(font);
-        const int margin = 60;
-        QImage image(metrics.horizontalAdvance(phrase) + 2 * margin, metrics.height() + 2 * margin, QImage::Format_RGB32);
-        image.fill(Qt::white);
-        { QPainter painter(&image); painter.setFont(font); painter.setPen(Qt::black);
-          painter.drawText(margin, margin + metrics.ascent(), phrase); }
-        QVERIFY(image.save(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-chinese-ocr.png"))));
+        QFile source(QStringLiteral(":/images/") + fixture); QVERIFY(source.open(QIODevice::ReadOnly));
+        const QByteArray bytes = source.readAll();
+        QCOMPARE(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex(), sha256);
+        const QImage image = QImage::fromData(bytes, "PNG"); QVERIFY(!image.isNull());
+        QFile saved(QDir(temporary.path()).filePath(fixture)); QVERIFY(saved.open(QIODevice::WriteOnly));
+        QCOMPARE(saved.write(bytes), bytes.size()); saved.close();
         ExtractionOptions options; options.tessdataDir = qEnvironmentVariable("QCOPILOTS_SEARCH_TESSDATA_DIR");
         QVERIFY2(!options.tessdataDir.isEmpty(), "The pinned English, Simplified Chinese and Traditional Chinese OCR data is required");
         QString error;
         const QString text = recognizeText(image, options, &error);
-        QVERIFY2(error.isEmpty(), qPrintable(error));
         QString normalized;
         for (const QChar character : text) if (!character.isSpace()) normalized += character;
-        qInfo().noquote() << QStringLiteral("Direct OCR font=%1 expected=%2 actual=%3").arg(font.family(), expected, normalized);
-        QVERIFY2(normalized.contains(expected), qPrintable(QStringLiteral("Direct OCR failed for %1: '%2' (font %3)")
-            .arg(expected, text, font.family())));
+        QFile diagnostic(QDir(temporary.path()).filePath(QStringLiteral("qcopilots-search-ocr-result.json")));
+        QVERIFY(diagnostic.open(QIODevice::WriteOnly));
+        const QJsonObject record{{"fixture", fixture}, {"sha256", QString::fromLatin1(sha256)},
+            {"expected", expected}, {"actual", text}, {"whitespaceRemoved", normalized}, {"error", error}};
+        QVERIFY(diagnostic.write(QJsonDocument(record).toJson()) > 0); diagnostic.close();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        qInfo().noquote() << QStringLiteral("Direct OCR fixture=%1 expected=%2 actual=%3").arg(fixture, expected, normalized);
+        QVERIFY2(normalized.contains(expected), qPrintable(QStringLiteral("Direct OCR failed for %1: '%2' (%3)")
+            .arg(expected, text, fixture)));
+    }
+    void ocrPreservesLargeMultilineColumns()
+    {
+        QImage image(2600, 600, QImage::Format_RGB32); image.fill(Qt::white);
+        const QStringList left{QStringLiteral("Alpha planning report"), QStringLiteral("Workshop opens Monday")};
+        const QStringList right{QStringLiteral("Omega delivery schedule"), QStringLiteral("Fresh apples arrive Tuesday")};
+        { QPainter painter(&image); QFont font(QStringLiteral("Arial")); font.setPixelSize(80);
+          painter.setFont(font); painter.setPen(Qt::black);
+          for (int line = 0; line < left.size(); ++line) {
+              painter.drawText(60, 150 + line * 220, left[line]); painter.drawText(1360, 150 + line * 220, right[line]);
+          } }
+        ExtractionOptions options; options.tessdataDir = qEnvironmentVariable("QCOPILOTS_SEARCH_TESSDATA_DIR");
+        QVERIFY2(!options.tessdataDir.isEmpty(), "The pinned OCR data directory is required");
+        QString error; const auto text = recognizeText(image, options, &error).simplified();
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        for (const auto &line : left + right) QVERIFY2(text.contains(line), qPrintable(text));
     }
 private:
     static QString testTemplate()

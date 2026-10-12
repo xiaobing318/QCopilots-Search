@@ -1,5 +1,6 @@
 #include "service/service_client.h"
 #include "service/ipc_protocol.h"
+#include "service/ipc_security.h"
 #include "core/types.h"
 #include "support/test_environment.h"
 #include <QtTest>
@@ -8,6 +9,9 @@
 #include <QFile>
 #include <QDir>
 #include <QPointer>
+#ifndef Q_OS_WIN
+#include <sys/un.h>
+#endif
 using namespace qcopilots_search;
 
 struct Fixture {
@@ -25,7 +29,7 @@ struct Fixture {
             && f.write(QByteArray(64, letter)) == 64;
     }
     bool start() {
-        if (!root.isValid() || !paths.ensure() || !token()) return false;
+        if (!root.isValid() || !paths.ensure() || !paths.ensureIpcDirectory() || !token()) return false;
         QObject::connect(&server, &QLocalServer::newConnection, &server, [this] {
             peer = server.nextPendingConnection();
             QObject::connect(peer, &QLocalSocket::readyRead, &server, [this] {
@@ -93,9 +97,54 @@ private slots:
         const auto id = client.request("status");
         QTRY_COMPARE(failure.size(), 1);
         QCOMPARE(failure[0][0].toString(), id);
-        QCOMPARE(failure[0][1].toString(), "connection_failed");
+        const auto code = failure[0][1].toString();
+        QVERIFY(code == QStringLiteral("connection_failed")
+                || code == QStringLiteral("ipc_directory_unavailable"));
         QVERIFY(!QFileInfo::exists(paths.profileDir));
     }
+#ifndef Q_OS_WIN
+    void unixPeerCredentialsAreVerified() {
+        struct SocketPair {
+            int descriptors[2]{-1, -1};
+            ~SocketPair() { for (const int fd : descriptors) if (fd >= 0) ::close(fd); }
+        } pair;
+        QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair.descriptors), 0);
+        QString error;
+        QVERIFY2(ipcPeerIsCurrentUser(pair.descriptors[0], &error), qPrintable(error));
+        QVERIFY2(ipcPeerIsCurrentUser(pair.descriptors[1], &error), qPrintable(error));
+        QVERIFY(!ipcPeerIsCurrentUser(-1, &error));
+        QVERIFY(!error.isEmpty());
+        // Exercise the UID rejection decision without needing a privileged
+        // process or modifying another account's credentials in a unit test.
+        QVERIFY(!ipc_security_detail::matchesUser(100, 101, &error));
+        QVERIFY(error.contains(QStringLiteral("different")));
+    }
+    void unixLongTemporaryDirectoryStillConnects() {
+        test::TestEnvironment environment(QStringLiteral("ipc-long-tmpdir"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto longTemporary = environment.path(QStringLiteral("temporary/") + QString(120, u't'));
+        QVERIFY(QDir().mkpath(longTemporary));
+        test::ScopedEnvironment temporary("TMPDIR", longTemporary.toUtf8());
+        Fixture fixture;
+        QVERIFY(fixture.start());
+        QVERIFY(QDir::isAbsolutePath(fixture.paths.ipcName));
+        sockaddr_un address{};
+        QVERIFY(QFile::encodeName(fixture.paths.ipcName).size() + 1 <= qsizetype(sizeof(address.sun_path)));
+        {
+            test::ScopedEnvironment differentTemporary("TMPDIR", environment.root().toUtf8());
+            QCOMPARE(RuntimePaths::resolve(fixture.paths.profileDir, fixture.paths.modelDir).ipcName,
+                     fixture.paths.ipcName);
+        }
+        ServiceClient client(fixture.paths);
+        client.setAutoStart(false);
+        QSignalSpy response(&client, &ServiceClient::response);
+        const auto id = client.request(QStringLiteral("status"));
+        QTRY_COMPARE(fixture.requests.size(), 1);
+        fixture.reply(id);
+        QTRY_COMPARE(response.size(), 1);
+        QCOMPARE(response.first().first().toString(), id);
+    }
+#endif
     void roundTripAndEvent() {
         Fixture f;
         QVERIFY(f.start());

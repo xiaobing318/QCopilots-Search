@@ -88,6 +88,8 @@ ctest --test-dir "$build_root/release" --show-only=json-v1
 
 CI 在 Windows x64、Linux x64、macOS arm64 和 macOS x86_64 分别原生编译并运行测试。构建和测试根来自 runner 临时目录与运行 ID，checkout 路径包含空格和中文。模型缓存命中后仍由 CLI 校验内容。
 
+macOS 原始 GUI 测试失败时，CI 最多用 LLDB 重放两次图片预览场景，每次 45 秒，分别使用独立测试目录。原始 JUnit 和失败结论保持不变，调试日志只用于定位问题。超时先中断调试器并请求终止其测试进程，无法确认进程退出时记录 `cleanupUnknown` 并停止后续重放。日志位于 `reports/mac-gui-debug`。CI 另有界收集本次构建之后生成的产品 `.ips` / `.crash` 文件，并上传失败图片提取用例保留的 `qcopilots-search-image-*` 目录。没有崩溃文件不代表没有发生崩溃。
+
 GUI 自动化在可用显示环境中执行，Linux 使用 Xvfb。QtTest 可以验证输入事件和界面状态，Windows 额外 Computer Use 验收记录真实窗口和系统输入法，见 [用户操作验收](windows-user-acceptance.md)。
 
 包级验证从安装或解压后的布局启动程序，清除开发 Qt 插件路径，使用独立 profile。服务与 worker 需要从安装布局正确找到资源，运行时不能从开发机 SDK 或源码目录补齐缺失文件。

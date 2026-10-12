@@ -623,6 +623,10 @@ bool VectorIndex::rebuildShard(int shardNumber, quint64 generation,
             built = std::make_shared<Shard>(d_->dimensions, records.size());
             QSet<qint64> labels;
             labels.reserve(records.size());
+            // Observe the actual graph construction, excluding serialization
+            // and publication. Failed builds deliberately have no completion.
+            if (d_->faultHook)
+                d_->faultHook(QStringLiteral("ann-build-started"));
             for (const auto &record : records) {
                 if (shardForId(record.id) != shardNumber || labels.contains(record.id))
                     return fail(error, QStringLiteral("ANN labels must be positive, unique and belong to their shard"));
@@ -630,6 +634,8 @@ bool VectorIndex::rebuildShard(int shardNumber, quint64 generation,
                 const auto vector = normalized(record.vector, d_->dimensions);
                 built->graph.addPoint(vector.constData(), hnswlib::labeltype(record.id));
             }
+            if (d_->faultHook)
+                d_->faultHook(QStringLiteral("ann-build-completed"));
             built->filename = QStringLiteral("qcopilots-search-ann-shard-%1-%2-%3.bin")
                                   .arg(shardNumber).arg(generation).arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
             built->path = QDir(d_->root).filePath(built->filename);

@@ -68,6 +68,10 @@ def same_number(left, right):
     return finite(left) and finite(right) and math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-9)
 
 
+def integer_at_least(value, minimum):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
 def malformed_as_error(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
@@ -76,6 +80,49 @@ def malformed_as_error(function):
         except (TypeError, ValueError, AttributeError, KeyError, OverflowError) as error:
             return [f"Malformed {function.__name__} evidence: {error}"]
     return wrapped
+
+
+def validate_rebuild_intervals(concurrent):
+    errors = []
+    check(errors, concurrent.get("timingClock") == "steady-clock-relative-nanoseconds",
+          "capacity rebuild clock is missing or incompatible")
+    builds, queries = concurrent.get("buildIntervals", []), concurrent.get("queryIntervals", [])
+    check(errors, len(builds) == 1 and concurrent.get("observedBuilds") == len(builds)
+          and integer_at_least(concurrent.get("observedBuilds"), 1),
+          "capacity rebuild must observe exactly one actual graph build")
+    check(errors, 1 <= len(queries) <= 500 and concurrent.get("measuredQueries") == len(queries)
+          and integer_at_least(concurrent.get("measuredQueries"), 1),
+          "capacity rebuild query intervals are missing or inconsistent")
+    valid_builds = []
+    for build in builds:
+        start, end = build.get("startNanoseconds"), build.get("endNanoseconds")
+        valid = integer_at_least(start, 0) and integer_at_least(end, 0) and end > start
+        check(errors, valid, "capacity graph build interval is invalid")
+        if valid:
+            valid_builds.append((start, end))
+    overlapping = []
+    for query in queries:
+        start, end = query.get("startNanoseconds"), query.get("endNanoseconds")
+        valid = integer_at_least(start, 0) and integer_at_least(end, 0) and end > start
+        check(errors, valid, "capacity rebuild query interval is invalid")
+        if not valid:
+            continue
+        duration = (end - start) / 1000000.0
+        overlaps = any(start < build_end and end > build_start for build_start, build_end in valid_builds)
+        check(errors, query.get("overlapsBuild") is overlaps
+              and same_number(query.get("durationMilliseconds"), duration),
+              "capacity rebuild query duration or overlap disagrees with its raw interval")
+        if overlaps:
+            overlapping.append(duration)
+    check(errors, bool(overlapping) and concurrent.get("overlappingQueries") == len(overlapping),
+          "capacity rebuild has no measured overlap or its count disagrees")
+    if overlapping:
+        overlapping.sort()
+        for name, percentile in (("p50Milliseconds", .50), ("p95Milliseconds", .95), ("p99Milliseconds", .99)):
+            observed = overlapping[math.ceil(percentile * len(overlapping)) - 1]
+            check(errors, same_number(concurrent.get(name), observed),
+                  f"capacity rebuild {name} does not match genuinely overlapping queries")
+    return errors
 
 
 @malformed_as_error
@@ -127,14 +174,83 @@ def validate_capacity(doc, *, minimum_segments, minimum_queries, minimum_timings
     check(errors, doc.get("concurrentRebuildEvaluated") is True and concurrent.get("passed") is True
           and concurrent.get("singleShard") is True and at_least(concurrent.get("overlappingQueries"), 1)
           and within(concurrent.get("p95Milliseconds"), 0, 1000), "capacity concurrent single-shard rebuild evidence is incomplete or slow")
+    errors.extend(validate_rebuild_intervals(concurrent))
     mutations = doc.get("mutations", {})
     check(errors, mutations.get("passed") is True and at_least(mutations.get("vectorsPerPhase"), min(10000, segments)),
           "capacity mutation evidence is incomplete")
+    mutation_files, mutation_vectors = mutations.get("filesPerPhase"), mutations.get("vectorsPerPhase")
+    check(errors, integer_at_least(mutation_files, 1) and integer_at_least(mutation_vectors, 1)
+          and mutation_files * per_file == mutation_vectors,
+          "capacity mutation file/vector counts disagree")
+    phases = mutations.get("phases", [])
+    check(errors, mutations.get("queryScope") == "filtered-exact-file-plus-global-production-search-sample"
+          and [phase.get("phase") for phase in phases] == ["add", "update", "delete"],
+          "capacity mutation search phases are incomplete")
+    for phase in phases:
+        check(errors, phase.get("passed") is True and all(
+            integer_at_least(phase.get(name), 1) and phase.get(name) == mutation_files
+            for name in ("filesChecked", "keywordQueries", "vectorQueries")),
+            "capacity mutation did not check every changed file and its search results")
+        check(errors, all(integer_at_least(phase.get(name), 0) and phase.get(name) == 0
+            for name in ("staleHitCount", "retiredSegmentIdsRemaining", "globalSearchStaleHitCount")),
+            "capacity mutation returned stale versions or retained retired segments")
+        expected_retired = 0 if phase.get("phase") == "add" else mutation_vectors
+        check(errors, integer_at_least(phase.get("retiredSegmentIdsChecked"), 0)
+              and phase.get("retiredSegmentIdsChecked") == expected_retired,
+              "capacity mutation did not inspect every retired segment")
+        check(errors, integer_at_least(phase.get("globalSearchQueries"), 1)
+              and phase.get("globalSearchQueries") == min(16, mutation_files)
+              and integer_at_least(phase.get("globalSearchCheckedHits"), 1),
+              "capacity mutation global production search did not return checked hits")
+        global_vectors = segments + (0 if phase.get("phase") == "delete" else mutation_vectors)
+        expected_backend = "ann" if global_vectors > 20000 else "exact-subset"
+        check(errors, integer_at_least(phase.get("globalSearchVectorCount"), 1)
+              and phase.get("globalSearchVectorCount") == global_vectors
+              and phase.get("globalSearchBackend") == expected_backend,
+              "capacity mutation global search backend disagrees with the actual corpus scale")
     faults = doc.get("recoveryFaults", [])
     check(errors, doc.get("recoveryFaultInjectionEvaluated") is True and len(faults) == len(FAULTS)
           and {item.get("faultPoint") for item in faults} == FAULTS, "capacity recovery fault points are incomplete")
+    ordered_faults = ["committed-before-ann", "uncommitted-sqlite", "ann-file-saved-before-manifest",
+                      "ann-manifest-published-before-outbox-cleanup"]
+    check(errors, [item.get("faultPoint") for item in faults] == ordered_faults,
+          "capacity recovery fault order is incomplete or inconsistent")
+    previous_id = 0
+    previous_version = previous_token = None
+    committed_versions, committed_tokens = set(), set()
     for item in faults:
         check(errors, item.get("passed") is True and item.get("childExitCode") == 73, "capacity recovery child did not exercise the required interruption")
+        version, token = item.get("expectedVersion"), item.get("expectedToken")
+        check(errors, isinstance(version, str) and bool(version.strip()) and version == item.get("observedVersion")
+              and isinstance(token, str) and bool(token.strip()) and token == item.get("observedToken"),
+              "capacity recovery did not recover the intended committed version and keyword")
+        observed_id = item.get("observedSegmentId")
+        check(errors, integer_at_least(item.get("previousSegmentId"), 0) and item.get("previousSegmentId") == previous_id
+              and integer_at_least(observed_id, 1), "capacity recovery segment lineage is incomplete")
+        rollback = item.get("faultPoint") == "uncommitted-sqlite"
+        if rollback:
+            check(errors, observed_id == previous_id and version == previous_version and token == previous_token,
+                  "capacity rollback did not preserve the previous committed identity")
+        else:
+            check(errors, integer_at_least(observed_id, 1) and observed_id > previous_id
+                  and version not in committed_versions and token not in committed_tokens,
+                  "capacity recovery reused an earlier committed identity")
+            committed_versions.add(version)
+            committed_tokens.add(token)
+        expected_dimension = {"committed-before-ann": 700, "uncommitted-sqlite": 700,
+                              "ann-file-saved-before-manifest": 702,
+                              "ann-manifest-published-before-outbox-cleanup": 703}.get(item.get("faultPoint"))
+        check(errors, integer_at_least(item.get("expectedVectorDimension"), 0)
+              and item.get("expectedVectorDimension") == expected_dimension
+              and integer_at_least(item.get("observedVectorDimension"), 0)
+              and item.get("observedVectorDimension") == expected_dimension
+              and within(item.get("observedVectorCosine"), .999, 1.000000001)
+              and item.get("vectorMatched") is True,
+              "capacity recovery did not recover the intended committed vector")
+        check(errors, all(integer_at_least(item.get(name), 0) and item.get(name) == 0
+              for name in ("staleVersionHits", "oldKeywordHits", "uncommittedCorruptionRows")),
+              "capacity recovery retained stale search results or uncommitted table changes")
+        previous_id, previous_version, previous_token = observed_id, version, token
         if item.get("faultPoint") == "ann-manifest-published-before-outbox-cleanup":
             check(errors, item.get("stalePublishedOutboxEvents") == 0 and item.get("postRecoveryWritePassed") is True,
                   "capacity recovery retained stale events or could not accept a subsequent write")
@@ -370,7 +486,7 @@ def inspect_native(root: Path, *, expected_head: str | None = None):
         errors.extend(validate_semantic(semantic))
         result["modelFingerprint"] = semantic.get("modelFingerprint")
         result["extractionFingerprint"] = semantic.get("extractionFingerprint")
-        errors.extend(validate_capacity(document("reports/capacity-ci.json"), minimum_segments=10000, minimum_queries=10, minimum_timings=20))
+        errors.extend(validate_capacity(document("reports/capacity-ci.json"), minimum_segments=30000, minimum_queries=10, minimum_timings=20))
         errors.extend(validate_physical(document("reports/physical-files-ci.json"), minimum_files=1000))
         package_reports = ["reports/package/report.json"]
         if system == "Windows":

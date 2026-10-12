@@ -21,6 +21,35 @@ native_spec = importlib.util.spec_from_file_location(
 native = importlib.util.module_from_spec(native_spec)
 native_spec.loader.exec_module(native)
 
+SIGNING_PROGRAM = "qcopilots-search-tests-macos-signing"
+SIGNING_SKIP_REASON = ("Windows lacks symbolic-link creation privilege (WinError 1314). "
+                       "Native CI must run this case.")
+SIGNING_SYMLINK_CASES = (
+    "test_directory_symlink_is_not_recursed", "test_external_directory_symlink_is_rejected",
+    "test_external_file_symlink_is_rejected", "test_internal_library_symlink_is_not_signed_twice",
+)
+SIGNING_CASES = SIGNING_SYMLINK_CASES + (
+    "test_inventory_includes_unreferenced_versioned_library_and_plugin",
+    "test_framework_and_outer_app_use_bundle_units",
+    "test_framework_with_multiple_concrete_versions_is_rejected_even_with_direct_binary",
+    "test_nested_helper_and_framework_precede_enclosing_bundles",
+    "test_missing_bundle_executable_fails_before_signing",
+    "test_malformed_bundled_macho_is_rejected_before_signing",
+    "test_commands_sign_every_unit_in_plan_order_without_deep_signing",
+    "test_each_unit_has_strict_verification_and_final_app_has_deep",
+)
+
+
+def signing_verbose(rows=None, *, run=None, footer=None):
+    """Synthetic unittest verbose output, never a signing execution report."""
+    if rows is None:
+        rows = [(name, "ok") for name in SIGNING_CASES]
+    if footer is None:
+        skipped = sum(status.startswith("skipped ") for _, status in rows)
+        footer = f"OK (skipped={skipped})" if skipped else "OK"
+    return ("\n".join(f"{name} (__main__.SigningTests.{name}) ... {status}" for name, status in rows)
+            + f"\n\n----------------------------------------------------------------------\nRan {len(rows) if run is None else run} tests in 0.012s\n\n{footer}\n")
+
 
 class EvidenceTests(unittest.TestCase):
     def inspect(self, output="Totals: 3 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n",
@@ -129,6 +158,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_non_qt_programs_do_not_require_qt_totals(self):
         for name in evidence.NON_QT_TESTS:
+            if name == SIGNING_PROGRAM:
+                continue
             self.assertTrue(self.inspect("success\n", name=name)["releaseComplete"])
 
     def test_python_inference_install_layout_is_not_a_qt_test(self):
@@ -137,9 +168,109 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(self.inspect("success\n",
             name="qcopilots-search-tests-backend-layout")["releaseComplete"])
 
+    def test_python_macos_signing_is_not_a_qt_test(self):
+        result = self.inspect(signing_verbose(), name=SIGNING_PROGRAM, raw=True)
+        self.assertTrue(result["releaseComplete"])
+        self.assertFalse(result["ctestPrograms"][0]["qtTest"])
+        self.assertTrue(result["ctestPrograms"][0]["pythonTest"])
+
     def test_ctest_failure_error_or_skip_cannot_pass(self):
         for kind in ("failure", "error", "skipped"):
             self.assertFalse(self.inspect(failure=kind)["releaseComplete"])
+
+
+class PythonSigningEvidenceTests(unittest.TestCase):
+    def inspect(self, output=None, *, system="Windows"):
+        return EvidenceTests.inspect(self, signing_verbose() if output is None else output,
+                                     name=SIGNING_PROGRAM, system=system, raw=True)
+
+    def skipped_rows(self, *, reason=SIGNING_SKIP_REASON):
+        return [(name, "skipped " + repr(reason) if name in SIGNING_SYMLINK_CASES else "ok")
+                for name in SIGNING_CASES]
+
+    def test_complete_verbose_pass_records_have_independent_python_totals(self):
+        expected = {"run": 12, "passed": 12, "failed": 0, "skipped": 0, "notApplicable": 0}
+        for system in ("Windows", "Darwin", "Linux"):
+            with self.subTest(system=system):
+                result = self.inspect(system=system)
+                self.assertTrue(result["releaseComplete"])
+                self.assertEqual(result["pythonTestTotals"], expected)
+                self.assertEqual(result["ctestPrograms"][0]["pythonTestTotals"], expected)
+                self.assertEqual(len(result["ctestPrograms"][0]["cases"]), 12)
+                self.assertEqual(result["qtTestTotals"]["passed"], 0)
+
+    def test_four_exact_windows_symlink_skips_are_not_counted_as_passed(self):
+        result = self.inspect(signing_verbose(self.skipped_rows()))
+        self.assertTrue(result["releaseComplete"])
+        self.assertEqual(result["pythonTestTotals"],
+                         {"run": 12, "passed": 8, "failed": 0, "skipped": 4, "notApplicable": 4})
+        self.assertEqual(len(result["pythonTestSkips"]), 4)
+        self.assertEqual({row["case"] for row in result["pythonTestSkips"]},
+                         {"__main__.SigningTests." + name for name in SIGNING_SYMLINK_CASES})
+        for row in result["pythonTestSkips"]:
+            self.assertEqual(row["program"], SIGNING_PROGRAM)
+            self.assertEqual(row["reason"], SIGNING_SKIP_REASON)
+            self.assertEqual(row["classification"], "notApplicable")
+
+    def test_unknown_windows_skip_id_remains_required_not_run(self):
+        rows = self.skipped_rows()
+        rows[0] = ("test_unknown_symlink_operation", rows[0][1])
+        result = self.inspect(signing_verbose(rows))
+        self.assertFalse(result["releaseComplete"])
+        self.assertEqual(result["pythonTestSkips"][0]["classification"], "requiredNotRun")
+
+    def test_changed_windows_skip_reason_is_not_allowlisted(self):
+        result = self.inspect(signing_verbose(self.skipped_rows(reason="Permission denied")))
+        self.assertFalse(result["releaseComplete"])
+        self.assertTrue(all(row["classification"] == "requiredNotRun" for row in result["pythonTestSkips"]))
+
+    def test_windows_skip_exception_cannot_apply_on_native_macos_or_linux(self):
+        for system in ("Darwin", "Linux"):
+            result = self.inspect(signing_verbose(self.skipped_rows()), system=system)
+            self.assertFalse(result["releaseComplete"])
+            self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+            self.assertTrue(all(row["classification"] == "requiredNotRun" for row in result["pythonTestSkips"]))
+
+    def test_success_text_or_summary_without_records_cannot_pass(self):
+        for output in ("success\n", "Ran 12 tests in 0.012s\n\nOK\n", ""):
+            with self.subTest(output=output):
+                self.assertFalse(self.inspect(output)["releaseComplete"])
+
+    def test_verbose_records_require_one_complete_summary(self):
+        complete = signing_verbose()
+        for output in (complete.partition("\n\n----------------------------------------------------------------------")[0],
+                       complete.replace("\nOK\n", "\n"), complete + "\nRan 12 tests in 0.012s\n\nOK\n"):
+            self.assertFalse(self.inspect(output)["releaseComplete"])
+
+    def test_run_count_and_skipped_summary_must_match_verbose_records(self):
+        self.assertFalse(self.inspect(signing_verbose(run=13))["releaseComplete"])
+        self.assertFalse(self.inspect(signing_verbose(self.skipped_rows(), footer="OK (skipped=3)"))["releaseComplete"])
+
+    def test_duplicate_verbose_case_is_not_an_additional_executed_case(self):
+        rows = [(name, "ok") for name in SIGNING_CASES]
+        rows[-1] = rows[0]
+        self.assertFalse(self.inspect(signing_verbose(rows))["releaseComplete"])
+
+    def test_zero_executed_cases_cannot_pass_even_with_allowlisted_skips(self):
+        rows = [(name, "skipped " + repr(SIGNING_SKIP_REASON)) for name in SIGNING_SYMLINK_CASES]
+        self.assertFalse(self.inspect(signing_verbose(rows))["releaseComplete"])
+        self.assertFalse(self.inspect(signing_verbose([]))["releaseComplete"])
+
+    def test_fail_and_error_records_fail_despite_ctest_success(self):
+        for status, footer in (("FAIL", "FAILED (failures=1)"), ("ERROR", "FAILED (errors=1)")):
+            rows = [(name, "ok") for name in SIGNING_CASES]
+            rows[0] = (rows[0][0], status)
+            result = self.inspect(signing_verbose(rows, footer=footer))
+            self.assertFalse(result["releaseComplete"])
+            self.assertEqual(result["pythonTestTotals"]["failed"], 1)
+            self.assertFalse(self.inspect(signing_verbose(rows, footer="OK"))["releaseComplete"])
+
+    def test_expected_failure_and_unexpected_success_are_not_release_passes(self):
+        for status, footer in (("expected failure", "OK (expected failures=1)"),
+                               ("unexpected success", "FAILED (unexpected successes=1)")):
+            rows = [(name, "ok") for name in SIGNING_CASES]
+            rows[0] = (rows[0][0], status)
+            self.assertFalse(self.inspect(signing_verbose(rows, footer=footer))["releaseComplete"])
 
 
 class NativeIdentityTests(unittest.TestCase):
@@ -153,6 +284,99 @@ class NativeIdentityTests(unittest.TestCase):
     def test_non_pr_candidate_uses_actual_trigger_commit(self):
         with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": "", "GITHUB_SHA": "b" * 40}):
             self.assertEqual(native.candidate_head(), "b" * 40)
+
+    def test_crash_collection_excludes_other_apps_old_files_and_large_dumps(self):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-crash-") as temporary:
+            root = Path(temporary)
+            source = root / "diagnostics"
+            source.mkdir()
+            for name in ("qcopilots-search-tests-gui.ips", "qcopilots-search-old.crash", "other-application.ips", "qcopilots-search.core"):
+                (source / name).write_text("synthetic diagnostic fixture", encoding="utf-8")
+            os.utime(source / "qcopilots-search-old.crash", (1, 1))
+            with (source / "qcopilots-search-large.ips").open("wb") as stream:
+                stream.truncate(4 * 1024**2 + 1)
+            result = native.collect_crash_reports([source], root / "collected", 2)
+            self.assertEqual([item["name"] for item in result["files"]], ["0-qcopilots-search-tests-gui.ips"])
+            self.assertEqual(len(result["unavailable"]), 1)
+            self.assertEqual(len(list((root / "collected").iterdir())), 1)
+
+    def test_absent_crash_report_is_not_a_success_claim(self):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-crash-") as temporary:
+            result = native.collect_crash_reports([Path(temporary) / "missing"], Path(temporary) / "collected", 0)
+            self.assertEqual(result["files"], [])
+            self.assertIn("does not prove", result["note"])
+
+
+class GuiDiagnosticsTests(unittest.TestCase):
+    def replay(self, *, failed=True, system="Darwin", crash=False, timeout=False, exited=True):
+        with tempfile.TemporaryDirectory(prefix="qcopilots-search-debug-test-") as temporary:
+            root = Path(temporary)
+            junit = root / "ctest.xml"
+            xml = ET.Element("testsuite")
+            case = ET.SubElement(xml, "testcase", name="qcopilots-search-tests-gui")
+            if failed:
+                ET.SubElement(case, "failure")
+            ET.ElementTree(xml).write(junit, encoding="utf-8")
+            original = junit.read_bytes()
+            processes = []
+
+            def spawn(command, **arguments):
+                text = ("Process 5678 launched: fixture\n" +
+                        ("stop reason = EXC_BAD_ACCESS (code=1)\nframe #0: fixture\n" if crash else "") +
+                        ("Process 5678 exited with status = 0\n" if exited else ""))
+                arguments["stdout"].write(text.encode("utf-8"))
+                process = mock.Mock(pid=12345)
+                process.wait.side_effect = ([native.subprocess.TimeoutExpired(command, 45), -9, -9]
+                                            if timeout else [0, 0])
+                processes.append((command, arguments, process))
+                return process
+
+            with mock.patch.object(native.platform, "system", return_value=system), \
+                    mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "find_program", return_value=root / "fixture-program"), \
+                    mock.patch.object(native, "native_environment", side_effect=lambda: {}), \
+                    mock.patch.object(native.subprocess, "Popen", side_effect=spawn), \
+                    mock.patch.object(native.os, "killpg", create=True) as kill_group, \
+                    mock.patch.object(native.signal, "SIGKILL", 9, create=True):
+                result = native.gui_failure_diagnostics(junit, root / "reports")
+            self.assertEqual(junit.read_bytes(), original)
+            for command, arguments, process in processes:
+                self.assertTrue(arguments["start_new_session"])
+                self.assertTrue(Path(arguments["cwd"]).is_relative_to(root / "test-runs"))
+                self.assertEqual(arguments["env"]["QCOPILOTS_SEARCH_TEST_ROOT"], str(arguments["cwd"]))
+                self.assertIn("--one-line-on-crash", command)
+                self.assertIn("thread backtrace all", command)
+                self.assertEqual(process.wait.call_args_list[0].kwargs["timeout"], 45)
+            self.assertEqual(kill_group.call_count, len(processes))
+            return result
+
+    def test_successful_original_or_non_macos_does_not_replay(self):
+        self.assertEqual(self.replay(failed=False)["attempts"], [])
+        self.assertEqual(self.replay(system="Windows")["attempts"], [])
+
+    def test_original_failure_is_preserved_and_crash_stack_stops_replay(self):
+        result = self.replay(crash=True)
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertTrue(result["attempts"][0]["backtraceObserved"])
+        self.assertNotIn("passed", result)
+
+    def test_unreproduced_failure_runs_only_two_isolated_sequences(self):
+        result = self.replay()
+        self.assertEqual(len(result["attempts"]), 2)
+        self.assertNotEqual(result["attempts"][0]["testRoot"], result["attempts"][1]["testRoot"])
+        self.assertEqual(result["attempts"][1]["cases"],
+                         ["pdfHitPageIsSelected", "imageAndMissingFileReleaseResources"])
+
+    def test_timeout_is_diagnostic_and_child_group_is_terminated(self):
+        result = self.replay(timeout=True)
+        self.assertEqual(len(result["attempts"]), 2)
+        self.assertTrue(all(attempt["timedOut"] for attempt in result["attempts"]))
+
+    def test_unconfirmed_inferior_exit_prevents_another_replay(self):
+        result = self.replay(exited=False)
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertFalse(result["attempts"][0]["inferiorCleanupConfirmed"])
+        self.assertIn("cleanupUnknown", result["attempts"][0])
 
 
 class SignatureEvidenceTests(unittest.TestCase):

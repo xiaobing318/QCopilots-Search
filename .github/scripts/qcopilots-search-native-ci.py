@@ -9,9 +9,12 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 
@@ -125,7 +128,7 @@ def models():
 
 def capacity():
     run([find_program(PRODUCT + "-benchmark", installed=False),
-         "--profile-dir", ROOT / "ci-capacity", "--files", "1000",
+         "--profile-dir", ROOT / "ci-capacity", "--files", "3000",
          "--segments-per-file", "10", "--queries", "10", "--timings", "20",
          "--report", REPORTS / "capacity-ci.json"], environment=native_environment())
 
@@ -210,11 +213,124 @@ def signature_evidence(stage: Path, *, system: str | None = None):
     return result
 
 
+def collect_crash_reports(directories: list[Path], destination: Path, started_at: float):
+    """Collect bounded supplementary OS diagnostics for this run's product processes."""
+    result = {"scope": "qcopilots-search processes since this build began", "files": [], "unavailable": []}
+    total = 0
+    for index, directory in enumerate(directories):
+        try:
+            candidates = sorted(directory.glob(PRODUCT + "*"))
+            for path in candidates:
+                if path.suffix.lower() not in (".ips", ".crash") or path.is_symlink() or not path.is_file():
+                    continue
+                metadata = path.stat()
+                if metadata.st_mtime < started_at:
+                    continue
+                if metadata.st_size > 4 * 1024**2 or total + metadata.st_size > 16 * 1024**2 or len(result["files"]) >= 20:
+                    result["unavailable"].append({"name": path.name, "reason": "Diagnostic exceeds the bounded collection budget"})
+                    continue
+                destination.mkdir(parents=True, exist_ok=True)
+                target = destination / (str(index) + "-" + path.name)
+                shutil.copyfile(path, target)
+                total += metadata.st_size
+                result["files"].append({"name": target.name, "bytes": target.stat().st_size})
+        except OSError as error:
+            result["unavailable"].append({"directory": str(directory), "reason": str(error)})
+    result["bytes"] = total
+    if not result["files"]:
+        result["note"] = "No matching OS crash report was available. This does not prove that no crash occurred."
+    return result
+
+
+def gui_failure_diagnostics(junit: Path, destination: Path):
+    """Replay only the known GUI crash, without replacing its original CTest result."""
+    result = {"scope": "diagnostic replay, never acceptance evidence", "attempts": []}
+    if platform.system() != "Darwin":
+        result["reason"] = "LLDB replay is limited to macOS"
+        return result
+    try:
+        failures = [case for case in ET.parse(junit).getroot().iter("testcase")
+                    if case.get("name") == PRODUCT + "-tests-gui"
+                    and (case.find("failure") is not None or case.find("error") is not None)]
+        if not failures:
+            result["reason"] = "The original GUI CTest did not report failure"
+            return result
+        program = find_program(PRODUCT + "-tests-gui", installed=False)
+        destination.mkdir(parents=True, exist_ok=True)
+        selections = [["imageAndMissingFileReleaseResources"],
+                      ["pdfHitPageIsSelected", "imageAndMissingFileReleaseResources"]]
+        for index, cases in enumerate(selections, 1):
+            test_parent = ROOT / "test-runs"
+            test_parent.mkdir(parents=True, exist_ok=True)
+            test_root = Path(tempfile.mkdtemp(prefix=PRODUCT + "-lldb-", dir=test_parent))
+            environment = native_environment()
+            environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(test_root)
+            environment["QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS"] = "1"
+            environment["QT_FORCE_STDERR_LOGGING"] = "1"
+            command = ["/usr/bin/lldb", "--batch", "--no-lldbinit", "--one-line",
+                       "settings set target.disable-aslr false", "--one-line", "settings set auto-confirm true",
+                       "--one-line", "run", "--one-line", "thread backtrace all", "--one-line", "process kill",
+                       "--one-line-on-crash", "thread backtrace all", "--one-line-on-crash", "process kill",
+                       "--", str(program), *cases, "-o", "-,txt"]
+            log = destination / f"attempt-{index}.log"
+            attempt = {"command": command, "cases": cases, "testRoot": str(test_root),
+                       "log": log.name, "timeoutSeconds": 45, "timedOut": False}
+            result["attempts"].append(attempt)
+            with log.open("wb") as output:
+                process = subprocess.Popen(command, cwd=test_root, env=environment,
+                                           stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    attempt["debuggerExitCode"] = process.wait(timeout=45)
+                except subprocess.TimeoutExpired:
+                    attempt["timedOut"] = True
+                    # LLDB's inferior may have its own process group. Interrupt
+                    # the debugger first so its queued process-kill command runs.
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        attempt["debuggerExitCode"] = process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        attempt["debuggerDidNotRespondToInterrupt"] = True
+                finally:
+                    # Last-resort cleanup covers this fresh debugger group only.
+                    # It cannot prove termination of a separately grouped target.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
+            with log.open("rb") as output:
+                text = output.read(4 * 1024**2).decode("utf-8", errors="replace")
+            attempt["logBytes"] = log.stat().st_size
+            attempt["crashObserved"] = bool(re.search(r"stop reason = (?:EXC_|signal SIG(?:BUS|SEGV|ABRT|ILL))", text))
+            attempt["backtraceObserved"] = attempt["crashObserved"] and bool(re.search(r"frame #\d+:", text))
+            launched = re.search(r"Process (\d+) launched:", text)
+            attempt["inferiorCleanupConfirmed"] = bool(launched and re.search(
+                r"Process " + launched.group(1) + r" exited with status", text))
+            if not attempt["inferiorCleanupConfirmed"]:
+                attempt["cleanupUnknown"] = "No matching inferior exit was observed. Do not start another replay."
+            if attempt["backtraceObserved"] or not attempt["inferiorCleanupConfirmed"]:
+                break
+    except (OSError, ET.ParseError, RuntimeError, subprocess.SubprocessError) as error:
+        result["error"] = str(error)
+    return result
+
+
 def report():
     case_evidence = test_evidence()
     signature = signature_evidence(ROOT / "stage")
     evidence = release_evidence()
     identity = evidence.source_identity(SOURCE, candidate_head())
+    diagnostics = {"scope": "not collected on this operating system"}
+    if platform.system() == "Darwin":
+        begin_path = REPORTS / "build-begin.json"
+        if begin_path.is_file():
+            started = evidence.timestamp(evidence.read_json(begin_path)["startedAt"]).timestamp()
+            diagnostics = collect_crash_reports([Path.home() / "Library/Logs/DiagnosticReports",
+                                                 Path("/Library/Logs/DiagnosticReports")],
+                                                REPORTS / "mac-crash-reports", started)
+        else:
+            diagnostics = {"scope": "not collected because this job never began a build"}
+        evidence.write_json(REPORTS / "mac-crash-reports.json", diagnostics)
     document = {"schemaVersion": 1, "product": PRODUCT,
                 "sourceIdentity": identity, "system": platform.system(),
                 "commit": os.environ.get("GITHUB_SHA"),
@@ -223,6 +339,7 @@ def report():
                 "platform": platform.platform(), "architecture": platform.machine(),
                 "expectedArchitecture": os.environ.get("QCOPILOTS_SEARCH_CI_ARCH"),
                 "signature": signature["status"], "signatureEvidence": signature, "published": False,
+                "crashDiagnostics": diagnostics,
                 "testReportPresent": (REPORTS / "tests/ctest.xml").is_file(),
                 "testCasesComplete": case_evidence["releaseComplete"],
                 "testInventoryVerified": case_evidence["inventoryVerified"],
@@ -235,7 +352,7 @@ def report():
                 "installerReportPresent": (REPORTS / ("package-nsis/report.json" if os.name == "nt" else "package-deb/report.json")).is_file() if platform.system() in ("Windows", "Linux") else None,
                 "sourceManifestPresent": (ROOT / "packages/qcopilots-search-source-manifest.json").is_file(),
                 "sourceIntegrityReportPresent": (REPORTS / "source-integrity.json").is_file(),
-                "capacityScope": "10,000 synthetic vectors, not the local million-vector acceptance",
+                "capacityScope": "30,000 synthetic vectors exercising global ANN, not the local million-vector acceptance",
                 "computerUse": "Requires a separate Windows desktop evidence report",
                 "timestampUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     (REPORTS / "native-acceptance.json").write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -278,7 +395,13 @@ def main():
         (REPORTS / "tests/ctest-inventory.json").write_text(inventory.stdout, encoding="utf-8")
         os.environ["QCOPILOTS_SEARCH_SEMANTIC_REPORT"] = str(REPORTS / "semantic-quality.json")
         os.environ["QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT"] = str(REPORTS / "physical-files-ci.json")
-        dev(action, "--keep-failed-tests", "--report-dir", str(REPORTS / "tests"), display=True)
+        try:
+            dev(action, "--keep-failed-tests", "--report-dir", str(REPORTS / "tests"), display=True)
+        except subprocess.CalledProcessError:
+            diagnostics = gui_failure_diagnostics(REPORTS / "tests/ctest.xml", REPORTS / "mac-gui-debug")
+            (REPORTS / "gui-failure-diagnostics.json").write_text(
+                json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+            raise
         test_evidence(require_complete=True)
     elif action == "capacity":
         capacity()

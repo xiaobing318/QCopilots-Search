@@ -1,4 +1,5 @@
 #include "service/ipc_protocol.h"
+#include "service/ipc_security.h"
 #include "service/service_client.h"
 #include "service/service_server.h"
 #include "core/runtime_paths.h"
@@ -15,9 +16,13 @@
 #include <QLocalSocket>
 #include <QProcess>
 #include <QSignalSpy>
+#include <QScopeGuard>
 #include <QTest>
 #include <QTimer>
 #include <QtEndian>
+#ifndef Q_OS_WIN
+#include <sys/un.h>
+#endif
 #include <stdexcept>
 
 using namespace qcopilots_search;
@@ -115,6 +120,63 @@ public:
 class ServiceTests final : public QObject {
     Q_OBJECT
 private slots:
+#ifndef Q_OS_WIN
+    void unixLongTemporaryDirectoryUsesStableEndpoint() {
+        TestEnvironment environment("service-long-tmpdir");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QString longTemporary = environment.path(QStringLiteral("temporary/") + QString(120, u't'));
+        QVERIFY(QDir().mkpath(longTemporary));
+        ScopedEnvironment temporary("TMPDIR", longTemporary.toUtf8());
+        const auto paths = environment.runtimePaths();
+        QVERIFY(QDir::isAbsolutePath(paths.ipcName));
+        sockaddr_un address{};
+        QVERIFY(QFile::encodeName(paths.ipcName).size() + 1 <= qsizetype(sizeof(address.sun_path)));
+        ServiceProcess service(paths);
+        QVERIFY2(service.start(), qPrintable(service.error));
+        // The already-running child retains the long TMPDIR. A client resolving
+        // its path under another TMPDIR must still find that exact service.
+        ScopedEnvironment changedTemporary("TMPDIR", environment.root().toUtf8());
+        QCOMPARE(RuntimePaths::resolve(paths.profileDir, paths.modelDir).ipcName, paths.ipcName);
+        QVERIFY(service.call("status").value("ok").toBool());
+    }
+
+    void unixUnexpectedSocketLeafIsNotRemoved_data() {
+        QTest::addColumn<bool>("symbolicLink");
+        QTest::newRow("regular-file") << false;
+        QTest::newRow("symbolic-link") << true;
+    }
+    void unixUnexpectedSocketLeafIsNotRemoved() {
+        QFETCH(bool, symbolicLink);
+        TestEnvironment environment("service-occupied-endpoint");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        QVERIFY2(paths.ensureIpcDirectory(&error), qPrintable(error));
+        const QByteArray marker("Never delete this test-owned non-socket file.");
+        const QString target = environment.path(QStringLiteral("marker"));
+        QVERIFY(environment.writeFile("marker", marker));
+        if (symbolicLink) {
+            QVERIFY(QFile::link(target, paths.ipcName));
+        } else {
+            QFile leaf(paths.ipcName);
+            QVERIFY(leaf.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+            QCOMPARE(leaf.write(marker), marker.size());
+        }
+        const auto cleanup = qScopeGuard([&] { QFile::remove(paths.ipcName); });
+        ServiceProcess service(paths);
+        QVERIFY(!service.start());
+        QVERIFY2(service.error.contains(QStringLiteral("Refusing to remove")), qPrintable(service.error));
+        QCOMPARE(QFileInfo(paths.ipcName).isSymLink(), symbolicLink);
+        QFile leaf(paths.ipcName);
+        QVERIFY(leaf.open(QIODevice::ReadOnly));
+        QCOMPARE(leaf.readAll(), marker);
+        leaf.close();
+        QFile original(target);
+        QVERIFY(original.open(QIODevice::ReadOnly));
+        QCOMPARE(original.readAll(), marker);
+    }
+#endif
     void corruptDocumentRemainsSearchableByFilename() {
         TestEnvironment environment("service-corrupt-filename");
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));

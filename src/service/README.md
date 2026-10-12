@@ -2,7 +2,11 @@
 
 `qcopilots-search-service` 是运行配置目录的唯一数据库写入者。GUI 与 CLI 链接 `qcopilots-search-client`，通过 `ServiceClient` 异步发送请求。调用者使用同一个 `RuntimePaths`，无需依赖工作目录。
 
-服务先取得配置目录中的 `QLockFile`，再创建仅允许当前用户访问的本地 IPC。每次服务启动生成独立认证 token，保存在配置目录的 `qcopilots-search-ipc-token`。Unix 文件权限为 `0600`，Windows 同时依靠 named pipe 的当前用户访问控制。客户端只在成功连接后读取 token。
+服务先取得配置目录中的 `QLockFile`，再创建仅允许当前用户访问的本地 IPC。每次服务启动生成独立认证 token，保存在配置目录的 `qcopilots-search-ipc-token`。Unix token 文件权限为 `0600`，Windows 同时依靠 named pipe 的当前用户访问控制。客户端只在成功连接并验证对端用户后读取 token。
+
+Windows 使用 `qcopilots-search-<用户和规范化配置目录摘要>` 管道名。Unix 使用 `/tmp/qcopilots-search-<有效UID>/qcopilots-search-<同一摘要>` 的短绝对 socket 路径，与 `TMPDIR`、配置目录长度和当前工作目录无关。路径按本机 `sockaddr_un` 的编码字节上限检查。私有 UID 目录以 `0700` 创建，已有目录必须属于当前用户且权限相同，符号链接和宽权限目录会被拒绝。macOS 系统 `/tmp` 指向 `/private/tmp` 的别名只在父目录解析时处理。
+
+macOS 使用 `getpeereid`、Linux 使用 `SO_PEERCRED` 双向验证对端有效 UID，随后仍执行配置 token 认证。服务只有取得对应 profile 的锁后才清理同名旧 socket，且拒绝移除普通文件、符号链接或异用户节点。停止时不删除共享的 UID 父目录，也不触碰其他配置的 socket。首次升级到此 Unix endpoint 布局时，需要退出旧版服务后再启动新版。
 
 消息由四字节大端长度和 UTF-8 JSON 对象组成，单帧上限为 16 MiB。所有消息带 `protocol: 1`。请求包含字符串 `id`、`token`、`method` 和对象 `params`。成功响应包含 `ok: true` 与 `result`，失败响应包含 `ok: false` 与 `error.code`、`error.message`。进度广播使用 `event` 与 `data`。
 

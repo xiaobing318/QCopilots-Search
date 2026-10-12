@@ -30,11 +30,13 @@
 #include <atomic>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <random>
 #include <stdexcept>
@@ -338,6 +340,61 @@ SearchOptions benchmarkSearchOptions(const RuntimePaths &paths, bool enforceFold
     return options;
 }
 
+// The hooks delimit real, nonempty graph construction inside VectorIndex.
+// Thread launch and the later graph-file publication are outside this interval.
+class BuildObserver {
+public:
+    struct Interval { qint64 start = -1; qint64 end = -1; };
+    void begin()
+    {
+        std::lock_guard lock(mutex_);
+        intervals_.clear();
+        invalidEvents_ = 0;
+        started_.store(false, std::memory_order_relaxed);
+        origin_ = std::chrono::steady_clock::now();
+        enabled_.store(true, std::memory_order_release);
+    }
+    qint64 now() const
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - origin_).count();
+    }
+    bool hasStarted() const { return started_.load(std::memory_order_acquire); }
+    void observe(const QString &point)
+    {
+        if (!enabled_.load(std::memory_order_acquire))
+            return;
+        if (point != QStringLiteral("ann-build-started") && point != QStringLiteral("ann-build-completed"))
+            return;
+        std::lock_guard lock(mutex_);
+        const qint64 timestamp = now();
+        if (point == QStringLiteral("ann-build-started")) {
+            if (!intervals_.empty() && intervals_.back().end < 0)
+                ++invalidEvents_;
+            intervals_.push_back({timestamp, -1});
+            started_.store(true, std::memory_order_release);
+        } else if (intervals_.empty() || intervals_.back().end >= 0) {
+            ++invalidEvents_;
+        } else {
+            intervals_.back().end = timestamp;
+        }
+    }
+    std::vector<Interval> finish()
+    {
+        enabled_.store(false, std::memory_order_release);
+        std::lock_guard lock(mutex_);
+        require(invalidEvents_ == 0, QStringLiteral("Invalid ANN build observer sequence"));
+        return intervals_;
+    }
+private:
+    std::chrono::steady_clock::time_point origin_;
+    std::atomic<bool> enabled_{false};
+    std::atomic<bool> started_{false};
+    std::mutex mutex_;
+    std::vector<Interval> intervals_;
+    int invalidEvents_ = 0;
+};
+
 bool exerciseFilters(IndexRepository &repository, const RuntimePaths &paths,
                      const std::vector<Query> &queries, qint64 files, bool enforceFolderRules,
                      QJsonObject &report)
@@ -400,7 +457,8 @@ bool exerciseFilters(IndexRepository &repository, const RuntimePaths &paths,
 bool exerciseMutationsAndRebuild(IndexRepository &repository, const RuntimePaths &paths,
                                 const Generator &generator, const std::vector<Query> &queries,
                                 qint64 files, int segmentsPerFile, int timings,
-                                Budget &budget, bool enforceFolderRules, QJsonObject &report)
+                                Budget &budget, bool enforceFolderRules, BuildObserver &observer,
+                                QJsonObject &report)
 {
     const qint64 affectedFiles = std::min(files, std::max(qint64(1), qint64(10000 / segmentsPerFile)));
     const qint64 affectedVectors = affectedFiles * segmentsPerFile;
@@ -424,7 +482,143 @@ bool exerciseMutationsAndRebuild(IndexRepository &repository, const RuntimePaths
         return file;
     };
     QJsonObject mutationReport{{QStringLiteral("filesPerPhase"), affectedFiles},
-                               {QStringLiteral("vectorsPerPhase"), affectedVectors}};
+                               {QStringLiteral("vectorsPerPhase"), affectedVectors},
+                               {QStringLiteral("queryScope"), QStringLiteral("filtered-exact-file-plus-global-production-search-sample")},
+                               {QStringLiteral("passed"), false}};
+    QJsonArray phaseReports;
+    using RetiredIds = std::vector<QSet<qint64>>;
+    auto captureIds = [&](qint64 firstFile) {
+        RetiredIds result(static_cast<size_t>(affectedFiles));
+        for (qint64 i = 0; i < affectedFiles; ++i) {
+            const auto segments = repository.fileSegments(logicalPath(paths.profileDir, firstFile + i), false, &error);
+            require(error.isEmpty() && segments.size() == segmentsPerFile,
+                    QStringLiteral("Cannot capture the previous mutation segments"));
+            for (const auto &segment : segments)
+                result[size_t(i)].insert(segment.id);
+        }
+        return result;
+    };
+    auto validatePhase = [&](const QString &phase, qint64 firstFile, const RetiredIds &retired) {
+        const bool deleted = phase == QStringLiteral("delete");
+        const QString version = phase == QStringLiteral("update") ? QStringLiteral("mutation-updated")
+                                                                  : QStringLiteral("mutation-added");
+        QString token = version;
+        token.remove('-');
+        token += QStringLiteral("token");
+        qint64 filesChecked = 0, keywordQueries = 0, vectorQueries = 0;
+        qint64 staleHits = 0, retiredChecked = 0, retiredRemaining = 0;
+        sqlite3 *rawDatabase = nullptr;
+        const int opened = sqlite3_open_v2(repository.databasePath().toUtf8().constData(), &rawDatabase,
+                                           SQLITE_OPEN_READONLY, nullptr);
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
+        require(opened == SQLITE_OK, QStringLiteral("Cannot inspect retired mutation segments"));
+        sqlite3_busy_timeout(database.get(), 30000);
+        sqlite3_stmt *rawStatement = nullptr;
+        require(sqlite3_prepare_v2(database.get(), "SELECT count(*) FROM segments WHERE id=?", -1,
+                                   &rawStatement, nullptr) == SQLITE_OK,
+                QStringLiteral("Cannot prepare retired-segment verification"));
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> retiredStatement(rawStatement, sqlite3_finalize);
+        for (qint64 i = 0; i < affectedFiles; ++i) {
+            const QString path = logicalPath(paths.profileDir, firstFile + i);
+            const auto current = repository.fileSegments(path, false, &error);
+            require(error.isEmpty() && current.size() == (deleted ? 0 : segmentsPerFile),
+                    QStringLiteral("Mutation segment count mismatch"));
+            QSet<qint64> currentIds;
+            for (const auto &segment : current)
+                currentIds.insert(segment.id);
+            qint64 previousMaximum = 0;
+            for (const qint64 id : retired[size_t(i)]) {
+                ++retiredChecked;
+                require(sqlite3_bind_int64(retiredStatement.get(), 1, id) == SQLITE_OK &&
+                            sqlite3_step(retiredStatement.get()) == SQLITE_ROW,
+                        QStringLiteral("Cannot observe a retired segment's global presence"));
+                retiredRemaining += sqlite3_column_int64(retiredStatement.get(), 0);
+                require(sqlite3_reset(retiredStatement.get()) == SQLITE_OK,
+                        QStringLiteral("Cannot reset retired-segment verification"));
+                require(!currentIds.contains(id), QStringLiteral("Retired mutation segment remained in its original file"));
+                previousMaximum = std::max(previousMaximum, id);
+            }
+            require(retiredRemaining == 0, QStringLiteral("A retired mutation segment is still present"));
+            const QString storedVersion = repository.fileVersion(path, false, &error);
+            require(error.isEmpty() && storedVersion == (deleted ? QString{} : version),
+                    QStringLiteral("Committed mutation version mismatch"));
+            auto checkHits = [&](const QList<SearchHit> &hits, bool semantic) {
+                for (const auto &hit : hits) {
+                    if (deleted || hit.path != path || hit.sourceVersion != version ||
+                        !currentIds.contains(hit.segmentId) || hit.segmentId <= previousMaximum ||
+                        hit.text != token + QStringLiteral(" mutation fixture"))
+                        ++staleHits;
+                }
+                require(staleHits == 0, QStringLiteral("Mutation search returned stale content or source version"));
+                require(hits.size() == (deleted ? 0 : 1), QStringLiteral("Mutation search result count mismatch"));
+                if (semantic && !deleted)
+                    require(hits.first().segmentId == current.first().id,
+                            QStringLiteral("The replacement's first vector was not recalled"));
+            };
+            auto keyword = benchmarkSearchOptions(paths, enforceFolderRules);
+            keyword.root = path;
+            keyword.query = token;
+            keyword.limit = topK;
+            const auto keywordHits = repository.search(keyword, &error);
+            ++keywordQueries;
+            require(error.isEmpty(), error);
+            checkHits(keywordHits, false);
+            auto semantic = benchmarkSearchOptions(paths, enforceFolderRules);
+            semantic.root = path;
+            semantic.queryEmbedding = generator.vector(files * 2 + i, 0);
+            semantic.limit = topK;
+            const auto vectorHits = repository.search(semantic, &error);
+            ++vectorQueries;
+            require(error.isEmpty(), error);
+            checkHits(vectorHits, true);
+            ++filesChecked;
+        }
+        // Every changed file is exercised through the production search API.
+        // A small global production-search sample additionally checks returned identities
+        // still belong to the current authoritative segments and source versions.
+        const auto globalStatus = repository.status(&error);
+        require(error.isEmpty(), error);
+        const qint64 globalVectors = globalStatus.value(QStringLiteral("vectors")).toInteger();
+        require(globalVectors == files * segmentsPerFile + (deleted ? 0 : affectedVectors),
+                QStringLiteral("Unexpected vector count during mutation search verification"));
+        // IndexRepository::search selects exact-subset for <= 20,000 eligible
+        // vectors. Small native runs must not label that production path ANN.
+        const QString globalBackend = globalVectors > 20000 ? QStringLiteral("ann") : QStringLiteral("exact-subset");
+        const int globalQueries = int(std::min(qint64(16), affectedFiles));
+        qint64 globalCheckedHits = 0, globalStaleHits = 0;
+        for (int sample = 0; sample < globalQueries; ++sample) {
+            const qint64 selected = qint64(sample) * affectedFiles / globalQueries;
+            auto options = benchmarkSearchOptions(paths, enforceFolderRules);
+            options.queryEmbedding = generator.vector(files * 2 + selected, 0);
+            options.limit = topK;
+            const auto hits = repository.search(options, &error);
+            require(error.isEmpty() && !hits.isEmpty(), QStringLiteral("Global mutation search failed: %1").arg(error));
+            for (const auto &hit : hits) {
+                const QString currentVersion = repository.fileVersion(hit.path, false, &error);
+                require(error.isEmpty(), error);
+                const auto current = repository.fileSegments(hit.path, false, &error);
+                require(error.isEmpty(), error);
+                const bool currentSegment = std::any_of(current.cbegin(), current.cend(), [&](const Segment &segment) {
+                    return segment.id == hit.segmentId && segment.text == hit.text;
+                });
+                globalStaleHits += currentVersion.isEmpty() || hit.sourceVersion != currentVersion || !currentSegment ? 1 : 0;
+                ++globalCheckedHits;
+            }
+        }
+        require(globalStaleHits == 0, QStringLiteral("Global search returned a retired mutation segment or source version"));
+        phaseReports.append(QJsonObject{
+            {QStringLiteral("phase"), phase}, {QStringLiteral("passed"), true},
+            {QStringLiteral("filesChecked"), filesChecked},
+            {QStringLiteral("keywordQueries"), keywordQueries}, {QStringLiteral("vectorQueries"), vectorQueries},
+            {QStringLiteral("staleHitCount"), staleHits},
+            {QStringLiteral("retiredSegmentIdsChecked"), retiredChecked},
+            {QStringLiteral("retiredSegmentIdsRemaining"), retiredRemaining},
+            {QStringLiteral("globalSearchQueries"), globalQueries}, {QStringLiteral("globalSearchCheckedHits"), globalCheckedHits},
+            {QStringLiteral("globalSearchStaleHitCount"), globalStaleHits},
+            {QStringLiteral("globalSearchVectorCount"), globalVectors}, {QStringLiteral("globalSearchBackend"), globalBackend}});
+        mutationReport.insert(QStringLiteral("phases"), phaseReports);
+        report.insert(QStringLiteral("mutations"), mutationReport);
+    };
     auto replacePhase = [&](bool additions) {
         QElapsedTimer timer;
         timer.start();
@@ -439,17 +633,16 @@ bool exerciseMutationsAndRebuild(IndexRepository &repository, const RuntimePaths
             start += count;
         }
         require(repository.flush(&error), error);
-        for (qint64 i = 0; i < affectedFiles; ++i) {
-            const auto version = repository.fileVersion(logicalPath(paths.profileDir, additions ? files + i : i), false, &error);
-            require(error.isEmpty() && version == (additions ? QStringLiteral("mutation-added") : QStringLiteral("mutation-updated")),
-                    QStringLiteral("Committed mutation version mismatch"));
-        }
         require(repository.checkIntegrity(&error), error);
         budget.check();
         return timer.elapsed();
     };
     mutationReport.insert(QStringLiteral("addMilliseconds"), replacePhase(true));
+    validatePhase(QStringLiteral("add"), files, RetiredIds(size_t(affectedFiles)));
+    const auto replacedIds = captureIds(0);
     mutationReport.insert(QStringLiteral("updateMilliseconds"), replacePhase(false));
+    validatePhase(QStringLiteral("update"), 0, replacedIds);
+    const auto removedIds = captureIds(files);
     QElapsedTimer deleteTimer;
     deleteTimer.start();
     for (qint64 i = 0; i < affectedFiles; ++i) {
@@ -458,9 +651,7 @@ bool exerciseMutationsAndRebuild(IndexRepository &repository, const RuntimePaths
             budget.check();
     }
     require(repository.flush(&error), error);
-    for (qint64 i = 0; i < affectedFiles; ++i)
-        require(repository.fileVersion(logicalPath(paths.profileDir, files + i), false, &error).isEmpty() && error.isEmpty(),
-                QStringLiteral("Deleted file retained a version"));
+    validatePhase(QStringLiteral("delete"), files, removedIds);
     auto removed = benchmarkSearchOptions(paths, enforceFolderRules);
     removed.query = QStringLiteral("mutationaddedtoken");
     require(repository.search(removed, &error).isEmpty() && error.isEmpty(), QStringLiteral("Deleted content remained searchable"));
@@ -476,14 +667,13 @@ bool exerciseMutationsAndRebuild(IndexRepository &repository, const RuntimePaths
     // Add one replacement without deferred indexing so queries remain available.
     // flushOneShard rebuilds exactly one pending graph, using immutable snapshots.
     require(repository.replaceFiles({makeFile(0, files * 3, QStringLiteral("background-rebuild"))}, &error), error);
-    std::atomic<bool> started{false};
     std::atomic<bool> finished{false};
     bool rebuildSucceeded = false;
     QString rebuildError;
     QElapsedTimer rebuildTimer;
     rebuildTimer.start();
+    observer.begin();
     std::thread rebuilding([&] {
-        started.store(true, std::memory_order_release);
         rebuildSucceeded = repository.flushOneShard(&rebuildError);
         finished.store(true, std::memory_order_release);
     });
@@ -491,28 +681,52 @@ bool exerciseMutationsAndRebuild(IndexRepository &repository, const RuntimePaths
         if (rebuilding.joinable())
             rebuilding.join();
     });
-    while (!started.load(std::memory_order_acquire))
+    while (!observer.hasStarted() && !finished.load(std::memory_order_acquire))
         std::this_thread::yield();
-    std::vector<double> concurrentTimes;
+    std::vector<BuildObserver::Interval> queryIntervals;
     for (int i = 0; i < timings && !finished.load(std::memory_order_acquire); ++i) {
         auto options = benchmarkSearchOptions(paths, enforceFolderRules);
         options.queryEmbedding = queries[size_t(i) % queries.size()].values;
         options.limit = topK;
-        QElapsedTimer timer;
-        timer.start();
+        const qint64 start = observer.now();
         const auto hits = repository.search(options, &error);
-        concurrentTimes.push_back(double(timer.nsecsElapsed()) / 1000000.0);
+        queryIntervals.push_back({start, observer.now()});
         require(error.isEmpty() && !hits.isEmpty(), error.isEmpty() ? QStringLiteral("Search failed during a shard rebuild") : error);
         for (const auto &hit : hits)
             require(!hit.text.contains(QStringLiteral("mutationaddedtoken")), QStringLiteral("Deleted file returned during a shard rebuild"));
     }
     rebuilding.join();
+    const auto buildIntervals = observer.finish();
     require(rebuildSucceeded, rebuildError);
-    const bool measured = !concurrentTimes.empty();
+    const bool singleShard = buildIntervals.size() == 1 && buildIntervals.front().start >= 0
+        && buildIntervals.front().end > buildIntervals.front().start;
+    QJsonArray rawBuildIntervals;
+    for (const auto &interval : buildIntervals)
+        rawBuildIntervals.append(QJsonObject{{QStringLiteral("startNanoseconds"), interval.start},
+                                            {QStringLiteral("endNanoseconds"), interval.end}});
+    QJsonArray rawQueryIntervals;
+    std::vector<double> concurrentTimes;
+    for (const auto &interval : queryIntervals) {
+        const double duration = double(interval.end - interval.start) / 1000000.0;
+        const bool overlaps = singleShard && interval.start < buildIntervals.front().end
+            && interval.end > buildIntervals.front().start;
+        if (overlaps)
+            concurrentTimes.push_back(duration);
+        rawQueryIntervals.append(QJsonObject{{QStringLiteral("startNanoseconds"), interval.start},
+                                            {QStringLiteral("endNanoseconds"), interval.end},
+                                            {QStringLiteral("durationMilliseconds"), duration},
+                                            {QStringLiteral("overlapsBuild"), overlaps}});
+    }
+    const bool measured = singleShard && !concurrentTimes.empty();
     const double p95 = percentile(concurrentTimes, .95);
     report.insert(QStringLiteral("concurrentRebuild"), QJsonObject{
-        {QStringLiteral("singleShard"), true},
+        {QStringLiteral("singleShard"), singleShard},
         {QStringLiteral("rebuildMilliseconds"), rebuildTimer.elapsed()},
+        {QStringLiteral("timingClock"), QStringLiteral("steady-clock-relative-nanoseconds")},
+        {QStringLiteral("observedBuilds"), int(buildIntervals.size())},
+        {QStringLiteral("measuredQueries"), int(queryIntervals.size())},
+        {QStringLiteral("buildIntervals"), rawBuildIntervals},
+        {QStringLiteral("queryIntervals"), rawQueryIntervals},
         {QStringLiteral("overlappingQueries"), int(concurrentTimes.size())},
         {QStringLiteral("p50Milliseconds"), percentile(concurrentTimes, .50)},
         {QStringLiteral("p95Milliseconds"), p95},
@@ -530,6 +744,26 @@ QString recoveryPath(const RuntimePaths &paths)
     return QDir(paths.profileDir).filePath(QStringLiteral("recovery/committed.txt"));
 }
 
+struct RecoveryExpectation {
+    QString version;
+    QString token;
+    int vectorDimension;
+};
+
+RecoveryExpectation recoveryExpectation(const QString &phase)
+{
+    if (phase == QStringLiteral("committed-before-ann") || phase == QStringLiteral("uncommitted-sqlite"))
+        return {QStringLiteral("recovery-committed-before-ann"),
+                QStringLiteral("recoverycommittedbeforeanntoken"), 700};
+    if (phase == QStringLiteral("ann-file-saved-before-manifest"))
+        return {QStringLiteral("recovery-ann-file-saved-before-manifest"),
+                QStringLiteral("recoveryannfilesavedbeforemanifesttoken"), 702};
+    require(phase == QStringLiteral("ann-manifest-published-before-outbox-cleanup"),
+            QStringLiteral("Unknown recovery identity"));
+    return {QStringLiteral("recovery-ann-manifest-published-before-outbox-cleanup"),
+            QStringLiteral("recoveryannmanifestpublishedbeforeoutboxcleanuptoken"), 703};
+}
+
 int runCrashChild(const QCommandLineParser &parser)
 {
     const QString profile = parser.value(QStringLiteral("profile-dir"));
@@ -541,6 +775,7 @@ int runCrashChild(const QCommandLineParser &parser)
     marker.close();
     const auto paths = RuntimePaths::resolve(profile);
     const QString mode = parser.value(QStringLiteral("fault-child"));
+    const auto expected = recoveryExpectation(mode);
     const bool annFileFault = mode == QStringLiteral("ann-file-saved-before-manifest");
     const bool annOutboxFault = mode == QStringLiteral("ann-manifest-published-before-outbox-cleanup");
     if (mode == QStringLiteral("committed-before-ann") || annFileFault || annOutboxFault) {
@@ -556,12 +791,12 @@ int runCrashChild(const QCommandLineParser &parser)
         QString error;
         require(repository.open(paths, &error), error);
         Segment segment;
-        segment.text = QStringLiteral("recoverycommittedtoken");
+        segment.text = expected.token;
         segment.kind = QStringLiteral("text");
         segment.modality = QStringLiteral("text");
         segment.embedding = QVector<float>(embeddingDimensions, 0);
-        segment.embedding[700] = 1;
-        require(repository.replaceFiles({{recoveryPath(paths), QStringLiteral("recovery-committed"), false, {segment}}}, &error), error);
+        segment.embedding[expected.vectorDimension] = 1;
+        require(repository.replaceFiles({{recoveryPath(paths), expected.version, false, {segment}}}, &error), error);
         if (annOutboxFault) {
             // The caller's ownership token was checked before entering this
             // test-only SQL path. A large same-shard outbox reproduces the exact
@@ -610,9 +845,24 @@ void exerciseRecovery(const RuntimePaths &paths, Budget &budget, bool enforceFol
     require(marker.open(QIODevice::WriteOnly) && marker.write(token.toUtf8()) == token.toUtf8().size() && marker.commit(),
             QStringLiteral("Cannot create recovery-child ownership marker"));
     QJsonArray phases;
+    qint64 previousSegmentId = 0;
+    QSet<QString> previousTokens;
     for (const QString &phase : {QStringLiteral("committed-before-ann"), QStringLiteral("uncommitted-sqlite"),
                                  QStringLiteral("ann-file-saved-before-manifest"),
                                  QStringLiteral("ann-manifest-published-before-outbox-cleanup")}) {
+        const auto expected = recoveryExpectation(phase);
+        QJsonObject phaseReport{{QStringLiteral("faultPoint"), phase},
+                                {QStringLiteral("expectedVersion"), expected.version},
+                                {QStringLiteral("expectedToken"), expected.token},
+                                {QStringLiteral("expectedVectorDimension"), expected.vectorDimension},
+                                {QStringLiteral("previousSegmentId"), previousSegmentId},
+                                {QStringLiteral("passed"), false}};
+        // Retain completed phases and the failed phase's actual observations if
+        // a later assertion throws. The outer driver writes the final report.
+        const auto preservePhase = qScopeGuard([&] {
+            phases.append(phaseReport);
+            report.insert(QStringLiteral("recoveryFaults"), phases);
+        });
         QProcess child;
         child.setProgram(QCoreApplication::applicationFilePath());
         child.setArguments({QStringLiteral("--profile-dir"), paths.profileDir,
@@ -626,29 +876,114 @@ void exerciseRecovery(const RuntimePaths &paths, Budget &budget, bool enforceFol
             child.waitForFinished(10000);
             require(false, QStringLiteral("Recovery child timed out"));
         }
+        phaseReport.insert(QStringLiteral("childExitCode"), child.exitCode());
         require(child.exitCode() == 73, QStringLiteral("Recovery child failed before fault point: %1").arg(QString::fromUtf8(child.readAllStandardError())));
         StorageOptions options;
         options.diskReserveBytes = budget.reserve;
         IndexRepository reopened(options);
         QString error;
         require(reopened.open(paths, &error), error);
-        require(reopened.fileVersion(recoveryPath(paths), false, &error) == QStringLiteral("recovery-committed") && error.isEmpty(),
+        const QString observedVersion = reopened.fileVersion(recoveryPath(paths), false, &error);
+        phaseReport.insert(QStringLiteral("observedVersion"), observedVersion);
+        require(observedVersion == expected.version && error.isEmpty(),
                 QStringLiteral("Recovery lost the committed file or exposed an uncommitted version"));
         auto keyword = benchmarkSearchOptions(paths, enforceFolderRules);
-        keyword.query = QStringLiteral("recoverycommittedtoken");
+        keyword.query = expected.token;
         const auto keywordHits = reopened.search(keyword, &error);
         require(error.isEmpty() && keywordHits.size() == 1 && keywordHits.first().path == recoveryPath(paths),
                 QStringLiteral("Recovery keyword result is inconsistent"));
+        const auto &keywordHit = keywordHits.first();
+        phaseReport.insert(QStringLiteral("observedToken"), keywordHit.text);
+        phaseReport.insert(QStringLiteral("observedSegmentId"), keywordHit.segmentId);
+        require(keywordHit.text == expected.token,
+                QStringLiteral("Recovery returned a previous phase's text"));
+        require(phase == QStringLiteral("uncommitted-sqlite")
+                    ? keywordHit.segmentId == previousSegmentId
+                    : keywordHit.segmentId > previousSegmentId,
+                QStringLiteral("Recovery segment identity did not match this phase's commit or rollback"));
+        qint64 oldKeywordHits = 0;
+        for (const auto &oldToken : previousTokens) {
+            if (oldToken == expected.token)
+                continue;
+            auto retired = benchmarkSearchOptions(paths, enforceFolderRules);
+            retired.query = oldToken;
+            const auto stale = reopened.search(retired, &error);
+            require(error.isEmpty(), error);
+            oldKeywordHits += stale.size();
+        }
+        phaseReport.insert(QStringLiteral("oldKeywordHits"), oldKeywordHits);
+        require(oldKeywordHits == 0, QStringLiteral("A replaced recovery phase's keyword remains searchable"));
         auto semantic = benchmarkSearchOptions(paths, enforceFolderRules);
         semantic.queryEmbedding = QVector<float>(embeddingDimensions, 0);
-        semantic.queryEmbedding[700] = 1;
+        semantic.queryEmbedding[expected.vectorDimension] = 1;
         semantic.limit = 1;
         const auto vectorHits = reopened.search(semantic, &error);
         require(error.isEmpty() && vectorHits.size() == 1 && vectorHits.first().path == recoveryPath(paths),
                 QStringLiteral("Recovery did not replay the committed vector delta"));
-        QJsonObject phaseReport{{QStringLiteral("faultPoint"), phase},
-                                {QStringLiteral("childExitCode"), child.exitCode()},
-                                {QStringLiteral("passed"), true}};
+        const auto &vectorHit = vectorHits.first();
+        const qint64 staleVersionHits = qint64(keywordHit.sourceVersion != expected.version)
+                                     + qint64(vectorHit.sourceVersion != expected.version);
+        phaseReport.insert(QStringLiteral("staleVersionHits"), staleVersionHits);
+        require(staleVersionHits == 0 && vectorHit.segmentId == keywordHit.segmentId,
+                QStringLiteral("Recovery keyword and semantic results refer to inconsistent source versions or segments"));
+
+        // Observe the persisted FP16 vector independently of the ANN and the
+        // storage decoder. A matching path alone cannot prove this phase's
+        // replacement vector survived the crash.
+        {
+            sqlite3 *rawDatabase = nullptr;
+            const int opened = sqlite3_open_v2(paths.databaseFile().toUtf8().constData(), &rawDatabase,
+                                               SQLITE_OPEN_READONLY, nullptr);
+            std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
+            require(opened == SQLITE_OK, QStringLiteral("Cannot inspect recovered vector and rollback state"));
+            sqlite3_busy_timeout(database.get(), 30000);
+            sqlite3_stmt *rawStatement = nullptr;
+            require(sqlite3_prepare_v2(database.get(), "SELECT embedding FROM segments WHERE id=?", -1,
+                                       &rawStatement, nullptr) == SQLITE_OK,
+                    QStringLiteral("Cannot prepare recovered-vector observation"));
+            std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(rawStatement, sqlite3_finalize);
+            require(sqlite3_bind_int64(statement.get(), 1, vectorHit.segmentId) == SQLITE_OK
+                        && sqlite3_step(statement.get()) == SQLITE_ROW
+                        && sqlite3_column_bytes(statement.get(), 0) == embeddingDimensions * 2,
+                    QStringLiteral("Recovered semantic result has no valid FP16 vector"));
+            const auto *bytes = static_cast<const unsigned char *>(sqlite3_column_blob(statement.get(), 0));
+            int observedDimension = -1;
+            double maximumAbsolute = -1;
+            double normSquared = 0;
+            double expectedComponent = 0;
+            for (int dimension = 0; dimension < embeddingDimensions; ++dimension) {
+                const double value = fromHalf(quint16(bytes[2 * dimension])
+                                              | quint16(bytes[2 * dimension + 1] << 8));
+                require(std::isfinite(value), QStringLiteral("Recovered vector contains a non-finite value"));
+                normSquared += value * value;
+                if (std::abs(value) > maximumAbsolute) {
+                    maximumAbsolute = std::abs(value);
+                    observedDimension = dimension;
+                }
+                if (dimension == expected.vectorDimension)
+                    expectedComponent = value;
+            }
+            require(normSquared > 0, QStringLiteral("Recovered vector has zero norm"));
+            const double observedCosine = expectedComponent / std::sqrt(normSquared);
+            const bool vectorMatched = observedDimension == expected.vectorDimension && observedCosine >= .999;
+            phaseReport.insert(QStringLiteral("observedVectorDimension"), observedDimension);
+            phaseReport.insert(QStringLiteral("observedVectorCosine"), observedCosine);
+            phaseReport.insert(QStringLiteral("vectorMatched"), vectorMatched);
+            require(vectorMatched, QStringLiteral("Recovered vector belongs to an earlier fault phase"));
+            statement.reset();
+
+            rawStatement = nullptr;
+            require(sqlite3_prepare_v2(database.get(),
+                                       "SELECT count(*) FROM files WHERE version='uncommitted-corruption'", -1,
+                                       &rawStatement, nullptr) == SQLITE_OK,
+                    QStringLiteral("Cannot prepare whole-database rollback observation"));
+            statement.reset(rawStatement);
+            require(sqlite3_step(statement.get()) == SQLITE_ROW,
+                    QStringLiteral("Cannot inspect whole-database rollback state"));
+            const qint64 corruptionRows = sqlite3_column_int64(statement.get(), 0);
+            phaseReport.insert(QStringLiteral("uncommittedCorruptionRows"), corruptionRows);
+            require(corruptionRows == 0, QStringLiteral("Recovery exposed uncommitted versions in the corpus"));
+        }
         if (phase == QStringLiteral("ann-manifest-published-before-outbox-cleanup")) {
             sqlite3 *rawDatabase = nullptr;
             const int opened = sqlite3_open_v2(paths.databaseFile().toUtf8().constData(), &rawDatabase,
@@ -699,7 +1034,9 @@ void exerciseRecovery(const RuntimePaths &paths, Budget &budget, bool enforceFol
         require(reopened.checkIntegrity(&error), error);
         require(reopened.flush(&error), error);
         budget.check();
-        phases.append(phaseReport);
+        phaseReport.insert(QStringLiteral("passed"), true);
+        previousSegmentId = keywordHit.segmentId;
+        previousTokens.insert(expected.token);
     }
     report.insert(QStringLiteral("recoveryFaultInjectionEvaluated"), true);
     report.insert(QStringLiteral("recoveryFaults"), phases);
@@ -898,6 +1235,8 @@ int main(int argc, char **argv)
         const auto oracle = exactOracle(databasePath, queries, files * segmentsPerFile, report);
         StorageOptions searchStorageOptions;
         searchStorageOptions.diskReserveBytes = budget->reserve;
+        BuildObserver observer;
+        searchStorageOptions.faultHook = [&](const QString &point) { observer.observe(point); };
         auto capacityRepository = std::make_unique<IndexRepository>(searchStorageOptions);
         IndexRepository &reopened = *capacityRepository;
         require(reopened.open(paths, &error), error);
@@ -977,7 +1316,8 @@ int main(int argc, char **argv)
         writeReport(reportPath, report);
         QTextStream(stdout) << "checking additions, replacements, deletions, and concurrent single-shard rebuild" << Qt::endl;
         const bool rebuildPassed = exerciseMutationsAndRebuild(reopened, paths, generator, queries, files,
-                                                               segmentsPerFile, timings, *budget, enforceFolderRules, report);
+                                                               segmentsPerFile, timings, *budget, enforceFolderRules,
+                                                               observer, report);
         writeReport(reportPath, report);
         capacityRepository.reset(); // Child fault injection requires exclusive profile ownership.
         QTextStream(stdout) << "checking process-loss recovery" << Qt::endl;

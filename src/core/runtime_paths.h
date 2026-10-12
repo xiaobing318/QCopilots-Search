@@ -15,10 +15,12 @@ struct RuntimePaths {
     QString tempDir;
     QString configFile;
     QString lockFile;
-    QString ipcName;
+    QString ipcName; // Windows pipe name, Unix absolute socket pathname.
 
     static RuntimePaths resolve(const QString &profileDir = {}, const QString &modelDir = {});
     bool ensure(QString *error = nullptr) const;
+    bool ensureIpcDirectory(QString *error = nullptr) const;
+    bool validateIpcDirectory(QString *error = nullptr) const;
     QString databaseFile() const;
 };
 

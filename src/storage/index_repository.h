@@ -23,6 +23,10 @@ struct StorageOptions {
   qint64 diskReserveBytes = 64LL * 1024 * 1024;
   std::function<qint64(const QString &)> availableBytes;
   std::function<void(const QString &)> faultHook;
+  // Pause new writes while readers or another connection prevent reclaiming
+  // a WAL larger than this budget. Must be positive. Keeping this configurable
+  // also permits real SQLite recovery tests without a 256 MiB fixture.
+  qint64 maxWalBytes = 256LL * 1024 * 1024;
 };
 
 // One service owns the writer. Each search creates an independent SQLite read
