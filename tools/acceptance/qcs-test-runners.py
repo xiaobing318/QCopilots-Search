@@ -23,6 +23,7 @@ SCRIPTS = (
     "qcs-test-million-evidence.py",
     "qcs-test-package-runners.py",
     "qcs-test-portability-runners.py",
+    "qcs-test-diagnostics.py",
     "qcs-test-latency-preparation.py",
     "qcs-cu-recorder-tests.py",
     "qcs-test-copy-cu-fixtures.py",
@@ -63,8 +64,11 @@ def main():
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     capabilities = {}
+    portability = None
     for filename in SCRIPTS:
         module = load_script(filename)
+        if filename == "qcs-test-portability-runners.py":
+            portability = module
         if hasattr(module, "CAPABILITIES"):
             capabilities[filename] = module.CAPABILITIES
         tests = loader.loadTestsFromModule(module)
@@ -74,7 +78,9 @@ def main():
     suite.addTests(loader.loadTestsFromTestCase(RecorderIntegration))
     print("QCS_ACCEPTANCE_TEST_CAPABILITIES " + json.dumps(capabilities, ensure_ascii=False),
           file=sys.stderr, flush=True)
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if portability is None:
+        raise RuntimeError("Required portability diagnostic producer was not loaded")
+    result = portability.DiagnosticTestRunner(verbosity=2).run(suite)
     # Only the three exact Windows-native contracts are inapplicable elsewhere.
     # Missing tools on Windows and every other skip remain required failures.
     return 0 if result.wasSuccessful() and not unexpected_skips(result) else 1

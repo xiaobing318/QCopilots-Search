@@ -16,6 +16,43 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 DIRECTORY = Path(__file__).resolve().parent
+_DIAGNOSTICS: list[str] = []
+
+
+def queue_diagnostic(prefix: str, payload: dict) -> None:
+    # Freeze each record before fixtures are restored or removed.
+    _DIAGNOSTICS.append(prefix + " " + json.dumps(payload, ensure_ascii=False))
+
+
+def flush_diagnostics(stream) -> None:
+    if not _DIAGNOSTICS:
+        return
+    count = len(_DIAGNOSTICS)
+    stream.write("\n")
+    for line in _DIAGNOSTICS[:count]:
+        stream.write(line + "\n")
+    stream.flush()
+    del _DIAGNOSTICS[:count]
+
+
+class DiagnosticTestRunner(unittest.TextTestRunner):
+    def run(self, test):
+        primary = None
+        try:
+            return super().run(test)
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                # unittest and diagnostics share one stream after the summary.
+                # CTest merging stdout/stderr must not split case lines or JSON.
+                flush_diagnostics(self.stream)
+            except BaseException as error:
+                if primary is None:
+                    raise
+                if hasattr(primary, "add_note"):
+                    primary.add_note("Diagnostic output also failed: " + repr(error))
 
 
 def load(name):
@@ -95,7 +132,7 @@ class PortabilityContracts(unittest.TestCase):
         if hasattr(primary, "add_note"):
             primary.add_note(note)
         else:
-            print(note, file=sys.stderr)
+            _DIAGNOSTICS.append(note)
         return primary
 
     def test_only_exact_non_windows_native_cases_are_not_applicable(self):
@@ -391,11 +428,11 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
                         restored_probes = runner.restored_write_probes(source)
                         self.assertEqual(len(restored_probes), 6)
                         runner.require_restored_write_probes(restored_probes)
-                    print("QCS_ACL_SCENARIO " + json.dumps({"scenario": scenario,
+                    queue_diagnostic("QCS_ACL_SCENARIO", {"scenario": scenario,
                           "expectedFailureObserved": stale_order,
                           "original": saved, "denied": applied, "readonlyProbes": probes,
                           "restoration": report, "restoredWriteProbes": restored_probes,
-                          "readonlyFileAttributes": readonly_attributes}, ensure_ascii=False))
+                          "readonlyFileAttributes": readonly_attributes})
                 except BaseException as error:
                     primary = self.retain_primary_failure(primary, error)
                 finally:
@@ -424,8 +461,8 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
                             self.assertTrue(all(item["semanticMatch"] and item["restored"] for item in cleanup_result["nodes"]))
                             cleanup_probes = runner.restored_write_probes(source)
                             runner.require_restored_write_probes(cleanup_probes)
-                            print("QCS_ACL_FIXTURE_CLEANUP " + json.dumps({"scenario": scenario,
-                                  "preScenarioRestoration": cleanup_result, "writeProbes": cleanup_probes}, ensure_ascii=False))
+                            queue_diagnostic("QCS_ACL_FIXTURE_CLEANUP", {"scenario": scenario,
+                                  "preScenarioRestoration": cleanup_result, "writeProbes": cleanup_probes})
                         except BaseException as error:
                             primary = self.retain_primary_failure(primary, error)
             if readonly is not None:
@@ -498,8 +535,8 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
         self.assertEqual(record["isolatedSourceAclRestoration"], restoration)
         self.assertNotIn("restoredWriteProbes", record)
         self.assertEqual(before, runner.snapshot(source, exclude_git=False))
-        print("QCS_ACL_SCENARIO " + json.dumps({"scenario": scenario,
-              "expectedFailureObserved": True, "restoration": restoration, "diagnostics": record}, ensure_ascii=False))
+        queue_diagnostic("QCS_ACL_SCENARIO", {"scenario": scenario,
+              "expectedFailureObserved": True, "restoration": restoration, "diagnostics": record})
 
     def check_native_sharing_conflict_is_not_a_permission_denial(self):
         import ctypes
@@ -532,9 +569,9 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
             raise primary
         runner.probe_write_access(target, True)
         self.assertEqual(target.read_bytes(), original)
-        print("QCS_ACL_SCENARIO " + json.dumps({"scenario": "sharing-conflict",
+        queue_diagnostic("QCS_ACL_SCENARIO", {"scenario": "sharing-conflict",
               "expectedFailureObserved": True, "readonlyProbes": records,
-              "handleReleasedAndFileUnchanged": True}, ensure_ascii=False))
+              "handleReleasedAndFileUnchanged": True})
 
     def test_writable_probes_keep_every_result_and_fail_closed(self):
         source = self.probe_fixture()
@@ -852,4 +889,4 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, testRunner=DiagnosticTestRunner)
