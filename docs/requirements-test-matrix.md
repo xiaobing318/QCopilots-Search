@@ -12,6 +12,7 @@
 | 每次 CTest 调用使用独立 cwd | `tools/qcs-test-runner.py`、测试支持库 | `qcs-tests-runner`，同一构建树并发执行同一测试，核对 cwd 和可写配置不共享 | 已建立回归，以本轮逐用例报告为准 |
 | 真实只读源码与双 checkout | `tools/acceptance/qcs-two-checkout-portability.py`、开发脚本 | 实际只读权限下 configure/build/test，源码哈希不变，两个独立 checkout 并行构建 | 必需验收，不能用只读夹具替代 |
 | Windows 逐节点只读与恢复 | `tools/acceptance/qcs-test-portability-runners.py` | 显式允许、继承保护、父子删除权限、只读属性、共享冲突、节点丢失与替换、恢复差异及原始错误保留 | 原生 Windows 用例，恢复差异必须使专项验收失败 |
+| Windows 权限测试进程上下文 | `tools/acceptance/qcs-token-context.py` 与三个验收入口 | `qcs-test-token-context.py`，仅在受控暂停子进程中移除 Backup/Restore 特权、构建后代继承、父令牌不变、已有线程令牌拒绝、真实五探针及失败进程收尾 | 原生 Windows 用例与跨平台错误回归，实际结果待同一冻结候选报告，诊断分支不能替代验收 |
 | 正式应用同时运行时隔离 | RuntimePaths、服务锁和 IPC | 启动受控正式实例并运行独立测试，核对其 PID、状态和数据未变 | 必需回归，以本轮进程报告为准 |
 | 唯一临时根与失败不回退 | 测试支持库、runtime 夹具 | temporaryRootsUnique、customTemporaryRoot、temporaryFailureDoesNotFallback、temporaryDirectoryUsesConfiguredRoot、temporaryDirectoryRejectsFileAsRoot | 已建立用例 |
 | Python 临时根空值与失败边界 | `tests/support/temp_paths.py` | `qcs-tests-temp-paths`，未设置或空值不写 cwd，中文目录隔离，阻塞路径明确失败 | 已建立回归，以本轮逐用例报告为准 |

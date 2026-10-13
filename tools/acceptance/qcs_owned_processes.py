@@ -52,6 +52,7 @@ class WindowsProcesses:
             ("Thread32First", [wintypes.HANDLE, ctypes.POINTER(Thread)], wintypes.BOOL),
             ("Thread32Next", [wintypes.HANDLE, ctypes.POINTER(Thread)], wintypes.BOOL),
             ("OpenThread", [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            ("GetProcessIdOfThread", [wintypes.HANDLE], wintypes.DWORD),
             ("ResumeThread", [wintypes.HANDLE], wintypes.DWORD),
         ):
             function = getattr(self.k, name)
@@ -96,9 +97,10 @@ class WindowsProcesses:
         finally:
             self.k.CloseHandle(snapshot_handle)
         require(len(threads) == 1, "Expected exactly one suspended initial thread in the owned subprocess")
-        handle = self.k.OpenThread(2, False, threads[0])
+        handle = self.k.OpenThread(0x0802, False, threads[0])
         require(bool(handle), "Cannot open owned suspended initial thread")
         try:
+            require(self.k.GetProcessIdOfThread(handle) == process.pid, "The suspended thread no longer belongs to this owned subprocess")
             require(self.k.ResumeThread(handle) == 1, "Owned initial thread did not have the expected suspend count")
         finally:
             self.k.CloseHandle(handle)

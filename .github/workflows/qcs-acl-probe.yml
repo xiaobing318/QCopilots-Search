@@ -63,6 +63,15 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         run: |
           pwsh -NoProfile -Command '$reportRoot = Join-Path $env:RUNNER_TEMP ("qcs-acl-" + $env:GITHUB_RUN_ID); python -X utf8 -B tools/acceptance/qcs-acl-probe.py --probe-token disable-restore --output-root (Join-Path $reportRoot "disable-restore") *> (Join-Path $reportRoot "disable-restore.log"); $probeExit = $LASTEXITCODE; Get-Content -LiteralPath (Join-Path $reportRoot "disable-restore.log"); exit $probeExit'
+      - name: Exercise the fixed full acceptance suite through Bash and PowerShell
+        if: always()
+        shell: bash
+        working-directory: 'qcs 源码'
+        env:
+          PYTHONUTF8: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          pwsh -NoProfile -Command '$reportRoot = Join-Path $env:RUNNER_TEMP ("qcs-acl-" + $env:GITHUB_RUN_ID); $env:QCOPILOTS_SEARCH_TEST_ROOT = Join-Path $reportRoot "fixed-tests"; New-Item -ItemType Directory -Path $env:QCOPILOTS_SEARCH_TEST_ROOT -ErrorAction Stop | Out-Null; python -X utf8 -B tools/acceptance/qcs-test-runners.py *> (Join-Path $reportRoot "fixed-suite.log"); $suiteExit = $LASTEXITCODE; @{exitCode=$suiteExit; candidate=$env:GITHUB_SHA} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $reportRoot "fixed-suite-exit.json") -Encoding utf8; Get-Content -LiteralPath (Join-Path $reportRoot "fixed-suite.log"); exit $suiteExit'
       - name: Preserve original diagnostic evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

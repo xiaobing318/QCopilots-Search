@@ -90,7 +90,11 @@ ctest --test-dir "$build_root/release" --show-only=json-v1
 
 完整候选和本机专项运行器位于 `tools/acceptance`，包括 `qcs-candidate-ctest-run.py`、`qcs-two-checkout-portability.py`、`qcs-run-physical.ps1`、`qcs-run-million.ps1` 和 `qcs-service-latency.py`。使用各工具的帮助查看显式源码、外置根、Qt、模型及来源参数。真实只读源码与双 checkout 验收必须运行专项入口，不能仅用运行器自身的单元测试替代。
 
-Windows 只读验收先保存独立 checkout 的全部节点身份和 ACL，再逐节点拒绝写入、删除及重命名。原 checkout 的权限始终只读取。权限探针必须获得实际访问拒绝，文件占用不能作为通过依据。收尾时逐项恢复原 ACL，完成后重新比较所有节点，并执行实际读写和清理探针。
+`qcs-test-runners.py`、`qcs-test-portability-runners.py` 和 `qcs-two-checkout-portability.py` 统一通过 `qcs-token-context.py` 检查 Windows 执行上下文。若进程令牌持有 `SeBackupPrivilege` 或 `SeRestorePrivilege`，入口创建暂停的自有子进程，先纳入 Job Object，再仅从该子进程的独立主令牌中永久移除这两项特权，核对其他身份和令牌属性后才恢复执行。实际配置、构建和测试后代继承此上下文，父进程令牌始终不变。原本不持有这两项特权时直接执行，不能伪造移除记录或跳过原生用例。已有线程令牌会在创建子进程前被明确拒绝，不通过撤销线程身份继续执行。
+
+重新启动时，输出保留为 `QCS_TOKEN_CONTEXT` 诊断记录，包含移除项、子进程前后快照、父令牌一致性和清理错误。子进程非零退出需要透传，异常和中断必须收束本次 Job 内的后代、等待退出并关闭句柄。主错误与收尾错误都保留，清理失败不能记为成功。`qcs-test-token-context.py` 同时覆盖真实 Windows 子进程与后代、线程身份保留，以及跨平台模拟的调用顺序和失败边界。测试源码存在或诊断分支结论不代表最终候选已经通过。
+
+Windows 只读验收先保存独立 checkout 的全部节点身份和 ACL，再逐节点拒绝写入、删除及重命名。原 checkout 的权限始终只读取。五项实际权限探针包括在根目录新建文件、写入现有文件、在子目录新建文件、删除和重命名，每项都必须得到真实访问拒绝。文件占用、只读属性或只检查 ACL 文本不能替代这些探针，也不能减少删除与重命名检查。收尾时逐项恢复原 ACL，完成后重新比较所有节点，并执行实际读写和清理探针。
 
 无法精确恢复时，运行器保留原始和实际描述符、节点差异及首个错误，并将整个验收判为失败。回归测试同时覆盖继承保护目录、显式允许权限、只读文件属性和恢复失败路径，不通过忽略差异或减少探针满足门槛。权限快照及恢复比较必须保留实际描述符的条目顺序，不能用经过排序的显示文本代替原始状态。
 
@@ -121,6 +125,8 @@ QtTest 的 `QSKIP` 不会使测试程序退出失败，CTest JUnit 也不会自�
 `qcs-tests-workflow` 的三个 POSIX 布局清理用例有单独的精确规则：`test_clean_unlinks_internal_framework_and_versioned_library_links`、`test_clean_rejects_external_symlink_without_deleting_any_target` 和 `test_clean_rejects_linked_top_level_target`。仅在 Windows 且原始原因完全匹配 `Windows symbolic-link creation privilege unavailable (WinError 1314), native macOS/Linux execution required` 时，记录为 `notApplicable` 并保留原始 skip，不能计为 PASS。Linux 和两种 macOS 架构必须实际通过这三个用例，缺失、跳过或失败均阻断各自原生门槛。
 
 Windows 必须实际通过 `test_clean_rejects_windows_junction_inside_generated_tree`，验证当前平台的真实重定向边界。该单一用例只有在 Linux / macOS 且原因完全匹配 `Windows junction semantics require Windows` 时才能记为不适用。以上规则不扩大到其他符号链接、清理测试或权限错误，完整覆盖仍需四组合原生证据共同闭合。
+
+`qcs-tests-acceptance-runners` 中的 `qcs_test_token_context.TokenContextContracts.test_windows_owned_child_preserves_parent_and_contains_descendants` 必须在 Windows 实际通过。仅在 Linux / macOS，且完整用例名与原因 `Windows native process token and Job Object contract` 同时匹配时，才单独记为不适用并保留原始 skip。任一平台缺少该用例都失败，Windows 缺少所需 API 或权限也不能转为不适用。原有三个 PowerShell/ACL 原生用例继续使用原有精确规则。
 
 每个 QtTest 日志还必须有匹配的开始与结束记录、非零实际执行数，并且逐条 PASS / FAIL / SKIP 等记录与汇总一致。只保留 `Totals` 行或截断后的日志不能作为完整通过证据。
 

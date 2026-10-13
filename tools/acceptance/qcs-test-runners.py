@@ -24,6 +24,7 @@ SCRIPTS = (
     "qcs-test-package-runners.py",
     "qcs-test-portability-runners.py",
     "qcs-test-diagnostics.py",
+    "qcs-test-token-context.py",
     "qcs-test-latency-preparation.py",
     "qcs-cu-recorder-tests.py",
     "qcs-test-copy-cu-fixtures.py",
@@ -56,8 +57,10 @@ class RecorderIntegration(unittest.TestCase):
 
 def unexpected_skips(result, platform=None):
     portability = load_script("qcs-test-portability-runners.py")
+    tokens = load_script("qcs-test-token-context.py")
     return [(test, reason) for test, reason in result.skipped
-            if not portability.is_windows_platform_skip(test, reason, os.name if platform is None else platform)]
+            if not any(module.is_windows_platform_skip(test, reason, os.name if platform is None else platform)
+                       for module in (portability, tokens))]
 
 
 def main():
@@ -81,10 +84,13 @@ def main():
     if portability is None:
         raise RuntimeError("Required portability diagnostic producer was not loaded")
     result = portability.DiagnosticTestRunner(verbosity=2).run(suite)
-    # Only the three exact Windows-native contracts are inapplicable elsewhere.
+    # Only the registered exact Windows-native contracts are inapplicable elsewhere.
     # Missing tools on Windows and every other skip remain required failures.
     return 0 if result.wasSuccessful() and not unexpected_skips(result) else 1
 
 
 if __name__ == "__main__":
+    child_code = load_script("qcs-token-context.py").reexec_if_needed(Path(__file__), sys.argv[1:])
+    if child_code is not None:
+        raise SystemExit(child_code)
     raise SystemExit(main())

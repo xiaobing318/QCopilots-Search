@@ -889,4 +889,7 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
 
 
 if __name__ == "__main__":
+    child_code = load("qcs-token-context").reexec_if_needed(Path(__file__), sys.argv[1:])
+    if child_code is not None:
+        raise SystemExit(child_code)
     unittest.main(verbosity=2, testRunner=DiagnosticTestRunner)
