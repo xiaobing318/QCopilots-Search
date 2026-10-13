@@ -696,7 +696,9 @@ def main():
                                                          build, configured_test_root)
                 record.setdefault("testWrapperIdentities", {})[label] = wrapper_identity
             write(reports / (label + "-inventory.json"), inventory)
-        test_a = developer_command(clone, "clone-tests", ["test", *common, "--jobs", "1", "--test-label", "^(core|workflow)$", "--report-dir", reports / "clone-tests"])
+        # The workflow is registered first and runs much longer than core.
+        # Give core a concurrent slot so both checkouts can overlap in QtTest.
+        test_a = developer_command(clone, "clone-tests", ["test", *common, "--jobs", "2", "--test-label", "^(core|workflow)$", "--report-dir", reports / "clone-tests"])
         test_b = developer_command(source, "original-tests", ["test", "--build-root", main_build,
                   "--qt-root", args.qt_root, "--jobs", "1", "--test-label", "^core$", "--report-dir", reports / "original-tests"])
         if args.sentinel_launch_record:
