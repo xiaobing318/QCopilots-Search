@@ -1445,7 +1445,7 @@ class AcceptanceNativePortabilityEvidenceTests(unittest.TestCase):
 
     def inspect(self, *, system="Linux", omitted=(), changed=None,
                 program="qcs-tests-acceptance-runners"):
-        rows = [("qcs_test_portability_runners.PortabilityContracts.test_other", "ok")]
+        rows = [(evidence.ACCEPTANCE_WINDOWS_TOKEN_CASE, "ok")]
         for method in self.methods:
             if method in omitted:
                 continue
@@ -1534,10 +1534,102 @@ class AcceptanceNativePortabilityEvidenceTests(unittest.TestCase):
             contracts.PortabilityContracts)}
         expected = {self.prefix + name for name in self.methods}
         self.assertTrue(expected <= actual_ids)
-        self.assertEqual(evidence.ACCEPTANCE_WINDOWS_CASES, expected)
+        self.assertEqual(evidence.ACCEPTANCE_WINDOWS_CASES,
+                         expected | {evidence.ACCEPTANCE_WINDOWS_TOKEN_CASE})
         self.assertEqual(contracts.WINDOWS_NATIVE_CASES, expected)
         self.assertEqual(contracts.WINDOWS_SKIP_REASON, self.reason)
         self.assertEqual(evidence.ACCEPTANCE_WINDOWS_SKIP_REASON, self.reason)
+
+
+class AcceptanceTokenContextEvidenceTests(unittest.TestCase):
+    case = ("qcs_test_token_context.TokenContextContracts."
+            "test_windows_owned_child_preserves_parent_and_contains_descendants")
+    reason = "Windows native process token and Job Object contract"
+
+    def inspect(self, *, system="Linux", identifier=None, status=None, omitted=False,
+                duplicate=False, program="qcs-tests-acceptance-runners"):
+        rows = [(case, "ok") for case in sorted(evidence.ACCEPTANCE_WINDOWS_CASES - {self.case})]
+        if not omitted:
+            case_status = status if status is not None else (
+                "ok" if system == "Windows" else "skipped " + repr(self.reason))
+            row = (identifier or self.case, case_status)
+            rows.append(row)
+            if duplicate:
+                rows.append(row)
+        skipped = sum(value.startswith("skipped ") for _, value in rows)
+        output = "\n".join(f"{case.rsplit('.', 1)[-1]} ({case}) ... {value}" for case, value in rows)
+        output += f"\nRan {len(rows)} tests in 0.012s\n\n"
+        output += (f"OK (skipped={skipped})" if skipped else "OK") + "\n"
+        return EvidenceTests.inspect(self, output, name=program, system=system, raw=True)
+
+    def test_exact_posix_token_skip_retains_raw_reason_and_requires_windows(self):
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system=system):
+                result = self.inspect(system=system)
+                self.assertTrue(result["releaseComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"],
+                    {"run": 4, "passed": 3, "failed": 0, "skipped": 1, "notApplicable": 1})
+                self.assertEqual(result["pythonTestSkips"], [{
+                    "program": "qcs-tests-acceptance-runners", "case": self.case,
+                    "reason": self.reason, "classification": "notApplicable",
+                    "requiredNativePlatforms": ["Windows"]}])
+                self.assertEqual(result["ctestPrograms"][0]["cases"][-1]["status"],
+                                 "skipped " + repr(self.reason))
+
+    def test_windows_token_case_requires_actual_pass_even_when_other_native_cases_pass(self):
+        result = self.inspect(system="Windows")
+        self.assertTrue(result["releaseComplete"], result["errors"])
+        self.assertEqual(result["pythonTestTotals"]["passed"], 4)
+        for status in ("skipped " + repr(self.reason), "skipped 'required Windows API unavailable'", "FAIL", "ERROR"):
+            with self.subTest(status=status):
+                result = self.inspect(system="Windows", status=status)
+                self.assertFalse(result["releaseComplete"])
+                self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+                self.assertTrue(any(error.endswith("Required native portability case did not pass: " + self.case)
+                                    for error in result["errors"]))
+
+    def test_missing_or_duplicate_token_case_is_not_hidden_by_matching_totals(self):
+        for system in ("Windows", "Linux", "Darwin"):
+            for alteration in ({"omitted": True}, {"duplicate": True}):
+                with self.subTest(system=system, alteration=alteration):
+                    result = self.inspect(system=system, **alteration)
+                    self.assertFalse(result["releaseComplete"])
+                    self.assertTrue(any("missing: " + self.case in error or "duplicate case records" in error
+                                        for error in result["errors"]))
+
+    def test_token_skip_requires_exact_case_reason_platform_and_program(self):
+        for system in ("Linux", "Darwin"):
+            for changes in ({"status": "skipped " + repr(self.reason + " unavailable")},
+                            {"status": "skipped " + repr(evidence.ACCEPTANCE_WINDOWS_SKIP_REASON)},
+                            {"identifier": self.case.replace("qcs_test_token_context", "__main__")},
+                            {"identifier": self.case.replace("TokenContextContracts", "OtherContracts")},
+                            {"identifier": self.case + "_other"},
+                            {"program": "qcs-tests-path-budget"}):
+                with self.subTest(system=system, changes=changes):
+                    result = self.inspect(system=system, **changes)
+                    self.assertFalse(result["releaseComplete"])
+                    self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+                    self.assertTrue(any(row["classification"] == "requiredNotRun"
+                                        for row in result["pythonTestSkips"]))
+        result = self.inspect(system="FreeBSD", status="skipped " + repr(self.reason))
+        self.assertFalse(result["releaseComplete"])
+        self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+
+    def test_token_registry_matches_real_native_method_without_executing_it(self):
+        directory = Path(__file__).resolve().parents[2] / "tools" / "acceptance"
+        spec = importlib.util.spec_from_file_location("qcs_ci_token_registry", directory / "qcs-test-runners.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertIn("qcs-test-token-context.py", module.SCRIPTS)
+        contracts = module.load_script("qcs-test-token-context.py")
+        actual_ids = {item.id() for item in unittest.defaultTestLoader.loadTestsFromTestCase(
+            contracts.TokenContextContracts)}
+        self.assertIn(self.case, actual_ids)
+        self.assertEqual(evidence.ACCEPTANCE_WINDOWS_TOKEN_CASE, self.case)
+        self.assertEqual(evidence.ACCEPTANCE_WINDOWS_TOKEN_SKIP_REASON, self.reason)
+        self.assertEqual(evidence.ACCEPTANCE_WINDOWS_SKIP_REASONS[self.case], self.reason)
+        self.assertEqual(contracts.WINDOWS_NATIVE_CASES, {self.case})
+        self.assertEqual(contracts.WINDOWS_SKIP_REASON, self.reason)
 
 
 class PythonTestRunnerEvidenceTests(PythonLicenseEvidenceTests):

@@ -69,6 +69,15 @@ ACCEPTANCE_WINDOWS_CASES = {
         "test_windows_acl_restoration_restores_effective_access",
         "test_windows_acl_comparison_rejects_semantic_changes")
 }
+ACCEPTANCE_WINDOWS_TOKEN_CASE = (
+    "qcs_test_token_context.TokenContextContracts."
+    "test_windows_owned_child_preserves_parent_and_contains_descendants")
+ACCEPTANCE_WINDOWS_TOKEN_SKIP_REASON = "Windows native process token and Job Object contract"
+ACCEPTANCE_WINDOWS_SKIP_REASONS = {
+    **{case: ACCEPTANCE_WINDOWS_SKIP_REASON for case in ACCEPTANCE_WINDOWS_CASES},
+    ACCEPTANCE_WINDOWS_TOKEN_CASE: ACCEPTANCE_WINDOWS_TOKEN_SKIP_REASON,
+}
+ACCEPTANCE_WINDOWS_CASES = set(ACCEPTANCE_WINDOWS_SKIP_REASONS)
 UNITTEST_CASE = re.compile(r"^(test\S+) \((\S+)\) \.\.\. (ok|FAIL|ERROR|expected failure|unexpected success|skipped [^\r\n]*)\r?$", re.MULTILINE)
 UNITTEST_TOTAL = re.compile(r"^Ran (\d+) tests? in [\d.]+s\r?$", re.MULTILINE)
 UNITTEST_RESULT = re.compile(r"^(OK(?: \(skipped=\d+\))?|FAILED(?: \([^\r\n]*\))?)\r?$", re.MULTILINE)
@@ -105,7 +114,8 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
                 or (program == RUNNER_TEST and operating_system in ("Linux", "Darwin")
                     and identifier == RUNNER_WINDOWS_HANDLE_CASE and reason == RUNNER_WINDOWS_HANDLE_SKIP_REASON)
                 or (program == ACCEPTANCE_TEST and operating_system in ("Linux", "Darwin")
-                    and identifier in ACCEPTANCE_WINDOWS_CASES and reason == ACCEPTANCE_WINDOWS_SKIP_REASON))
+                    and identifier in ACCEPTANCE_WINDOWS_CASES
+                    and reason == ACCEPTANCE_WINDOWS_SKIP_REASONS[identifier]))
             entry = {"program": program, "case": identifier, "reason": reason,
                      "classification": "notApplicable" if applicable else "requiredNotRun"}
             if applicable and program == WORKFLOW_TEST and identifier in WORKFLOW_POSIX_LINK_CASES:

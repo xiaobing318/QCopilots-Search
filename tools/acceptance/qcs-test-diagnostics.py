@@ -58,6 +58,12 @@ class PortabilityContracts(unittest.TestCase):
 
 PortabilityContracts.__module__ = "qcs_test_portability_runners"
 
+class TokenContextContracts(unittest.TestCase):
+    def test_windows_owned_child_preserves_parent_and_contains_descendants(self):
+        pass
+
+TokenContextContracts.__module__ = "qcs_test_token_context"
+
 def load(name):
     spec = importlib.util.spec_from_file_location(name.replace("-", "_"), directory / (name + ".py"))
     module = importlib.util.module_from_spec(spec)
@@ -65,14 +71,24 @@ def load(name):
     spec.loader.exec_module(module)
     return module
 
+# Apply the real entry boundary before replacing any test classes. Restarting
+# an already mocked aggregate would lose this small fixture and run its suite.
+token_context = load("qcs-token-context")
+child_exit = token_context.reexec_if_needed(Path(__file__), sys.argv[1:])
+if child_exit is not None:
+    raise SystemExit(child_exit)
+
 if entry == "aggregate":
     aggregate = load("qcs-test-runners")
     portability = load("qcs-test-portability-runners")
+    token_tests = load("qcs-test-token-context")
     queue = portability.queue_diagnostic
     portability.PortabilityContracts = PortabilityContracts
-    aggregate.SCRIPTS = ("qcs-test-portability-runners.py",)
+    token_tests.TokenContextContracts = TokenContextContracts
+    aggregate.SCRIPTS = ("qcs-test-portability-runners.py", "qcs-test-token-context.py")
     original_load = aggregate.load_script
-    aggregate.load_script = lambda name: portability if name == "qcs-test-portability-runners.py" else original_load(name)
+    fixtures = {"qcs-test-portability-runners.py": portability, "qcs-test-token-context.py": token_tests}
+    aggregate.load_script = lambda name: fixtures[name] if name in fixtures else original_load(name)
     aggregate.RecorderIntegration = type("EmptyFixtureIntegration", (unittest.TestCase,), {})
     raise SystemExit(aggregate.main())
 elif entry == "standalone":
@@ -82,6 +98,7 @@ elif entry == "standalone":
         module = sys.modules["__main__"]
         queue = module.queue_diagnostic
         module.PortabilityContracts = PortabilityContracts
+        module.TokenContextContracts = TokenContextContracts
         if keywords.get("testRunner") is not module.DiagnosticTestRunner:
             raise AssertionError("Standalone entry did not use the diagnostic runner")
         return original_main(*arguments, **keywords)
@@ -146,8 +163,9 @@ class DiagnosticOutputContracts(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout[-4000:])
                 counts, records, skips, errors = self.inspect(result.stdout)
                 self.assertEqual(errors, [], result.stdout[-4000:])
-                self.assertEqual((counts["run"], counts["passed"], counts["failed"], counts["skipped"]), (3, 3, 0, 0))
-                self.assertEqual({record["case"] for record in records}, EVIDENCE.ACCEPTANCE_WINDOWS_CASES)
+                self.assertEqual((counts["run"], counts["passed"], counts["failed"], counts["skipped"]), (4, 4, 0, 0))
+                self.assertEqual({record["case"] for record in records}, EVIDENCE.ACCEPTANCE_WINDOWS_CASES | {
+                    "qcs_test_token_context.TokenContextContracts.test_windows_owned_child_preserves_parent_and_contains_descendants"})
                 self.assertEqual(skips, [])
                 self.assert_diagnostics(result.stdout, "OK")
 
