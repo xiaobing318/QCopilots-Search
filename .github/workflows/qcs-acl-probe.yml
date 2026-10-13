@@ -1,0 +1,46 @@
+name: qcs Windows ACL diagnostic
+
+on:
+  push:
+    branches: [codex/qcs-acl-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - name: Checkout diagnostic source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: 'qcs 源码'
+          persist-credentials: false
+      - name: Use the native acceptance Python version
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Observe effective token and isolated ACL behavior
+        shell: pwsh
+        working-directory: 'qcs 源码'
+        env:
+          PYTHONUTF8: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $reportRoot = Join-Path $env:RUNNER_TEMP ('qcs-acl-' + $env:GITHUB_RUN_ID)
+          New-Item -ItemType Directory -Path $reportRoot -ErrorAction Stop | Out-Null
+          $env:QCOPILOTS_SEARCH_TEST_ROOT = $reportRoot
+          python -X utf8 -B tools/acceptance/qcs-acl-probe.py --output-root $reportRoot *> (Join-Path $reportRoot 'probe.log')
+          $probeExit = $LASTEXITCODE
+          Get-Content -LiteralPath (Join-Path $reportRoot 'probe.log')
+          exit $probeExit
+      - name: Preserve original diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qcs-acl-probe-${{ github.sha }}
+          path: ${{ runner.temp }}/qcs-acl-${{ github.run_id }}/
+          if-no-files-found: error
+          retention-days: 14
