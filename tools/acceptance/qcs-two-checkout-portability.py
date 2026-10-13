@@ -317,10 +317,44 @@ ACL_COMPARE_SCRIPT = r'''function Compare-QcsAclSddl([string]$Original, [string]
 }
 '''
 
+ACL_READ_SCRIPT = r'''Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class QcsAclReader {
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode)]
+  static extern uint GetNamedSecurityInfoW(string path, int kind, uint info,
+    out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(
+    IntPtr descriptor, uint revision, uint info, out IntPtr text, out uint size);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+  public static string Read(string path) {
+    string native = path.StartsWith(@"\\?\") ? path : path.StartsWith(@"\\")
+      ? @"\\?\UNC\" + path.Substring(2) : @"\\?\" + path;
+    IntPtr owner, group, dacl, sacl, descriptor;
+    uint error = GetNamedSecurityInfoW(native, 1, 7, out owner, out group, out dacl, out sacl, out descriptor);
+    if (error != 0) throw new Win32Exception((int)error, path);
+    try {
+      IntPtr text; uint size;
+      if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 7, out text, out size))
+        throw new Win32Exception(Marshal.GetLastWin32Error(), path);
+      try { return Marshal.PtrToStringUni(text); } finally { LocalFree(text); }
+    } finally { LocalFree(descriptor); }
+  }
+}
+'@
+'''
+
 ACL_SCRIPT = r'''param([string]$Source,[string]$Report,[string]$Mode)
-''' + ACL_COMPARE_SCRIPT + r'''
+''' + ACL_COMPARE_SCRIPT + ACL_READ_SCRIPT + r'''
 $ErrorActionPreference = 'Stop'
 $ownedRoot = Split-Path -Parent $PSScriptRoot
+foreach ($boundary in @($ownedRoot, $PSScriptRoot, (Join-Path $ownedRoot '.qcs-owned-run.json'))) {
+  if ((Get-Item -LiteralPath $boundary -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    throw 'ACL ownership boundary must not be a reparse point'
+  }
+}
 $marker = Get-Content -LiteralPath (Join-Path $ownedRoot '.qcs-owned-run.json') -Raw | ConvertFrom-Json
 $expectedClone = [IO.Path]::GetFullPath((Join-Path $ownedRoot '中文 源码'))
 $resolvedSource = [IO.Path]::GetFullPath($Source)
@@ -334,29 +368,212 @@ if ($Mode -in @('deny','restore')) {
 } elseif ($Mode -eq 'inspect' -and $resolvedSource -ne [IO.Path]::GetFullPath($marker.source)) {
   throw 'Read-only ACL inspection must target the recorded original checkout'
 }
-if ($Mode -eq 'deny') {
-  $acl = Get-Acl -LiteralPath $Source
-  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-  [pscustomobject]@{source=$Source;sid=$sid.Value;sddl=$acl.Sddl} | ConvertTo-Json | Set-Content -LiteralPath $Report -Encoding utf8
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid,
-    [System.Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles',
-    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Deny)
-  $acl.AddAccessRule($rule)
-  Set-Acl -LiteralPath $Source -AclObject $acl
-} elseif ($Mode -eq 'restore') {
-  $original = Get-Content -LiteralPath $Report -Raw | ConvertFrom-Json
-  if ($original.source -ne $Source) { throw 'ACL recovery path mismatch' }
-  $acl = Get-Acl -LiteralPath $Source
-  $acl.SetSecurityDescriptorSddlForm($original.sddl)
-  Set-Acl -LiteralPath $Source -AclObject $acl
-  $comparison = Compare-QcsAclSddl $original.sddl (Get-Acl -LiteralPath $Source).Sddl
-  $comparison | ConvertTo-Json -Compress
-  if (-not $comparison.semanticMatch) { throw 'ACL restoration did not reproduce original security semantics' }
-} elseif ($Mode -eq 'inspect') {
-  Get-Acl -LiteralPath $Source | Select-Object Owner,Sddl | ConvertTo-Json -Compress
-} else { throw 'Unknown bounded ACL operation' }
+if ($Mode -eq 'inspect') {
+  $sddl = [QcsAclReader]::Read($resolvedSource)
+  [pscustomobject]@{Owner=([Security.AccessControl.RawSecurityDescriptor]::new($sddl)).Owner.Value;Sddl=$sddl} | ConvertTo-Json -Compress
+  exit 0
+}
+if ($Mode -notin @('deny','restore')) { throw 'Unknown bounded ACL operation' }
+# Keep every node open without delete sharing while changing permissions. This
+# prevents rename/replacement races, including parent-directory replacement.
+# OPEN_REPARSE_POINT inspects links themselves, never their external targets.
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public sealed class QcsAclNode : IDisposable {
+  [StructLayout(LayoutKind.Sequential)] struct Info {
+    public uint Attributes; public System.Runtime.InteropServices.ComTypes.FILETIME Created, Accessed, Written;
+    public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool GetFileInformationByHandle(SafeFileHandle file, out Info info);
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl, uint revision, out IntPtr descriptor, out uint size);
+  [DllImport("advapi32.dll", SetLastError=true)]
+  static extern bool GetSecurityDescriptorDacl(IntPtr descriptor, out bool present, out IntPtr dacl, out bool defaulted);
+  [DllImport("advapi32.dll", SetLastError=true)]
+  static extern bool GetSecurityDescriptorControl(IntPtr descriptor, out ushort control, out uint revision);
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode)]
+  static extern uint SetNamedSecurityInfoW(string path, int kind, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+  SafeFileHandle handle;
+  public string Identity { get; private set; }
+  public bool Directory { get; private set; }
+  static string NativePath(string path) {
+    return path.StartsWith(@"\\?\") ? path : path.StartsWith(@"\\") ? @"\\?\UNC\" + path.Substring(2) : @"\\?\" + path;
+  }
+  public static QcsAclNode Open(string path) {
+    var handle = CreateFileW(NativePath(path), 0, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+    if (handle.IsInvalid) { int error=Marshal.GetLastWin32Error(); handle.Dispose(); throw new Win32Exception(error, path); }
+    try {
+      Info info;
+      if (!GetFileInformationByHandle(handle, out info)) throw new Win32Exception(Marshal.GetLastWin32Error(), path);
+      if ((info.Attributes & 0x400) != 0) throw new InvalidOperationException("Reparse point in owned ACL tree: " + path);
+      bool directory=(info.Attributes & 0x10) != 0;
+      if (!directory && info.Links != 1) throw new InvalidOperationException("Non-private hard-linked ACL file: " + path);
+      return new QcsAclNode { handle=handle, Directory=directory,
+        Identity=info.Volume.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8") };
+    } catch { handle.Dispose(); throw; }
+  }
+  public static void SetDacl(string path, string sddl) {
+    IntPtr descriptor; uint size;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out descriptor, out size))
+      throw new Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      bool present, defaulted; IntPtr dacl; ushort control; uint revision;
+      if (!GetSecurityDescriptorDacl(descriptor, out present, out dacl, out defaulted)
+          || !GetSecurityDescriptorControl(descriptor, out control, out revision))
+        throw new Win32Exception(Marshal.GetLastWin32Error());
+      if (!present) throw new InvalidOperationException("Expected a recorded DACL");
+      // Change only DACL and its original protection flag. In particular do not
+      // request SACL, owner or group access, or enable SeSecurityPrivilege.
+      uint flags = 4u | ((control & 0x1000) != 0 ? 0x80000000u : 0x20000000u);
+      uint error = SetNamedSecurityInfoW(NativePath(path), 1, flags, IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+      if (error != 0) throw new Win32Exception((int)error, path);
+    } finally { LocalFree(descriptor); }
+  }
+  public void Dispose() { if (handle != null) handle.Dispose(); }
+}
+'@
+function Save-QcsAclRecord($Path, $Value) {
+  $Value | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $Path -Encoding utf8
+}
+function Open-QcsAclTree {
+  $pending = [Collections.Generic.Queue[string]]::new()
+  $pending.Enqueue($resolvedSource)
+  while ($pending.Count) {
+    $path = $pending.Dequeue()
+    try { $node = [QcsAclNode]::Open($path) } catch {
+      if ($Mode -ne 'restore' -or $path -eq $resolvedSource) { throw }
+      $errors.Add($path + ': cannot safely open ACL node: ' + $_.Exception.Message)
+      continue
+    }
+    $handles.Add($node)
+    $relative = [IO.Path]::GetRelativePath($resolvedSource, $path).Replace('\','/')
+    $entry = [pscustomobject]@{relativePath=$relative;path=$path;kind=$(if ($node.Directory) {'directory'} else {'file'});fileIdentity=$node.Identity}
+    $entries.Add($entry)
+    if ($node.Directory) {
+      try {
+        foreach ($child in @(Get-ChildItem -LiteralPath $path -Force | Sort-Object Name)) { $pending.Enqueue($child.FullName) }
+      } catch {
+        if ($Mode -ne 'restore') { throw }
+        $errors.Add($path + ': cannot enumerate ACL directory: ' + $_.Exception.Message)
+      }
+    }
+  }
+}
+$handles = [Collections.Generic.List[QcsAclNode]]::new()
+$entries = [Collections.Generic.List[object]]::new()
+$errors = [Collections.Generic.List[string]]::new()
+try {
+  $handles.Add([QcsAclNode]::Open([IO.Path]::GetFullPath($ownedRoot)))
+  $handles.Add([QcsAclNode]::Open([IO.Path]::GetFullPath($PSScriptRoot)))
+  Open-QcsAclTree
+  if ($Mode -eq 'deny') {
+    if (Test-Path -LiteralPath $Report) { throw 'Refusing to overwrite existing ACL recovery evidence' }
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $nodes = @($entries | ForEach-Object {
+      # FileSystemSecurity canonicalizes explicit ACE order even when reading.
+      # Record the native descriptor before constructing any managed ACL object.
+      $sddl = [QcsAclReader]::Read($_.path)
+      $descriptor = Compare-QcsAclSddl $sddl $sddl
+      [pscustomobject]@{relativePath=$_.relativePath;kind=$_.kind;fileIdentity=$_.fileIdentity;originalSddl=$sddl;
+        originalBinaryBase64=$descriptor.originalBinaryBase64;originalControlFlags=$descriptor.originalControlFlags}
+    })
+    # Persist all original ACLs before the first mutation, including protected
+    # child DACLs and explicit Allow entries that outrank inherited Deny ACEs.
+    $original = [pscustomobject]@{schemaVersion=2;source=$Source;sid=$sid.Value;sddl=$nodes[0].originalSddl;nodes=$nodes}
+    Save-QcsAclRecord $Report $original
+    $applied = @{}
+    $denyError = $null
+    try {
+      foreach ($entry in $entries) {
+        $acl = Get-Acl -LiteralPath $entry.path
+        $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid,
+          [Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles',
+          [Security.AccessControl.InheritanceFlags]::None,
+          [Security.AccessControl.PropagationFlags]::None,
+          [Security.AccessControl.AccessControlType]::Deny)
+        $acl.AddAccessRule($rule)
+        [QcsAclNode]::SetDacl($entry.path, $acl.Sddl)
+        $applied[$entry.relativePath] = $true
+      }
+    } catch { $denyError = $_ }
+    try {
+      $denyRows = @($entries | ForEach-Object {
+        $entry = $_
+        $row = [ordered]@{relativePath=$entry.relativePath;kind=$entry.kind;fileIdentity=$entry.fileIdentity;applied=$applied.ContainsKey($entry.relativePath)}
+        try { $row.actualSddl=[QcsAclReader]::Read($entry.path) } catch { $row.error=$_.Exception.Message }
+        [pscustomobject]$row
+      })
+      Save-QcsAclRecord (Join-Path $PSScriptRoot 'source-denied-acl.json') ([pscustomobject]@{schemaVersion=2;source=$Source;nodeCount=$nodes.Count;appliedCount=$applied.Count;nodes=$denyRows;error=$(if ($denyError) {$denyError.Exception.Message} else {$null})})
+    } catch {
+      if ($denyError) { Write-Warning ('Cannot save ACL denial diagnostics: ' + $_.Exception.Message) } else { throw }
+    }
+    if ($denyError) { throw $denyError }
+  } else {
+    $original = Get-Content -LiteralPath $Report -Raw | ConvertFrom-Json
+    if ($original.source -ne $Source -or $original.schemaVersion -ne 2 -or -not $original.nodes.Count) {
+      throw 'ACL recovery path or complete node inventory mismatch'
+    }
+    $actualNodes = @{}
+    foreach ($entry in $entries) { $actualNodes[$entry.relativePath] = $entry }
+    $originalRoots = @($original.nodes | Where-Object relativePath -EQ '.')
+    if ($originalRoots.Count -ne 1 -or $originalRoots[0].fileIdentity -cne $actualNodes['.'].fileIdentity) {
+      throw 'Original owned clone root identity was replaced'
+    }
+    $seen = @{}
+    $restoreRows = [Collections.Generic.List[object]]::new()
+    foreach ($old in $original.nodes) {
+      $row = [ordered]@{relativePath=$old.relativePath;kind=$old.kind;fileIdentity=$old.fileIdentity;originalSddl=$old.originalSddl;restored=$false;semanticMatch=$false}
+      try {
+        if ($seen.ContainsKey($old.relativePath)) { throw 'Duplicate ACL recovery entry' }
+        $seen[$old.relativePath] = $true
+        if (-not $actualNodes.ContainsKey($old.relativePath)) { throw 'Original ACL node is missing' }
+        $entry = $actualNodes[$old.relativePath]
+        if ($entry.fileIdentity -cne $old.fileIdentity -or $entry.kind -cne $old.kind) { throw 'Original ACL node identity was replaced' }
+        $row.beforeRestorationSddl = [QcsAclReader]::Read($entry.path)
+        # Only the DACL was changed. Do not request owner/group/SACL privileges.
+        # The final comparison still verifies the complete original descriptor.
+        [QcsAclNode]::SetDacl($entry.path, $old.originalSddl)
+        $row.restored = $true
+      } catch { $row.error = $_.Exception.Message; $errors.Add($old.relativePath + ': ' + $_.Exception.Message) }
+      $restoreRows.Add([pscustomobject]$row)
+    }
+    foreach ($entry in $entries) {
+      if (-not $seen.ContainsKey($entry.relativePath)) { $errors.Add('Unexpected node in ACL recovery tree: ' + $entry.relativePath) }
+    }
+    # Read the entire tree again only after all parent-first restorations.
+    # The native DACL setter can propagate inheritable ACEs to descendants.
+    foreach ($row in $restoreRows) {
+      if (-not $row.restored) { continue }
+      try {
+        $comparison = Compare-QcsAclSddl $row.originalSddl ([QcsAclReader]::Read($actualNodes[$row.relativePath].path))
+        foreach ($property in $comparison.PSObject.Properties) { $row | Add-Member -NotePropertyName $property.Name -NotePropertyValue $property.Value -Force }
+        if (-not $comparison.semanticMatch) { throw 'Original node security semantics were not restored' }
+      } catch {
+        $row.restored=$false; $row.semanticMatch=$false
+        $row | Add-Member -NotePropertyName error -NotePropertyValue $_.Exception.Message -Force
+        $errors.Add($row.relativePath + ': ' + $_.Exception.Message)
+      }
+    }
+    $result = [ordered]@{}
+    $rootRow = @($restoreRows | Where-Object relativePath -EQ '.')[0]
+    if ($rootRow) { foreach ($property in $rootRow.PSObject.Properties) { $result[$property.Name] = $property.Value } }
+    $result.schemaVersion=2; $result.nodeCount=$original.nodes.Count; $result.nodes=$restoreRows.ToArray(); $result.errors=$errors.ToArray()
+    $result.allNodesRestored=($errors.Count -eq 0 -and $restoreRows.Count -eq $original.nodes.Count)
+    $result.semanticMatch=($result.semanticMatch -and $result.allNodesRestored)
+    Save-QcsAclRecord (Join-Path $PSScriptRoot 'source-restored-acl.json') $result
+    $result | ConvertTo-Json -Depth 15 -Compress
+    if (-not $result.allNodesRestored) { throw 'ACL restoration did not reproduce every original node' }
+  }
+} finally {
+  foreach ($handle in $handles) { $handle.Dispose() }
+}
 '''
 
 POWERSHELL_BRIDGE_SCRIPT = r'''param([Parameter(Mandatory=$true)][string]$Request)
@@ -391,21 +608,54 @@ Get-ChildItem Env: | Select-Object Name,Value | ConvertTo-Json -Compress
 '''
 
 
+def probe_write_access(path, existing):
+    """Open without truncation, retaining Windows' actual access error code."""
+    if os.name != "nt":
+        flags = os.O_WRONLY if existing else os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        descriptor = os.open(path, flags, 0o600)
+        os.close(descriptor)
+        return
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    # Share read/write/delete so a lock cannot masquerade as an ACL refusal.
+    native = os.path.abspath(path)
+    if not native.startswith("\\\\?\\"):
+        native = "\\\\?\\UNC\\" + native[2:] if native.startswith("\\\\") else "\\\\?\\" + native
+    handle = kernel.CreateFileW(native, 0x40000000, 7, None, 3 if existing else 1, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return
+    finally:
+        if not kernel.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
 def write_probes(source):
+    """Return every result before the caller enforces the all-denied gate."""
+    source = Path(source)
     records = []
     for relative, existing in (("qcs-write-probe.tmp", False), ("CMakeLists.txt", True),
                                ("src/core/qcs-write-probe.tmp", False)):
         path = source / relative
-        flags = os.O_WRONLY if existing else os.O_WRONLY | os.O_CREAT | os.O_EXCL
         try:
-            descriptor = os.open(path, flags, 0o600)
-        except PermissionError as error:
-            records.append({"path": str(path), "denied": True, "error": str(error), "winerror": error.winerror})
+            probe_write_access(path, existing)
+        except OSError as error:
+            records.append({"path": str(path), "denied": isinstance(error, PermissionError)
+                            and (os.name != "nt" or getattr(error, "winerror", None) == 5),
+                            "error": str(error), "winerror": getattr(error, "winerror", None)})
         else:
-            os.close(descriptor)
+            row = {"path": str(path), "denied": False}
             if not existing:
-                path.unlink()
-            records.append({"path": str(path), "denied": False})
+                try:
+                    path.unlink()
+                except OSError as error:
+                    row["cleanupError"] = str(error)
+            records.append(row)
     for operation in ("delete", "rename"):
         path = source / ".git" / ("qcs-acl-" + operation + ".tmp")
         try:
@@ -413,13 +663,19 @@ def write_probes(source):
                 path.unlink()
             else:
                 path.rename(path.with_suffix(".renamed"))
-        except PermissionError as error:
-            records.append({"path": str(path), "operation": operation, "denied": True,
-                            "error": str(error), "winerror": error.winerror})
+        except OSError as error:
+            records.append({"path": str(path), "operation": operation,
+                            "denied": isinstance(error, PermissionError)
+                            and (os.name != "nt" or getattr(error, "winerror", None) == 5),
+                            "error": str(error), "winerror": getattr(error, "winerror", None)})
         else:
             records.append({"path": str(path), "operation": operation, "denied": False})
-    require(all(item["denied"] for item in records), "The isolated source is not effectively read-only")
     return records
+
+
+def require_readonly_probes(records):
+    require(len(records) == 5 and all(item.get("denied") is True for item in records),
+            "The isolated source is not effectively read-only")
 
 
 def restored_write_probes(source):
@@ -428,13 +684,14 @@ def restored_write_probes(source):
     records = []
     for relative in (".", "src/core", ".git"):
         directory = source / relative
-        require(directory.is_dir() and not (getattr(directory.lstat(), "st_file_attributes", 0) & 0x400)
-                and not directory.is_symlink() and directory.resolve().is_relative_to(source.resolve()),
-                "Restored write probe directory is not an owned plain directory")
         path = directory / ("qcs-acl-r-" + uuid.uuid4().hex[:12] + ".tmp")
         renamed = path.with_suffix(".renamed")
         created = False
+        row = {"directory": str(directory), "createWriteReadRenameDelete": False}
         try:
+            require(directory.is_dir() and not (getattr(directory.lstat(), "st_file_attributes", 0) & 0x400)
+                    and not directory.is_symlink() and directory.resolve().is_relative_to(source.resolve()),
+                    "Restored write probe directory is not an owned plain directory")
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
             created = True
             try:
@@ -443,22 +700,73 @@ def restored_write_probes(source):
                 os.close(descriptor)
             require(path.read_bytes() == b"owned restored access probe\n", "Restored file bytes differ")
             path.rename(renamed)
+            row["createWriteReadRenameDelete"] = True
+        except (OSError, RuntimeError) as error:
+            row["error"] = str(error)
         finally:
-            if created and path.exists():
-                path.unlink()
-            if created and renamed.exists():
-                renamed.unlink()
-        records.append({"directory": str(directory), "createWriteReadRenameDelete": True})
-    descriptor = os.open(source / "CMakeLists.txt", os.O_WRONLY)
-    os.close(descriptor)  # Open without truncation or changing the source bytes.
-    records.append({"path": str(source / "CMakeLists.txt"), "existingFileWritable": True})
+            for candidate in (path, renamed):
+                try:
+                    if created and candidate.exists():
+                        candidate.unlink()
+                except OSError as error:
+                    row["createWriteReadRenameDelete"] = False
+                    row.setdefault("cleanupErrors", []).append(str(error))
+        records.append(row)
+    row = {"path": str(source / "CMakeLists.txt"), "existingFileWritable": False}
+    try:
+        descriptor = os.open(source / "CMakeLists.txt", os.O_WRONLY)
+        os.close(descriptor)  # Open without truncation or changing the source bytes.
+        row["existingFileWritable"] = True
+    except OSError as error:
+        row["error"] = str(error)
+    records.append(row)
     for operation in ("delete", "rename"):
         path = source / ".git" / ("qcs-acl-" + operation + ".tmp")
-        if operation == "rename":
-            path = path.rename(path.with_suffix(".renamed"))
-        path.unlink()
-        records.append({"operation": operation, "originalProbeRestored": True})
+        row = {"operation": operation, "originalProbeRestored": False}
+        try:
+            if operation == "rename":
+                path = path.rename(path.with_suffix(".renamed"))
+            path.unlink()
+            row["originalProbeRestored"] = True
+        except OSError as error:
+            row["error"] = str(error)
+        records.append(row)
     return records
+
+
+def require_restored_write_probes(records):
+    keys = ("createWriteReadRenameDelete", "existingFileWritable", "originalProbeRestored")
+    require(len(records) == 6 and all(any(row.get(key) is True for key in keys) for row in records),
+            "Not every owned restoration write probe succeeded")
+
+
+def record_acl_restoration(record, returncode, stdout, source):
+    """Keep a primary test failure intact while recording restoration failures."""
+    record["isolatedSourceAclRestored"] = False
+    try:
+        result = json.loads(stdout.decode("utf-8-sig") if isinstance(stdout, bytes) else stdout)
+        require(isinstance(result, dict), "ACL restoration report is not an object")
+        record["isolatedSourceAclRestoration"] = result
+        rows = result.get("nodes", [])
+        require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows),
+                "ACL restoration node evidence is malformed")
+        require(returncode == 0 and result.get("semanticMatch") is True
+                and result.get("allNodesRestored") is True and result.get("nodeCount") == len(rows)
+                and bool(rows) and not result.get("errors")
+                and all(row.get("restored") is True and row.get("semanticMatch") is True for row in rows),
+                "ACL restoration did not verify every original node")
+        record["restoredWriteProbes"] = restored_write_probes(source)
+        require_restored_write_probes(record["restoredWriteProbes"])
+        record["isolatedSourceAclRestored"] = True
+    except (OSError, RuntimeError, ValueError, TypeError) as error:
+        record["aclRestorationError"] = str(error)
+
+
+def acl_restore_timeout(node_count):
+    # Inventory size bounds the per-node native ACL reads/writes and final comparison.
+    # Retain a finite ten-minute ceiling even for an unexpectedly large clone.
+    require(isinstance(node_count, int) and node_count > 0, "Invalid ACL inventory size")
+    return min(600, 30 + (node_count + 4) // 5)
 
 
 def main():
@@ -660,8 +968,10 @@ def main():
         acl_attempted = True
         run([pwsh, "-NoProfile", "-File", reports / "qcs-owned-acl.ps1", "-Source", clone,
              "-Report", reports / "source-original-acl.json", "-Mode", "deny"], "acl-deny", env, caller)
+        record["isolatedSourceAclInventorySha256"] = sha(reports / "source-original-acl.json")
         record["readonlyProbesBefore"] = write_probes(clone)
         write(reports / "readonly-proof.json", record["readonlyProbesBefore"])
+        require_readonly_probes(record["readonlyProbesBefore"])
         cached_sources = sorted(path for path in dependency.glob("*-src") if path.is_dir()) + [args.calligra_source.resolve()]
         record["sharedSourceRoots"] = list(map(str, cached_sources))
         before_native = {str(path): snapshot(path) for path in cached_sources}
@@ -763,6 +1073,8 @@ def main():
         require(roots[0] != roots[1], "Two checkout runs unexpectedly shared a writable root")
         record["testRoots"] = roots
         record["readonlyProbesAfter"] = write_probes(clone)
+        write(reports / "readonly-proof-after.json", record["readonlyProbesAfter"])
+        require_readonly_probes(record["readonlyProbesAfter"])
         _, record["cloneBinariesAfter"] = clone_executable_snapshot(clone_build)
         require(record["cloneBinariesAfter"] == clone_binaries, "Clone binary bytes changed during tests")
         record["testExecutionPassed"] = True
@@ -848,16 +1160,34 @@ def main():
             record["finalVerificationError"] = type(error).__name__ + ": " + str(error)
         try:
             if acl_attempted and (reports / "source-original-acl.json").is_file():
-                restoration = subprocess.run([pwsh, "-NoProfile", "-File", str(reports / "qcs-owned-acl.ps1"),
-                    "-Source", str(clone), "-Report", str(reports / "source-original-acl.json"), "-Mode", "restore"],
-                    capture_output=True, cwd=caller, timeout=30)
+                original_acl = reports / "source-original-acl.json"
+                original_acl_data = json.loads(original_acl.read_text(encoding="utf-8-sig"))
+                original_acl_sha = sha(original_acl)
+                require(original_acl_sha == record.get("isolatedSourceAclInventorySha256", original_acl_sha),
+                        "Original ACL inventory changed before restoration")
+                node_count = len(original_acl_data["nodes"])
+                record["isolatedSourceAclInventory"] = {"path": str(original_acl), "sha256": original_acl_sha,
+                                                       "nodeCount": node_count}
+                if (reports / "source-denied-acl.json").is_file():
+                    record["isolatedSourceAclDeny"] = {"path": str(reports / "source-denied-acl.json"),
+                                                     "sha256": sha(reports / "source-denied-acl.json")}
+                timeout = min(args.command_timeout, acl_restore_timeout(node_count))
+                record["aclRestorationTimeoutSeconds"] = timeout
+                try:
+                    restoration = subprocess.run([pwsh, "-NoProfile", "-File", str(reports / "qcs-owned-acl.ps1"),
+                        "-Source", str(clone), "-Report", str(reports / "source-original-acl.json"), "-Mode", "restore"],
+                        capture_output=True, cwd=caller, timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    (reports / "acl-restore.stdout.log").write_bytes(error.stdout or b"")
+                    (reports / "acl-restore.stderr.log").write_bytes(error.stderr or b"")
+                    raise
                 (reports / "acl-restore.stdout.log").write_bytes(restoration.stdout)
                 (reports / "acl-restore.stderr.log").write_bytes(restoration.stderr)
-                record["isolatedSourceAclRestored"] = restoration.returncode == 0
-                if restoration.returncode == 0:
-                    record["isolatedSourceAclRestoration"] = json.loads(restoration.stdout.decode("utf-8-sig"))
-                    record["isolatedSourceAclRestored"] = record["isolatedSourceAclRestoration"].get("semanticMatch") is True
-                    record["restoredWriteProbes"] = restored_write_probes(clone)
+                record_acl_restoration(record, restoration.returncode, restoration.stdout, clone)
+                if (reports / "source-restored-acl.json").is_file():
+                    record["isolatedSourceAclRestorationEvidence"] = {
+                        "path": str(reports / "source-restored-acl.json"),
+                        "sha256": sha(reports / "source-restored-acl.json")}
         except BaseException as error:
             record["isolatedSourceAclRestored"] = False
             record["aclRestorationError"] = str(error)

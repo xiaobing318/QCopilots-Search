@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,37 @@ WINDOWS_NATIVE_CASES = frozenset(
         "test_windows_acl_restoration_restores_effective_access",
         "test_windows_acl_comparison_rejects_semantic_changes"))
 
+FIXTURE_ACL_SCRIPT = r'''Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+public static class QcsFixtureAcl {
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode)]
+  static extern uint SetNamedSecurityInfoW(string name, int type, uint info,
+    IntPtr owner, IntPtr group, byte[] dacl, IntPtr sacl);
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool SetFileSecurityW(string name, uint info, byte[] descriptor);
+  public static void Initialize(string path) {
+    var descriptor = new RawSecurityDescriptor("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)");
+    var dacl = new byte[descriptor.DiscretionaryAcl.BinaryLength];
+    descriptor.DiscretionaryAcl.GetBinaryForm(dacl, 0);
+    uint error = SetNamedSecurityInfoW(path, 1, 0x80000004,
+      IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+    if (error != 0) throw new Win32Exception((int)error);
+  }
+  public static void SimulateLegacyInheritedOrder(string path) {
+    // This obsolete API models a descriptor written by an older application.
+    // It is deliberately confined to test fixture creation, never recovery.
+    var descriptor = new RawSecurityDescriptor("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)(A;ID;FA;;;BA)");
+    var bytes = new byte[descriptor.BinaryLength];
+    descriptor.GetBinaryForm(bytes, 0);
+    if (!SetFileSecurityW(path, 4, bytes)) throw new Win32Exception(Marshal.GetLastWin32Error());
+  }
+}
+'@
+'''
+
 
 def is_windows_platform_skip(test, reason, platform):
     return platform != "nt" and test.id() in WINDOWS_NATIVE_CASES and reason == WINDOWS_SKIP_REASON
@@ -54,6 +86,17 @@ class PortabilityContracts(unittest.TestCase):
         self.assertIsNotNone(executable, "The Windows contract requires PowerShell 7")
         return subprocess.run([executable, "-NoProfile", "-File", str(script), *map(str, arguments)],
                               cwd=self.root, capture_output=True, encoding="utf-8", errors="replace", timeout=45)
+
+    @staticmethod
+    def retain_primary_failure(primary, secondary):
+        if primary is None:
+            return secondary
+        note = "Independent fixture cleanup failure: " + repr(secondary)
+        if hasattr(primary, "add_note"):
+            primary.add_note(note)
+        else:
+            print(note, file=sys.stderr)
+        return primary
 
     def test_only_exact_non_windows_native_cases_are_not_applicable(self):
         aggregate = load("qcs-test-runners")
@@ -163,29 +206,433 @@ class PortabilityContracts(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", WINDOWS_SKIP_REASON)
     def test_windows_acl_restoration_restores_effective_access(self):
-        source, reports = self.root / "中文 源码", self.root / "reports"
+        scenarios = ("inherited", "explicit-file-allow", "protected-directory",
+                     "protected-file", "parent-delete-child", "leaf-delete", "readonly-object",
+                     "raw-descriptor-order", "stale-inheritance-order")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                self.check_native_acl_scenario(scenario)
+        for scenario in ("missing-node", "replaced-node", "unexpected-node"):
+            with self.subTest(scenario=scenario):
+                self.check_native_acl_recovery_rejects_changed_inventory(scenario)
+        with self.subTest(scenario="sharing-conflict"):
+            self.check_native_sharing_conflict_is_not_a_permission_denial()
+
+    def probe_fixture(self, parent=None, *, controlled_inheritance=False):
+        source = (parent or self.root) / "中文 源码"
+        source.mkdir(parents=True)
+        if controlled_inheritance:
+            # Give the isolated tree a reproducible inherited ACE order before
+            # creating children. This does not depend on the runner account's
+            # default DACL or alter any directory outside this fixture.
+            script = source.parent / "fixture-acl.ps1"
+            script.write_text(r'''param([string]$Source)
+$ErrorActionPreference = 'Stop'
+''' + runner.ACL_READ_SCRIPT + FIXTURE_ACL_SCRIPT + r'''
+[QcsFixtureAcl]::Initialize($Source)
+[QcsAclReader]::Read([IO.Path]::GetFullPath($Source))
+''', encoding="utf-8")
+            result = self.powershell(script, "-Source", source)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # The expected ACE order comes from the explicit native write above,
+            # not from reusing the reader to invent an expected descriptor.
+            self.assertTrue(result.stdout.strip().endswith(
+                'D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)'), result.stdout)
         (source / "src/core").mkdir(parents=True)
         (source / ".git").mkdir()
-        reports.mkdir()
         (source / "CMakeLists.txt").write_bytes(b"owned source bytes\n")
         for operation in ("delete", "rename"):
             (source / ".git" / ("qcs-acl-" + operation + ".tmp")).write_bytes(b"owned disposable\n")
+        return source
+
+    def check_native_acl_scenario(self, scenario):
+        owned = self.root / scenario
+        stale_order = scenario == "stale-inheritance-order"
+        source = self.probe_fixture(owned, controlled_inheritance=scenario in (
+            "raw-descriptor-order", "stale-inheritance-order"))
+        readonly = source / ".git/objects/owned-object" if scenario == "readonly-object" else None
+        if readonly is not None:
+            readonly.parent.mkdir()
+            readonly.write_bytes(b"owned readonly Git-like object\n")
+        reports = owned / "reports"
+        reports.mkdir()
+        prepare = reports / "prepare.ps1"
+        prepare.write_text(r'''param([string]$Source,[string]$Scenario)
+$ErrorActionPreference = 'Stop'
+''' + runner.ACL_READ_SCRIPT + FIXTURE_ACL_SCRIPT + r'''
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+function Add-Rule($Path, $Rights, $Type) {
+  $acl = Get-Acl -LiteralPath $Path
+  $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,
+    [Security.AccessControl.FileSystemRights]$Rights,
+    [Security.AccessControl.AccessControlType]$Type))
+  Set-Acl -LiteralPath $Path -AclObject $acl
+}
+$git = Join-Path $Source '.git'
+$files = @((Join-Path $Source 'CMakeLists.txt'),
+  (Join-Path $git 'qcs-acl-delete.tmp'), (Join-Path $git 'qcs-acl-rename.tmp'))
+function Read-FixtureAcls {
+  $items = @((Get-Item -LiteralPath $Source -Force)) + @(Get-ChildItem -LiteralPath $Source -Force -Recurse)
+  @($items | ForEach-Object {
+    [pscustomobject]@{relativePath=[IO.Path]::GetRelativePath($Source,$_.FullName).Replace('\','/');sddl=[QcsAclReader]::Read($_.FullName)}
+  })
+}
+$before = @(Read-FixtureAcls)
+switch ($Scenario) {
+  'explicit-file-allow' { foreach ($file in $files) { Add-Rule $file 'Write,Delete' 'Allow' } }
+  'protected-directory' {
+    foreach ($file in $files[1..2]) { [IO.File]::Delete($file) }
+    $acl = Get-Acl -LiteralPath $git
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,
+      [Security.AccessControl.FileSystemRights]::FullControl,
+      [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
+      [Security.AccessControl.PropagationFlags]::None,
+      [Security.AccessControl.AccessControlType]::Allow))
+    Set-Acl -LiteralPath $git -AclObject $acl
+    foreach ($file in $files[1..2]) { [IO.File]::WriteAllBytes($file,[Text.Encoding]::UTF8.GetBytes("owned disposable`n")) }
+  }
+  'raw-descriptor-order' {
+    $acl = Get-Acl -LiteralPath $git
+    $acl.SetAccessRuleProtection($true, $true)
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,
+      [Security.AccessControl.FileSystemRights]::FullControl,
+      [Security.AccessControl.AccessControlType]::Allow))
+    Set-Acl -LiteralPath $git -AclObject $acl
+  }
+  'stale-inheritance-order' {
+    foreach ($file in $files[1..2]) { [QcsFixtureAcl]::SimulateLegacyInheritedOrder($file) }
+  }
+  'protected-file' {
+    $acl = Get-Acl -LiteralPath $files[0]
+    $acl.SetAccessRuleProtection($true, $true)
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,
+      [Security.AccessControl.FileSystemRights]::FullControl,
+      [Security.AccessControl.AccessControlType]::Allow))
+    Set-Acl -LiteralPath $files[0] -AclObject $acl
+  }
+  'parent-delete-child' {
+    Add-Rule $git 'Write,DeleteSubdirectoriesAndFiles' 'Allow'
+    foreach ($file in $files[1..2]) { Add-Rule $file 'Delete' 'Deny' }
+  }
+  'leaf-delete' {
+    Add-Rule $git 'DeleteSubdirectoriesAndFiles' 'Deny'
+    foreach ($file in $files[1..2]) { Add-Rule $file 'Write,Delete' 'Allow' }
+  }
+}
+ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Depth 5 -Compress
+''', encoding="utf-8")
+        prepared = self.powershell(prepare, "-Source", source, "-Scenario", scenario)
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        fixture_acls = json.loads(prepared.stdout)
+        expected = {item["relativePath"]: item["sddl"] for item in fixture_acls["prepared"]}
+        original_mode, readonly_attributes = None, None
+        if readonly is not None:
+            original_mode = readonly.stat().st_mode
+            readonly.chmod(stat.S_IREAD)
+            readonly_attributes = readonly.stat().st_file_attributes
+            self.assertTrue(readonly_attributes & stat.FILE_ATTRIBUTE_READONLY)
         before = runner.snapshot(source)
-        runner.write(self.root / ".qcs-owned-run.json", {"source": str(source)})
+        runner.write(owned / ".qcs-owned-run.json", {"source": str(source)})
         script, original = reports / "qcs-owned-acl.ps1", reports / "source-original-acl.json"
         script.write_text(runner.ACL_SCRIPT, encoding="utf-8")
+        primary = None
         try:
             denied = self.powershell(script, "-Source", source, "-Report", original, "-Mode", "deny")
             self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
-            self.assertTrue(all(item["denied"] for item in runner.write_probes(source)))
+            saved = json.loads(original.read_text(encoding="utf-8-sig"))
+            self.assertEqual(saved["schemaVersion"], 2)
+            self.assertEqual({item["relativePath"]: item["originalSddl"] for item in saved["nodes"]}, expected)
+            applied = json.loads((reports / "source-denied-acl.json").read_text(encoding="utf-8-sig"))
+            self.assertEqual(applied["nodeCount"], len(expected))
+            self.assertEqual(applied["appliedCount"], len(expected))
+            self.assertTrue(all(item["applied"] for item in applied["nodes"]))
+            self.assertEqual({item["relativePath"]: item["fileIdentity"] for item in applied["nodes"]},
+                             {item["relativePath"]: item["fileIdentity"] for item in saved["nodes"]})
+            probes = runner.write_probes(source)
+            self.assertEqual(len(probes), 5)
+            # Handles used during the ACL transaction must already be closed.
+            # Sharing violations (32) are not effective ACL denials (5).
+            self.assertTrue(all(item["denied"] and item["winerror"] == 5 for item in probes), probes)
+            runner.require_readonly_probes(probes)
+        except BaseException as error:
+            primary = error
         finally:
             if original.is_file():
-                restored = self.powershell(script, "-Source", source, "-Report", original, "-Mode", "restore")
-                self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
-                report = json.loads(restored.stdout)
-                self.assertTrue(report["semanticMatch"])
-                self.assertEqual(len(runner.restored_write_probes(source)), 6)
+                try:
+                    restored = self.powershell(script, "-Source", source, "-Report", original, "-Mode", "restore")
+                    report = json.loads(restored.stdout)
+                    self.assertEqual(report["nodeCount"], len(expected))
+                    self.assertEqual({item["relativePath"]: item["originalSddl"] for item in report["nodes"]}, expected)
+                    restored_probes = []
+                    if stale_order:
+                        self.assertNotEqual(restored.returncode, 0)
+                        self.assertFalse(report["semanticMatch"])
+                        self.assertFalse(report["allNodesRestored"])
+                        changed = [item for item in report["nodes"] if not item["semanticMatch"]]
+                        self.assertEqual({item["relativePath"] for item in changed},
+                                         {".git/qcs-acl-delete.tmp", ".git/qcs-acl-rename.tmp"})
+                        self.assertTrue(all(item["originalSddl"].endswith(
+                            '(A;ID;FA;;;OW)(A;ID;FA;;;SY)(A;ID;FA;;;BA)') for item in changed))
+                        self.assertTrue(all(item["actualSddl"].endswith(
+                            '(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;OW)') for item in changed))
+                        self.assertTrue(all("security semantics were not restored" in item for item in report["errors"]))
+                        diagnostics = {"error": "original readonly failure"}
+                        runner.record_acl_restoration(diagnostics, restored.returncode, restored.stdout, source)
+                        self.assertEqual(diagnostics["error"], "original readonly failure")
+                        self.assertFalse(diagnostics["isolatedSourceAclRestored"])
+                        self.assertNotIn("restoredWriteProbes", diagnostics)
+                    else:
+                        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+                        self.assertTrue(report["semanticMatch"])
+                        self.assertTrue(report["allNodesRestored"])
+                        self.assertEqual(report["errors"], [])
+                        self.assertTrue(all(item["restored"] and item["semanticMatch"] for item in report["nodes"]))
+                        restored_probes = runner.restored_write_probes(source)
+                        self.assertEqual(len(restored_probes), 6)
+                        runner.require_restored_write_probes(restored_probes)
+                    print("QCS_ACL_SCENARIO " + json.dumps({"scenario": scenario,
+                          "expectedFailureObserved": stale_order,
+                          "original": saved, "denied": applied, "readonlyProbes": probes,
+                          "restoration": report, "restoredWriteProbes": restored_probes,
+                          "readonlyFileAttributes": readonly_attributes}, ensure_ascii=False))
+                except BaseException as error:
+                    primary = self.retain_primary_failure(primary, error)
+                finally:
+                    if stale_order:
+                        try:
+                            # Restore the complete, consistent fixture state
+                            # captured before changing the parent's inheritance.
+                            # Keep the tested recovery record and its failure
+                            # untouched in the original reports directory.
+                            cleanup_reports = owned / "fixture-cleanup"
+                            cleanup_reports.mkdir()
+                            baseline = json.loads(original.read_text(encoding="utf-8-sig"))
+                            before_acls = {item["relativePath"]: item["sddl"] for item in fixture_acls["before"]}
+                            for item in baseline["nodes"]:
+                                item["originalSddl"] = before_acls[item["relativePath"]]
+                            baseline["sddl"] = before_acls["."]
+                            cleanup_original = cleanup_reports / "source-original-acl.json"
+                            runner.write(cleanup_original, baseline)
+                            cleanup_script = cleanup_reports / "restore-fixture.ps1"
+                            cleanup_script.write_text(runner.ACL_SCRIPT, encoding="utf-8")
+                            cleanup = self.powershell(cleanup_script, "-Source", source,
+                                                      "-Report", cleanup_original, "-Mode", "restore")
+                            self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
+                            cleanup_result = json.loads(cleanup.stdout)
+                            self.assertTrue(cleanup_result["allNodesRestored"])
+                            self.assertTrue(all(item["semanticMatch"] and item["restored"] for item in cleanup_result["nodes"]))
+                            cleanup_probes = runner.restored_write_probes(source)
+                            runner.require_restored_write_probes(cleanup_probes)
+                            print("QCS_ACL_FIXTURE_CLEANUP " + json.dumps({"scenario": scenario,
+                                  "preScenarioRestoration": cleanup_result, "writeProbes": cleanup_probes}, ensure_ascii=False))
+                        except BaseException as error:
+                            primary = self.retain_primary_failure(primary, error)
+            if readonly is not None:
+                try:
+                    self.assertEqual(readonly.stat().st_file_attributes, readonly_attributes)
+                except BaseException as error:
+                    primary = self.retain_primary_failure(primary, error)
+                finally:
+                    try:
+                        readonly.chmod(original_mode)
+                    except BaseException as error:
+                        primary = self.retain_primary_failure(primary, error)
+        if primary is not None:
+            raise primary
         self.assertEqual(before, runner.snapshot(source))
+
+    def check_native_acl_recovery_rejects_changed_inventory(self, scenario):
+        owned = self.root / scenario
+        source = self.probe_fixture(owned)
+        reports = owned / "reports"
+        reports.mkdir()
+        runner.write(owned / ".qcs-owned-run.json", {"source": str(source)})
+        script, original = reports / "qcs-owned-acl.ps1", reports / "source-original-acl.json"
+        script.write_text(runner.ACL_SCRIPT, encoding="utf-8")
+        # First restore every node normally, then alter real owned files. This
+        # tests recovery against stale identities without fabricating a manifest
+        # or leaving intentionally denied files for TemporaryDirectory cleanup.
+        primary = None
+        try:
+            denied = self.powershell(script, "-Source", source, "-Report", original, "-Mode", "deny")
+            self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
+        except BaseException as error:
+            primary = error
+        finally:
+            if original.exists():
+                try:
+                    initial = self.powershell(script, "-Source", source, "-Report", original, "-Mode", "restore")
+                    self.assertEqual(initial.returncode, 0, initial.stdout + initial.stderr)
+                    self.assertTrue(json.loads(initial.stdout)["allNodesRestored"])
+                except BaseException as error:
+                    primary = self.retain_primary_failure(primary, error)
+        if primary is not None:
+            raise primary
+        target = source / ".git/qcs-acl-delete.tmp"
+        if scenario == "missing-node":
+            target.unlink()
+            expected_error = "Original ACL node is missing"
+        elif scenario == "replaced-node":
+            # Keep the original inode alive, so the replacement cannot reuse it.
+            target.rename(reports / "retained-original.tmp")
+            target.write_bytes(b"different owned replacement\n")
+            expected_error = "Original ACL node identity was replaced"
+        else:
+            (source / "unexpected.txt").write_bytes(b"new owned node\n")
+            expected_error = "Unexpected node"
+        before = runner.snapshot(source, exclude_git=False)
+        result = self.powershell(script, "-Source", source, "-Report", original, "-Mode", "restore")
+        self.assertNotEqual(result.returncode, 0)
+        restoration = json.loads(result.stdout)
+        self.assertFalse(restoration["allNodesRestored"])
+        self.assertFalse(restoration["semanticMatch"])
+        self.assertTrue(any(expected_error in item for item in restoration["errors"]), restoration)
+        failed = [item for item in restoration["nodes"] if not item["restored"]]
+        self.assertEqual(len(failed), 0 if scenario == "unexpected-node" else 1)
+        self.assertTrue(all(item["semanticMatch"] for item in restoration["nodes"] if item["restored"]))
+        record = {"error": "original readonly failure"}
+        runner.record_acl_restoration(record, result.returncode, result.stdout, source)
+        self.assertEqual(record["error"], "original readonly failure")
+        self.assertFalse(record["isolatedSourceAclRestored"])
+        self.assertEqual(record["isolatedSourceAclRestoration"], restoration)
+        self.assertNotIn("restoredWriteProbes", record)
+        self.assertEqual(before, runner.snapshot(source, exclude_git=False))
+        print("QCS_ACL_SCENARIO " + json.dumps({"scenario": scenario,
+              "expectedFailureObserved": True, "restoration": restoration, "diagnostics": record}, ensure_ascii=False))
+
+    def check_native_sharing_conflict_is_not_a_permission_denial(self):
+        import ctypes
+        from ctypes import wintypes
+        source = self.probe_fixture(self.root / "sharing-conflict")
+        target = source / "CMakeLists.txt"
+        original = target.read_bytes()
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.CreateFileW(str(target), 0x80000000, 0, None, 3, 0x80, None)
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value, ctypes.get_last_error())
+        primary = None
+        try:
+            records = runner.write_probes(source)
+            self.assertEqual(len(records), 5)
+            self.assertEqual(records[1]["winerror"], 32)
+            self.assertFalse(records[1]["denied"])
+            with self.assertRaises(RuntimeError):
+                runner.require_readonly_probes(records)
+        except BaseException as error:
+            primary = error
+        finally:
+            if not kernel.CloseHandle(handle):
+                primary = self.retain_primary_failure(primary, ctypes.WinError(ctypes.get_last_error()))
+        if primary is not None:
+            raise primary
+        runner.probe_write_access(target, True)
+        self.assertEqual(target.read_bytes(), original)
+        print("QCS_ACL_SCENARIO " + json.dumps({"scenario": "sharing-conflict",
+              "expectedFailureObserved": True, "readonlyProbes": records,
+              "handleReleasedAndFileUnchanged": True}, ensure_ascii=False))
+
+    def test_writable_probes_keep_every_result_and_fail_closed(self):
+        source = self.probe_fixture()
+        content = (source / "CMakeLists.txt").read_bytes()
+        records = runner.write_probes(source)
+        self.assertEqual(len(records), 5)
+        self.assertTrue(all(item["denied"] is False for item in records))
+        self.assertEqual([item.get("operation") for item in records[-2:]], ["delete", "rename"])
+        self.assertFalse((source / ".git/qcs-acl-delete.tmp").exists())
+        self.assertFalse((source / ".git/qcs-acl-rename.tmp").exists())
+        self.assertTrue((source / ".git/qcs-acl-rename.renamed").is_file())
+        self.assertEqual((source / "CMakeLists.txt").read_bytes(), content)
+        with self.assertRaisesRegex(RuntimeError, "not effectively read-only"):
+            runner.require_readonly_probes(records)
+        restored = runner.restored_write_probes(source)
+        self.assertEqual(len(restored), 6)
+        self.assertTrue(all(item["createWriteReadRenameDelete"] for item in restored[:3]))
+        self.assertTrue(restored[3]["existingFileWritable"])
+        self.assertTrue(all(not item["originalProbeRestored"] and item["error"] for item in restored[-2:]))
+        with self.assertRaisesRegex(RuntimeError, "Not every owned restoration"):
+            runner.require_restored_write_probes(restored)
+        self.assertEqual((source / "CMakeLists.txt").read_bytes(), content)
+
+    def test_probe_missing_files_are_errors_without_losing_later_results(self):
+        source = self.probe_fixture()
+        (source / "CMakeLists.txt").unlink()
+        (source / ".git/qcs-acl-delete.tmp").unlink()
+        records = runner.write_probes(source)
+        self.assertEqual(len(records), 5)
+        for index in (1, 3):
+            self.assertFalse(records[index]["denied"])
+            self.assertIn("error", records[index])
+        self.assertFalse(records[4]["denied"])
+        self.assertTrue((source / ".git/qcs-acl-rename.renamed").exists())
+        with self.assertRaises(RuntimeError):
+            runner.require_readonly_probes(records)
+
+    def test_probe_keeps_native_error_codes_and_permission_classification(self):
+        source = self.probe_fixture()
+        before = runner.snapshot(source, exclude_git=False)
+        for code in (5, 32, None):
+            error = PermissionError("controlled Windows access result")
+            error.winerror = code
+            # A POSIX PermissionError has no Windows status contract. Windows
+            # requires the exact native ACCESS_DENIED code, never None or 32.
+            denied = code == 5 if os.name == "nt" else True
+            with self.subTest(winerror=code), mock.patch.object(runner, "probe_write_access", side_effect=error), \
+                    mock.patch.object(Path, "unlink", side_effect=error), \
+                    mock.patch.object(Path, "rename", side_effect=error):
+                records = runner.write_probes(source)
+            self.assertEqual(len(records), 5)
+            self.assertTrue(all(item["winerror"] == code and item["denied"] == denied for item in records))
+            if denied:
+                runner.require_readonly_probes(records)
+            else:
+                with self.assertRaises(RuntimeError):
+                    runner.require_readonly_probes(records)
+        self.assertEqual(before, runner.snapshot(source, exclude_git=False))
+
+    def test_restoration_diagnostics_preserve_primary_error_and_missing_probes(self):
+        source = self.probe_fixture()
+        records = runner.write_probes(source)
+        with self.assertRaises(RuntimeError) as failure:
+            runner.require_readonly_probes(records)
+        original_error = "RuntimeError: " + str(failure.exception)
+        record = {"error": original_error, "readonlyProbesBefore": records}
+        # A successful ACL response alone cannot turn already deleted probes
+        # into successful restoration. The real temporary files remain absent.
+        response = {"semanticMatch": True, "allNodesRestored": True, "nodeCount": 1,
+                    "nodes": [{"relativePath": ".", "restored": True, "semanticMatch": True}], "errors": []}
+        runner.record_acl_restoration(record, 0, json.dumps(response), source)
+        self.assertEqual(record["error"], original_error)
+        self.assertEqual(record["readonlyProbesBefore"], records)
+        self.assertFalse(record["isolatedSourceAclRestored"])
+        self.assertEqual(len(record["restoredWriteProbes"]), 6)
+        self.assertIn("Not every owned restoration", record["aclRestorationError"])
+        self.assertFalse((source / ".git/qcs-acl-delete.tmp").exists())
+
+    def test_restoration_diagnostics_preserve_failed_node_inventory(self):
+        source = self.probe_fixture()
+        before = runner.snapshot(source, exclude_git=False)
+        node = {"relativePath": ".git/qcs-acl-delete.tmp", "restored": False,
+                "semanticMatch": False, "error": "Original ACL node is missing"}
+        response = {"semanticMatch": False, "allNodesRestored": False, "nodeCount": 1,
+                    "nodes": [node], "errors": [node["error"]]}
+        outputs = ((1, json.dumps(response)), (0, json.dumps(response)), (1, "invalid JSON"),
+                   (0, "null"), (0, "[]"), (0, '{"nodes": [null]}'))
+        for exit_code, output in outputs:
+            with self.subTest(exitCode=exit_code, validJson=output.startswith("{")):
+                record = {"error": "original readonly failure"}
+                runner.record_acl_restoration(record, exit_code, output, source)
+                self.assertEqual(record["error"], "original readonly failure")
+                self.assertFalse(record["isolatedSourceAclRestored"])
+                self.assertIn("aclRestorationError", record)
+                self.assertNotIn("restoredWriteProbes", record)
+                if output == json.dumps(response):
+                    self.assertEqual(record["isolatedSourceAclRestoration"], response)
+        self.assertEqual(before, runner.snapshot(source, exclude_git=False))
 
     def wrapper(self, name="qcs-tests-core", *, workflow=False):
         source, build, tests = self.root / "中文 源码", self.root / "独立 build", self.root / "自定 temp"
