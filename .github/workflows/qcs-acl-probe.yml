@@ -45,6 +45,24 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         run: |
           pwsh -NoProfile -Command '$reportRoot = Join-Path $env:RUNNER_TEMP ("qcs-acl-" + $env:GITHUB_RUN_ID); python -X utf8 -B tools/acceptance/qcs-acl-probe.py --output-root (Join-Path $reportRoot "bash-pwsh") *> (Join-Path $reportRoot "bash-pwsh.log"); $probeExit = $LASTEXITCODE; Get-Content -LiteralPath (Join-Path $reportRoot "bash-pwsh.log"); exit $probeExit'
+      - name: Observe Bash with an unchanged duplicate thread token
+        if: always()
+        shell: bash
+        working-directory: 'qcs 源码'
+        env:
+          PYTHONUTF8: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          pwsh -NoProfile -Command '$reportRoot = Join-Path $env:RUNNER_TEMP ("qcs-acl-" + $env:GITHUB_RUN_ID); python -X utf8 -B tools/acceptance/qcs-acl-probe.py --probe-token duplicate-control --output-root (Join-Path $reportRoot "duplicate-control") *> (Join-Path $reportRoot "duplicate-control.log"); $probeExit = $LASTEXITCODE; Get-Content -LiteralPath (Join-Path $reportRoot "duplicate-control.log"); exit $probeExit'
+      - name: Observe Bash with SeRestore disabled only on a duplicate token
+        if: always()
+        shell: bash
+        working-directory: 'qcs 源码'
+        env:
+          PYTHONUTF8: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          pwsh -NoProfile -Command '$reportRoot = Join-Path $env:RUNNER_TEMP ("qcs-acl-" + $env:GITHUB_RUN_ID); python -X utf8 -B tools/acceptance/qcs-acl-probe.py --probe-token disable-restore --output-root (Join-Path $reportRoot "disable-restore") *> (Join-Path $reportRoot "disable-restore.log"); $probeExit = $LASTEXITCODE; Get-Content -LiteralPath (Join-Path $reportRoot "disable-restore.log"); exit $probeExit'
       - name: Preserve original diagnostic evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

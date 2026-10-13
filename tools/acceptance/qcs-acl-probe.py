@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small Windows ACL diagnostic. Never changes token privileges or product data."""
+"""Small Windows ACL diagnostic. Optional intervention changes only a duplicate token."""
 from __future__ import annotations
 
 import argparse
@@ -59,6 +59,13 @@ class TOKEN_PRIVILEGES(C.Structure):
     _fields_ = [("Count", W.DWORD), ("Items", LUID_ATTRIBUTES * 1)]
 
 
+class TOKEN_STATISTICS(C.Structure):
+    _fields_ = [("TokenId", LUID), ("AuthenticationId", LUID), ("ExpirationTime", C.c_longlong),
+                ("TokenType", W.DWORD), ("ImpersonationLevel", W.DWORD),
+                ("DynamicCharged", W.DWORD), ("DynamicAvailable", W.DWORD),
+                ("GroupCount", W.DWORD), ("PrivilegeCount", W.DWORD), ("ModifiedId", LUID)]
+
+
 class Native:
     def __init__(self):
         self.k = C.WinDLL("kernel32", use_last_error=True)
@@ -73,6 +80,10 @@ class Native:
             (self.k, "MoveFileExW", [W.LPCWSTR, W.LPCWSTR, W.DWORD], W.BOOL),
             (self.a, "OpenProcessToken", [W.HANDLE, W.DWORD, C.POINTER(W.HANDLE)], W.BOOL),
             (self.a, "OpenThreadToken", [W.HANDLE, W.DWORD, W.BOOL, C.POINTER(W.HANDLE)], W.BOOL),
+            (self.a, "DuplicateTokenEx", [W.HANDLE, W.DWORD, C.c_void_p, C.c_int, C.c_int, C.POINTER(W.HANDLE)], W.BOOL),
+            (self.a, "SetThreadToken", [C.POINTER(W.HANDLE), W.HANDLE], W.BOOL),
+            (self.a, "LookupPrivilegeValueW", [W.LPCWSTR, W.LPCWSTR, C.POINTER(LUID)], W.BOOL),
+            (self.a, "AdjustTokenPrivileges", [W.HANDLE, W.BOOL, C.POINTER(TOKEN_PRIVILEGES), W.DWORD, C.c_void_p, C.c_void_p], W.BOOL),
             (self.a, "GetTokenInformation", [W.HANDLE, C.c_int, C.c_void_p, W.DWORD, C.POINTER(W.DWORD)], W.BOOL),
             (self.a, "LookupPrivilegeNameW", [W.LPCWSTR, C.POINTER(LUID), W.LPWSTR, C.POINTER(W.DWORD)], W.BOOL),
             (self.a, "ConvertSidToStringSidW", [C.c_void_p, C.POINTER(C.c_void_p)], W.BOOL),
@@ -155,6 +166,10 @@ class Native:
         record["integrity"] = {"sid": self.sid(item.Sid), "attributes": item.Attributes}
         if record["type"] == 2:
             record["impersonationLevel"] = W.DWORD.from_buffer(self.information(handle, 9, C.sizeof(W.DWORD))).value
+        statistics = TOKEN_STATISTICS.from_buffer(self.information(handle, 10, C.sizeof(TOKEN_STATISTICS)))
+        record["identity"] = {label: {"low": getattr(statistics, field).LowPart,
+                                      "high": getattr(statistics, field).HighPart}
+                              for label, field in (("tokenId", "TokenId"), ("authenticationId", "AuthenticationId"), ("modifiedId", "ModifiedId"))}
         return record
 
     def tokens(self):
@@ -215,9 +230,136 @@ class Native:
             raise C.WinError(C.get_last_error())
 
 
+class ProbeToken:
+    """Own only a duplicate. Preserve an existing thread token by its handle."""
+    def __init__(self, native, mode, reports):
+        self.native, self.mode, self.reports = native, mode, reports
+        self.original_thread = W.HANDLE()
+        self.process = W.HANDLE()
+        self.duplicate = W.HANDLE()
+        self.active = False
+        self.before = None
+        self.record = {"mode": mode, "scope": "duplicate-thread-token", "privilegesChanged": False,
+                       "threadTokenRestored": False, "processTokenUnchanged": False}
+
+    def write(self):
+        save(self.reports / "token-intervention.json", self.record)
+
+    def activate(self):
+        native = self.native
+        self.before = native.tokens()
+        self.record["before"] = self.before
+        self.write()
+        # QUERY | DUPLICATE | IMPERSONATE lets us restore this exact original
+        # thread token. Failure other than ERROR_NO_TOKEN is not a fallback.
+        if native.a.OpenThreadToken(native.k.GetCurrentThread(), 0x0e, True, C.byref(self.original_thread)):
+            source = self.original_thread
+        else:
+            error = C.get_last_error()
+            if error != 1008:
+                raise C.WinError(error)
+            if not native.a.OpenProcessToken(native.k.GetCurrentProcess(), 0x0a, C.byref(self.process)):
+                raise C.WinError(C.get_last_error())
+            source = self.process
+        # New non-inheritable impersonation token, SecurityImpersonation level.
+        # QUERY | ADJUST_PRIVILEGES | IMPERSONATE applies only to this copy.
+        if not native.a.DuplicateTokenEx(source, 0x2c, None, 2, 2, C.byref(self.duplicate)):
+            raise C.WinError(C.get_last_error())
+        duplicate_before = native.token(self.duplicate)
+        self.record["duplicateBefore"] = duplicate_before
+        source_record = self.before[self.before["effective"]]
+        self.record["copyDiff"] = {key: {"before": source_record.get(key), "after": duplicate_before.get(key)}
+                                  for key in set(source_record) | set(duplicate_before)
+                                  if source_record.get(key) != duplicate_before.get(key)}
+        copied_fields = set(source_record) | set(duplicate_before)
+        copied_fields -= {"type", "impersonationLevel", "identity"}
+        self.record["copyPreservedAccessFields"] = all(source_record.get(key) == duplicate_before.get(key) for key in copied_fields)
+        self.write()
+        if not self.record["copyPreservedAccessFields"]:
+            raise RuntimeError("Duplicate token did not preserve the source access fields")
+        if self.mode == "disable-restore":
+            matches = [item for item in duplicate_before["privileges"] if item["name"] == "SeRestorePrivilege"]
+            if len(matches) != 1 or not matches[0]["enabled"]:
+                raise RuntimeError("Causal intervention requires an already-enabled SeRestorePrivilege, never enables it")
+            change = TOKEN_PRIVILEGES()
+            change.Count = 1
+            if not native.a.LookupPrivilegeValueW(None, "SeRestorePrivilege", C.byref(change.Items[0].Luid)):
+                raise C.WinError(C.get_last_error())
+            change.Items[0].Attributes = 0
+            C.set_last_error(0)
+            success = native.a.AdjustTokenPrivileges(self.duplicate, False, C.byref(change), 0, None, None)
+            error = C.get_last_error()
+            self.record["adjustResult"] = {"success": bool(success), "winerror": error}
+            self.write()
+            if not success or error != 0:  # includes ERROR_NOT_ALL_ASSIGNED (1300)
+                raise C.WinError(error)
+            self.record["privilegesChanged"] = True
+        duplicate_after = native.token(self.duplicate)
+        self.record["duplicateAfter"] = duplicate_after
+        self.record["duplicateDiff"] = {key: {"before": duplicate_before.get(key), "after": duplicate_after.get(key)}
+                                        for key in set(duplicate_before) | set(duplicate_after)
+                                        if duplicate_before.get(key) != duplicate_after.get(key)}
+        expected = json.loads(json.dumps(duplicate_before))
+        if self.mode == "disable-restore":
+            for privilege in expected["privileges"]:
+                if privilege["name"] == "SeRestorePrivilege":
+                    privilege["attributes"] &= ~2
+                    privilege["enabled"] = False
+            # Windows advances ModifiedId when changing a token. Its token and
+            # authentication identities must still refer to the same copy.
+            expected["identity"]["modifiedId"] = duplicate_after["identity"]["modifiedId"]
+        self.record["onlyRequestedChange"] = expected == duplicate_after
+        self.write()
+        if not self.record["onlyRequestedChange"]:
+            raise RuntimeError("Duplicate token has unexpected changes")
+        if not native.a.SetThreadToken(None, self.duplicate):
+            raise C.WinError(C.get_last_error())
+        self.active = True
+        effective = native.tokens()
+        self.record["effective"] = effective
+        self.write()
+        if effective["process"] != self.before["process"] or effective["thread"] != duplicate_after:
+            raise RuntimeError("Unexpected effective token or process token mutation")
+
+    def restore(self):
+        error = None
+        try:
+            if self.active:
+                if not self.native.a.SetThreadToken(None, self.original_thread if self.original_thread.value else None):
+                    raise C.WinError(C.get_last_error())
+                self.active = False
+            after = self.native.tokens()
+            self.record["afterRestoration"] = after
+            self.record["processTokenUnchanged"] = self.before is not None and self.before["process"] == after["process"]
+            self.record["threadTokenRestored"] = self.before is not None and self.before == after
+            self.write()
+            if not self.record["threadTokenRestored"]:
+                raise RuntimeError("Original effective token identity or state was not restored")
+        except BaseException as caught:
+            error = caught
+            self.record["restorationError"] = repr(caught)
+        finally:
+            close_errors = []
+            for handle in (self.duplicate, self.process, self.original_thread):
+                if handle.value:
+                    try:
+                        self.native.close(handle)
+                    except BaseException as caught:
+                        close_errors.append(repr(caught))
+                    handle.value = None
+            if close_errors:
+                self.record["closeErrors"] = close_errors
+                if error is None:
+                    error = RuntimeError("Token handle cleanup failed")
+            self.write()
+        if error is not None:
+            raise error
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--probe-token", choices=("original", "duplicate-control", "disable-restore"), default="original")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This diagnostic requires Windows")
@@ -236,6 +378,7 @@ def main():
     reports.mkdir()
     original = reports / "source-original-acl.json"
     report = {"schemaVersion": 1, "diagnosticOnly": True, "privilegesChanged": False,
+              "probeTokenMode": args.probe_token, "tokenRestored": args.probe_token == "original",
               "startedAt": datetime.now(timezone.utc).isoformat(), "ownedRoot": str(owned),
               "python": sys.version, "executable": sys.executable, "platform": platform.platform(),
               "pid": os.getpid(), "parentPid": os.getppid(),
@@ -264,6 +407,7 @@ def main():
         return completed
 
     primary = None
+    probe_token = None
     try:
         save(reports / "token-before.json", native.tokens())
         (source / "src/core").mkdir(parents=True)
@@ -284,6 +428,11 @@ def main():
             raise RuntimeError("Incomplete ACL denial inventory")
         save(reports / "native-applied-before-probes.json", [native.acl(source / item["relativePath"]) for item in saved["nodes"]])
         save(reports / "token-before-probes.json", native.tokens())
+        if args.probe_token != "original":
+            probe_token = ProbeToken(native, args.probe_token, reports)
+            probe_token.activate()
+            report["privilegesChanged"] = probe_token.record["privilegesChanged"]
+        save(reports / "token-effective-probes.json", native.tokens())
         # Execute the original five probes without substituting weaker APIs.
         probes = runner.write_probes(source)
         save(reports / "original-five-probes.json", probes)
@@ -317,9 +466,20 @@ def main():
         report["primaryError"] = repr(error)
         (reports / "primary-error.log").write_text(traceback.format_exc(), encoding="utf-8")
     finally:
+        # End impersonation before starting any restoration subprocess. Never
+        # proceed under a token whose restoration failed or was unverified.
+        if probe_token is not None:
+            try:
+                probe_token.restore()
+                report["tokenRestored"] = True
+                report["privilegesChanged"] = probe_token.record["privilegesChanged"]
+            except BaseException as error:
+                report["tokenRestorationError"] = repr(error)
+        elif args.probe_token != "original":
+            report["tokenRestored"] = True  # no impersonation was attempted
         # A successful observed deletion is not disguised by recreating its path.
         # Missing/replaced nodes remain strict restoration failures and are kept.
-        if original.exists():
+        if original.exists() and report["tokenRestored"]:
             try:
                 restored = ps("restore")
                 result_path = reports / "source-restored-acl.json"
@@ -349,7 +509,7 @@ def main():
         report["finishedAt"] = datetime.now(timezone.utc).isoformat()
         save(summary_path, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if report["collectionComplete"] and report["restored"] and report["cleanup"] else 1
+    return 0 if report["collectionComplete"] and report["tokenRestored"] and report["restored"] and report["cleanup"] else 1
 
 
 if __name__ == "__main__":
