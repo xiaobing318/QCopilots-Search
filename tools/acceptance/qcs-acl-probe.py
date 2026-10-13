@@ -117,6 +117,9 @@ class Native:
     def token(self, handle):
         user = self.information(handle, 1)
         record = {"user": self.sid(SID_ATTRIBUTES.from_buffer(user).Sid)}
+        for label, kind in (("defaultOwner", 4), ("primaryGroup", 5)):
+            buffer = self.information(handle, kind)
+            record[label] = self.sid(C.c_void_p.from_buffer(buffer).value)
         for label, kind in (("groups", 2), ("restrictedSids", 11)):
             buffer = self.information(handle, kind)
             count = W.DWORD.from_buffer(buffer).value
