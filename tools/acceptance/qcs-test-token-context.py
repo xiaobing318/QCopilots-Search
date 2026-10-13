@@ -41,6 +41,9 @@ def load(name):
 context = load("qcs-token-context")
 REMOVED = {"SeBackupPrivilege", "SeRestorePrivilege"}
 NATIVE_RECORDS = []
+# The aggregate owns this exact runner instance. Other contract tests reload
+# modules, so resolving sys.modules again during a case can lose its queue.
+DIAGNOSTIC_PRODUCER = sys.modules.get("qcs_test_portability_runners")
 
 NATIVE_FIXTURE = r'''
 import importlib.util
@@ -432,11 +435,23 @@ class TokenContextContracts(unittest.TestCase):
                 self.assertIn("close-owned-job", boundary.events)
 
     def test_cleanup_failure_never_returns_a_successful_exit(self):
-        for failure in ("stop", "close-owned-job", "close-child-token", "close-parent-token"):
+        for failure in ("stop", "close-owned-job", "close-parent-token"):
             with self.subTest(failure=failure):
-                boundary = FakeBoundary(failure=failure, descendants=1)
-                with self.assertRaises(Exception):
-                    self.run_fake(boundary)
+                boundary = FakeBoundary(failure=failure, descendants=0)
+                report = {}
+                with self.assertRaisesRegex(RuntimeError, "Token context cleanup failed"):
+                    self.run_fake(boundary, report=report)
+                self.assertTrue(report["resumed"])
+                self.assertEqual(report["childExitCode"], 0)
+                self.assertNotIn("error", report, "The only injected failure must be cleanup")
+                self.assertTrue(any("injected " + failure in value for value in report["cleanupErrors"]))
+                self.assertFalse(report["passed"])
+        boundary, report = FakeBoundary(failure="close-child-token"), {}
+        with self.assertRaisesRegex(RuntimeError, "injected close-child-token"):
+            self.run_fake(boundary, report=report)
+        self.assertNotIn("resume", boundary.events)
+        self.assertIn("injected close-child-token", report["error"])
+        self.assertFalse(report["passed"])
 
     def test_primary_failure_is_preserved_when_cleanup_also_fails(self):
         boundary = FakeBoundary(failure="remove")
@@ -450,7 +465,8 @@ class TokenContextContracts(unittest.TestCase):
         self.assertIn("injected remove", report["error"])
         self.assertTrue(any("secondary stop failure" in value for value in report["cleanupErrors"]))
         self.assertFalse(report["passed"])
-        self.assertTrue(any("secondary stop failure" in note for note in getattr(caught.exception, "__notes__", [])))
+        if hasattr(caught.exception, "add_note"):
+            self.assertTrue(any("secondary stop failure" in note for note in caught.exception.__notes__))
         self.assertNotIn("resume", boundary.events)
 
     def test_native_adjustment_requests_removal_including_disabled_privileges(self):
@@ -628,12 +644,11 @@ class TokenContextContracts(unittest.TestCase):
             self.assertEqual(api.snapshot(parent_handle), parent_before)
         finally:
             api.close(parent_handle)
-            producer = sys.modules.get("qcs_test_portability_runners")
-            if producer is not None:
+            if DIAGNOSTIC_PRODUCER is not None:
                 for row in NATIVE_RECORDS:
-                    producer.queue_diagnostic("QCS_TOKEN_SCENARIO", row)
+                    DIAGNOSTIC_PRODUCER.queue_diagnostic("QCS_TOKEN_SCENARIO", row)
 
 
 if __name__ == "__main__":
-    producer = load("qcs-test-portability-runners")
-    unittest.main(verbosity=2, testRunner=producer.DiagnosticTestRunner)
+    DIAGNOSTIC_PRODUCER = load("qcs-test-portability-runners")
+    unittest.main(verbosity=2, testRunner=DIAGNOSTIC_PRODUCER.DiagnosticTestRunner)
