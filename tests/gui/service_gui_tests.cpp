@@ -4,6 +4,7 @@
 #include "service/service_client.h"
 #include "support/test_environment.h"
 #include <QFileInfo>
+#include <QFile>
 #include <QComboBox>
 #include <QDir>
 #include <QEventLoop>
@@ -27,6 +28,21 @@ struct ScopedService {
     explicit ScopedService(RuntimePaths paths) : paths(std::move(paths)) {}
     RuntimePaths paths;
     QProcess process;
+    QByteArray standardOutput, standardError;
+    QString diagnostics() {
+        standardOutput += process.readAllStandardOutput();
+        standardError += process.readAllStandardError();
+        QFile log(QDir(paths.logDir).filePath("qcs-service.log"));
+        QString logTail;
+        if (log.open(QIODevice::ReadOnly)) {
+            log.seek(qMax<qint64>(0, log.size() - 16384));
+            logTail = QString::fromUtf8(log.readAll());
+        } else logTail = log.errorString();
+        return QStringLiteral("service state=%1 exitCode=%2 exitStatus=%3 error=%4\nstdout:\n%5\nstderr:\n%6\nlog:\n%7")
+            .arg(int(process.state())).arg(process.exitCode()).arg(int(process.exitStatus()))
+            .arg(process.errorString(), QString::fromUtf8(standardOutput.right(16384)),
+                QString::fromUtf8(standardError.right(16384)), logTail);
+    }
     ~ScopedService() {
         if (process.state() == QProcess::NotRunning) return;
         ServiceClient client(paths);
@@ -79,13 +95,32 @@ private slots:
         service.process.setWorkingDirectory(env.root());
         service.process.start();
         QVERIFY2(service.process.waitForStarted(10000), qPrintable(service.process.errorString()));
-        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(QDir(paths.profileDir).filePath("qcs-ipc-token")), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(QFileInfo::exists(QDir(paths.profileDir).filePath("qcs-ipc-token")),
+            qPrintable(service.diagnostics()), 10000);
         ServiceClient probe(paths);
         probe.setAutoStart(false);
-        QTRY_VERIFY_WITH_TIMEOUT(([&] { if (!probe.isConnected()) probe.connectToService(); return probe.isConnected(); })(), 10000);
         QSignalSpy probeResponses(&probe, &ServiceClient::response);
+        QSignalSpy probeFailures(&probe, &ServiceClient::failed);
+        QSignalSpy probeDisconnected(&probe, &ServiceClient::disconnected);
+        const auto probeDiagnostics = [&] {
+            QStringList failures;
+            for (const auto &failure : probeFailures)
+                failures << QStringLiteral("id=%1 code=%2 message=%3")
+                    .arg(failure.at(0).toString(), failure.at(1).toString(), failure.at(2).toString());
+            return QStringLiteral("probe connected=%1 responses=%2 failures=%3 disconnected=%4\n%5\n%6")
+                .arg(probe.isConnected()).arg(probeResponses.count()).arg(probeFailures.count())
+                .arg(probeDisconnected.count()).arg(failures.join(u'\n'), service.diagnostics());
+        };
+        QTRY_VERIFY2_WITH_TIMEOUT(([&] { if (!probe.isConnected()) probe.connectToService(); return probe.isConnected(); })(),
+            qPrintable(probeDiagnostics()), 10000);
+        const auto failuresBeforeStatus = probeFailures.count();
+        const auto disconnectsBeforeStatus = probeDisconnected.count();
         const auto probeId = probe.request("status");
-        QTRY_VERIFY_WITH_TIMEOUT(probeResponses.count() == 1, 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(!probeResponses.isEmpty() || probeFailures.count() > failuresBeforeStatus
+            || probeDisconnected.count() > disconnectsBeforeStatus || service.process.state() == QProcess::NotRunning,
+            qPrintable(probeDiagnostics()), 10000);
+        QVERIFY2(probeFailures.count() == failuresBeforeStatus && probeDisconnected.count() == disconnectsBeforeStatus
+            && probeResponses.count() == 1, qPrintable(probeDiagnostics()));
         QCOMPARE(probeResponses.first().at(0).toString(), probeId);
         QVERIFY(probeResponses.first().at(1).toJsonObject().contains("progress"));
         probe.disconnectFromService();

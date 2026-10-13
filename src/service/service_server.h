@@ -2,6 +2,8 @@
 #include "core/runtime_paths.h"
 #include "storage/index_repository.h"
 #include <QObject>
+#include <QLocalServer>
+#include <functional>
 #include <memory>
 
 namespace qcopilots_search {
@@ -11,6 +13,9 @@ struct ServiceDependencies {
     // Empty selects real ModelFiles verification. Injection is restricted to the
     // C++ construction interface, never enabled by environment or IPC requests.
     std::function<bool(QString *)> verifyModels;
+    // Empty uses QLocalServer::listen. Construction-only injection lets tests
+    // deliver a real connection before the listen operation returns.
+    std::function<bool(QLocalServer &, const QString &)> listen;
 };
 
 class ServiceServer final : public QObject {

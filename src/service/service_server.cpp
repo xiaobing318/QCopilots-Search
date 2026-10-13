@@ -92,11 +92,15 @@ class ServiceServer::Private {
 public:
     explicit Private(ServiceServer *owner, RuntimePaths value, ServiceDependencies dependencies) : q(owner), paths(std::move(value)),
         repository(std::move(dependencies.storage)), modelVerifier(std::move(dependencies.verifyModels)),
+        listenFunction(std::move(dependencies.listen)),
         lock(nativeLockFilePath(paths.lockFile)), server(owner), monitor(owner), reconcile(owner), debounce(owner),
         indexWorker(owner), queryWorker(owner), indexTimeout(owner), queryTimeout(owner) {
         scanPool.setMaxThreadCount(1);
         writePool.setMaxThreadCount(1);
         searchPool.setMaxThreadCount(2);
+        // Windows can emit newConnection synchronously from listen(). Register
+        // once before listening so an early client is not left pending.
+        QObject::connect(&server, &QLocalServer::newConnection, q, [this] { accept(); });
     }
 
     struct Pending {
@@ -111,6 +115,7 @@ public:
     AppSettings settings;
     IndexRepository repository;
     std::function<bool(QString *)> modelVerifier;
+    std::function<bool(QLocalServer &, const QString &)> listenFunction;
     QLockFile lock;
     QLocalServer server;
     QFileSystemWatcher monitor;
@@ -187,13 +192,12 @@ public:
             return false;
         }
         server.setSocketOptions(QLocalServer::UserAccessOption);
-        if (!server.listen(paths.ipcName)) {
+        if (!(listenFunction ? listenFunction(server, paths.ipcName) : server.listen(paths.ipcName))) {
             if (error) *error = QStringLiteral("%1 (endpoint %2, %3 encoded bytes)")
                 .arg(server.errorString(), paths.ipcName).arg(QFile::encodeName(paths.ipcName).size());
             lock.unlock();
             return false;
         }
-        QObject::connect(&server, &QLocalServer::newConnection, q, [this] { accept(); });
         QObject::connect(&monitor, &QFileSystemWatcher::directoryChanged, q, [this] { debounce.start(); });
         QObject::connect(&monitor, &QFileSystemWatcher::fileChanged, q, [this] { debounce.start(); });
         debounce.setSingleShot(true);

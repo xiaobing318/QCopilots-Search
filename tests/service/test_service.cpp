@@ -20,6 +20,7 @@
 #include <QStorageInfo>
 #include <QTest>
 #include <QTimer>
+#include <QUuid>
 #include <QtEndian>
 #ifndef Q_OS_WIN
 #include <sys/un.h>
@@ -140,6 +141,93 @@ private slots:
     {
         const auto error = qcopilots_search::test::takeCleanupErrors();
         QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
+    void connectionArrivingBeforeListenReturnsIsAccepted() {
+        TestEnvironment environment("service-early-listen");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+
+        QLocalSocket socket;
+        QSignalSpy disconnected(&socket, &QLocalSocket::disconnected);
+        QString listenError;
+        int signalsBeforeListenReturned = 0;
+        ServiceDependencies dependencies;
+        dependencies.listen = [&](QLocalServer &listener, const QString &name) {
+            QSignalSpy connections(&listener, &QLocalServer::newConnection);
+            if (!listener.listen(name)) {
+                listenError = listener.errorString();
+                return false;
+            }
+            socket.connectToServer(name);
+            if (!socket.waitForConnected(5000)) {
+                listenError = socket.errorString();
+                return false;
+            }
+            // Drive a real pending connection synchronously before the listen
+            // callback returns. The production receiver may consume it, so
+            // waitForNewConnection's pending-queue return value is not proof.
+            if (connections.isEmpty()) listener.waitForNewConnection(5000);
+            signalsBeforeListenReturned = connections.count();
+            if (signalsBeforeListenReturned != 1)
+                listenError = QStringLiteral("Expected one real newConnection before listen returned, saw %1")
+                    .arg(signalsBeforeListenReturned);
+            return listenError.isEmpty();
+        };
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error + u'\n' + listenError));
+        QCOMPARE(signalsBeforeListenReturned, 1);
+        const auto listeners = service.findChildren<QLocalServer *>(QString(), Qt::FindDirectChildrenOnly);
+        QCOMPARE(listeners.size(), 1);
+        auto *listener = listeners.first();
+
+        QFile tokenFile(QDir(paths.profileDir).filePath("qcs-ipc-token"));
+        QVERIFY(tokenFile.open(QIODevice::ReadOnly));
+        const QString token = QString::fromLatin1(tokenFile.readAll());
+        tokenFile.close();
+        const QString requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QByteArray buffer;
+        QString protocolError;
+        QList<QJsonObject> replies;
+        const auto receive = QObject::connect(&socket, &QLocalSocket::readyRead, &socket, [&] {
+            buffer += socket.readAll();
+            QList<QJsonObject> frames;
+            if (!takeIpcFrames(buffer, frames, &protocolError)) return;
+            for (const auto &frame : frames)
+                if (frame.value("id").toString() == requestId) replies.append(frame);
+        });
+        const auto disconnectReceive = qScopeGuard([&] { QObject::disconnect(receive); });
+        // Send only after start returns. This isolates the lost newConnection
+        // from any separate question about pre-buffered readyRead delivery.
+        const auto frame = encodeIpcFrame({{"protocol", protocolVersion}, {"id", requestId},
+            {"token", token}, {"method", "status"}, {"params", QJsonObject{}}});
+        QVERIFY(!frame.isEmpty());
+        QCOMPARE(socket.write(frame), qint64(frame.size()));
+        socket.flush();
+        qInfo().noquote() << QStringLiteral("early-listen request=%1 signalsBeforeReturn=%2 pendingAfterStart=%3")
+            .arg(requestId).arg(signalsBeforeListenReturned).arg(listener->hasPendingConnections());
+        const auto diagnostics = [&] {
+            return QStringLiteral("request=%1 signalsBeforeReturn=%2 pending=%3 replies=%4 disconnected=%5 socketError=%6 protocolError=%7")
+                .arg(requestId).arg(signalsBeforeListenReturned).arg(listener->hasPendingConnections())
+                .arg(replies.size()).arg(disconnected.count()).arg(socket.errorString(), protocolError);
+        };
+        QVERIFY2(QTest::qWaitFor([&] {
+            return !replies.isEmpty() || !protocolError.isEmpty() || !disconnected.isEmpty();
+        }, 3000), qPrintable(diagnostics()));
+        QVERIFY2(protocolError.isEmpty(), qPrintable(diagnostics()));
+        QCOMPARE(replies.size(), 1);
+        QCOMPARE(replies.first().value("protocol").toInt(), protocolVersion);
+        QVERIFY2(replies.first().value("ok").toBool(), qPrintable(QJsonDocument(replies.first()).toJson()));
+        QVERIFY(replies.first().value("result").toObject().contains("progress"));
+        QVERIFY(!listener->hasPendingConnections());
+        qInfo().noquote() << QStringLiteral("early-listen response=%1 accepted=true").arg(requestId);
+        socket.abort();
+        service.stop();
     }
 
 #ifndef Q_OS_WIN
