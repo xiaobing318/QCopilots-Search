@@ -61,7 +61,7 @@ qcopilots_search_configure_test_directory("${CMAKE_CURRENT_SOURCE_DIR}")
 qcopilots_search_add_test(NAME qcs-tests-acceptance-runners
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py")
 # Includes native ACL restoration and failure recovery in isolated source trees.
-set_tests_properties(qcs-tests-acceptance-runners PROPERTIES LABELS "unit;tooling;acceptance" TIMEOUT 240)
+set_tests_properties(qcs-tests-acceptance-runners PROPERTIES LABELS "unit;tooling;acceptance;slow" TIMEOUT 240)
 
 qcopilots_search_add_test(NAME qcs-tests-runner
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-runner-tests.py")

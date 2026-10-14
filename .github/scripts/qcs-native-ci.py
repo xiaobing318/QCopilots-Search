@@ -27,6 +27,22 @@ for stream in (sys.stdout, sys.stderr):
 SOURCE = Path(__file__).resolve().parents[2]
 PRODUCT = "qcs"
 sys.dont_write_bytecode = True
+FAST_TESTS = {PRODUCT + "-tests-" + name for name in (
+    "workflow", "macos-signing", "license-materials", "runner", "path-budget", "temp-paths",
+    "core", "file-catalog", "model-files", "backend-layout", "inference-install-layout",
+    "image-sizing", "runtime", "extraction-document", "extraction-image", "extraction-media",
+    "extraction-legacy_doc", "index_repository", "vector_index", "index_repository_regression",
+    "search_cancellation", "recovery_process", "service", "client", "worker", "cli", "gui",
+    "gui-service", "semantic-manifest")}
+SLOW_TESTS = {PRODUCT + "-tests-" + name for name in (
+    "reference-vectors", "semantic", "acceptance-runners", "file-capacity")}
+
+
+def test_profile():
+    profile = os.environ.get("QCOPILOTS_SEARCH_TEST_PROFILE", "fast")
+    if profile not in ("fast", "full"):
+        raise ValueError(f"Unknown CI test profile: {profile!r}")
+    return profile
 
 
 def release_evidence():
@@ -54,6 +70,7 @@ def candidate_head():
 
 def initialize_runner():
     """Use an exclusively created short root, retaining full CI identity in JSON."""
+    profile = test_profile()
     required = ("RUNNER_TEMP", "GITHUB_ENV", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
                 "QCOPILOTS_SEARCH_CI_ID")
     for name in required:
@@ -81,7 +98,7 @@ def initialize_runner():
     report = root / "reports"
     report.mkdir()
     (report / "runner-identity.json").write_text(json.dumps({
-        "schemaVersion": 1, "candidateHead": head,
+        "schemaVersion": 1, "candidateHead": head, "testProfile": profile,
         "workflowCommit": os.environ.get("GITHUB_SHA"),
         "runId": os.environ["GITHUB_RUN_ID"], "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
         "platformId": os.environ["QCOPILOTS_SEARCH_CI_ID"], "source": str(SOURCE),
@@ -207,13 +224,14 @@ def installers():
         raise RuntimeError("There is no additional installer acceptance for this platform")
 
 
-def test_evidence(*, require_complete=False):
+def test_evidence(*, require_complete=False, profile="full"):
+    inventory_name = "test-selected-inventory.json" if profile == "fast" else "ctest-inventory.json"
     command = [sys.executable, SOURCE / ".github/scripts/qcs-ctest-evidence.py",
                "--junit", REPORTS / "tests/ctest.xml", "--platform", platform.system(),
-               "--inventory", REPORTS / "tests/ctest-inventory.json",
+               "--inventory", REPORTS / "tests" / inventory_name, "--test-profile", profile,
                "--output", REPORTS / "tests/qt-test-cases.json"]
     if require_complete:
-        command.append("--require-complete")
+        command.append("--require-selected-tests" if profile == "fast" else "--require-complete")
     run(command)
     return json.loads((REPORTS / "tests/qt-test-cases.json").read_text(encoding="utf-8"))
 
@@ -633,6 +651,157 @@ def doctor():
                 print(f"SDK loader diagnostics unavailable: {error}", file=sys.stderr)
 
 
+def fast_selection(root: Path, architecture: str):
+    """Recompute the exact fast scope from the preserved full CTest graph."""
+    evidence = release_evidence()
+    directory = root / "reports/tests"
+    registered = evidence.read_json(directory / "ctest-inventory.json")
+    selected = evidence.read_json(directory / "test-selected-inventory.json")
+    selection = evidence.read_json(directory / "test-selection.json")
+    def names(document):
+        if document.get("kind") != "ctestInfo" or not isinstance(document.get("tests"), list):
+            raise ValueError("Invalid CTest inventory")
+        values = [test["name"] for test in document["tests"]]
+        if not values or any(not isinstance(name, str) for name in values) or len(set(values)) != len(values):
+            raise ValueError("Empty, invalid or duplicate CTest inventory")
+        return set(values)
+    all_names, selected_names = names(registered), names(selected)
+    slow = set(SLOW_TESTS)
+    if architecture == "x86_64":
+        slow.add("qcs-tests-reference-vectors-baseline")
+    labeled_slow = {test["name"] for test in registered["tests"] if "slow" in next(
+        (prop["value"] for prop in test.get("properties", []) if prop["name"] == "LABELS"), [])}
+    if all_names != FAST_TESTS | slow or labeled_slow != slow or selected_names != FAST_TESTS:
+        raise ValueError("Fast CTest registration, slow labels or selection differ from the required scope")
+    if evidence.read_json(directory / "test-inventory.json") != registered:
+        raise ValueError("CTest registration changed between native and developer invocations")
+    expected = {"profile": "fast", "kind": "ctest-selection", "status": "passed", "passed": True,
+                "fullSuitePassed": False, "releaseComplete": False, "exitCode": 0,
+                "filters": ["-LE", "^slow$"], "labelFilter": None,
+                "counts": {"registered": len(all_names), "selected": len(selected_names), "excluded": len(slow)}}
+    if (any(selection.get(key) != value for key, value in expected.items())
+            or selection.get("passed") is not True or selection.get("releaseComplete") is not False
+            or selection.get("fullSuitePassed") is not False or type(selection.get("exitCode")) is not int):
+        raise ValueError("Fast test execution was unsuccessful or has an unexpected selection contract")
+    for key, wanted in (("registeredTests", all_names), ("selectedTests", selected_names), ("excludedTests", slow)):
+        observed = selection.get(key, [])
+        if len(observed) != len(wanted) or set(observed) != wanted:
+            raise ValueError(f"Fast selection {key} differs from the actual inventories")
+    return selection
+
+
+def inspect_fast(root: Path, *, expected_head: str, expected_run: str, expected_attempt: str):
+    evidence = release_evidence()
+    result = {"schemaVersion": 1, "kind": "native-fast-gate", "testProfile": "fast",
+              "passed": False, "releaseComplete": False, "errors": []}
+    errors = result["errors"]
+    try:
+        manifest = evidence.read_json(root / "reports/fast-evidence.json")
+        errors.extend(evidence.verify_manifest(root, manifest))
+        identity, platform_id = manifest["identity"], manifest["platformId"]
+        result.update(identity=identity, platformId=platform_id)
+        if (manifest.get("kind") != "native-fast" or platform_id not in evidence.PLATFORMS
+                or identity.get("candidateHead") != expected_head or identity.get("checkoutCommit") != expected_head):
+            errors.append("Fast manifest profile, platform or candidate identity is invalid")
+        bound = {entry["path"] for entry in manifest["files"]}
+        required = {"reports/" + name for name in ("fast-acceptance.json", "runner-identity.json",
+            "build-provenance.json", "wrappers/index.json", "tests/ctest.xml", "tests/ctest-inventory.json",
+            "tests/test-inventory.json", "tests/test-selected-inventory.json", "tests/test-selection.json")}
+        if not required.issubset(bound):
+            errors.append("Fast evidence omits required bound raw reports")
+        runner = evidence.read_json(root / "reports/runner-identity.json")
+        if (runner.get("candidateHead") != expected_head or runner.get("platformId") != platform_id
+                or runner.get("runId") != expected_run or runner.get("runAttempt") != expected_attempt
+                or runner.get("testProfile") != "fast"):
+            errors.append("Fast runner identity differs from this run, attempt, platform or profile")
+        build_record = evidence.read_json(root / "reports/build-provenance.json")
+        if (build_record.get("identity") != identity or build_record.get("completed") is not True
+                or not evidence.APPLICATIONS.issubset(build_record.get("programs", {}))):
+            errors.append("Fast executable build provenance is incomplete")
+        summary = evidence.read_json(root / "reports/fast-acceptance.json")
+        if (summary.get("sourceIdentity") != identity or summary.get("testProfile") != "fast"
+                or summary.get("releaseComplete") is not False or summary.get("kind") != "native-fast-acceptance"
+                or summary.get("testCasesComplete") is not True or summary.get("testEvidenceErrors") != []
+                or summary.get("wrapperCollectionComplete") is not True):
+            errors.append("Fast acceptance identity or scope is invalid")
+        system, architecture = evidence.PLATFORMS[platform_id]
+        fast_selection(root, architecture)
+        spec = importlib.util.spec_from_file_location("qcs_fast_cases", SOURCE / ".github/scripts/qcs-ctest-evidence.py")
+        parser = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(parser)
+        cases = parser.inspect_junit(root / "reports/tests/ctest.xml", system,
+                                     root / "reports/tests/test-selected-inventory.json", "fast")
+        errors.extend(cases["errors"])
+        if cases.get("testsComplete") is not True or cases.get("releaseComplete") is not False:
+            errors.append("Fast selected test cases are incomplete or falsely claim release completion")
+        wrappers = evidence.read_json(root / "reports/wrappers/index.json")
+        if wrappers.get("collectionComplete") is not True or wrappers.get("errors") or wrappers.get("missingLabels"):
+            errors.append("Fast wrapper diagnostics are incomplete")
+        if (len(wrappers.get("files", [])) != len(FAST_TESTS)
+                or {item.get("label") for item in wrappers.get("files", [])} != FAST_TESTS):
+            errors.append("Fast wrapper programs differ from the required selected tests")
+        for item in wrappers.get("files", []):
+            path = "reports/" + item["path"]
+            if path not in bound or evidence.digest(evidence.safe_file(root, path)) != item["sha256"]:
+                errors.append("Fast wrapper raw report is unbound or changed")
+            if (type(item.get("exitCode")) is not int or item["exitCode"] != 0
+                    or type(item.get("childExitCode")) is not int or item["childExitCode"] != 0
+                    or item.get("error") or item.get("reportError")):
+                errors.append("Fast wrapper child or cleanup did not complete successfully")
+            raw = evidence.read_json(evidence.safe_file(root, path))
+            if any(raw.get(key) != item.get(key) for key in ("label", "runId", "exitCode", "childExitCode", "cleanup", "error", "reportError")):
+                errors.append("Fast wrapper index differs from its raw execution report")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, ET.ParseError) as error:
+        errors.append(f"Cannot inspect fast evidence: {error}")
+    result["passed"] = not errors
+    return result
+
+
+def report_fast():
+    evidence = release_evidence()
+    wrappers = collect_test_wrappers()
+    cases = test_evidence(profile="fast")
+    identity = evidence.source_identity(SOURCE, candidate_head())
+    document = {"schemaVersion": 1, "kind": "native-fast-acceptance", "testProfile": "fast",
+                "sourceIdentity": identity, "releaseComplete": False,
+                "testCasesComplete": cases["testsComplete"], "testEvidenceErrors": cases["errors"],
+                "wrapperCollectionComplete": wrappers["collectionComplete"],
+                "notRun": ["real-model", "semantic-quality", "physical-file-capacity", "vector-capacity",
+                           "package", "installer", "source-bundle", "computer-use"],
+                "scope": "Daily build and selected fast tests only. Full release acceptance remains required."}
+    evidence.write_json(REPORTS / "fast-acceptance.json", document)
+    files = [evidence.file_record(ROOT, path) for path in sorted(REPORTS.rglob("*"))
+             if path.is_file() and path.name not in ("fast-evidence.json", "fast-gate.json")]
+    evidence.write_json(REPORTS / "fast-evidence.json", {
+        "schemaVersion": 1, "kind": "native-fast", "identity": identity,
+        "platformId": os.environ["QCOPILOTS_SEARCH_CI_ID"], "files": files})
+
+
+def aggregate_fast(artifacts: Path, output: Path):
+    evidence = release_evidence()
+    gates, errors = {}, []
+    for manifest in sorted(artifacts.rglob("fast-evidence.json")):
+        gate = inspect_fast(manifest.parent.parent, expected_head=candidate_head(),
+                            expected_run=os.environ["GITHUB_RUN_ID"], expected_attempt=os.environ["GITHUB_RUN_ATTEMPT"])
+        name = gate.get("platformId")
+        if name in gates:
+            errors.append(f"Duplicate fast platform: {name}")
+        gates[name] = gate
+        errors.extend(f"{name}: {message}" for message in gate["errors"])
+    if set(gates) != set(evidence.PLATFORMS):
+        errors.append("Exactly four distinct fast native platform combinations are required")
+    identities = [gate.get("identity") for gate in gates.values()]
+    if identities and any(identity != identities[0] for identity in identities):
+        errors.append("Fast executions disagree on immutable source identity")
+    result = {"schemaVersion": 1, "kind": "native-fast-aggregate", "testProfile": "fast",
+              "candidateHead": candidate_head(), "runId": os.environ["GITHUB_RUN_ID"],
+              "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"], "passed": not errors,
+              "releaseComplete": False, "errors": errors, "gates": gates}
+    evidence.write_json(output, result)
+    if errors:
+        raise RuntimeError("Fast native aggregation failed: " + ", ".join(errors))
+
+
 def report():
     # Run before any other report parser so failed or interrupted tests retain
     # their cleanup diagnosis even when subsequent acceptance evidence is absent.
@@ -697,8 +866,20 @@ def preflight():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["initialize", "bootstrap", "doctor", "configure", "build", "install", "models", "test", "capacity", "package", "installers", "sources", "report", "preflight"])
-    action = parser.parse_args().action
+    parser.add_argument("action", choices=["initialize", "bootstrap", "doctor", "configure", "build", "install", "models", "test", "capacity", "package", "installers", "sources", "report", "preflight", "aggregate-fast"])
+    parser.add_argument("--artifacts-dir", type=Path)
+    parser.add_argument("--output", type=Path)
+    arguments = parser.parse_args()
+    action, profile = arguments.action, test_profile()
+    if action == "aggregate-fast":
+        if profile != "fast" or arguments.artifacts_dir is None or arguments.output is None:
+            parser.error("aggregate-fast requires the fast profile, --artifacts-dir and --output")
+        aggregate_fast(arguments.artifacts_dir.resolve(), arguments.output.resolve())
+        return
+    if arguments.artifacts_dir is not None or arguments.output is not None:
+        parser.error("Artifact aggregate arguments are only valid for aggregate-fast")
+    if profile == "fast" and action in ("install", "models", "capacity", "package", "installers", "sources"):
+        raise RuntimeError(f"{action} requires QCOPILOTS_SEARCH_TEST_PROFILE=full")
     if action == "initialize":
         initialize_runner()
         return
@@ -726,12 +907,12 @@ def main():
         models()
     elif action == "test":
         (REPORTS / "tests").mkdir(parents=True, exist_ok=True)
-        inventory = run(["ctest", "--test-dir", ROOT / "release", "--show-only=json-v1"], capture=True)
+        inventory = run(["ctest", "--test-dir", ROOT / "release", "-C", "Release", "--show-only=json-v1"], capture=True)
         (REPORTS / "tests/ctest-inventory.json").write_text(inventory.stdout, encoding="utf-8")
         os.environ["QCOPILOTS_SEARCH_SEMANTIC_REPORT"] = str(REPORTS / "semantic-quality.json")
         os.environ["QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT"] = str(REPORTS / "physical-files-ci.json")
         try:
-            dev(action, "--keep-failed-tests", "--report-dir", str(REPORTS / "tests"), display=True)
+            dev(action, "--test-profile", profile, "--keep-failed-tests", "--report-dir", str(REPORTS / "tests"), display=True)
         except subprocess.CalledProcessError:
             diagnostics = gui_failure_diagnostics(REPORTS / "tests/ctest.xml", REPORTS / "mac-gui-debug")
             (REPORTS / "gui-failure-diagnostics.json").write_text(
@@ -744,7 +925,7 @@ def main():
             wrappers = collect_test_wrappers()
         if not wrappers["collectionComplete"]:
             raise RuntimeError("Test wrapper diagnostic collection is incomplete. See reports/wrappers/index.json")
-        test_evidence(require_complete=True)
+        test_evidence(require_complete=True, profile=profile)
     elif action == "capacity":
         capacity()
     elif action == "package":
@@ -766,9 +947,16 @@ def main():
     elif action == "installers":
         installers()
     elif action == "report":
-        report()
+        report_fast() if profile == "fast" else report()
     elif action == "preflight":
-        preflight()
+        if profile == "full":
+            preflight()
+        else:
+            gate = inspect_fast(ROOT, expected_head=candidate_head(), expected_run=os.environ["GITHUB_RUN_ID"],
+                                expected_attempt=os.environ["GITHUB_RUN_ATTEMPT"])
+            release_evidence().write_json(REPORTS / "fast-gate.json", gate)
+            if not gate["passed"]:
+                raise RuntimeError("Fast evidence gate failed: " + ", ".join(gate["errors"]))
 
 
 if __name__ == "__main__":

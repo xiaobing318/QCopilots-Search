@@ -17,6 +17,7 @@ import tempfile
 import time
 import uuid
 import venv
+import xml.etree.ElementTree as ET
 
 SOURCE = Path(__file__).resolve().parent.parent
 PRODUCT = "qcs"
@@ -24,6 +25,7 @@ MARKER = ".qcs-build-root.json"
 OPERATION_LOCK = ".qcs-dev.lock"
 GENERATED_DIRECTORIES = frozenset({"release", "debug", "relwithdebinfo", "deps", "runs", "stage", "pkg", "reports", "bootstrap"})
 PRESERVED_DIRECTORIES = frozenset({"models", "sdk", "development-profile"})
+SLOW_TEST_LABEL_REGEX = "^slow$"
 
 
 def validate_owner(owner: object, root: Path):
@@ -309,6 +311,101 @@ def executable(directory: Path, name: str):
     return candidates[0]
 
 
+def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
+    """Use CTest itself to resolve labels, then record the exact selected scope."""
+    run_id = str(uuid.uuid4())
+    test_root = Path(tempfile.mkdtemp(prefix="qcs-t-", dir=root / "runs"))
+    environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(test_root)
+    run_report = args.report_dir.expanduser().resolve() if args.report_dir else reports / test_root.name
+    assert_external(run_report)
+    run_report.mkdir(parents=True, exist_ok=True)
+    latest = {"runId": run_id, "directory": str(run_report), "testRoot": str(test_root),
+              "profile": args.test_profile}
+    (reports / "latest-test-run.json").write_text(json.dumps(latest, indent=2), encoding="utf-8")
+    filters = []
+    if args.test_profile == "fast":
+        filters.extend(["-LE", SLOW_TEST_LABEL_REGEX])
+    if args.test_label:
+        filters.extend(["-L", args.test_label])
+    base = ["ctest", "--test-dir", str(build), "-C", args.config]
+    selection = {"schemaVersion": 1, "kind": "ctest-selection", **latest,
+                 "labelFilter": args.test_label, "filters": filters,
+                 "registeredTests": [], "selectedTests": [], "excludedTests": [],
+                 "commands": [], "status": "preparing", "passed": False,
+                 "fullSuitePassed": False, "releaseComplete": False, "exitCode": None}
+
+    def save():
+        (run_report / "test-selection.json").write_text(
+            json.dumps(selection, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def inventory(name, extra):
+        command = [*base, "--show-only=json-v1", *extra]
+        selection["commands"].append({"purpose": name, "arguments": command})
+        save()
+        result = subprocess.run(command, cwd=root, env=environment, capture_output=True)
+        (run_report / (name + ".json")).write_bytes(result.stdout)
+        (run_report / (name + ".stderr.log")).write_bytes(result.stderr)
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
+        data = json.loads(result.stdout)
+        tests = data.get("tests")
+        if data.get("kind") != "ctestInfo" or not isinstance(tests, list):
+            raise RuntimeError("CTest returned an invalid test inventory")
+        names = [test.get("name") for test in tests]
+        if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+            raise RuntimeError("CTest inventory contains invalid or duplicate test names")
+        return tests
+
+    save()
+    try:
+        registered = inventory("test-inventory", [])
+        selection["registeredTests"] = [test["name"] for test in registered]
+        selected = inventory("test-selected-inventory", filters)
+        selected_names = [test["name"] for test in selected]
+        selection["selectedTests"] = selected_names
+        selection["excludedTests"] = [name for name in selection["registeredTests"] if name not in selected_names]
+        selection["counts"] = {"registered": len(registered), "selected": len(selected),
+                               "excluded": len(selection["excludedTests"])}
+        if not set(selected_names).issubset(selection["registeredTests"]):
+            raise RuntimeError("CTest registration changed while selecting tests")
+        if not selected:
+            raise RuntimeError("No tests match the selected profile and label. Use --test-profile full to include slow tests.")
+        if args.test_profile == "fast":
+            slow = [test["name"] for test in selected if "slow" in next(
+                (prop["value"] for prop in test.get("properties", []) if prop["name"] == "LABELS"), [])]
+            if slow:
+                # CTest may automatically include fixture setup/cleanup despite
+                # label filters. Never execute that slow dependency implicitly.
+                raise RuntimeError("Fast tests require slow fixtures. Use --test-profile full: " + ", ".join(slow))
+        command = [*base, "--output-on-failure", "--no-tests=error", "--parallel", str(args.jobs),
+                   "--test-output-size-passed", "16777216", "--test-output-size-failed", "16777216",
+                   "--test-output-truncation", "middle", "--output-junit", str(run_report / "ctest.xml"), *filters]
+        if args.fail_fast:
+            command.append("--stop-on-failure")
+        selection["commands"].append({"purpose": "execute", "arguments": command})
+        selection["status"] = "running"
+        save()
+        print(f"CTest profile {args.test_profile}: {len(selected)} selected, "
+              f"{len(selection['excludedTests'])} excluded. Release acceptance is incomplete.", flush=True)
+        run(command, cwd=root, env=environment)
+        cases = list(ET.parse(run_report / "ctest.xml").getroot().iter("testcase"))
+        actual_names = [case.get("name") for case in cases]
+        if len(actual_names) != len(selected_names) or set(actual_names) != set(selected_names):
+            raise RuntimeError("Executed CTest programs differ from the selected inventory")
+        if any(case.get("status") != "run" or case.find("failure") is not None
+               or case.find("error") is not None or case.find("skipped") is not None for case in cases):
+            raise RuntimeError("Selected CTest programs include failed or unexecuted tests")
+        selection.update(status="passed", passed=True, exitCode=0,
+                         fullSuitePassed=args.test_profile == "full" and not args.test_label
+                         and not selection["excludedTests"])
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, ET.ParseError) as error:
+        selection.update(status="failed", error=str(error),
+                         exitCode=error.returncode if isinstance(error, subprocess.CalledProcessError) else 1)
+        raise
+    finally:
+        save()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "clean"])
@@ -319,7 +416,9 @@ def main():
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 2))
     parser.add_argument("--model-dir", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_MODEL_DIR") or None)
     parser.add_argument("--keyword-only", action="store_true", help="Partial verify-package without models, insufficient for release")
-    parser.add_argument("--test-label")
+    parser.add_argument("--test-profile", choices=("fast", "full"), default="fast",
+                        help="Test scope: fast excludes slow tests by default, full keeps all registered tests")
+    parser.add_argument("--test-label", help="CTest label regex, intersected with the selected test profile")
     parser.add_argument("--fail-fast", action="store_true",
                         help="Stop scheduling further tests after the first failure")
     parser.add_argument("--generator", help="CPack generator, for example ZIP, NSIS, TGZ, DEB or DragNDrop")
@@ -389,21 +488,7 @@ def main():
         elif args.action == "build":
             run(["cmake", "--build", build, "--config", args.config, "--parallel", args.jobs], cwd=root, env=environment)
         elif args.action == "test":
-            run_id = str(uuid.uuid4())
-            test_root = Path(tempfile.mkdtemp(prefix="qcs-t-", dir=root / "runs"))
-            environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(test_root)
-            run_report = args.report_dir.expanduser().resolve() if args.report_dir else reports / test_root.name
-            assert_external(run_report)
-            run_report.mkdir(parents=True, exist_ok=True)
-            (reports / "latest-test-run.json").write_text(json.dumps({"runId": run_id, "directory": str(run_report), "testRoot": str(test_root)}, indent=2), encoding="utf-8")
-            command = ["ctest", "--test-dir", build, "-C", args.config, "--output-on-failure", "--no-tests=error", "--parallel", args.jobs,
-                       "--test-output-size-passed", "16777216", "--test-output-size-failed", "16777216", "--test-output-truncation", "middle",
-                       "--output-junit", run_report / "ctest.xml"]
-            if args.test_label:
-                command.extend(["-L", args.test_label])
-            if args.fail_fast:
-                command.append("--stop-on-failure")
-            run(command, cwd=root, env=environment)
+            run_tests(args, root, build, reports, environment)
         elif args.action == "run":
             run([executable(build, PRODUCT), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=environment)
         elif args.action == "install":
@@ -450,6 +535,6 @@ if __name__ == "__main__":
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     try:
         main()
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, ET.ParseError) as error:
         print(f"{PRODUCT}: {error}", file=sys.stderr)
         sys.exit(1)

@@ -16,13 +16,15 @@
 | 许可与源码材料 | 实际部署依赖的许可证、版本、源归档、补丁及重建说明 |
 | 签名状态 | macOS 对实际 staging APP 执行 `codesign --verify --deep --strict` 并读取身份，区分 ad-hoc、Developer ID、其他证书、未签名、无效与未知状态，公证单独记录 |
 
-本地自动化、四组合 Actions 和当前 Windows Computer Use 必须分别完成。每个必需 CI job 和汇总 job 必须实际结束为 success，并提供对应 run 链接。任一必需证据缺失时，保持草稿或测试包状态。部分 runner 的系统版本高于最低发行目标，因此原生 CI 通过不自动证明所有最低操作系统版本已经过实机验收。
+本地自动化、四组合 Actions 和当前 Windows Computer Use 必须分别完成。发行候选显式使用 `full` 测试范围，日常本地或普通 PR 的 `fast` 通过只说明所选范围通过。每个必需完整 CI job 和汇总 job 必须实际结束为 success，并提供对应 run 链接。任一必需证据缺失时，保持草稿或测试包状态。部分 runner 的系统版本高于最低发行目标，因此原生 CI 通过不自动证明所有最低操作系统版本已经过实机验收。
+
+在 Actions 的 `qcs native acceptance` 中选择冻结候选所在分支，手动运行时将 `test_profile` 设为 `full`，并核对实际运行的完整提交 SHA。普通 PR 和手动运行的默认范围均为 `fast`，只有推送到 `main` 默认执行 `full`。完整运行需取得四份 `qcs-native-<platform>-<sha>` 及 `qcs-native-aggregate-<sha>`，不能混入 `qcs-fast-*` 报告或不同提交、不同运行的通过结果。快速运行不生成发行包或对应源码归档，其报告的 `releaseComplete` 保持 false。
 
 发布检查同时读取 CTest 进程结果和 QtTest 用例明细。测试程序退出码为零不能替代内部用例执行证据。`reports/tests/qt-test-cases.json` 必须没有未执行的必需用例或缺失明细。唯一经过明确分类的平台不适用用例及其精确匹配规则见 [测试指南](testing.md)，这类用例保留单独计数，不计为通过。
 
 ## 构建与安装布局
 
-先执行开发脚本的 `configure`、`build` 和 `test`。`install` 调用 `cmake --install`，将程序及依赖放入 `<build-root>/stage`。安装布局是后续部署和打包的依据，不手动复制开发目录里的 DLL 来补包。
+先执行开发脚本的 `configure`、`build` 和 `test --test-profile full --model-dir <已校验模型目录>`。完整候选运行器也显式选择 `full`，并核对完整注册清单。`install` 调用 `cmake --install`，将程序及依赖放入 `<build-root>/stage`。安装布局是后续部署和打包的依据，不手动复制开发目录里的 DLL 来补包。
 
 ```powershell
 ./qcs-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
@@ -47,9 +49,9 @@ Windows NSIS 生成器需要安装 NSIS。macOS 使用 `DragNDrop`，分架构�
 
 包中 Qt SDK 的许可清单、对应许可文本和 llama/ggml 许可会完整复制到验收报告目录。`record-package` 同时保留这些材料和三份原始 worker 回复，检查清单哈希、模块覆盖及每份附件的实际字节。DEB 验收容器以只读方式挂载模型目录，不把模型写入安装包。
 
-Windows CI 分别验证 ZIP 和最终 NSIS。NSIS 验证真实执行单用户安装、GUI / 服务 / worker / 提取及搜索测试，再执行卸载并检查独立用户配置保留。若检查到已有产品安装，验证器会停止，不修改已有安装。
+Windows 完整 CI 分别验证 ZIP 和最终 NSIS。NSIS 验证真实执行单用户安装、GUI / 服务 / worker / 提取及搜索测试，再执行卸载并检查独立用户配置保留。若检查到已有产品安装，验证器会停止，不修改已有安装。
 
-Linux CI 在固定 Ubuntu 22.04 容器中使用 `dpkg --install` 安装最终 DEB，随后以普通用户从 `/usr` 运行共同包级验证器。验证器根据 `dpkg-query --listfiles` 的清单核对实际加载的库，避免系统中已有 Qt 掩盖漏包。完成后执行 `dpkg --remove`，确认包文件已移除且独立 profile 的文件哈希全部保留。源码和 DEB 以只读方式挂载，开发机和 CI 宿主不安装该 DEB。
+Linux 完整 CI 在固定 Ubuntu 22.04 容器中使用 `dpkg --install` 安装最终 DEB，随后以普通用户从 `/usr` 运行共同包级验证器。验证器根据 `dpkg-query --listfiles` 的清单核对实际加载的库，避免系统中已有 Qt 掩盖漏包。完成后执行 `dpkg --remove`，确认包文件已移除且独立 profile 的文件哈希全部保留。源码和 DEB 以只读方式挂载，开发机和 CI 宿主不安装该 DEB。
 
 相应报告分别为 `reports/package-nsis/report.json` 和 `reports/package-deb/report.json`。后者同时保存容器日志及普通用户 smoke 报告。容器方案与脚本存在不代表验收已经通过，实际结果以对应原生 CI 为准。
 
@@ -71,9 +73,9 @@ Linux CI 在固定 Ubuntu 22.04 容器中使用 `dpkg --install` 安装最终 DE
 
 ## CI 和人工发布
 
-`.github/workflows/qcs-native.yml` 在 PR 创建或同步、main 推送时运行四个原生组合，也支持手动触发。每个 job 使用独立外置根，执行校验过的模型下载、测试、小规模容量和平台打包，并上传报告与测试包。
+`.github/workflows/qcs-native.yml` 在 PR 创建或同步、main 推送时运行四个原生组合，也支持手动触发。每个 job 使用独立外置根。`fast` 运行构建和所选测试，上传快速报告。`full` 还执行校验过的模型下载、全套测试、小规模容量、平台打包及安装验收，并上传报告与测试包。
 
-CI 的 `required` job 下载当前运行的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `qcs-native-aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。这个结果只代表四个原生组合，最终 Windows 百万规模和 Computer Use 由下面的本机门禁单独核验。
+完整 CI 的 `required` job 下载当前运行的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `qcs-native-aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。快速汇总只验证快速范围并生成 `qcs-fast-aggregate.json`。这两个结果都不能代替最终 Windows 百万规模和 Computer Use，后两项由下面的本机门禁单独核验。
 
 PR 的候选提交使用事件中的 `pull_request.head.sha`，其他事件使用 `github.sha`。四个原生 job 和汇总 job 都显式检出该候选，分别记录候选 head 与实际 checkout commit，并核对 Git tree 和依赖锁哈希。PR 事件的 `GITHUB_SHA` 可能是 GitHub 生成的临时合并提交，不能替代实际 checkout 身份写入包报告。最终本机候选必须与原生证据一致，不能将旧报告事后绑定到新的 HEAD。
 

@@ -36,6 +36,24 @@ class CandidateContracts(unittest.TestCase):
         return {"name": "qcs-tests-fixture", "command": [sys.executable, str(self.launcher),
                 "--label", "qcs-tests-fixture", "--root", str(self.root / "runs"), "--", *payload]}
 
+    def test_full_selection_cannot_use_fast_filtered_missing_or_unexecuted_evidence(self):
+        names = ["qcs-tests-unit", "qcs-tests-real-model"]
+        selection = {"schemaVersion": 1, "kind": "ctest-selection", "profile": "full",
+                     "labelFilter": None, "filters": [], "registeredTests": names, "selectedTests": names,
+                     "excludedTests": [], "counts": {"registered": 2, "selected": 2, "excluded": 0},
+                     "passed": True, "fullSuitePassed": True, "status": "passed", "exitCode": 0,
+                     "releaseComplete": False}
+        module.validate_full_selection(selection, names)
+        for changes in ({"profile": "fast"}, {"labelFilter": "unit"}, {"filters": ["-LE", "^slow$"]},
+                        {"selectedTests": names[:1]}, {"registeredTests": names[:1]},
+                        {"excludedTests": names[1:]}, {"counts": {"registered": 2, "selected": 1, "excluded": 1}},
+                        {"passed": False}, {"fullSuitePassed": False}, {"status": "running"},
+                        {"exitCode": 1}, {"releaseComplete": True}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                module.validate_full_selection({**selection, **changes}, names)
+        with self.assertRaises(ValueError):
+            module.validate_full_selection({}, names)
+
     def test_native_wrapper_binds_interpreter_launcher_and_exact_binary(self):
         bound = {}
         item = module.inventory_binding(self.command([str(self.binary)]), self.source, self.binaries, bound)

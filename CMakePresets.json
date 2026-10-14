@@ -29,10 +29,13 @@
     {"name": "qcs-debug", "configurePreset": "qcs-debug"}
   ],
   "testPresets": [
-    {"name": "qcs-release", "configurePreset": "qcs-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
-    {"name": "qcs-debug", "configurePreset": "qcs-debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
+    {"name": "qcs-release", "configurePreset": "qcs-release", "filter": {"exclude": {"label": "^slow$"}}, "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "qcs-debug", "configurePreset": "qcs-debug", "filter": {"exclude": {"label": "^slow$"}}, "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "qcs-release-full", "configurePreset": "qcs-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "qcs-debug-full", "configurePreset": "qcs-debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
   ],
   "workflowPresets": [
-    {"name": "qcs-release", "steps": [{"type": "configure", "name": "qcs-release"}, {"type": "build", "name": "qcs-release"}, {"type": "test", "name": "qcs-release"}]}
+    {"name": "qcs-release", "steps": [{"type": "configure", "name": "qcs-release"}, {"type": "build", "name": "qcs-release"}, {"type": "test", "name": "qcs-release"}]},
+    {"name": "qcs-release-full", "steps": [{"type": "configure", "name": "qcs-release"}, {"type": "build", "name": "qcs-release"}, {"type": "test", "name": "qcs-release-full"}]}
   ]
 }

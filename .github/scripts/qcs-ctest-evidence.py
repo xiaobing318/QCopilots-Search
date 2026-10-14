@@ -164,9 +164,13 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
     return counts, records, skips, errors
 
 
-def inspect_junit(path: Path, operating_system: str, inventory: Path | None = None) -> dict:
+def inspect_junit(path: Path, operating_system: str, inventory: Path | None = None,
+                  test_profile: str = "full") -> dict:
+    if test_profile not in ("fast", "full"):
+        raise ValueError(f"Unknown test profile: {test_profile!r}")
     document = {"schemaVersion": 1, "platform": operating_system, "source": str(path),
-                "releaseComplete": False, "ctestPrograms": [], "qtTestSkips": [], "pythonTestSkips": [],
+                "testProfile": test_profile, "testsComplete": False, "releaseComplete": False,
+                "ctestPrograms": [], "qtTestSkips": [], "pythonTestSkips": [],
                 "pythonTestTotals": {"run": 0, "passed": 0, "failed": 0, "skipped": 0, "notApplicable": 0},
                 "inventoryVerified": False, "expectedPrograms": [],
                 "errors": [], "qtTestTotals": {"passed": 0, "failed": 0,
@@ -206,6 +210,10 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
     for case in cases:
         name = case.get("name", "")
         errors = []
+        # CTest may exit zero for DISABLED tests and emit only status="disabled",
+        # without a <skipped> child. Such a program did not execute.
+        if case.get("status") not in (None, "run"):
+            errors.append(f"CTest program did not run: status={case.get('status')!r}")
         failures = sum(len(list(case.iter(tag))) for tag in ("failure", "error", "skipped"))
         if failures:
             errors.append("CTest program contains failure, error or skipped evidence")
@@ -265,7 +273,8 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
             errors.append("Unexpected QtTest output in a non-QtTest program")
         document["ctestPrograms"].append(summary)
         document["errors"].extend(f"{name}: {error}" for error in errors)
-    document["releaseComplete"] = not document["errors"]
+    document["testsComplete"] = not document["errors"]
+    document["releaseComplete"] = document["testsComplete"] and test_profile == "full"
     return document
 
 
@@ -275,13 +284,20 @@ def main():
     parser.add_argument("--inventory", type=Path, help="Saved ctest --show-only=json-v1 output")
     parser.add_argument("--platform", choices=("Windows", "Linux", "Darwin"), required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--test-profile", choices=("fast", "full"), default="full",
+                        help="The scope of the supplied CTest inventory and results")
+    parser.add_argument("--require-selected-tests", action="store_true",
+                        help="Fail unless every program in the selected inventory passed")
     parser.add_argument("--require-complete", action="store_true")
     arguments = parser.parse_args()
-    result = inspect_junit(arguments.junit, arguments.platform, arguments.inventory)
+    result = inspect_junit(arguments.junit, arguments.platform, arguments.inventory,
+                           arguments.test_profile)
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 1 if arguments.require_complete and not result["releaseComplete"] else 0
+    failed = ((arguments.require_complete and not result["releaseComplete"])
+              or (arguments.require_selected_tests and not result["testsComplete"]))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

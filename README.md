@@ -54,19 +54,22 @@ bash ./qcs-dev.sh run --build-root "$build_root" --qt-root "$qt_root"
 
 ## 测试与安装包
 
-自动化测试使用独立临时配置，不连接正在使用的正式应用实例。完整测试需要已校验的真实模型缓存：
+自动化测试使用独立临时配置，不连接正在使用的正式应用实例。日常 `test` 默认运行 `fast` 范围，保留 GUI、服务、进程协议、存储和提取回归。完整测试使用显式 `--test-profile full`，需要已校验的真实模型缓存：
 
 ```powershell
+./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot
 $modelDir = Join-Path $buildRoot 'models'
-./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --test-profile full --model-dir $modelDir
 ./qcs-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
 ./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
 ./qcs-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ```
 
-模型获取、测试分层和保留失败证据见 [测试指南](docs/testing.md)。模型缺失或校验失败会使必需的真实模型验收失败。黄金向量测试验证数值一致性，独立的语义质量集验证检索效果，合成百万向量测试验证容量，三者分别报告。
+模型获取、测试分层和保留失败证据见 [测试指南](docs/testing.md)。`fast` 排除真实模型、语义质量和容量等 `slow` 测试，排除项记录为未运行。模型缺失或校验失败会使完整真实模型验收失败。黄金向量测试验证数值一致性，独立的语义质量集验证检索效果，合成百万向量测试验证容量，三者分别报告。
 
-发行包目标为 Windows ZIP / NSIS、macOS 分架构 APP / DMG、Linux TGZ / DEB。实际包级测试、许可证材料、签名状态与发布门槛见 [发布指南](docs/releasing.md)。CI 生成测试包和报告，不自动公开发布。
+普通 PR 的四组合 Actions 默认执行快速构建和测试，只上传快速范围的报告。需要完整原生验收时，在 `qcs native acceptance` 的手动运行界面选择候选分支并将 `test_profile` 设为 `full`。推送到 `main` 也执行完整范围，手动运行的默认值仍为 `fast`。
+
+发行包目标为 Windows ZIP / NSIS、macOS 分架构 APP / DMG、Linux TGZ / DEB。实际包级测试、许可证材料、签名状态与发布门槛见 [发布指南](docs/releasing.md)。完整 CI 生成测试包和报告，不自动公开发布。
 
 交付需要同一候选的本地完整自动化测试、四组合原生 GitHub Actions 和当前 Windows 最终包的 Computer Use 全部完成，另有十万物理文件与百万向量验收。测试程序存在、触发工作流或旧候选通过均不代表本轮通过。每次测试使用动态独立目录，不依赖此电脑的盘符、用户名或临时目录。
 

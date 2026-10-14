@@ -62,6 +62,7 @@
 | Linux Qt FFmpeg 源码元数据加载 | `tools/qcs-source-bundle.py` | `qcs-tests-acceptance-runners` 中的 `qcs-test-source-checksums.py`，同目录 avformat 先加载、局部符号范围、句柄生命周期、错误传播及许可拒绝的模拟回归 | 已建立回归，真实 Linux SDK 与源码材料结果待原生 CI |
 | QtTest 内部跳过和平台不适用分类 | CI CTest 证据解析器 | qcs-tests-ci-evidence.py，注册程序集合、逐用例与汇总核对、精确平台分类及日志截断拦截 | 已建立回归，短名候选结果以本轮报告为准 |
 | 本地完整自动化门槛 | CTest、QtTest、工具与包验证 | 全量注册清单、逐用例明细、真实模型及安装报告，缺失不放行 | 同一冻结候选的独立门槛 |
+| 日常快速与完整验收范围 | `qcs-dev`、CTest 标签及 preset、原生 CI | 默认 fast 排除 slow、显式 full、标签交集、空选择失败、慢 fixture 拒绝、实际清单核对和快速报告不可通过发行门禁 | 已建立回归，快速通过与完整验收分别报告 |
 | 四组合远端 Actions 门槛 | qcs-native.yml、required 汇总 | 四组合 configure/build/test/真实模型/package/verify 全部 success，记录实际 run URL | 同一冻结候选的独立门槛 |
 | Windows Computer Use 门槛 | 最终 Windows 包、@oai/sky | CU-01 至 CU-10，真实枚举与窗口操作，包及程序哈希、截图和结果 | 同一最终包的独立门槛 |
 

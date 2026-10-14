@@ -60,7 +60,7 @@ Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。二者�
 | `doctor` | 检查编译器、SDK、构建工具、路径和必要环境 |
 | `configure` | 生成外置 CMake 构建树 |
 | `build` | 编译程序、工具和启用的测试 |
-| `test` | 在隔离测试根中运行 CTest，并保存报告 |
+| `test` | 默认运行快速 CTest 范围，显式 `--test-profile full` 运行全套，并保存报告 |
 | `run` | 从构建结果启动应用 |
 | `install` | 使用 CMake install 生成 staging 布局 |
 | `package` | 从安装布局生成选定平台包 |
@@ -76,7 +76,8 @@ Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。二者�
 | `--config Release\|Debug` | 构建配置，默认 Release |
 | `--jobs N` | 并行编译任务数 |
 | `--model-dir PATH` | 实际模型目录 |
-| `--test-label LABEL` | 选择 CTest 标签 |
+| `--test-profile fast\|full` | 测试范围，默认 `fast` 排除 `slow` 标签，`full` 不排除 |
+| `--test-label LABEL` | 在所选测试范围内继续按 CTest 标签筛选 |
 | `--generator NAME` | CPack 生成器，如 ZIP、NSIS、TGZ、DEB、DragNDrop |
 | `--cmake-arg=-DNAME=VALUE` | 向 configure 传递额外的 CMake 配置 |
 | `--report-dir PATH` | 当前测试或包验证的独立外置报告目录 |
@@ -86,7 +87,11 @@ Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。二者�
 
 使用较少的并行任务可以降低编译峰值内存和磁盘压力。修改构建选项后重新运行 `configure`，修改源文件后运行 `build` 和相关测试。
 
-## 一次完整开发循环
+## 日常修改与完整验收
+
+日常修改后先运行 `build` 和默认 `test`。`fast` 仍包含 GUI、真实服务、进程、存储、路径和提取回归，但不执行真实模型推理、语义质量、物理容量及完整验收运行器测试。只运行某类测试时可加 `--test-label`，筛选与 `fast` 的排除条件取交集。例如真实模型用例必须同时指定 `--test-profile full --test-label real-model`，空选择会明确失败。
+
+下面的完整验收示例显式选择 `full`。日常快速通过不能替代发行所需的完整本地、四组合原生 CI、Computer Use 及容量证据。
 
 ```powershell
 $buildRoot = 'D:\Builds\qcs 示例'
@@ -96,7 +101,7 @@ $modelDir = Join-Path $buildRoot 'models'
 ./qcs-dev.ps1 doctor --build-root $buildRoot --qt-root $qtRoot
 ./qcs-dev.ps1 configure --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ./qcs-dev.ps1 build --build-root $buildRoot --qt-root $qtRoot --jobs 4
-./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --test-profile full --model-dir $modelDir
 ./qcs-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
 ./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
 ./qcs-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
@@ -118,6 +123,8 @@ cmake --build --preset qcs-release
 ctest --preset qcs-release
 cmake --install "$QCOPILOTS_SEARCH_BUILD_ROOT/release"
 ```
+
+`ctest --preset qcs-release` 与 `qcs-debug` 默认排除 `slow`。需要全套测试时使用 `ctest --preset qcs-release-full` 或 `qcs-debug-full`，完整 configure → build → test 可使用 `cmake --workflow --preset qcs-release-full`。这些是运行时筛选，所有用例仍注册在构建树中。直接执行无过滤的 `ctest --test-dir <build>/release` 仍运行全套测试，并需要真实模型。
 
 不同操作系统的 Qt kit 名称不同。Windows 在 MSVC 环境中运行直接 CMake 命令，或使用会初始化工具链的开发脚本。CMake 会拒绝源码树内构建。
 

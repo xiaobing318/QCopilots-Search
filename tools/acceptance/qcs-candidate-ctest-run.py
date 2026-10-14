@@ -57,6 +57,21 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def validate_full_selection(selection, names):
+    require(isinstance(selection, dict) and selection.get("schemaVersion") == 1
+            and selection.get("kind") == "ctest-selection", "Missing CTest profile selection evidence")
+    require(selection.get("profile") == "full" and not selection.get("labelFilter")
+            and selection.get("filters") == [], "Candidate CTest requires the explicit unfiltered full profile")
+    require(selection.get("registeredTests") == names and selection.get("selectedTests") == names
+            and selection.get("excludedTests") == []
+            and selection.get("counts") == {"registered": len(names), "selected": len(names), "excluded": 0},
+            "Full CTest selection differs from the frozen registered inventory")
+    require(selection.get("passed") is True and selection.get("fullSuitePassed") is True
+            and selection.get("status") == "passed" and selection.get("exitCode") == 0
+            and selection.get("releaseComplete") is False,
+            "Full CTest profile did not complete or incorrectly claims complete release acceptance")
+
+
 def verify_preserved_corpus(semantic, test_runs):
     """Check original semantic inputs in this candidate's isolated test tree.
 
@@ -431,7 +446,7 @@ def execute(args, plan):
         pwsh, ctest = shutil.which("pwsh"), shutil.which("ctest")
         require(pwsh is not None and ctest is not None, "PowerShell 7 and CTest must be available on PATH")
         command = [pwsh, "-NoProfile", "-File", str(args.source / "qcs-dev.ps1"),
-                   "test", "--build-root", str(args.build_root), "--qt-root", str(args.qt_root),
+                   "test", "--test-profile", "full", "--build-root", str(args.build_root), "--qt-root", str(args.qt_root),
                    "--model-dir", str(args.model_dir), "--jobs", str(args.jobs),
                    "--report-dir", str(tests), "--keep-failed-tests"]
         environment = os.environ.copy()
@@ -500,9 +515,16 @@ def execute(args, plan):
         record["exitCode"] = completed.returncode
         if completed.returncode != 0:
             record["errors"].append(f"Full CTest command exited {completed.returncode}")
-        for filename in ("ctest.xml", "ctest-inventory.json", "command.stdout.log", "command.stderr.log"):
+        for filename in ("ctest.xml", "ctest-inventory.json", "command.stdout.log", "command.stderr.log",
+                         "test-selection.json", "test-inventory.json", "test-selected-inventory.json"):
             archive_file(tests / filename, root / "raw" / filename, root, record["archives"],
                          origin="tests/" + filename)
+        try:
+            validate_full_selection(evidence.read_json(tests / "test-selection.json"), names)
+            record["fullProfileSelectionPassed"] = True
+        except ValueError as error:
+            record["fullProfileSelectionPassed"] = False
+            record["errors"].append(str(error))
         checker = [sys.executable, str(checker_path), "--junit", str(tests / "ctest.xml"),
                    "--platform", "Windows", "--inventory", str(tests / "ctest-inventory.json"),
                    "--output", str(tests / "qt-test-cases.json"), "--require-complete"]

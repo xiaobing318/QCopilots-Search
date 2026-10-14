@@ -28,6 +28,7 @@ foreach(_entry IN LISTS _qcopilots_runtime_tests)
   set_tests_properties("${_target}" PROPERTIES LABELS "${_label};runtime" TIMEOUT 1800)
   if(_label STREQUAL "real-model")
     set_tests_properties("${_target}" PROPERTIES RUN_SERIAL TRUE)
+    set_property(TEST "${_target}" APPEND PROPERTY LABELS slow)
     if(QCOPILOTS_SEARCH_MODEL_DIR)
       set_tests_properties("${_target}" PROPERTIES ENVIRONMENT
         "QCOPILOTS_SEARCH_MODEL_DIR=${QCOPILOTS_SEARCH_MODEL_DIR}")
@@ -38,6 +39,6 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
   qcopilots_search_add_test(NAME qcs-tests-reference-vectors-baseline
     COMMAND "$<TARGET_FILE:qcs-tests-reference-vectors>" vectorsMatchReference -o "-,txt")
   set_tests_properties(qcs-tests-reference-vectors-baseline PROPERTIES
-    LABELS "real-model;runtime;cpu-baseline" TIMEOUT 1800 RUN_SERIAL TRUE
+    LABELS "real-model;runtime;cpu-baseline;slow" TIMEOUT 1800 RUN_SERIAL TRUE
     ENVIRONMENT "QCOPILOTS_SEARCH_CPU_BASELINE=1;QCOPILOTS_SEARCH_MODEL_DIR=${QCOPILOTS_SEARCH_MODEL_DIR}")
 endif()

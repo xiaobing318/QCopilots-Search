@@ -2,6 +2,8 @@
 
 这些工具与应用源码一起版本管理，不依赖外置 `reports` 目录中的代码。所有运行记录必须由当前候选重新产生。脚本的快速单元测试使用合成输入，不构成真实模型、容量、安装包或 Computer Use 通过证据。
 
+日常 `qcs-dev test` 默认 `fast`，完整候选入口 `qcs-candidate-ctest-run.py` 内部显式传递 `--test-profile full`，继续核对全部注册程序和逐用例证据。通过 `qcs-dev` 手动执行完整候选测试时也必须指定 `full`。CTest 的 `qcs-tests-acceptance-runners` 和 `qcs-tests-file-capacity` 标记为 `slow`，默认快速范围不会运行它们。独立的十万文件、百万向量、双 checkout、服务延迟及包级验收仍按下面的执行顺序显式运行，不会因为切换日常默认范围而取消。
+
 ## 输入与执行顺序
 
 源码默认从脚本位置定位。构建根、Qt kit、模型、报告根及候选完整提交 SHA 由参数传入。`qcs-dev.ps1 build` 只执行构建，完整构建记录必须由 `tools/qcs-release-evidence.py record-build` 捕获该真实构建命令产生。每个入口的完整参数由 `--help` 或 PowerShell `Get-Help` 查看。

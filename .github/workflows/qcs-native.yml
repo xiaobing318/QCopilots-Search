@@ -5,6 +5,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      test_profile:
+        description: 'fast: daily checks, full: required release acceptance'
+        type: choice
+        required: true
+        default: fast
+        options: [fast, full]
+
+env:
+  QCOPILOTS_SEARCH_TEST_PROFILE: ${{ github.event_name == 'push' && 'full' || inputs.test_profile || 'fast' }}
 
 permissions:
   contents: read
@@ -79,6 +89,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
       - name: Restore immutable model cache
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.QCOPILOTS_SEARCH_MODEL_DIR }}
@@ -92,28 +103,33 @@ jobs:
       - name: Build
         run: python .github/scripts/qcs-native-ci.py build
       - name: Install staging tree
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         run: python .github/scripts/qcs-native-ci.py install
       - name: Download and verify required real models
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         run: python .github/scripts/qcs-native-ci.py models
-      - name: Run all portable tests and nine reference vectors
+      - name: Run selected portable tests (full includes real-model and capacity tests)
         run: python .github/scripts/qcs-native-ci.py test
       - name: Exercise the capacity path at CI scale
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         run: python .github/scripts/qcs-native-ci.py capacity
       - name: Package and verify deployment
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         run: python .github/scripts/qcs-native-ci.py package
       - name: Install and remove the final NSIS or DEB package
-        if: runner.os == 'Windows' || runner.os == 'Linux'
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && (runner.os == 'Windows' || runner.os == 'Linux')
         timeout-minutes: 45
         run: python .github/scripts/qcs-native-ci.py installers
       - name: Collect corresponding source materials
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         run: python .github/scripts/qcs-native-ci.py sources
-      - name: Record acceptance and signature status
+      - name: Record evidence for the selected profile
         if: always()
         run: python .github/scripts/qcs-native-ci.py report
       - name: Verify this native evidence unit
         run: python .github/scripts/qcs-native-ci.py preflight
       - name: Upload reports and test packages
-        if: always()
+        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qcs-native-${{ matrix.id }}-${{ env.QCOPILOTS_SEARCH_CANDIDATE_HEAD }}
@@ -129,6 +145,17 @@ jobs:
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/CMakeFiles/CMakeConfigureLog.yaml
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/tests/**/qcs-tests-*.xml
             ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/runs/**/qcs-image-*/**
+      - name: Upload daily fast reports (no release packages)
+        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'fast'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qcs-fast-${{ matrix.id }}-${{ env.QCOPILOTS_SEARCH_CANDIDATE_HEAD }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/reports
+            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/Testing/Temporary
+            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/CMakeFiles/CMakeConfigureLog.yaml
 
   required:
     name: qcs all native combinations
@@ -146,12 +173,13 @@ jobs:
         with:
           python-version: '3.12'
       - name: Download all four native evidence units
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: qcs-native-*-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/qcs-native-artifacts
       - name: Aggregate native raw reports and immutable source identities
-        if: always()
+        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         shell: bash
         env:
           CANDIDATE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -161,11 +189,31 @@ jobs:
             --native-artifacts-dir "$RUNNER_TEMP/qcs-native-artifacts" \
             --output "$RUNNER_TEMP/qcs-native-aggregate.json"
       - name: Upload native aggregate report
-        if: always()
+        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qcs-native-aggregate-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/qcs-native-aggregate.json
+          if-no-files-found: error
+      - name: Download all four daily fast evidence units
+        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'fast'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: qcs-fast-*-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/qcs-fast-artifacts
+      - name: Aggregate daily fast evidence (release acceptance remains incomplete)
+        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'fast'
+        shell: bash
+        run: |
+          python .github/scripts/qcs-native-ci.py aggregate-fast \
+            --artifacts-dir "$RUNNER_TEMP/qcs-fast-artifacts" \
+            --output "$RUNNER_TEMP/qcs-fast-aggregate.json"
+      - name: Upload daily fast aggregate report
+        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'fast'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qcs-fast-aggregate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/qcs-fast-aggregate.json
           if-no-files-found: error
       - name: Check all native jobs
         if: always()

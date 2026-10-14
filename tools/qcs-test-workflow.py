@@ -1135,6 +1135,145 @@ add_test(NAME qcs-tests-second-marker
                 self.assertEqual(len(cases), 1 if fail_fast else 2)
                 self.assertEqual(len([case for case in cases if case.find("failure") is not None]), 1)
 
+    def profile_fixture(self, extra=""):
+        checkout = self.root / "配置源码 中文"
+        tools = checkout / "tools"
+        tools.mkdir(parents=True)
+        shutil.copy2(SCRIPT, tools / SCRIPT.name)
+        shutil.copy2(SCRIPT.with_name("qcs-path-budget.py"), tools / "qcs-path-budget.py")
+        (checkout / "CMakeLists.txt").write_text('''
+cmake_minimum_required(VERSION 3.28)
+project(qcs-test-profile-fixture LANGUAGES NONE)
+enable_testing()
+foreach(name quick model similar)
+  add_test(NAME "qcs-tests-${name}" COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/${name}-ran")
+endforeach()
+set_tests_properties(qcs-tests-quick PROPERTIES LABELS "unit")
+set_tests_properties(qcs-tests-model PROPERTIES LABELS "real-model;slow;unit")
+set_tests_properties(qcs-tests-similar PROPERTIES LABELS "slow-motion")
+''' + extra, encoding="utf-8")
+        build = self.root / "构建 空格"
+        command = [sys.executable, "-B", str(tools / SCRIPT.name)]
+        completed = subprocess.run([*command, "configure", "--build-root", str(build)],
+                                   cwd=self.root, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return command, build
+
+    def invoke_profile(self, command, build, *arguments):
+        report = Path(tempfile.mkdtemp(prefix="profile-report-", dir=self.root))
+        unrelated = self.root / "启动 cwd 中文"
+        unrelated.mkdir(exist_ok=True)
+        completed = subprocess.run([*command, "test", "--build-root", str(build), "--jobs", "1",
+                                    "--report-dir", str(report), *arguments], cwd=unrelated,
+                                   capture_output=True, text=True, encoding="utf-8", timeout=30)
+        selection = json.loads((report / "test-selection.json").read_text(encoding="utf-8"))
+        self.assertFalse(selection["releaseComplete"], "CTest alone cannot close release acceptance")
+        self.assertEqual(list(unrelated.iterdir()), [], "An arbitrary launch directory must stay untouched")
+        return completed, selection, report
+
+    def test_default_fast_profile_preserves_inventory_and_excludes_exact_slow_label(self):
+        command, build = self.profile_fixture()
+        completed, selection, report = self.invoke_profile(command, build)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(selection["profile"], "fast")
+        self.assertEqual(selection["counts"], {"registered": 3, "selected": 2, "excluded": 1})
+        self.assertEqual(selection["selectedTests"], ["qcs-tests-quick", "qcs-tests-similar"])
+        self.assertEqual(selection["excludedTests"], ["qcs-tests-model"])
+        self.assertTrue(selection["passed"])
+        self.assertFalse(selection["fullSuitePassed"])
+        self.assertFalse((build / "release/model-ran").exists())
+        self.assertTrue((build / "release/similar-ran").is_file(), "The slow label is an exact match")
+        all_tests = json.loads((report / "test-inventory.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(all_tests["tests"]), 3)
+        _, again, _ = self.invoke_profile(command, build)
+        self.assertNotEqual(selection["runId"], again["runId"])
+        self.assertNotEqual(selection["testRoot"], again["testRoot"])
+        self.assertEqual(Path(selection["testRoot"]).parent, build / "runs")
+
+    def test_full_profile_executes_all_registered_programs_and_explicit_slow_filter(self):
+        command, build = self.profile_fixture()
+        for arguments, expected, complete in (
+                (["--test-profile", "full"], ["qcs-tests-quick", "qcs-tests-model", "qcs-tests-similar"], True),
+                (["--test-profile", "full", "--test-label", "^real-model$"], ["qcs-tests-model"], False)):
+            with self.subTest(arguments=arguments):
+                completed, selection, _ = self.invoke_profile(command, build, *arguments)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertEqual(selection["selectedTests"], expected)
+                self.assertEqual(selection["fullSuitePassed"], complete)
+                self.assertTrue((build / "release/model-ran").is_file())
+                self.assertNotIn("-LE", selection["commands"][-1]["arguments"])
+
+    def test_fast_label_is_intersection_and_no_match_fails_without_execution(self):
+        command, build = self.profile_fixture()
+        completed, selection, _ = self.invoke_profile(command, build, "--test-label", "^unit$")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(selection["selectedTests"], ["qcs-tests-quick"])
+        self.assertFalse(selection["fullSuitePassed"])
+        for label in ("^slow$", "^no-such-label$"):
+            with self.subTest(label=label):
+                completed, selection, report = self.invoke_profile(command, build, "--test-label", label)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("No tests match", completed.stderr)
+                self.assertEqual(selection["selectedTests"], [])
+                self.assertEqual(len(selection["excludedTests"]), 3)
+                self.assertFalse(selection["passed"])
+                self.assertFalse((report / "ctest.xml").exists())
+                self.assertFalse(any(item["purpose"] == "execute" for item in selection["commands"]))
+        self.assertFalse((build / "release/model-ran").exists())
+
+    def test_fast_rejects_automatically_required_slow_fixture(self):
+        command, build = self.profile_fixture('''
+set_tests_properties(qcs-tests-model PROPERTIES FIXTURES_SETUP model-data)
+set_tests_properties(qcs-tests-quick PROPERTIES FIXTURES_REQUIRED model-data)
+''')
+        completed, selection, _ = self.invoke_profile(command, build)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Fast tests require slow fixtures", completed.stderr)
+        self.assertIn("qcs-tests-model", selection["selectedTests"])
+        self.assertFalse(any((build / "release").glob("*-ran")))
+
+    def test_disabled_selected_program_is_not_a_passing_profile(self):
+        command, build = self.profile_fixture("set_tests_properties(qcs-tests-quick PROPERTIES DISABLED TRUE)\n")
+        completed, selection, _ = self.invoke_profile(command, build)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(selection["passed"])
+        self.assertFalse(selection["fullSuitePassed"])
+        self.assertIn("unexecuted", completed.stderr)
+
+    def test_invalid_profile_is_rejected_before_build_root_creation(self):
+        build = self.root / "must remain absent"
+        completed = self.invoke("test", "--build-root", build, "--test-profile", "unknown")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("invalid choice", completed.stderr)
+        self.assertFalse(build.exists())
+
+    def test_temporary_test_root_failure_does_not_fall_back_to_cwd(self):
+        from types import SimpleNamespace
+        build = self.root / "temporary failure"
+        build.mkdir()
+        reports = build / "reports"
+        reports.mkdir()
+        runs = build / "runs"
+        runs.mkdir()
+        with patch.object(workflow.tempfile, "mkdtemp", side_effect=PermissionError("test root denied")), \
+                patch.object(workflow.subprocess, "run") as execute:
+            with self.assertRaisesRegex(PermissionError, "test root denied"):
+                workflow.run_tests(SimpleNamespace(), build, build / "release", reports, {})
+        execute.assert_not_called()
+        self.assertEqual(list(reports.iterdir()), [])
+        self.assertEqual(list(runs.iterdir()), [])
+
+    def test_test_presets_select_fast_or_full_with_real_ctest_inventory(self):
+        command, build = self.profile_fixture()
+        checkout = Path(command[-1]).parent.parent
+        shutil.copy2(workflow.SOURCE / "CMakePresets.json", checkout / "CMakePresets.json")
+        environment = dict(os.environ, QCOPILOTS_SEARCH_BUILD_ROOT=str(build))
+        for preset, expected in (("qcs-release", 2), ("qcs-release-full", 3)):
+            result = subprocess.run(["ctest", "--preset", preset, "--show-only=json-v1"], cwd=checkout,
+                                    env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(json.loads(result.stdout)["tests"]), expected)
+
     def test_qt_sdk_relocation_with_unicode(self):
         sdk = self.root / "SDK 中文 空格"
         kit = {"Windows": "msvc2022_64", "Darwin": "macos", "Linux": "gcc_64"}[workflow.platform.system()]
