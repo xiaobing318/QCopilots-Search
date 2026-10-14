@@ -566,6 +566,115 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                 if not partial:
                     self.assertEqual(command[command.index("--model-dir") + 1], str(models.resolve()))
 
+    def development_ocr_fixture(self, config="Release"):
+        root = self.root / ("开发 output " + config)
+        workflow.initialize_root(root)
+        build = root / config.lower()
+        build.mkdir()
+        data = self.root / ("custom OCR 缓存 " + config)
+        data.mkdir()
+        for language in ("eng", "chi_sim", "chi_tra"):
+            (data / (language + ".traineddata")).write_bytes(b"nonempty path fixture")
+        cache = build / "CMakeCache.txt"
+        cache.write_text("CMAKE_HOME_DIRECTORY:INTERNAL=" + workflow.SOURCE.as_posix()
+                         + "\nCMAKE_CACHEFILE_DIR:INTERNAL=" + build.as_posix()
+                         + "\nQCOPILOTS_SEARCH_TESSDATA_DIR:INTERNAL=" + data.as_posix() + "\n",
+                         encoding="utf-8-sig")
+        return build, data, cache
+
+    def test_development_run_uses_selected_configured_ocr_directory(self):
+        for config in ("Release", "Debug"):
+            with self.subTest(config=config):
+                build, data, cache = self.development_ocr_fixture(config)
+                arguments = [str(SCRIPT), "run", "--build-root", str(build.parent),
+                             "--qt-root", str(self.root / "SDK"), "--config", config]
+                with patch.object(sys, "argv", arguments), patch.object(workflow, "run") as run, \
+                        patch.dict(os.environ, {"QCOPILOTS_SEARCH_TESSDATA_DIR": "stale other checkout"}):
+                    workflow.main()
+                    self.assertEqual(os.environ["QCOPILOTS_SEARCH_TESSDATA_DIR"], "stale other checkout")
+                run.assert_called_once()
+                command = list(map(str, run.call_args.args[0]))
+                self.assertEqual(Path(command[0]).parent, build / "bin")
+                self.assertEqual(Path(command[0]).stem, "qcs-gui")
+                self.assertEqual(run.call_args.kwargs["env"]["QCOPILOTS_SEARCH_TESSDATA_DIR"], str(data.resolve()))
+                self.assertEqual(run.call_args.kwargs["cwd"], build.parent)
+
+    def test_development_run_missing_cache_fails_before_launch(self):
+        root = self.root / "unconfigured output"
+        arguments = [str(SCRIPT), "run", "--build-root", str(root), "--qt-root", str(self.root / "SDK")]
+        with patch.object(sys, "argv", arguments), patch.object(workflow, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "Configure this build"):
+                workflow.main()
+        run.assert_not_called()
+
+    def test_development_run_rejects_stale_or_ambiguous_cache_paths(self):
+        build, data, cache = self.development_ocr_fixture()
+        original = cache.read_text(encoding="utf-8-sig")
+        line = "QCOPILOTS_SEARCH_TESSDATA_DIR:INTERNAL=" + data.as_posix() + "\n"
+        changes = {
+            "other checkout": original.replace(workflow.SOURCE.as_posix(), self.root.as_posix()),
+            "copied build": original.replace(build.as_posix(), self.root.as_posix()),
+            "relative directory": original.replace(data.as_posix(), "relative/tessdata"),
+            "empty directory": original.replace(data.as_posix(), ""),
+            "missing directory": original.replace(data.as_posix(), (self.root / "missing").as_posix()),
+            "missing key": original.replace(line, ""),
+            "duplicate key": original + line,
+            "duplicate source": original + "CMAKE_HOME_DIRECTORY:PATH=" + workflow.SOURCE.as_posix() + "\n",
+            "duplicate build": original + "CMAKE_CACHEFILE_DIR:PATH=" + build.as_posix() + "\n",
+        }
+        arguments = [str(SCRIPT), "run", "--build-root", str(build.parent), "--qt-root", str(self.root / "SDK")]
+        for scenario, content in changes.items():
+            with self.subTest(scenario=scenario):
+                cache.write_text(content, encoding="utf-8")
+                with patch.object(sys, "argv", arguments), patch.object(workflow, "run") as run:
+                    with self.assertRaises(RuntimeError):
+                        workflow.main()
+                run.assert_not_called()
+
+    def test_development_run_rejects_ocr_data_inside_source_or_its_parent(self):
+        build, data, cache = self.development_ocr_fixture()
+        original = cache.read_text(encoding="utf-8-sig")
+        for forbidden in (workflow.SOURCE, workflow.SOURCE / "tools", workflow.SOURCE.parent):
+            with self.subTest(directory=forbidden):
+                cache.write_text(original.replace(data.as_posix(), forbidden.as_posix()), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "outside the source tree"):
+                    workflow.development_tessdata(build)
+
+    def test_development_run_requires_all_three_nonempty_language_files(self):
+        build, data, cache = self.development_ocr_fixture()
+        arguments = [str(SCRIPT), "run", "--build-root", str(build.parent), "--qt-root", str(self.root / "SDK")]
+        for language in ("eng", "chi_sim", "chi_tra"):
+            path = data / (language + ".traineddata")
+            for condition in ("missing", "empty", "directory"):
+                with self.subTest(language=language, condition=condition):
+                    path.unlink()
+                    if condition == "empty":
+                        path.touch()
+                    elif condition == "directory":
+                        path.mkdir()
+                    with patch.object(sys, "argv", arguments), patch.object(workflow, "run") as run:
+                        with self.assertRaisesRegex(RuntimeError, language + r"\.traineddata"):
+                            workflow.main()
+                    run.assert_not_called()
+                    if path.is_dir():
+                        path.rmdir()
+                    path.write_bytes(b"nonempty path fixture")
+
+    def test_development_ocr_environment_does_not_leak_into_install(self):
+        build, data, cache = self.development_ocr_fixture()
+        environment = {"PATH": "unchanged", "QCOPILOTS_SEARCH_TESSDATA_DIR": "inherited"}
+        args = argparse.Namespace(config="Release", program_arg=[])
+        paths = (build.parent, build, build.parent / "stage", build.parent / "reports",
+                 self.root / "SDK", self.root / "SDK/kit")
+        with patch.object(workflow, "run") as run:
+            workflow.execute_action("run", args, *paths, environment)
+            runtime_environment = run.call_args.kwargs["env"]
+            self.assertEqual(runtime_environment["QCOPILOTS_SEARCH_TESSDATA_DIR"], str(data.resolve()))
+            self.assertEqual(environment, {"PATH": "unchanged", "QCOPILOTS_SEARCH_TESSDATA_DIR": "inherited"})
+            with patch.object(workflow, "development_tessdata", side_effect=AssertionError("install must not read development data")):
+                workflow.execute_action("install", args, *paths, environment)
+            self.assertIs(run.call_args.kwargs["env"], environment)
+
     def test_real_model_manifest_rejects_changed_missing_or_duplicate_artifacts(self):
         import copy
         result = {"valid": True, "directory": str(self.root), "artifacts": [

@@ -57,6 +57,30 @@ class FixtureCopyTests(unittest.TestCase):
         callback(plan)
         self.plan.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
 
+    def bind_source_manifest(self, source_root):
+        retained = self.run / copy.RECORDER_SOURCE_MANIFEST
+        retained.write_bytes((source_root / copy.SOURCE_MANIFEST).read_bytes())
+        self.state["inputs"].append({"path": copy.RECORDER_SOURCE_MANIFEST,
+                                     "bytes": retained.stat().st_size, "sha256": copy.sha(retained)})
+        self.run_json.write_text(json.dumps(self.state, ensure_ascii=False), encoding="utf-8")
+        return retained
+
+    def prepare_bound_source(self):
+        # A small complete prepared-source contract keeps binding edge cases
+        # independent of media generation. The full generator is tested below.
+        files = [{"relativePath": path.relative_to(self.sources).as_posix(),
+                  "bytes": path.stat().st_size, "sha256": copy.sha(path),
+                  "mtimeMs": path.stat().st_mtime_ns // 1_000_000}
+                 for path in copy.tree_files(self.sources)]
+        copy.write_json(self.sources / copy.SOURCE_MANIFEST,
+                        {"schemaVersion": 1, "kind": "qcopilots-search-cu-fixture-source",
+                         "generator": {"path": "tools/acceptance/qcs-copy-cu-fixtures.py", "sha256": copy.sha(copy.__file__)},
+                         "sourceInputs": [], "sourceRoot": str(self.sources), "files": files})
+        retained = self.bind_source_manifest(self.sources)
+        self.plan = self.root / "bound-copy-plan.json"
+        copy.create_plan(self.sources, self.plan)
+        return retained
+
     def test_dry_run_writes_nothing_and_cannot_pass_acceptance(self):
         before = sorted(path.relative_to(self.run).as_posix() for path in self.run.rglob("*"))
         result = copy.materialize(self.run_json, self.plan)
@@ -163,6 +187,7 @@ class FixtureCopyTests(unittest.TestCase):
         generated = self.root / "generated 中文 source"
         prepared = copy.prepare_source(generated)
         source_manifest = json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))
+        retained = self.bind_source_manifest(generated)
         plan_path = self.root / "generated-plan.json"
         copy.create_plan(generated, plan_path)
         result = copy.materialize(self.run_json, plan_path, True)
@@ -177,6 +202,100 @@ class FixtureCopyTests(unittest.TestCase):
                 copy.check_file(copied, row["bytes"], row["sha256"], mtime_ms=row["mtimeMs"])
         self.assertFalse(any((self.run / "profile").iterdir()))
         self.assertFalse(any((self.run / "models").iterdir()))
+        report = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(report["sourceRoot"], str(generated))
+        self.assertEqual(report["sourceManifest"], {"relativePath": copy.SOURCE_MANIFEST,
+                         "bytes": retained.stat().st_size, "sha256": copy.sha(retained)})
+        self.assertEqual(report["recorderFixtureManifest"], self.state["inputs"][-1])
+
+    def test_bound_manifest_identity_cannot_be_replaced_with_identical_content_files(self):
+        retained = self.prepare_bound_source()
+        source = self.sources / copy.SOURCE_MANIFEST
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+        before = {row["relativePath"]: (row["bytes"], row["sha256"]) for row in manifest["files"]}
+        manifest["sourceRoot"] = str(self.root / "different prepared source identity")
+        source.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        self.assertNotEqual(copy.sha(source), copy.sha(retained))
+        self.assertEqual(before, {row["relativePath"]: (row["bytes"], row["sha256"]) for row in manifest["files"]})
+        self.plan = self.root / "different-identity-plan.json"
+        copy.create_plan(self.sources, self.plan)
+        with self.assertRaisesRegex(ValueError, "differs from the recorder-bound"):
+            copy.materialize(self.run_json, self.plan, True)
+        self.assertFalse(any((self.run / "samples").iterdir()))
+        self.assertFalse((self.run / "negative-models").exists())
+
+    def test_bound_manifest_hash_is_checked_before_copy(self):
+        retained = self.prepare_bound_source()
+        retained.write_bytes(retained.read_bytes() + b" ")
+        with self.assertRaisesRegex(ValueError, "File size differs"):
+            copy.materialize(self.run_json, self.plan, True)
+        self.assertFalse(any((self.run / "samples").iterdir()))
+
+    def test_bound_source_requires_complete_unmapped_plan(self):
+        self.prepare_bound_source()
+        original = self.plan.read_bytes()
+        for mutate in (lambda plan: plan["files"].pop(),
+                       lambda plan: plan["files"][0].update(targetRelativePath="samples/remapped.txt"),
+                       lambda plan: plan["files"].remove(next(row for row in plan["files"] if row["sourceRelativePath"] == copy.SOURCE_MANIFEST))):
+            with self.subTest(mutate=mutate):
+                self.plan.write_bytes(original)
+                self.mutate_plan(mutate)
+                with self.assertRaisesRegex(ValueError, "complete source set without remapping"):
+                    copy.materialize(self.run_json, self.plan, True)
+                self.assertFalse(any((self.run / "samples").iterdir()))
+
+    def test_bound_manifest_cannot_copy_a_manual_source_without_manifest(self):
+        self.prepare_bound_source()
+        (self.sources / copy.SOURCE_MANIFEST).unlink()
+        self.plan = self.root / "manual-copy-plan.json"
+        copy.create_plan(self.sources, self.plan)
+        with self.assertRaisesRegex(ValueError, "requires a prepared source manifest"):
+            copy.materialize(self.run_json, self.plan, True)
+
+    def test_missing_unbound_and_duplicate_retained_manifests_are_rejected(self):
+        retained = self.prepare_bound_source()
+        original = retained.read_bytes()
+        retained.unlink()
+        with self.assertRaisesRegex(ValueError, "missing or unbound"):
+            copy.materialize(self.run_json, self.plan)
+        retained.write_bytes(original)
+        record = self.state["inputs"].pop()
+        self.run_json.write_text(json.dumps(self.state), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "missing or unbound"):
+            copy.materialize(self.run_json, self.plan)
+        self.state["inputs"].extend([record, record])
+        self.run_json.write_text(json.dumps(self.state), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "duplicate fixture source"):
+            copy.materialize(self.run_json, self.plan)
+
+    def test_bound_manifest_is_rechecked_after_copy(self):
+        retained = self.prepare_bound_source()
+        real_copy = copy.shutil.copyfileobj
+        changed = False
+
+        def change_retained_during_copy(*args, **kwargs):
+            nonlocal changed
+            result = real_copy(*args, **kwargs)
+            if not changed:
+                retained.write_bytes(retained.read_bytes() + b" ")
+                changed = True
+            return result
+
+        with patch.object(copy.shutil, "copyfileobj", side_effect=change_retained_during_copy):
+            with self.assertRaisesRegex(ValueError, "File size differs"):
+                copy.materialize(self.run_json, self.plan, True)
+        self.assertFalse((self.run / copy.MANIFEST).exists())
+        failure = json.loads((self.run / copy.FAILURE).read_text(encoding="utf-8"))
+        self.assertFalse(failure["complete"])
+
+    def test_bound_source_can_be_relocated_without_changing_manifest_identity(self):
+        self.prepare_bound_source()
+        relocated = self.root / "relocated identical source"
+        self.sources.rename(relocated)
+        result = copy.materialize(self.run_json, self.plan, True, relocated)
+        self.assertTrue(result["complete"])
+        report = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(report["sourceRoot"], str(relocated))
 
     def test_candidate_input_tampering_is_rejected(self):
         with (self.run / "inputs/package-candidate.json").open("a", encoding="utf-8") as output:

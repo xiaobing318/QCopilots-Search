@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,9 @@ NAMES = (GUI_EXECUTABLE, PRODUCT + "-service", PRODUCT + "-worker", PRODUCT + "-
 CASES = tuple(f"CU-{n:02d}" for n in range(1, 11))
 LOCKS = ("dependencies.lock.json", "tools/qt-packages.lock.json", "tools/nsis-package.lock.json",
          "tools/qcs-source-packages.lock.json", "cmake/qcs-native-deps.cmake")
+FIXTURE_INPUT = "inputs/fixture-source-manifest.json"
+FIXTURE_SOURCE = "negative-models/qcs-fixture-source.json"
+FIXTURE_COPY = "negative-models/qcs-fixture-copy.json"
 
 
 def now():
@@ -85,7 +89,13 @@ def safe(root, relative, *, exists=True):
     for item in [path, *path.parents]:
         if item == root:
             break
-        if item.is_symlink() or (hasattr(item, "is_junction") and item.is_junction()):
+        linked = item.is_symlink() or (hasattr(item, "is_junction") and item.is_junction())
+        try:
+            linked |= bool(getattr(item.lstat(), "st_file_attributes", 0)
+                           & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        except FileNotFoundError:
+            pass
+        if linked:
             raise ValueError("Evidence cannot use a symlink or junction")
     if exists and not path.is_file():
         raise ValueError(f"Missing evidence: {relative}")
@@ -103,6 +113,147 @@ def check_record(root, item):
     if path.stat().st_size != item["bytes"] or sha(path) != item["sha256"]:
         raise ValueError(f"Evidence changed: {item['path']}")
     return path
+
+
+def external_evidence_file(path):
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError("External evidence requires an absolute path")
+    return safe(Path(path.anchor), path.relative_to(path.anchor).as_posix())
+
+
+def validate_fixture_copy(root, state, report, source, plan, *, verify_targets):
+    """Check the copy receipt before UI actions, not the later mutable samples."""
+    if (report.get("schemaVersion") != 2 or report.get("kind") != "qcopilots-search-cu-fixture-copy"
+            or any(report.get(key) is not True for key in ("executed", "complete", "sourceFilesUnchanged"))
+            or report.get("acceptancePassed") is not False):
+        raise ValueError("A complete executed fixture copy receipt is required")
+    for key in ("runId", "identity", "packageSha256", "modelFingerprint", "extractionFingerprint"):
+        if report.get(key) != state[key]:
+            raise ValueError("Fixture copy belongs to another candidate: " + key)
+    if (source.get("schemaVersion") != 1 or source.get("kind") != "qcopilots-search-cu-fixture-source"
+            or plan.get("schemaVersion") != 2 or plan.get("kind") != "qcopilots-search-cu-fixture-copy-plan"):
+        raise ValueError("Invalid fixture source manifest or copy plan")
+    source_root = Path(report["sourceRoot"])
+    if (not source_root.is_absolute() or report.get("manifestRelativePath") != FIXTURE_COPY
+            or Path(report["sampleRoot"]) != root / "samples"
+            or Path(report["negativeModelDirectory"]) != root / "negative-models"):
+        raise ValueError("Fixture copy directories differ from this run")
+    retained = record(root, safe(root, FIXTURE_INPUT))
+    source_record = record(root, safe(root, FIXTURE_SOURCE))
+    if ((source_record["bytes"], source_record["sha256"]) != (retained["bytes"], retained["sha256"])
+            or report.get("recorderFixtureManifest") != retained
+            or report.get("sourceManifest") != {"relativePath": FIXTURE_SOURCE,
+                                               "bytes": retained["bytes"], "sha256": retained["sha256"]}):
+        raise ValueError("Copied fixture source manifest differs from the recorder input")
+    expected = {}
+    for item in source["files"]:
+        relative = item["relativePath"]
+        if relative in expected or not relative.startswith(("samples/", "negative-models/")):
+            raise ValueError("Duplicate or invalid fixture source entry")
+        safe(root, relative, exists=False)
+        expected[relative] = (item["bytes"], item["sha256"], item["mtimeMs"])
+    if FIXTURE_SOURCE in expected:
+        raise ValueError("Fixture source manifest cannot include itself")
+    expected[FIXTURE_SOURCE] = (retained["bytes"], retained["sha256"], None)
+    planned = {}
+    for item in plan["files"]:
+        relative = item["targetRelativePath"]
+        if relative in planned or item["sourceRelativePath"] != relative:
+            raise ValueError("Duplicate or remapped fixture plan entry")
+        planned[relative] = (item["bytes"], item["sha256"], item["mtimeMs"])
+    if set(planned) != set(expected):
+        raise ValueError("Fixture plan membership differs from its source manifest")
+    rows = report.get("files", [])
+    if (len(rows) != len(expected) or report.get("verifiedFileCount") != len(rows)
+            or report.get("filesToCopy") != len(rows)):
+        raise ValueError("Fixture copy receipt file counts disagree")
+    seen = set()
+    for item in rows:
+        relative = item["targetRelativePath"]
+        if relative in seen or relative not in expected:
+            raise ValueError("Fixture copy receipt membership differs")
+        seen.add(relative)
+        size, digest, mtime = expected[relative]
+        details = (item["expectedBytes"], item["expectedSha256"], item["expectedMtimeMs"])
+        if details != planned[relative] or details[:2] != (size, digest) or (mtime is not None and details[2] != mtime):
+            raise ValueError("Fixture copy receipt differs from its plan or source")
+        destination = safe(root, relative, exists=verify_targets)
+        if Path(item["targetPath"]) != destination:
+            raise ValueError("Fixture copy target escapes this run")
+        for key in ("source", "verifiedTarget"):
+            actual = item[key]
+            if (actual["bytes"], actual["sha256"], actual["mtimeMs"]) != details:
+                raise ValueError("Fixture copy verification details disagree")
+        if Path(item["verifiedTarget"]["path"]) != destination:
+            raise ValueError("Verified fixture target differs")
+        if Path(item["source"]["path"]) != source_root / relative:
+            raise ValueError("Fixture copy source differs from its declared root")
+        if verify_targets:
+            check_record(root, {"path": relative, "bytes": size, "sha256": digest})
+            if destination.stat().st_mtime_ns // 1_000_000 != details[2]:
+                raise ValueError("Fixture target modification time differs")
+
+
+def fixture_copy_evidence(root, state):
+    """Freeze the copy receipt once, before mutable CU actions can begin."""
+    bound = [item for item in state.get("inputs", []) if item.get("path") == FIXTURE_INPUT]
+    if not bound:
+        if state.get("fixtureCopyEvidence"):
+            raise ValueError("Fixture copy binding has no source manifest input")
+        return []  # Existing manual runs did not declare a generated fixture set.
+    if len(bound) != 1:
+        raise ValueError("Fixture source manifest input must be unique")
+    check_record(root, bound[0])
+    binding = state.get("fixtureCopyEvidence")
+    if binding:
+        for item in binding.values():
+            check_record(root, item)
+        if binding["report"]["path"] != FIXTURE_COPY or binding["sourceManifest"]["path"] != FIXTURE_SOURCE:
+            raise ValueError("Fixture copy binding paths differ")
+        initial = read(safe(root, binding["initialRun"]["path"]))
+        report = read(safe(root, FIXTURE_COPY))
+        if report.get("runJsonSha256") != binding["initialRun"]["sha256"]:
+            raise ValueError("Fixture copy does not bind the initial run snapshot")
+        for key in ("runId", "identity", "packageSha256", "modelFingerprint", "extractionFingerprint", "startedAt"):
+            if initial.get(key) != state.get(key):
+                raise ValueError("Initial fixture run identity differs: " + key)
+        plan = read(safe(root, binding["plan"]["path"]))
+        if report.get("planSha256") != binding["plan"]["sha256"]:
+            raise ValueError("Fixture copy plan hash differs")
+        validate_fixture_copy(root, state, report, read(safe(root, FIXTURE_SOURCE)), plan, verify_targets=False)
+        return [binding["report"], binding["sourceManifest"]]
+    report_record = record(root, safe(root, FIXTURE_COPY))
+    source_record = record(root, safe(root, FIXTURE_SOURCE))
+    report = read(safe(root, FIXTURE_COPY))
+    if report.get("runJsonSha256") != sha(root / "run.json"):
+        raise ValueError("Fixture copy does not bind the initialized run")
+    plan_path = external_evidence_file(report["planPath"])
+    if sha(plan_path) != report.get("planSha256"):
+        raise ValueError("Fixture copy plan hash differs")
+    validate_fixture_copy(root, state, report, read(safe(root, FIXTURE_SOURCE)), read(plan_path), verify_targets=True)
+    initial_path = safe(root, "inputs/fixture-copy-initial-run.json", exists=False)
+    retained_plan = safe(root, "inputs/fixture-copy-plan.json", exists=False)
+    for original, destination in ((root / "run.json", initial_path), (plan_path, retained_plan)):
+        if destination.exists():
+            if sha(destination) != sha(original):
+                raise ValueError("Partial fixture binding differs from its original input")
+        else:
+            with original.open("rb") as incoming, destination.open("xb") as outgoing:
+                shutil.copyfileobj(incoming, outgoing)
+    if sha(initial_path) != report["runJsonSha256"] or sha(retained_plan) != report["planSha256"]:
+        raise ValueError("Fixture copy snapshot changed while being captured")
+    if sha(root / "run.json") != report["runJsonSha256"]:
+        raise ValueError("Fixture run changed while capturing its copy evidence")
+    for item in (report_record, source_record, bound[0]):
+        check_record(root, item)
+    binding = {"report": report_record,
+               "sourceManifest": source_record,
+               "initialRun": record(root, initial_path), "plan": record(root, retained_plan)}
+    state["fixtureCopyEvidence"] = binding
+    state["inputs"].extend((binding["initialRun"], binding["plan"]))
+    write(root / "run.json", state)
+    return [binding["report"], binding["sourceManifest"]]
 
 
 def image_file(path):
@@ -257,6 +408,7 @@ def load_run(root, *, verify=True):
         current = verify_binaries(state["packagePath"], state["appDirectory"], candidate)
         if current != state["verifiedExecutables"] or candidate["executables"] != state["executables"]:
             raise ValueError("Candidate binaries changed during CU run")
+        fixture_copy_evidence(root, state)
     return root, state
 
 
@@ -369,6 +521,7 @@ def finish(args):
 
 def summarize(args):
     root, state = load_run(args.run)
+    fixture_files = fixture_copy_evidence(root, state)
     errors = []
     selected = []
     for scenario in CASES:
@@ -429,6 +582,7 @@ def summarize(args):
     destination = root / f"windows-computer-use-{tag}.json"
     files = [record(root, root / "run.json")]
     files.extend(record(root, path) for folder in ("inputs", "evidence") for path in sorted((root / folder).rglob("*")) if path.is_file())
+    files.extend(fixture_files)
     report["files"] = files
     write(destination, report, exclusive=True)
     manifest = {"schemaVersion": 1, "kind": "windows-computer-use-files", "identity": state["identity"],
@@ -440,6 +594,11 @@ def summarize(args):
 
 
 def main(argv=None):
+    # Redirected Windows streams may otherwise use a legacy encoding. The run
+    # directory deliberately includes Chinese characters even on English hosts.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="Verify one frozen package and create empty isolated runtime directories")

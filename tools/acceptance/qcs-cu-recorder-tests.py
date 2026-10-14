@@ -2,8 +2,9 @@
 """Synthetic stdlib tests for the external CU recorder; no UI or real candidate.
 
 Every fixture and generated export lives in a fresh TemporaryDirectory. No test
-creates ten passing cases or a passed CU summary. subprocess is blocked in every
-test. A mocked load_run supplies clearly marked synthetic state where needed.
+creates ten passing cases or a passed CU summary. Only the redirected CLI test
+starts Python child processes. Other tests block subprocess, and no test starts
+the application. A mocked load_run supplies clearly marked synthetic state.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -44,7 +46,7 @@ class TemporaryTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="qcs-recorder-SYNTHETIC-tests-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
         self.addCleanup(temporary.cleanup)
-        self.temp = Path(temporary.name)
+        self.temp = Path(temporary.name).resolve()
         # Even an accidental unmocked identity()/init path must never run git or an app.
         for name in ("check_output", "run", "Popen", "call", "check_call"):
             patcher = mock.patch.object(
@@ -103,7 +105,7 @@ class SafePathTests(TemporaryTest):
             import _winapi
             _winapi.CreateJunction(str(destination.resolve()), str(alias))
             self.addCleanup(alias.rmdir)
-            self.assertTrue(alias.is_junction())
+            self.assertTrue(alias.lstat().st_file_attributes & recorder.stat.FILE_ATTRIBUTE_REPARSE_POINT)
         else:
             alias.symlink_to(destination, target_is_directory=True)
             self.addCleanup(alias.unlink)
@@ -121,6 +123,14 @@ class SafePathTests(TemporaryTest):
         self.directory_link(outside.parent, alias)
         with self.assertRaisesRegex(ValueError, "escapes root"):
             recorder.safe(self.root, "outside-link/data.png")
+
+    if os.name == "nt":
+        def test_reparse_attribute_rejects_real_junction_without_path_junction_detection(self):
+            alias = self.root / "legacy-python-link"
+            self.directory_link(self.target.parent, alias)
+            with mock.patch.object(recorder.Path, "is_junction", return_value=False, create=True):
+                with self.assertRaisesRegex(ValueError, "symlink|junction"):
+                    recorder.safe(self.root, "legacy-python-link/中文 screenshot.png")
 
     if os.name != "nt":
         def test_rejects_real_file_symlink(self):
@@ -459,6 +469,243 @@ class ScenarioEvidenceTests(TemporaryTest):
         recorder.safe(self.root, row["operationLog"]).write_bytes(b"[]")
         with self.assertRaisesRegex(ValueError, "Evidence changed"):
             self.call_silently(recorder.summarize, self.args)
+
+
+class FixtureReceiptTests(TemporaryTest):
+    """Synthetic copy receipts test integrity, never actual CU completion."""
+    def setUp(self):
+        super().setUp()
+        self.root = self.temp / "SYNTHETIC fixture run"
+        for folder in ("inputs", "evidence", "samples", "negative-models"):
+            (self.root / folder).mkdir(parents=True)
+        self.sample = self.root / "samples/canary.txt"
+        self.sample.write_bytes(b"SYNTHETIC fixture before CU mutations")
+        sample = recorder.record(self.root, self.sample)
+        self.source = {"schemaVersion": 1, "kind": "qcopilots-search-cu-fixture-source",
+                       "syntheticTestOnly": True, "files": [{"relativePath": sample["path"],
+                        "bytes": sample["bytes"], "sha256": sample["sha256"],
+                        "mtimeMs": self.sample.stat().st_mtime_ns // 1_000_000}]}
+        recorder.write(self.root / recorder.FIXTURE_SOURCE, self.source)
+        (self.root / recorder.FIXTURE_INPUT).write_bytes((self.root / recorder.FIXTURE_SOURCE).read_bytes())
+        retained = recorder.record(self.root, self.root / recorder.FIXTURE_INPUT)
+        self.state = {"schemaVersion": 1, "kind": "qcopilots-search-cu-run", "syntheticTestOnly": True,
+                      "runId": "SYNTHETIC fixture receipt only", "startedAt": START,
+                      "identity": {"checkoutCommit": "a" * 40, "candidateHead": "a" * 40},
+                      "packageSha256": "b" * 64, "executables": {}, "modelFingerprint": "SYNTHETIC-model",
+                      "extractionFingerprint": "SYNTHETIC-extraction", "platform": {"system": "SYNTHETIC"},
+                      "profileRoot": str(self.root / "unused-profile"), "inputs": [retained]}
+        recorder.write(self.root / "run.json", self.state)
+        self.initial_hash = recorder.sha(self.root / "run.json")
+        self.plan_path = self.temp / "SYNTHETIC-plan.json"
+        rows, planned = [], []
+        for relative in (sample["path"], recorder.FIXTURE_SOURCE):
+            target = self.root / relative
+            item = recorder.record(self.root, target)
+            details = {"bytes": item["bytes"], "sha256": item["sha256"],
+                       "mtimeMs": target.stat().st_mtime_ns // 1_000_000}
+            planned.append({"sourceRelativePath": relative, "targetRelativePath": relative, **details})
+            rows.append({"targetRelativePath": relative, "targetPath": str(target),
+                         "source": {"path": str(self.temp / "unused-original-source" / relative), **details},
+                         "verifiedTarget": {"path": str(target), **details},
+                         "expectedBytes": details["bytes"], "expectedSha256": details["sha256"],
+                         "expectedMtimeMs": details["mtimeMs"]})
+        recorder.write(self.plan_path, {"schemaVersion": 2, "kind": "qcopilots-search-cu-fixture-copy-plan", "files": planned})
+        self.receipt = {"schemaVersion": 2, "kind": "qcopilots-search-cu-fixture-copy", "syntheticTestOnly": True,
+                        "executed": True, "complete": True, "sourceFilesUnchanged": True, "acceptancePassed": False,
+                        **{key: self.state[key] for key in ("runId", "identity", "packageSha256", "modelFingerprint", "extractionFingerprint")},
+                        "runJsonSha256": self.initial_hash, "planPath": str(self.plan_path),
+                        "sourceRoot": str(self.temp / "unused-original-source"), "sampleRoot": str(self.root / "samples"),
+                        "negativeModelDirectory": str(self.root / "negative-models"), "manifestRelativePath": recorder.FIXTURE_COPY,
+                        "planSha256": recorder.sha(self.plan_path), "filesToCopy": len(rows), "verifiedFileCount": len(rows),
+                        "files": rows, "recorderFixtureManifest": retained,
+                        "sourceManifest": {"relativePath": recorder.FIXTURE_SOURCE, "bytes": retained["bytes"], "sha256": retained["sha256"]}}
+        self.save_receipt()
+
+    def save_receipt(self):
+        recorder.write(self.root / recorder.FIXTURE_COPY, self.receipt)
+
+    def bind(self):
+        return recorder.fixture_copy_evidence(self.root, self.state)
+
+    def test_binds_original_run_and_keeps_copy_proof_after_canary_changes(self):
+        files = self.bind()
+        self.assertNotEqual(recorder.sha(self.root / "run.json"), self.initial_hash)
+        self.assertEqual(self.state["fixtureCopyEvidence"]["initialRun"]["sha256"], self.initial_hash)
+        self.sample.unlink()  # CU-09 intentionally modifies and deletes samples.
+        self.plan_path.unlink()  # The retained plan is now independent of its source path.
+        self.assertEqual(self.bind(), files)
+
+    def test_summarize_archives_copy_receipt_and_source_without_mutable_samples(self):
+        self.bind()
+        self.sample.write_bytes(b"SYNTHETIC allowed CU-09 changed canary")
+        with mock.patch.object(recorder, "load_run", return_value=(self.root, self.state)):
+            self.assertEqual(self.call_silently(recorder.summarize, SimpleNamespace(run=self.root)), 1)
+        report = next(recorder.read(path) for path in self.root.glob("windows-computer-use-*.json") if not path.stem.endswith("-files"))
+        self.assertFalse(report["passed"])
+        names = {item["path"] for item in report["files"]}
+        self.assertIn(recorder.FIXTURE_COPY, names)
+        self.assertIn(recorder.FIXTURE_SOURCE, names)
+        self.assertIn("inputs/fixture-copy-initial-run.json", names)
+        self.assertNotIn("samples/canary.txt", names)
+        for item in report["files"]:
+            recorder.check_record(self.root, item)
+
+    def test_bound_manifest_requires_an_actual_copy_report(self):
+        (self.root / recorder.FIXTURE_COPY).unlink()
+        with self.assertRaisesRegex(ValueError, "Missing evidence"):
+            self.bind()
+
+    def test_rejects_incomplete_or_other_candidate_copy_report(self):
+        changes = {"executed": False, "complete": False, "sourceFilesUnchanged": False,
+                   "acceptancePassed": True, "identity": {}, "packageSha256": "f" * 64,
+                   "runJsonSha256": "f" * 64, "planSha256": "f" * 64, "verifiedFileCount": 999}
+        for key, value in changes.items():
+            original = self.receipt[key]
+            self.receipt[key] = value
+            self.save_receipt()
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.bind()
+            self.receipt[key] = original
+        self.save_receipt()
+
+    def test_rejects_changed_source_manifest_or_initial_target(self):
+        source_path = self.root / recorder.FIXTURE_SOURCE
+        original = source_path.read_bytes()
+        source_path.write_bytes(original + b" ")
+        with self.assertRaisesRegex(ValueError, "source manifest differs"):
+            self.bind()
+        source_path.write_bytes(original)
+        self.sample.write_bytes(b"SYNTHETIC unexpectedly changed before beginning")
+        with self.assertRaisesRegex(ValueError, "Evidence changed"):
+            self.bind()
+
+    def test_rejects_incomplete_or_remapped_plan(self):
+        plan = recorder.read(self.plan_path)
+        for changed in ({**plan, "files": plan["files"][:-1]},
+                        {**plan, "files": [{**item, "sourceRelativePath": "samples/other.txt"} for item in plan["files"]]}):
+            recorder.write(self.plan_path, changed)
+            self.receipt["planSha256"] = recorder.sha(self.plan_path)
+            self.save_receipt()
+            with self.assertRaisesRegex(ValueError, "plan"):
+                self.bind()
+
+    def test_rejects_modified_copy_report_after_capture(self):
+        self.bind()
+        self.receipt["syntheticTampering"] = True
+        self.save_receipt()
+        with self.assertRaisesRegex(ValueError, "Evidence changed"):
+            self.bind()
+
+    def test_rejects_snapshot_corruption_during_initial_capture(self):
+        original_copy = recorder.shutil.copyfileobj
+        def corrupt_snapshot(incoming, outgoing, *args):
+            original_copy(incoming, outgoing, *args)
+            outgoing.write(b"SYNTHETIC corruption")
+        with mock.patch.object(recorder.shutil, "copyfileobj", side_effect=corrupt_snapshot):
+            with self.assertRaisesRegex(ValueError, "snapshot changed"):
+                self.bind()
+        self.assertNotIn("fixtureCopyEvidence", self.state)
+
+    def test_rejects_receipt_changes_during_initial_capture(self):
+        original_copy = recorder.shutil.copyfileobj
+        def change_receipt(incoming, outgoing, *args):
+            original_copy(incoming, outgoing, *args)
+            self.receipt["syntheticTampering"] = True
+            self.save_receipt()
+        with mock.patch.object(recorder.shutil, "copyfileobj", side_effect=change_receipt):
+            with self.assertRaisesRegex(ValueError, "Evidence changed"):
+                self.bind()
+        self.assertNotIn("fixtureCopyEvidence", self.state)
+
+    def test_rejects_redirected_plan_directory(self):
+        alias = self.temp / "plan-directory-alias"
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(self.plan_path.parent), str(alias))
+            self.addCleanup(alias.rmdir)
+        else:
+            alias.symlink_to(self.plan_path.parent, target_is_directory=True)
+            self.addCleanup(alias.unlink)
+        self.receipt["planPath"] = str(alias / self.plan_path.name)
+        self.save_receipt()
+        with self.assertRaisesRegex(ValueError, "symlink|junction"):
+            self.bind()
+
+    def test_unbound_manual_fixture_runs_remain_compatible(self):
+        self.state["inputs"] = []
+        (self.root / recorder.FIXTURE_COPY).unlink()
+        self.assertEqual(self.bind(), [])
+
+    def test_actual_copy_producer_receipt_is_consumed_without_rewriting_fields(self):
+        spec = importlib.util.spec_from_file_location("synthetic_copy_contract_helpers", SCRIPT.with_name("qcs-test-copy-cu-fixtures.py"))
+        helpers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helpers)
+        fixture = helpers.FixtureCopyTests("test_copy_verifies_sources_run_and_manifest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.prepare_bound_source()
+        result = helpers.copy.materialize(fixture.run_json, fixture.plan, execute=True)
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["acceptancePassed"])
+        state = recorder.read(fixture.run_json)
+        receipt_bytes = Path(result["manifest"]).read_bytes()
+        files = recorder.fixture_copy_evidence(fixture.run, state)
+        self.assertEqual(Path(result["manifest"]).read_bytes(), receipt_bytes)
+        self.assertIn(recorder.FIXTURE_COPY, {item["path"] for item in files})
+        (fixture.run / "samples/笔记.txt").unlink()
+        self.assertEqual(recorder.fixture_copy_evidence(fixture.run, state), files)
+
+
+class RedirectedCliTests(unittest.TestCase):
+    def test_init_and_summary_print_unicode_paths_through_ascii_redirected_streams(self):
+        # Only a Python CLI child is launched. Four dummy ZIP members are never
+        # executed, source identity is mocked, and no real candidate is claimed.
+        with tempfile.TemporaryDirectory(prefix="qcs-recorder-CLI-SYNTHETIC-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            root = Path(temporary)
+            source, app = root / "source", root / "app"
+            source.mkdir()
+            app.mkdir()
+            package = root / "SYNTHETIC.zip"
+            executables = {}
+            with zipfile.ZipFile(package, "w") as archive:
+                for name in recorder.NAMES:
+                    data = ("SYNTHETIC NOT EXECUTABLE " + name).encode()
+                    path = app / (name + ".exe")
+                    path.write_bytes(data)
+                    archive.writestr("bin/" + path.name, data)
+                    executables[name] = {"sha256": recorder.sha(path)}
+            provenance = root / "SYNTHETIC-provenance.json"
+            recorder.write(provenance, {"syntheticTestOnly": True})
+            candidate = {"schemaVersion": 1, "kind": "package-candidate", "syntheticTestOnly": True,
+                         "identity": {"candidateHead": "a" * 40, "checkoutCommit": "a" * 40},
+                         "recordedAt": START, "executables": executables, "packageSha256": recorder.sha(package),
+                         "modelFingerprint": "SYNTHETIC-model", "extractionFingerprint": "SYNTHETIC-extraction",
+                         "buildProvenance": {"path": provenance.name, "sha256": recorder.sha(provenance)}}
+            candidate_path = root / "SYNTHETIC-candidate.json"
+            recorder.write(candidate_path, candidate)
+            harness = '''import importlib.util,json,sys
+from unittest import mock
+spec=importlib.util.spec_from_file_location("synthetic_cli",sys.argv[1])
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+c=json.load(open(sys.argv[2],encoding="utf-8"))
+with mock.patch.object(m,"identity",return_value=c["identity"]), mock.patch.object(m,"fingerprints",return_value={k:c[k] for k in ("modelFingerprint","extractionFingerprint")}), mock.patch.object(m.subprocess,"check_output",return_value=""), mock.patch.object(m.platform,"system",return_value="Windows"), mock.patch.object(m.platform,"machine",return_value="AMD64"):
+    raise SystemExit(m.main(sys.argv[3:]))
+'''
+            environment = {**os.environ, "PYTHONIOENCODING": "ascii"}
+            prefix = [sys.executable, "-B", "-c", harness, str(SCRIPT), str(candidate_path)]
+            result = subprocess.run([*prefix, "init", "--candidate-record", str(candidate_path), "--package", str(package),
+                                     "--app-dir", str(app), "--source", str(source), "--run-parent", str(root / "runs")],
+                                    capture_output=True, env=environment, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+            initialized = json.loads(result.stdout.decode("utf-8"))
+            run = Path(initialized["runRoot"])
+            self.assertIn("验收", run.name)
+            self.assertTrue((run / "run.json").is_file())
+            summary = subprocess.run([*prefix, "summarize", "--run", str(run)], capture_output=True, env=environment, timeout=30)
+            self.assertEqual(summary.returncode, 1, summary.stderr.decode("utf-8"))
+            report = json.loads(summary.stdout.decode("utf-8"))
+            self.assertFalse(report["passed"])
+            self.assertTrue(Path(report["report"]).is_file())
 
 
 if __name__ == "__main__":

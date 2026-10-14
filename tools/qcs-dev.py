@@ -331,6 +331,35 @@ def executable(directory: Path, name: str):
     return candidates[0]
 
 
+def development_tessdata(build: Path) -> Path:
+    """Read the configured OCR input, never infer a dependency-cache layout."""
+    cache = build / "CMakeCache.txt"
+    if not cache.is_file() or is_redirect(cache):
+        raise RuntimeError(f"Configure this build before running the GUI: {cache}")
+    lines = cache.read_text(encoding="utf-8-sig").splitlines()
+
+    def configured_directory(name):
+        entries = [line.partition("=")[2] for line in lines
+                   if line.startswith(name + ":") and "=" in line]
+        if len(entries) != 1 or not entries[0] or not Path(entries[0]).is_absolute():
+            raise RuntimeError(f"Expected one absolute {name} directory in {cache}. Run configure again.")
+        directory = Path(entries[0]).resolve()
+        if not directory.is_dir():
+            raise RuntimeError(f"Configured {name} directory is missing: {directory}. Run configure again.")
+        return directory
+
+    if (configured_directory("CMAKE_HOME_DIRECTORY") != SOURCE
+            or configured_directory("CMAKE_CACHEFILE_DIR") != build.resolve()):
+        raise RuntimeError(f"CMake cache does not belong to this checkout and build: {cache}")
+    directory = configured_directory("QCOPILOTS_SEARCH_TESSDATA_DIR")
+    assert_external(directory)
+    for language in ("eng", "chi_sim", "chi_tra"):
+        data = directory / (language + ".traineddata")
+        if not data.is_file() or data.stat().st_size == 0:
+            raise RuntimeError(f"Configured OCR language data is missing or invalid: {data}. Run configure again.")
+    return directory
+
+
 def helper_module(filename, name):
     spec = importlib.util.spec_from_file_location(name, SOURCE / filename)
     module = importlib.util.module_from_spec(spec)
@@ -511,7 +540,8 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
     elif action == "test":
         run_tests(args, root, build, reports, environment)
     elif action == "run":
-        run([executable(build, GUI_EXECUTABLE), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=environment)
+        runtime_environment = dict(environment, QCOPILOTS_SEARCH_TESSDATA_DIR=str(development_tessdata(build)))
+        run([executable(build, GUI_EXECUTABLE), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=runtime_environment)
     elif action == "install":
         run(["cmake", "--install", build, "--config", args.config, "--prefix", stage], cwd=root, env=environment)
     elif action == "package":

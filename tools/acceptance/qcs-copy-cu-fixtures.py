@@ -34,6 +34,7 @@ import zipfile
 MANIFEST = "negative-models/qcs-fixture-copy.json"
 FAILURE = "negative-models/qcs-fixture-copy-failure.json"
 SOURCE_MANIFEST = "negative-models/qcs-fixture-source.json"
+RECORDER_SOURCE_MANIFEST = "inputs/fixture-source-manifest.json"
 PREPARING = ".qcs-fixture-preparing.json"
 BROWSE_ROOT = "samples/分页 普通文件"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -350,6 +351,7 @@ def validate_generated_source(root):
     for file in tree_files(root):
         actual.add(file.relative_to(root).as_posix())
     require(actual == expected, "Prepared fixture source contains unrecorded or missing files")
+    return manifest
 
 
 def create_plan(source_root, plan_path, excluded_relative=None):
@@ -423,7 +425,31 @@ def prepare(run_path, plan_path, source_root=None):
     source_root = unlinked(source_root if source_root is not None else plan["sourceRoot"])
     require(source_root.is_dir() and not root.is_relative_to(source_root) and not source_root.is_relative_to(root),
             "Fixture source and new run must be separate directories")
-    validate_generated_source(source_root)
+    source_manifest = validate_generated_source(source_root)
+    manifest_record = None
+    source_manifest_path = target(source_root, SOURCE_MANIFEST)
+    if source_manifest is not None:
+        manifest_record = {"relativePath": SOURCE_MANIFEST, "bytes": source_manifest_path.stat().st_size,
+                           "sha256": sha(source_manifest_path)}
+    recorder_records = [item for item in state["inputs"] if item["path"] == RECORDER_SOURCE_MANIFEST]
+    recorder_path = unlinked(root / RECORDER_SOURCE_MANIFEST)
+    recorder_record = None
+    require(len(recorder_records) <= 1, "Recorder binds duplicate fixture source manifests")
+    require(bool(recorder_records) == recorder_path.exists(), "Recorder fixture source manifest is missing or unbound")
+    if recorder_records:
+        recorder_record = recorder_records[0]
+        check_file(recorder_path, recorder_record["bytes"], recorder_record["sha256"])
+        require(manifest_record is not None, "Recorder-bound fixture source requires a prepared source manifest")
+        require(recorder_record["bytes"] == manifest_record["bytes"]
+                and recorder_record["sha256"] == manifest_record["sha256"],
+                "Actual fixture source differs from the recorder-bound source manifest")
+        # Binding a source set means copying that complete, unchanged set. A
+        # hand-edited subset or remapping must not inherit another set's identity.
+        expected = {item["relativePath"] for item in source_manifest["files"]} | {SOURCE_MANIFEST}
+        require(len(plan["files"]) == len(expected)
+                and {item["sourceRelativePath"] for item in plan["files"]} == expected
+                and all(item["sourceRelativePath"] == item["targetRelativePath"] for item in plan["files"]),
+                "Recorder-bound fixture plan must copy the complete source set without remapping")
     excluded_relative = plan.get("excludedRelativePath")
     if excluded_relative is not None:
         require(excluded_relative.startswith("samples/") and target(source_root, excluded_relative).is_dir(),
@@ -443,12 +469,17 @@ def prepare(run_path, plan_path, source_root=None):
                      "expectedMtimeMs": item["mtimeMs"], "role": item["role"]})
     require(len({row["targetRelativePath"].casefold() for row in rows}) == len(rows), "Duplicate destination names")
     require(any(row["targetRelativePath"].startswith("samples/") for row in rows), "At least one sample is required")
-    return root, state, rows, excluded_relative
+    binding = {"sourceRoot": str(source_root)}
+    if manifest_record is not None:
+        binding["sourceManifest"] = manifest_record
+    if recorder_record is not None:
+        binding["recorderFixtureManifest"] = {key: recorder_record[key] for key in ("path", "bytes", "sha256")}
+    return root, state, rows, excluded_relative, binding
 
 
 def materialize(run_path, plan_path, execute=False, source_root=None):
     run_sha, plan_sha = sha(unlinked(run_path)), sha(unlinked(plan_path))
-    root, state, rows, excluded_relative = prepare(run_path, plan_path, source_root)
+    root, state, rows, excluded_relative, binding = prepare(run_path, plan_path, source_root)
     require(sha(run_path) == run_sha and sha(plan_path) == plan_sha, "Run or source plan changed during validation")
     report = {"schemaVersion": 2, "kind": "qcopilots-search-cu-fixture-copy",
               "executed": execute, "complete": False, "runId": state["runId"], "identity": state["identity"],
@@ -458,7 +489,7 @@ def materialize(run_path, plan_path, execute=False, source_root=None):
               "sampleRoot": str(root / "samples"),
               "excludedRoot": str(root / excluded_relative) if excluded_relative else None,
               "negativeModelDirectory": str(root / "negative-models"), "manifestRelativePath": MANIFEST,
-              "files": rows, "acceptancePassed": False}
+              "files": rows, "acceptancePassed": False, **binding}
     if not execute:
         return report
     written = []
@@ -479,6 +510,9 @@ def materialize(run_path, plan_path, execute=False, source_root=None):
         for row in rows:
             check_file(row["source"]["path"], row["source"]["bytes"], row["source"]["sha256"], row["source"]["mtimeMs"])
             check_file(row["targetPath"], row["expectedBytes"], row["expectedSha256"], row["expectedMtimeMs"])
+        if "recorderFixtureManifest" in binding:
+            record = binding["recorderFixtureManifest"]
+            check_file(unlinked(root / record["path"]), record["bytes"], record["sha256"])
         report.update({"complete": True, "finishedAt": datetime.now(timezone.utc).isoformat(),
                        "sourceFilesUnchanged": True, "verifiedFileCount": len(rows)})
         manifest = report_target(root, MANIFEST)
