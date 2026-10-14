@@ -4,7 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import tempfile
@@ -18,6 +18,9 @@ from temp_paths import temporary_root
 spec = importlib.util.spec_from_file_location("qcs_gpu_abi", ROOT / "tools/qcs-gpu-abi.py")
 abi = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(abi)
+path_spec = importlib.util.spec_from_file_location("qcs_path_budget", ROOT / "tools/qcs-path-budget.py")
+path_budget = importlib.util.module_from_spec(path_spec)
+path_spec.loader.exec_module(path_budget)
 PARSER = argparse.ArgumentParser()
 PARSER.add_argument("--cmake", default="cmake")
 OPTIONS, REST = PARSER.parse_known_args()
@@ -65,6 +68,85 @@ message(STATUS "TARGETS=${{QCOPILOTS_SEARCH_GPU_TARGETS}}")
         result = self.configure({"id": "macos-x64-cpu", "os": "macos", "arch": "x64"})
         self.assertNotEqual(0, result.returncode)
         self.assertIn("Unknown QCS build variant", result.stderr)
+
+    def test_windows_gpu_subbuilds_keep_isolation_within_object_budget(self):
+        variants = [row for row in json.loads((ROOT / "config/build-variants.json").read_text())["variants"]
+                    if row["os"] == "windows" and row["backend"] in {"cuda", "hip"}]
+        self.assertEqual(3, len(variants))
+        configured = set()
+        with tempfile.TemporaryDirectory(prefix="qcs-gpu-path-", dir=temporary_root()) as root:
+            directory = Path(root)
+            source, upstream, sdk = directory / "source", directory / "upstream", directory / "sdk"
+            source.mkdir()
+            upstream.mkdir()
+            (upstream / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.28)\nproject(gpu-fixture LANGUAGES NONE)\n", encoding="utf-8")
+            (sdk / "lib/llvm/bin").mkdir(parents=True)
+            # Configuration checks the SDK layout without compiling or running it.
+            (sdk / "lib/llvm/bin/clang++.exe").write_bytes(b"configuration fixture")
+            (source / "CMakeLists.txt").write_text(f'''
+cmake_minimum_required(VERSION 3.28)
+project(qcs-gpu-path-contract LANGUAGES NONE)
+set(WIN32 TRUE)
+set(APPLE FALSE)
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR AMD64)
+set(Python3_EXECUTABLE "{Path(sys.executable).as_posix()}")
+set(QCOPILOTS_SEARCH_GPU_SDK_ROOT "{sdk.as_posix()}" CACHE PATH "")
+include("{(ROOT / 'cmake/qcs-output-paths.cmake').as_posix()}")
+include("{(ROOT / 'cmake/qcs-gpu-variants.cmake').as_posix()}")
+qcopilots_search_select_variant()
+add_library(ggml-base SHARED IMPORTED GLOBAL)
+set_target_properties(ggml-base PROPERTIES IMPORTED_LOCATION "{(directory / 'ggml-base.dll').as_posix()}")
+include("{(ROOT / 'cmake/qcs-gpu-backend.cmake').as_posix()}")
+qcopilots_search_add_windows_gpu_backend("{upstream.as_posix()}" _backend)
+get_target_property(_binary qcs-gpu-backend-build _EP_BINARY_DIR)
+get_target_property(_byproducts qcs-gpu-backend-build _EP_BUILD_BYPRODUCTS)
+get_target_property(_arguments qcs-gpu-backend-build _EP_CMAKE_ARGS)
+file(WRITE "${{CMAKE_BINARY_DIR}}/contract.txt" "binary=${{_binary}}\nbyproducts=${{_byproducts}}\narguments=${{_arguments}}\n")
+foreach(_config Debug Release RelWithDebInfo MinSizeRel)
+  string(TOUPPER "${{_config}}" _upper)
+  get_target_property(_module ${{_backend}} IMPORTED_LOCATION_${{_upper}})
+  file(APPEND "${{CMAKE_BINARY_DIR}}/contract.txt" "${{_config}}=${{_module}}\n")
+endforeach()
+''', encoding="utf-8")
+            for variant in variants:
+                for config in ("Debug", "Release"):
+                    with self.subTest(variant=variant["id"], config=config):
+                        build = directory / variant["id"] / config
+                        result = subprocess.run(
+                            [OPTIONS.cmake, "-S", str(source), "-B", str(build),
+                             f"-DQCOPILOTS_SEARCH_VARIANT={variant['id']}", f"-DCMAKE_BUILD_TYPE={config}"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                        contract = dict(line.split("=", 1) for line in (build / "contract.txt").read_text().splitlines())
+                        binary = Path(contract["binary"]).resolve()
+                        self.assertEqual((build / "nd/gpu").resolve(), binary)
+                        self.assertNotIn(binary, configured)
+                        configured.add(binary)
+                        backend = variant["backend"]
+                        for imported_config in ("Debug", "Release", "RelWithDebInfo", "MinSizeRel"):
+                            self.assertEqual(binary / "bin" / imported_config / f"ggml-{backend}.dll",
+                                             Path(contract[imported_config]).resolve())
+                        self.assertEqual(f"{binary.as_posix()}/bin/$<CONFIG>/ggml-{backend}.dll",
+                                         contract["byproducts"])
+                        if backend == "hip":
+                            self.assertIn("-DAMDGPU_TARGETS=gfx1200|gfx1201", contract["arguments"])
+                        else:
+                            self.assertNotIn("CMAKE_CUDA_ARCHITECTURES", contract["arguments"])
+                        # Use the actual CI root shape and the longest HIP template
+                        # path reported by the pinned upstream build (203 before).
+                        ci_binary = (PureWindowsPath("D:/a/_temp/qcs-bz1i4ln8") / variant["id"] / config
+                                     / PureWindowsPath(binary.relative_to(build).as_posix()))
+                        tail = (PureWindowsPath("ggml/src") / f"ggml-{backend}" / "CMakeFiles"
+                                / f"ggml-{backend}.dir" / config)
+                        if backend == "hip":
+                            tail /= "__/ggml-cuda"
+                        object_path = (ci_binary / tail / "template-instances"
+                                       / "fattn-mma-f16-instance-ncols1_1-ncols2_16.cu.obj")
+                        self.assertLessEqual(path_budget.path_length(object_path, "windows"),
+                                             path_budget.WINDOWS_OBJECT_BUDGET)
+        self.assertEqual(6, len(configured))
 
     def test_install_hook_uses_installed_module_and_actual_prefix(self):
         # The deployment wrapper must scan the installed module after CMake has

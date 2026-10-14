@@ -586,14 +586,51 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                     self.assertTrue(launcher_lines)
                     self.assertTrue(all(line.count("qcs-msvc-response.py") == 1 for line in launcher_lines))
                     self.assertEqual(list(current_build.rglob("qcs-msvc-*.rsp")), [])
-                # The copied unit must still use the actual consumer headers.
-                (project / "jpeglib.h").write_text(
+                # Verify the incremental edge itself before changing the
+                # header. Rebuilding from clean would hide a lost dependency.
+                objects = sorted(path for path in (native / "consumer").rglob("qcs-jpeg.c.*")
+                                 if path.suffix in (".obj", ".o"))
+                self.assertEqual(len(objects), 2, "Both JPEG consumers must compile the contract")
+                dependencies = subprocess.run(["cmake", "--build", str(current_build), "--", "-t", "deps"],
+                    cwd=self.root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                self.assertEqual(dependencies.returncode, 0, dependencies.stdout + dependencies.stderr)
+
+                def dependency_path(value):
+                    path = Path(value)
+                    return os.path.normcase(str((path if path.is_absolute() else current_build / path).resolve()))
+
+                dependency_records, current_object = {}, None
+                for line in dependencies.stdout.splitlines():
+                    if ": #deps " in line and not line[0].isspace():
+                        current_object = dependency_path(line.split(": #deps ", 1)[0])
+                        dependency_records[current_object] = set()
+                    elif current_object is not None and line.startswith("    "):
+                        dependency_records[current_object].add(dependency_path(line.strip()))
+                header = project / "jpeglib.h"
+                for object_path in objects:
+                    self.assertIn(dependency_path(str(header)),
+                                  dependency_records.get(dependency_path(str(object_path)), set()),
+                                  "Ninja lost the consumer JPEG header dependency:\n" + dependencies.stdout)
+                object_times = {str(path): path.stat().st_mtime_ns for path in objects}
+                original_header_time = header.stat().st_mtime_ns
+                # Same-size writes can retain a timestamp indistinguishable
+                # from the completed objects on a coarse or mounted filesystem.
+                # Advance only the changed header, preserving incremental work.
+                header.write_text(
                     "#define JPEG_LIB_VERSION 80\n#define LIBJPEG_TURBO_VERSION_NUMBER 3001004\n",
                     encoding="utf-8")
+                changed_header = header.stat()
+                os.utime(header, ns=(changed_header.st_atime_ns,
+                                    max(changed_header.st_mtime_ns, max(object_times.values()) + 2_000_000_000)))
+                timestamps = json.dumps({"originalHeaderMtimeNs": original_header_time,
+                    "changedHeaderMtimeNs": header.stat().st_mtime_ns,
+                    "objectMtimesNs": object_times}, indent=2)
+                self.assertGreater(header.stat().st_mtime_ns, max(object_times.values()), timestamps)
                 rejected = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
                                           encoding="utf-8", errors="replace", timeout=120)
-                self.assertNotEqual(rejected.returncode, 0)
-                self.assertIn("requires the pinned libjpeg API 62", rejected.stdout + rejected.stderr)
+                diagnostic = timestamps + "\n" + rejected.stdout + rejected.stderr
+                self.assertNotEqual(rejected.returncode, 0, diagnostic)
+                self.assertIn("requires the pinned libjpeg API 62", rejected.stdout + rejected.stderr, diagnostic)
 
     def test_msvc_response_encoding_exit_cleanup_and_parallel_calls(self):
         import codecs

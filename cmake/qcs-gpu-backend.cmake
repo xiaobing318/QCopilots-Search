@@ -10,7 +10,9 @@ function(qcopilots_search_add_windows_gpu_backend source_dir output)
   endif()
   set(QCOPILOTS_SEARCH_GPU_SDK_ROOT "" CACHE PATH "Verified GPU SDK root produced by qcs-gpu-sdk.py")
   set(_backend "${QCOPILOTS_SEARCH_GPU_BACKEND}")
-  set(_build "${CMAKE_BINARY_DIR}/nd/gpu-${QCOPILOTS_SEARCH_VARIANT}")
+  # The parent build already isolates variant and configuration. Avoid repeating
+  # that identity in long upstream CUDA/HIP template object paths.
+  set(_build "${CMAKE_BINARY_DIR}/nd/gpu")
   qcopilots_search_require_external_path(QCOPILOTS_SEARCH_GPU_BINARY_DIR "${_build}")
   set(_args
     -DCMAKE_BUILD_TYPE=$<CONFIG>
