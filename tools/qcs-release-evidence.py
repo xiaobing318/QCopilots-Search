@@ -370,7 +370,10 @@ def validate_package_release(doc, root: Path, *, model_fingerprint=None,
     check(errors, linkage == "shared-backend-dispatch"
           and {"llama", "mtmd", "ggml", "ggml-base", "cpu-backend"}.issubset({item.get("role") for item in libraries}),
           "Package shared backend runtime libraries are incomplete")
-    check(errors, runtime.get("cpuDispatch") is (expected_arch == "x64"),
+    dispatch = runtime.get("cpuDispatch")
+    check(errors, isinstance(dispatch, dict) and set(dispatch) == {"x64", "arm64"}
+          and all(type(value) is bool for value in dispatch.values())
+          and dispatch == {"x64": expected_arch == "x64", "arm64": False},
           "Package CPU dispatch selection differs from its architecture")
     check(errors, len({path_type(item.get("path", "")) for item in libraries}) == len(libraries),
           "Package inference runtime repeats a loaded file")
@@ -682,8 +685,12 @@ def validate_semantic(doc):
               and not relative.is_absolute() and ".." not in relative.parts and "\\" not in name and ":" not in name,
               "Multimodal functional file path is not a safe relative path")
         source_files.add(name)
+        modalities = row.get("extractedModalities")
         check(errors, integer_at_least(row.get("segments"), 1)
-              and isinstance(row.get("extractedModalities"), list) and bool(row["extractedModalities"])
+              and isinstance(modalities, dict) and bool(modalities)
+              and set(modalities).issubset({"text", "image", "audio", "video"})
+              and all(integer_at_least(count, 1) for count in modalities.values())
+              and sum(modalities.values()) == row["segments"]
               and isinstance(row.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is not None,
               "Multimodal functional file has no bound extraction and embedding output")
         by_id[row.get("id")] = name

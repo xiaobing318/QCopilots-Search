@@ -77,6 +77,8 @@ Linux CPU / Vulkan 使用 Ubuntu 22.04 基线，CUDA / ROCm 使用 Ubuntu 24.04 
 
 已有 Qt 时直接运行 `doctor`。未安装 SDK 时先运行 `bootstrap`。`check` 顺序执行环境诊断、配置、构建、模型准备、全部保留测试、安装、平台打包、最终包验证，以及 Windows / Linux 安装器验证。源码和符号使用独立动作，不在普通打包中重复生成。`check` 的本地记录包含 `semantic-functional.json`，并核对执行前后源码、四个程序、运行库和用户包的字节稳定性。Windows 完整检查按 NSIS → ZIP 顺序打包。每个生成器使用本次调用的独立 CPack 工作目录，生成后只清理本次受控 stage，保留用户指定的安装 stage 和已有历史产物。
 
+`check` 要求干净且身份确定的 Git 提交，存在未提交修改或显式候选与当前提交不一致时会在执行阶段前失败。日常 `build`、`test` 可以在有未提交修改的工作树中运行。
+
 ```powershell
 $buildRoot = 'C:\Dev\github-repos-compilations\qcs'
 $qtRoot = 'C:\Softwares\Qt'

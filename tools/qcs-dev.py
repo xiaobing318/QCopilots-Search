@@ -812,6 +812,25 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
     global _ACTIVE_LOG
     if args.test_label or args.keyword_only or args.generator or args.package_file:
         raise ValueError("check requires the entire test suite. Use individual actions for filtered work.")
+    evidence = helper_module("tools/qcs-release-evidence.py", "qcs_check_release")
+    identity = evidence.source_identity(SOURCE)
+    identity_errors = evidence.valid_identity(identity)
+    if identity.get("candidateHead") != identity.get("checkoutCommit"):
+        identity_errors.append("The candidate differs from the current checkout")
+    if identity_errors:
+        raise ValueError("check requires a clean immutable source checkout: " + "; ".join(identity_errors))
+    declarations = {name: environment[name] for name in (
+        "QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD", "QCOPILOTS_SEARCH_SOURCE_COMMIT")
+        if name in environment}
+    if getattr(args, "candidate_commit", None) is not None:
+        declarations["--candidate-commit"] = args.candidate_commit
+    for argument in getattr(args, "cmake_arg", []):
+        declaration = re.fullmatch(r"-DQCOPILOTS_SEARCH_CANDIDATE_COMMIT(?::[^=]+)?=(.+)", argument)
+        if declaration:
+            declarations[argument] = declaration.group(1)
+    for name, commit in declarations.items():
+        if commit != identity["checkoutCommit"]:
+            raise ValueError(f"check candidate differs from the current checkout: {name}")
     directory = args.report_dir.expanduser().resolve() if args.report_dir else Path(tempfile.mkdtemp(prefix="check-", dir=reports))
     assert_external(directory)
     if root not in directory.parents:
@@ -819,8 +838,6 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
     if directory.exists() and any(directory.iterdir()):
         raise RuntimeError("check requires an empty, unique report directory")
     directory.mkdir(parents=True, exist_ok=True)
-    evidence = helper_module("tools/qcs-release-evidence.py", "qcs_check_release")
-    identity = evidence.source_identity(SOURCE)
     original_sources = source_snapshot()
     document = {"schemaVersion": 2, "kind": "developer-check", "variant": args.variant, "config": args.config,
                 "system": platform.system(), "buildRoot": str(root), "identity": identity,
@@ -894,6 +911,18 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
         document["files"] = [evidence.file_record(root, path) for path in sorted(set(paths))]
         evidence.write_json(report_path, document)
         print(f"Developer check report: {report_path}")
+    try:
+        inspection = inspect_check(report_path, identity["checkoutCommit"])
+        validation_errors = inspection["errors"]
+        if inspection["passed"] is not True and not validation_errors:
+            validation_errors = ["The final report validator did not confirm success"]
+    except Exception as error:
+        validation_errors = [f"Cannot validate the final developer check report: {error}"]
+    if validation_errors:
+        document["passed"] = False
+        document["validationErrors"] = validation_errors
+        evidence.write_json(report_path, document)
+        raise RuntimeError("Developer check report validation failed: " + "; ".join(validation_errors))
     return report_path
 
 

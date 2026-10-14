@@ -139,7 +139,7 @@ def package_release_fixture(root, *, worker=None, model_fingerprint="synthetic-m
                                     for name in ("screen.png", "speech.wav", "vectors.json")},
                 "vectors": vectors,
                 "runtime": {"linkage": "shared-backend-dispatch", "architecture": "amd64",
-                    "cpuBaselineForced": False, "cpuDispatch": True,
+                    "cpuBaselineForced": False, "cpuDispatch": {"x64": True, "arm64": False},
                     "diagnostics": diagnostics,
                     "workerExecutable": {"path": str(worker.resolve()), "bytes": worker.stat().st_size,
                                          "sha256": hashlib.sha256(worker.read_bytes()).hexdigest()},
@@ -181,7 +181,7 @@ class PackageReleaseEvidenceTests(unittest.TestCase):
 
     def test_apple_silicon_uses_shared_metal_libraries_without_x64_cpu_dispatch(self):
         runtime = self.doc["modelSmoke"]["runtime"]
-        runtime.update({"architecture": "arm64", "cpuDispatch": False})
+        runtime.update({"architecture": "arm64", "cpuDispatch": {"x64": False, "arm64": False}})
         self.doc["variant"] = "macos-arm64-metal"
         self.doc["buildIdentity"].update({"variant": "macos-arm64-metal", "backend": "metal"})
         for diagnostics in (runtime["diagnostics"], self.doc["backendVerification"]["cpu"]["diagnostics"],
@@ -190,8 +190,56 @@ class PackageReleaseEvidenceTests(unittest.TestCase):
         runtime["diagnostics"]["fallbackReason"] = "No compatible Metal device in synthetic fixture"
         self.doc["backendVerification"]["strictGpu"]["reason"] = runtime["diagnostics"]["fallbackReason"]
         self.assertEqual(self.inspect(platform_id="macos-arm64-metal"), [])
-        runtime["cpuDispatch"] = True
-        self.assertTrue(self.inspect(platform_id="macos-arm64-metal"))
+        for dispatch in ({"x64": True, "arm64": False}, {"x64": False, "arm64": True}):
+            with self.subTest(dispatch=dispatch):
+                runtime["cpuDispatch"] = dispatch
+                self.assertIn("Package CPU dispatch selection differs from its architecture",
+                              self.inspect(platform_id="macos-arm64-metal"))
+
+    def test_cpu_dispatch_requires_exact_boolean_architecture_mapping(self):
+        invalid = (None, True, False, [], {}, {"x64": True}, {"arm64": False},
+                   {"x64": True, "arm64": False, "other": False},
+                   {"x64": 1, "arm64": False}, {"x64": True, "arm64": 0},
+                   {"x64": "true", "arm64": False}, {"x64": False, "arm64": False},
+                   {"x64": True, "arm64": True})
+        for value in invalid:
+            with self.subTest(value=value):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["runtime"]["cpuDispatch"] = value
+                self.assertIn("Package CPU dispatch selection differs from its architecture", self.inspect(changed))
+        self.doc["modelSmoke"]["runtime"].pop("cpuDispatch")
+        self.assertIn("Package CPU dispatch selection differs from its architecture", self.inspect())
+
+    def test_real_runtime_report_producer_matches_release_validator_contract(self):
+        producer_spec = importlib.util.spec_from_file_location(
+            "qcs_package_producer_contract",
+            Path(__file__).resolve().parents[2] / "tools/qcs-verify-package.py")
+        producer = importlib.util.module_from_spec(producer_spec)
+        producer_spec.loader.exec_module(producer)
+        cases = (("amd64", "win32", "windows-x64-cpu", "cpu"),
+                 ("x86_64", "linux", "linux-x64-cpu", "cpu"),
+                 ("arm64", "darwin", "macos-arm64-metal", "metal"),
+                 ("aarch64", "darwin", "macos-arm64-metal", "metal"))
+        for architecture, host, variant, backend in cases:
+            with self.subTest(architecture=architecture, variant=variant):
+                changed = deepcopy(self.doc)
+                runtime = changed["modelSmoke"]["runtime"]
+                changed["variant"] = variant
+                changed["buildIdentity"].update({"variant": variant, "backend": backend})
+                for diagnostics in (runtime["diagnostics"], changed["backendVerification"]["cpu"]["diagnostics"],
+                                    changed["backendVerification"]["strictGpu"]["diagnostics"]):
+                    diagnostics.update({"buildVariant": variant, "packagedBackend": backend})
+                if backend != "cpu":
+                    runtime["diagnostics"]["fallbackReason"] = "No GPU in synthetic producer contract test"
+                application = Path(changed["applicationRoot"])
+                libraries = [item["path"] for item in runtime["libraries"]]
+                with mock.patch.object(producer.platform, "machine", return_value=architecture), \
+                        mock.patch.object(producer.sys, "platform", host), \
+                        mock.patch.object(producer, "loaded_libraries", return_value=libraries):
+                    changed["modelSmoke"]["runtime"] = producer.inference_runtime_origins(
+                        object(), Path(runtime["workerExecutable"]["path"]), application,
+                        diagnostics=runtime["diagnostics"])
+                self.assertEqual(self.inspect(changed, platform_id=variant), [])
 
     def test_build_variant_and_backend_diagnostics_are_required(self):
         for field in ("variant", "buildIdentity", "backendVerification"):
@@ -372,7 +420,7 @@ class PackageReleaseEvidenceTests(unittest.TestCase):
         self.assertTrue(self.inspect())
 
     def test_x64_cpu_dispatch_cannot_be_omitted_or_reported_as_static(self):
-        for field, value in (("linkage", "static"), ("cpuDispatch", False)):
+        for field, value in (("linkage", "static"), ("cpuDispatch", {"x64": False, "arm64": False})):
             with self.subTest(field=field):
                 changed = deepcopy(self.doc)
                 changed["modelSmoke"]["runtime"][field] = value
@@ -505,23 +553,25 @@ def semantic_fixture():
     """Synthetic functional-report contract, never evidence of model execution."""
     source = Path(__file__).resolve().parents[2]
     fixtures = (
-        ("text", "txt", "text"), ("pdf", "pdf", "text"), ("code", "py", "text"),
-        ("illustration", "png", "image"), ("photo", "jpg", "image"),
-        ("ocr-en", "png", "image"), ("ocr-zh", "png", "image"),
-        ("speech", "wav", "audio"), ("environment", "ogg", "audio"),
-        ("tone", "wav", "audio"), ("video-generated", "avi", "video"),
-        ("video-natural", "webm", "video"),
+        ("text", "txt", "text", {"text": 1}), ("pdf", "pdf", "pdf", {"text": 1}),
+        ("code", "py", "code", {"text": 1}),
+        ("illustration", "png", "image", {"image": 1}), ("photo", "jpg", "image", {"image": 1}),
+        ("ocr-en", "png", "ocr", {"image": 1}), ("ocr-zh", "png", "ocr", {"image": 1}),
+        ("speech", "wav", "audio", {"audio": 1}), ("environment", "ogg", "audio", {"audio": 1}),
+        ("tone", "wav", "audio", {"audio": 1}), ("video-generated", "avi", "video", {"image": 2}),
+        ("video-natural", "webm", "video", {"audio": 2, "image": 8}),
     )
     files = [{"id": name, "file": f"{name}/source.{extension}", "modality": modality,
-              "code": name == "code", "segments": 1,
-              "extractedModalities": ["image", "audio"] if modality == "video" else [modality],
+              "code": name == "code", "segments": sum(modalities.values()),
+              "extractedModalities": modalities,
               "extractedTextCharacters": 100 if name in ("text", "pdf", "code", "ocr-en", "ocr-zh") else 0,
               "sha256": hashlib.sha256(("SYNTHETIC FILE " + name).encode()).hexdigest()}
-             for name, extension, modality in fixtures]
+             for name, extension, modality, modalities in fixtures]
     return {"schema": 2, "test": "multimodal-functional", "mode": "functional",
             "syntheticValidatorFixture": True, "passed": True, "realModel": True,
             "persisted": True, "reloaded": True, "fixtures": 12, "completedFiles": 12,
-            "queryCount": 24, "completedQueries": 24, "actualEmbeddedSegments": 12,
+            "queryCount": 24, "completedQueries": 24,
+            "actualEmbeddedSegments": sum(item["segments"] for item in files),
             "modelFingerprint": "synthetic-model-fingerprint",
             "extractionFingerprint": "synthetic-extraction-fingerprint",
             "fixtureManifestSha256": hashlib.sha256(
@@ -539,6 +589,39 @@ def semantic_fixture():
 class SemanticFunctionalEvidenceTests(unittest.TestCase):
     def test_complete_functional_contract_validates_without_running_a_model(self):
         self.assertEqual(evidence.validate_semantic(semantic_fixture()), [])
+
+    def test_extracted_modalities_require_a_nonempty_count_mapping(self):
+        doc = semantic_fixture()
+        del doc["files"][0]["extractedModalities"]
+        self.assertTrue(evidence.validate_semantic(doc))
+        for value in (None, {}, [], ["text"], "text", 1, True):
+            with self.subTest(value=value):
+                doc = semantic_fixture()
+                doc["files"][0]["extractedModalities"] = value
+                self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_extracted_modality_counts_are_positive_integers_not_booleans(self):
+        for value in (0, -1, True, False, 1.0, "1", None, {}, []):
+            with self.subTest(value=value):
+                doc = semantic_fixture()
+                doc["files"][0]["extractedModalities"] = {"text": value}
+                self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_extracted_modality_names_are_known_encoding_channels(self):
+        for name in ("unknown", "pdf", "ocr", "", "Text", " text", 1):
+            with self.subTest(name=name):
+                doc = semantic_fixture()
+                doc["files"][0]["extractedModalities"] = {name: 1}
+                self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_extracted_modality_counts_bind_every_embedded_segment(self):
+        for modalities in ({"image": 8}, {"audio": 2}, {"audio": 2, "image": 7},
+                           {"audio": 2, "image": 8, "text": 1},
+                           {"audio": 2, "image": 7, "unknown": 1}):
+            with self.subTest(modalities=modalities):
+                doc = semantic_fixture()
+                doc["files"][-1]["extractedModalities"] = modalities
+                self.assertTrue(evidence.validate_semantic(doc))
 
     def test_validation_only_or_missing_real_inference_cannot_claim_completion(self):
         for field, value in (("mode", "validate-only"), ("passed", False),

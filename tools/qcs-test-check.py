@@ -50,6 +50,7 @@ class CheckTests(unittest.TestCase):
         self.environment = {"QCS_SYNTHETIC_FIXTURE": "1"}
         self.calls = []
         self.real_helper = workflow.helper_module
+        self.real_inspect = workflow.inspect_check
 
     def args(self, **overrides):
         values = dict(config="Release", variant="linux-x64-cpu", test_label=None, keyword_only=False,
@@ -184,6 +185,7 @@ class CheckTests(unittest.TestCase):
                 patch.object(workflow, "execute_action", side_effect=execute or self.record_stage), \
                 patch.object(workflow, "source_snapshot", return_value={"main.cpp": {"bytes": 1, "sha256": "f" * 64}}), \
                 patch.object(workflow, "executable_snapshot", return_value={name: {"bytes": 1, "sha256": "e" * 64} for name in ("qcs-gui", "qcs-service", "qcs-worker", "qcs-cli")}), \
+                patch.object(workflow, "inspect_check", return_value={"passed": True, "errors": []}), \
                 redirect_stdout(io.StringIO()):
             yield
 
@@ -252,6 +254,49 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(all(call["args"].model_dir == model_dir for call in self.calls))
         self.assertTrue(all(call["environment"]["QCOPILOTS_SEARCH_MODEL_DIR"] == str(model_dir) for call in self.calls))
 
+    def test_final_report_validation_runs_after_complete_bound_report_is_written(self):
+        inspected = []
+
+        def inspect(path, head):
+            document = evidence.read_json(path)
+            self.assertEqual(head, HEAD)
+            self.assertTrue(document["passed"])
+            self.assertIn("finishedAt", document)
+            self.assertTrue(all(stage["status"] == "passed" for stage in document["stages"]))
+            self.assert_bound_logs(document, len(workflow.check_plan("Linux")))
+            self.assertEqual(set(document["packages"]),
+                             {"pkg/Release/qcs-example.tar.gz", "pkg/Release/qcs-example.deb"})
+            inspected.append(path)
+            return {"passed": True, "errors": []}
+
+        with self.runtime(), patch.object(workflow, "inspect_check", side_effect=inspect):
+            path = self.invoke(self.args())
+        self.assertEqual(inspected, [path])
+        self.assertEqual(len(self.calls), len(workflow.check_plan("Linux")))
+        self.assertNotIn("validationErrors", evidence.read_json(path))
+
+    def test_rejected_complete_report_cannot_be_reported_as_success(self):
+        errors = ["Package capabilities modalities are incomplete", "CPU dispatch evidence is invalid"]
+        with self.runtime(), patch.object(workflow, "inspect_check", return_value={"passed": False, "errors": errors}) as inspect, \
+                self.assertRaisesRegex(RuntimeError, "Developer check report validation failed"):
+            self.invoke(self.args())
+        path, document = self.latest()
+        inspect.assert_called_once_with(path, HEAD)
+        self.assertFalse(document["passed"])
+        self.assertFalse(document["releaseComplete"])
+        self.assertEqual(document["validationErrors"], errors)
+        self.assertTrue(all(stage["status"] == "passed" for stage in document["stages"]))
+        self.assertEqual(len(self.calls), len(workflow.check_plan("Linux")), "Validation cannot repeat stages")
+        self.assert_bound_logs(document, len(self.calls))
+
+    def test_final_validator_exception_cannot_leave_a_success_report(self):
+        with self.runtime(), patch.object(workflow, "inspect_check", side_effect=ValueError("invalid schema")), \
+                self.assertRaisesRegex(RuntimeError, "invalid schema"):
+            self.invoke(self.args())
+        _, document = self.latest()
+        self.assertFalse(document["passed"])
+        self.assertIn("invalid schema", document["validationErrors"][0])
+
     def test_failed_command_preserves_stdout_stderr_and_does_not_run_downstream(self):
         def execute(action, *arguments):
             self.record_stage(action, *arguments)
@@ -304,6 +349,37 @@ class CheckTests(unittest.TestCase):
                 self.invoke(self.args(**{option: value}))
             self.assertEqual(self.calls, [])
             self.assertEqual(list(self.reports.iterdir()), [])
+
+    def test_check_rejects_dirty_source_before_reports_or_stages(self):
+        dirty = dict(IDENTITY, workingTreeModified=True)
+        with self.runtime(identities=[dirty]), \
+                patch.object(workflow, "source_snapshot") as snapshot, \
+                self.assertRaisesRegex(ValueError, "clean immutable source checkout"):
+            self.invoke(self.args())
+        snapshot.assert_not_called()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(list(self.reports.iterdir()), [])
+
+    def test_check_rejects_candidate_mismatch_before_reports_or_stages(self):
+        cases = [({"candidate_commit": "d" * 40}, {}),
+                 ({"cmake_arg": ["-DQCOPILOTS_SEARCH_CANDIDATE_COMMIT:STRING=" + "d" * 40]}, {})]
+        cases.extend(({}, {name: "d" * 40}) for name in (
+            "QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD", "QCOPILOTS_SEARCH_SOURCE_COMMIT"))
+        for arguments, environment in cases:
+            with self.subTest(arguments=arguments, environment=environment), self.runtime(), \
+                    patch.dict(self.environment, environment), \
+                    patch.object(workflow, "source_snapshot") as snapshot, \
+                    self.assertRaisesRegex(ValueError, "candidate differs"):
+                self.invoke(self.args(**arguments))
+            snapshot.assert_not_called()
+            self.assertEqual(self.calls, [])
+            self.assertEqual(list(self.reports.iterdir()), [])
+
+    def test_check_accepts_matching_explicit_candidate(self):
+        with self.runtime(), patch.dict(self.environment, {"QCOPILOTS_SEARCH_CANDIDATE_HEAD": HEAD}):
+            path = self.invoke(self.args(candidate_commit=HEAD))
+        self.assertTrue(evidence.read_json(path)["passed"])
+        self.assertEqual(len(self.calls), len(workflow.check_plan("Linux")))
 
     def test_existing_report_directory_is_not_overwritten(self):
         directory = self.reports / "previous"
@@ -437,13 +513,14 @@ class CheckTests(unittest.TestCase):
             self.assertNotIn(path.relative_to(self.root).as_posix(), bound)
 
     def test_inspection_rejects_stage_success_without_original_test_evidence(self):
-        with self.runtime():
-            path = self.invoke(self.args())
-            result = workflow.inspect_check(path, HEAD)
-        self.assertTrue(evidence.read_json(path)["passed"], "Synthetic stage success alone is not acceptance")
-        self.assertFalse(result["passed"])
-        self.assertTrue(any("test-selection.json" in error or "original evidence" in error for error in result["errors"]),
-                        result["errors"])
+        with self.runtime(), patch.object(workflow, "inspect_check", side_effect=self.real_inspect), \
+                self.assertRaisesRegex(RuntimeError, "Developer check report validation failed"):
+            self.invoke(self.args())
+        _, document = self.latest()
+        self.assertFalse(document["passed"], "Stage success cannot replace acceptance of the original evidence")
+        self.assertTrue(all(stage["status"] == "passed" for stage in document["stages"]))
+        self.assertTrue(any("test-selection.json" in error or "original evidence" in error
+                            for error in document["validationErrors"]), document["validationErrors"])
 
     def test_inspection_rejects_report_moved_without_evidence_tree(self):
         with self.runtime():
@@ -451,7 +528,7 @@ class CheckTests(unittest.TestCase):
             moved = self.root / "unrelated" / "check-report.json"
             moved.parent.mkdir()
             shutil.copyfile(path, moved)
-            result = workflow.inspect_check(moved, HEAD)
+            result = self.real_inspect(moved, HEAD)
         self.assertFalse(result["passed"])
         self.assertTrue(any("moved without its evidence tree" in error for error in result["errors"]), result["errors"])
 
@@ -461,7 +538,7 @@ class CheckTests(unittest.TestCase):
             document = evidence.read_json(path)
             document["reportPath"] = "../check-report.json"
             evidence.write_json(path, document)
-            result = workflow.inspect_check(path, HEAD)
+            result = self.real_inspect(path, HEAD)
         self.assertFalse(result["passed"])
         self.assertTrue(any("not relative" in error for error in result["errors"]), result["errors"])
 
