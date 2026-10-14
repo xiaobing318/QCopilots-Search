@@ -8,7 +8,28 @@ target_link_libraries(qcs-tests-backend-layout PRIVATE qcs-test-support Qt6::Cor
 qcopilots_search_add_test(NAME qcs-tests-backend-layout
   COMMAND "$<TARGET_FILE:qcs-tests-backend-layout>" -o "-,txt")
 set_tests_properties(qcs-tests-backend-layout PROPERTIES LABELS "unit;runtime;package" TIMEOUT 60)
+foreach(_helper selection loader)
+  if(_helper STREQUAL "selection")
+    set(_implementation BackendSelection.cpp)
+  else()
+    set(_implementation BackendLoader.cpp)
+  endif()
+  add_executable(qcs-tests-backend-${_helper} backend_${_helper}_test.cpp
+    "${PROJECT_SOURCE_DIR}/src/runtime/${_implementation}")
+  target_include_directories(qcs-tests-backend-${_helper} PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(qcs-tests-backend-${_helper} PRIVATE qcs-test-support Qt6::Core Qt6::Test)
+  qcopilots_search_add_test(NAME qcs-tests-backend-${_helper}
+    COMMAND "$<TARGET_FILE:qcs-tests-backend-${_helper}>" -o "-,txt")
+  set_tests_properties(qcs-tests-backend-${_helper} PROPERTIES LABELS "unit;runtime;gpu" TIMEOUT 60)
+endforeach()
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+qcopilots_search_add_test(NAME qcs-tests-gpu-configuration
+  COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/gpu_configuration_test.py"
+    --cmake "${CMAKE_COMMAND}" -v)
+set_tests_properties(qcs-tests-gpu-configuration PROPERTIES LABELS "unit;runtime;workflow;gpu" TIMEOUT 120)
+qcopilots_search_add_test(NAME qcs-tests-gpu-tools
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-gpu-tests.py" -v)
+set_tests_properties(qcs-tests-gpu-tools PROPERTIES LABELS "unit;runtime;package;gpu" TIMEOUT 120)
 qcopilots_search_add_test(NAME qcs-tests-output-paths
   COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/output_paths_test.py"
     --cmake "${CMAKE_COMMAND}")
@@ -49,7 +70,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     COMMAND "$<TARGET_FILE:qcs-tests-reference-vectors>" vectorsMatchReference -o "-,txt")
   set_tests_properties(qcs-tests-reference-vectors-baseline PROPERTIES
     LABELS "real-model;runtime;cpu-baseline;slow" TIMEOUT 1800 RUN_SERIAL TRUE
-    ENVIRONMENT "QCOPILOTS_SEARCH_CPU_BASELINE=1")
+    ENVIRONMENT "QCOPILOTS_SEARCH_CPU_BASELINE=1;QCOPILOTS_SEARCH_BACKEND=cpu")
   if(QCOPILOTS_SEARCH_MODEL_DIR)
     set_property(TEST qcs-tests-reference-vectors-baseline APPEND PROPERTY ENVIRONMENT
       "QCOPILOTS_SEARCH_MODEL_DIR=${QCOPILOTS_SEARCH_MODEL_DIR}")

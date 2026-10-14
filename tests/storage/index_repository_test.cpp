@@ -226,7 +226,6 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(1);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         QVERIFY(repository.search(semantic, &error).isEmpty());
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QVERIFY(repository.fileVersion(path, false, &error).isEmpty());
@@ -310,7 +309,6 @@ private slots:
         }, &error), qPrintable(error));
         SearchOptions options;
         options.queryEmbedding = basis(0);
-        options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         options.limit = 1;
         const auto all = repository.search(options, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
@@ -354,7 +352,6 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         QVERIFY(repository.search(semantic, &error).isEmpty());
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
@@ -391,7 +388,6 @@ private slots:
         QCOMPARE(after.value(QStringLiteral("pendingShards")), before.value(QStringLiteral("pendingShards")));
         auto search = query(QStringLiteral("survivorword"));
         search.queryEmbedding = basis(0);
-        search.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = repository.search(search, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(1));
@@ -493,7 +489,6 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = reopened.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(1));
@@ -527,7 +522,6 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = reopened.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(1));
@@ -629,7 +623,6 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(1);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         semantic.limit = 1;
         const auto hits = repository.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
@@ -651,7 +644,6 @@ private slots:
         const QString path = environment.path(QStringLiteral("imported.txt"));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         QString error;
         {
             IndexRepository repository;
@@ -829,7 +821,6 @@ private slots:
                     SearchOptions semantic;
                     semantic.code = code;
                     semantic.queryEmbedding = current.embedding;
-                    semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
                     const auto semanticHits = repository.search(semantic, &error);
                     QVERIFY2(error.isEmpty(), qPrintable(error));
                     QCOMPARE(semanticHits.size(), qsizetype(1));
@@ -861,7 +852,6 @@ private slots:
         SearchOptions semantic;
         semantic.code = true;
         semantic.queryEmbedding = basis(2);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto remainingCode = repository.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(remainingCode.size(), qsizetype(1));
@@ -1063,11 +1053,9 @@ private slots:
         keyword.cancelled = cancelled;
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         semantic.cancelled = cancelled;
         auto hybrid = keyword;
         hybrid.queryEmbedding = basis(0);
-        hybrid.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         for (const auto &options : {keyword, semantic, hybrid}) {
             cancelled->store(true, std::memory_order_relaxed);
             QVERIFY(repository.search(options, &error).isEmpty());
@@ -1115,7 +1103,6 @@ private slots:
         QCOMPARE(repository.status(&error).value(QStringLiteral("annVectors")).toInteger(), qint64(files.size() - 1));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
-        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = repository.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(files.size() - 1));

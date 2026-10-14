@@ -453,6 +453,35 @@ private slots:
         QVERIFY(message->text().contains("incompatible versions"));
         QCOMPARE(backend.count("search"), 0);
     }
+    void inferenceStatusShowsBackendDeviceAndFallback() {
+        TestEnvironment env("gui-inference-status"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoStatus = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        QTRY_COMPARE(backend.count("status"), 1);
+        const QJsonObject runtime{{"buildVariant", "windows-x64-vulkan"}, {"selectedBackend", "cpu"},
+            {"deviceName", "CPU"}, {"deviceDescription", "Portable processor backend"},
+            {"gpuSelected", false}, {"loaded", true}, {"fallbackReason", "No Vulkan device is available"}};
+        emit backend.response(backend.last("status").id, {{"modelAvailable", true}, {"runtime", runtime}});
+        auto *status = window.findChild<QLabel *>("inferenceRuntimeStatus"); QVERIFY(status);
+        QVERIFY(status->isVisible());
+        QVERIFY(status->text().contains("windows-x64-vulkan"));
+        QVERIFY(status->text().contains("Inference: CPU"));
+        QVERIFY(status->text().contains("CPU fallback: No Vulkan device is available"));
+        QCOMPARE(status->toolTip(), QString("Portable processor backend"));
+        auto stopped = runtime; stopped.insert("loaded", false);
+        emit backend.eventReceived("runtime", {{"runtime", stopped}});
+        QVERIFY(status->text().contains("Last inference (idle)"));
+        stopped.insert("error", "Strict GPU initialization failed");
+        stopped.insert("fallbackReason", "");
+        emit backend.eventReceived("runtime", {{"runtime", stopped}});
+        QVERIFY(status->text().contains("Inference unavailable"));
+        QVERIFY(status->text().contains("Strict GPU initialization failed"));
+        QVERIFY(!status->text().contains("CPU fallback"));
+        backend.settings.language = "zh_CN";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QVERIFY(status->text().contains(QString::fromUtf8("推理不可用")));
+    }
     void independentFoldersAndExternalApplicationArgumentsRoundTrip() {
         AppSettings settings; settings.language = "en"; settings.roots = {"ordinary"}; settings.excludes = {"ordinary/private"};
         settings.codeRoots = {"code"}; settings.codeExcludes = {"code/build"}; settings.includeCode = false;
@@ -699,6 +728,9 @@ private slots:
     void keyboardNavigationAndQuickSearch() {
         TestEnvironment env("gui-keyboard"); QVERIFY(env.isValid());
         FakeBackend backend; SearchHit hit; hit.path = env.path("example.txt"); hit.text = "example"; backend.hits << hit;
+        backend.settings.includeCode = true;
+        backend.settings.roots << env.path("documents");
+        backend.settings.codeRoots << env.path("source code");
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
         auto *results = window.findChild<QListWidget *>("searchResults");
@@ -709,13 +741,55 @@ private slots:
         QCOMPARE(window.focusWidget(), results);
         QTest::keyClick(results, Qt::Key_Escape);
         QCOMPARE(window.focusWidget(), input);
+        backend.autoSearch = false;
+        auto *kind = window.findChild<QComboBox *>("kindFilter");
+        auto *root = window.findChild<QComboBox *>("rootFilter");
+        auto *code = window.findChild<QCheckBox *>("codeSearchCheck");
+        kind->setCurrentIndex(kind->findData("pdf"));
+        code->setChecked(true);
+        root->setCurrentIndex(1);
+        input->setText("updated quick query");
+        QTRY_COMPARE(backend.last("search").params.value("root").toString(), env.path("source code"));
+        QVERIFY(backend.last("search").params.value("code").toBool());
+        const auto oldMain = backend.last("search");
         window.showQuickSearch();
         auto *quick = window.findChild<SearchEdit *>("quickSearchInput"); QVERIFY(quick);
         quick->setText("quick query");
         QTRY_COMPARE(backend.last("search").params.value("query").toString(), QString("quick query"));
         QCOMPARE(backend.last("search").params.value("limit").toInt(), 12);
+        const auto oldQuick = backend.last("search");
+        QVERIFY(!oldQuick.params.value("code").toBool());
+        QCOMPARE(oldQuick.params.value("kind").toString(), QString());
+        QCOMPARE(oldQuick.params.value("root").toString(), QString());
+        quick->setText("updated quick query");
+        const int searchesBefore = backend.count("search");
         QTest::mouseClick(window.findChild<QPushButton *>("openFullSearchButton"), Qt::LeftButton);
-        QCOMPARE(input->text(), QString("quick query"));
+        QCOMPARE(input->text(), QString("updated quick query"));
+        QVERIFY(!code->isChecked());
+        QVERIFY(kind->isEnabled());
+        QCOMPARE(kind->currentData().toString(), QString());
+        QCOMPARE(root->currentData().toString(), QString());
+        QCOMPARE(root->itemData(1).toString(), env.path("documents"));
+        QCOMPARE(backend.count("search"), searchesBefore + 1);
+        auto expected = oldQuick.params;
+        expected.insert("query", "updated quick query");
+        expected.insert("limit", 100);
+        const auto fullSearch = backend.last("search");
+        QCOMPARE(fullSearch.params, expected);
+        QVERIFY(backend.cancelled.contains(oldMain.id));
+        QVERIFY(backend.cancelled.contains(oldQuick.id));
+        QJsonArray freshHits;
+        SearchHit fresh = hit; fresh.title = "Current full search";
+        freshHits.append(fresh.toJson());
+        emit backend.response(fullSearch.id, {{"hits", freshHits}, {"semantic", false}});
+        QCOMPARE(results->count(), 1);
+        QVERIFY(results->item(0)->text().contains(fresh.title));
+        emit backend.response(oldMain.id, {{"hits", QJsonArray{}}, {"semantic", false}});
+        emit backend.response(oldQuick.id, {{"hits", QJsonArray{}}, {"semantic", false}});
+        QCOMPARE(results->count(), 1);
+        QVERIFY(results->item(0)->text().contains(fresh.title));
+        QTest::qWait(300);
+        QCOMPARE(backend.count("search"), searchesBefore + 1);
     }
     void textPreviewDoesNotExecuteHtml() {
         TestEnvironment env("gui-html"); QVERIFY(env.isValid()); QVERIFY(env.writeFile("sample.html", "<h1>Heading</h1>"));

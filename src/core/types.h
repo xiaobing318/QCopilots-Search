@@ -50,8 +50,6 @@ struct SearchHit {
     static SearchHit fromJson(const QJsonObject &value);
 };
 
-enum class SemanticCandidateMode { MatchesOnly, RawCandidates };
-
 struct SearchOptions {
     QString query;
     QString kind;
@@ -65,8 +63,6 @@ struct SearchOptions {
     // Process-local cancellation shared by service, SQLite and ANN search.
     // The pointer is never serialized or sent over IPC.
     std::shared_ptr<std::atomic_bool> cancelled;
-    // Raw candidates are for process-local calibration and ANN measurements.
-    SemanticCandidateMode semanticCandidateMode = SemanticCandidateMode::MatchesOnly;
 };
 
 // Browsing operates on indexed files, independently of segment search/ranking.
@@ -119,6 +115,7 @@ struct IndexProgress {
 };
 
 inline constexpr int protocolVersion = 1;
+inline constexpr int maximumSearchResults = 500;
 inline constexpr int embeddingDimensions = 768;
 inline constexpr qsizetype maxMessageBytes = 16 * 1024 * 1024;
 

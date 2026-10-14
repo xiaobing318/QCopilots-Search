@@ -55,6 +55,19 @@ WORKFLOW_JUNCTION_CASE = "__main__.WorkflowTests.test_clean_rejects_windows_junc
 RUNNER_TEST = "qcs-tests-runner"
 RUNNER_WINDOWS_HANDLE_CASE = "__main__.TestRunner.test_real_windows_exclusive_handle_still_fails_cleanup"
 RUNNER_WINDOWS_HANDLE_SKIP_REASON = "Windows exclusive file handles require Windows"
+WINDOWS_NATIVE_PROGRAM_CASES = {
+    "qcs-tests-gpu-configuration": {
+        "__main__.AbiTests.test_real_windows_system_image": "Uses an actual host PE library",
+    },
+    "qcs-tests-windows-package": {
+        "__main__.NativeInstallerTests." + name: "The native NSIS installer runs on Windows"
+        for name in (
+            "test_install_uninstall_preserves_unowned_file",
+            "test_missing_payload_fails_before_installing",
+            "test_overlapping_payload_destination_is_rejected",
+            "test_same_length_corruption_fails_before_installing")
+    },
+}
 ACCEPTANCE_TEST = "qcs-tests-acceptance-runners"
 ACCEPTANCE_NATIVE_TEST = "qcs-tests-acceptance-native"
 ACCEPTANCE_WINDOWS_SKIP_REASON = "Windows native PowerShell and NTFS ACL contract"
@@ -170,6 +183,8 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
                     and identifier == WORKFLOW_JUNCTION_CASE and reason == WORKFLOW_JUNCTION_SKIP_REASON)
                 or (program == RUNNER_TEST and operating_system in ("Linux", "Darwin")
                     and identifier == RUNNER_WINDOWS_HANDLE_CASE and reason == RUNNER_WINDOWS_HANDLE_SKIP_REASON)
+                or (operating_system in ("Linux", "Darwin")
+                    and WINDOWS_NATIVE_PROGRAM_CASES.get(program, {}).get(identifier) == reason)
                 or (program == ACCEPTANCE_NATIVE_TEST and operating_system in ("Linux", "Darwin")
                     and identifier in ACCEPTANCE_WINDOWS_CASES
                     and reason == ACCEPTANCE_WINDOWS_SKIP_REASONS[identifier]))
@@ -180,6 +195,8 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
             if applicable and program == RUNNER_TEST and identifier == RUNNER_WINDOWS_HANDLE_CASE:
                 entry["requiredNativePlatforms"] = ["Windows"]
             if applicable and program == ACCEPTANCE_NATIVE_TEST and identifier in ACCEPTANCE_WINDOWS_CASES:
+                entry["requiredNativePlatforms"] = ["Windows"]
+            if applicable and identifier in WINDOWS_NATIVE_PROGRAM_CASES.get(program, {}):
                 entry["requiredNativePlatforms"] = ["Windows"]
             skips.append(entry)
             record["reason"] = reason
@@ -225,15 +242,19 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
                 errors.append(f"Required native portability case did not pass: {identifier}")
     if program == ACCEPTANCE_TEST and ACCEPTANCE_WINDOWS_CASES & set(identifiers):
         errors.append("Pure acceptance suite unexpectedly executed native portability cases")
+    native_cases = set(WINDOWS_NATIVE_PROGRAM_CASES.get(program, {}))
+    for identifier in sorted(native_cases - set(identifiers)):
+        errors.append(f"Required Windows case is missing: {identifier}")
+    if operating_system == "Windows":
+        executed = {record["case"] for record in records if record["status"] == "ok"}
+        for identifier in sorted(native_cases - executed):
+            errors.append(f"Required Windows case did not pass: {identifier}")
     return counts, records, skips, errors
 
 
-def inspect_junit(path: Path, operating_system: str, inventory: Path | None = None,
-                  test_profile: str = "full") -> dict:
-    if test_profile not in ("fast", "full"):
-        raise ValueError(f"Unknown test profile: {test_profile!r}")
+def inspect_junit(path: Path, operating_system: str, inventory: Path | None = None) -> dict:
     document = {"schemaVersion": 1, "platform": operating_system, "source": str(path),
-                "testProfile": test_profile, "testsComplete": False, "releaseComplete": False,
+                "testsComplete": False, "releaseComplete": False,
                 "ctestPrograms": [], "qtTestSkips": [], "pythonTestSkips": [], "pythonRegisteredNotApplicable": [],
                 "pythonTestTotals": {"run": 0, "passed": 0, "failed": 0, "skipped": 0, "notApplicable": 0},
                 "inventoryVerified": False, "expectedPrograms": [],
@@ -253,10 +274,9 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
     else:
         try:
             registered = json.loads(inventory.read_text(encoding="utf-8"))
-            selected = policy.select_inventory(registered, test_profile)
-            selection = policy.describe_inventory(registered, test_profile)
+            selected = policy.select_inventory(registered)
+            selection = policy.describe_inventory(registered)
             document["registeredPrograms"] = selection["registeredPrograms"]
-            document["excludedPrograms"] = selection["excludedPrograms"]
             kinds = selection["evidenceKinds"]
             expected = [entry["name"] for entry in selected["tests"]]
             document["expectedPrograms"] = sorted(expected)
@@ -348,7 +368,7 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
         document["ctestPrograms"].append(summary)
         document["errors"].extend(f"{name}: {error}" for error in errors)
     document["testsComplete"] = not document["errors"]
-    document["releaseComplete"] = document["testsComplete"] and test_profile == "full"
+    document["releaseComplete"] = document["testsComplete"]
     return document
 
 
@@ -358,19 +378,13 @@ def main():
     parser.add_argument("--inventory", type=Path, help="Saved ctest --show-only=json-v1 output")
     parser.add_argument("--platform", choices=("Windows", "Linux", "Darwin"), required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--test-profile", choices=("fast", "full"), default="full",
-                        help="The scope of the supplied CTest inventory and results")
-    parser.add_argument("--require-selected-tests", action="store_true",
-                        help="Fail unless every program in the selected inventory passed")
     parser.add_argument("--require-complete", action="store_true")
     arguments = parser.parse_args()
-    result = inspect_junit(arguments.junit, arguments.platform, arguments.inventory,
-                           arguments.test_profile)
+    result = inspect_junit(arguments.junit, arguments.platform, arguments.inventory)
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    failed = ((arguments.require_complete and not result["releaseComplete"])
-              or (arguments.require_selected_tests and not result["testsComplete"]))
+    failed = arguments.require_complete and not result["testsComplete"]
     return 1 if failed else 0
 
 

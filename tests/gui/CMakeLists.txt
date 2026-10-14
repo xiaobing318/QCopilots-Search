@@ -20,6 +20,11 @@ target_link_libraries(qcs-tests-login-startup PRIVATE qcs-app-components Qt6::Te
 qcopilots_search_add_test(NAME qcs-tests-login-startup COMMAND $<TARGET_FILE:qcs-tests-login-startup> -o "-,txt")
 set_tests_properties(qcs-tests-login-startup PROPERTIES TIMEOUT 120 LABELS "gui;unit;portable")
 
+add_executable(qcs-tests-gui-instance gui_instance_tests.cpp)
+target_link_libraries(qcs-tests-gui-instance PRIVATE qcs-app-components qcs-test-support Qt6::Test)
+qcopilots_search_add_test(NAME qcs-tests-gui-instance COMMAND $<TARGET_FILE:qcs-tests-gui-instance> -o "-,txt")
+set_tests_properties(qcs-tests-gui-instance PROPERTIES TIMEOUT 120 LABELS "gui;integration;portable")
+
 add_executable(qcs-tests-platform platform_integration_tests.cpp)
 target_link_libraries(qcs-tests-platform PRIVATE qcs-app-components qcs-test-support Qt6::Test)
 qcopilots_search_add_test(NAME qcs-tests-platform COMMAND $<TARGET_FILE:qcs-tests-platform> -o "-,txt")

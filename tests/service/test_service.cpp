@@ -63,7 +63,8 @@ int controlledWorker(const QStringList &arguments) {
         }
         return true;
     };
-    if (!record({{"event", "started"}})) return 3;
+    const QString requestedBackend = qEnvironmentVariable("QCOPILOTS_SEARCH_BACKEND", "auto");
+    if (!record({{"event", "started"}, {"backend", requestedBackend}})) return 3;
     std::string line;
     while (std::getline(std::cin, line)) {
         const auto request = QJsonDocument::fromJson(QByteArray::fromStdString(line)).object();
@@ -73,6 +74,28 @@ int controlledWorker(const QStringList &arguments) {
             return record({{"event", "exited"}}) ? 0 : 3;
         }
         if (operation == "cancel") continue;
+        QFile crashPolicy(QDir(gates).filePath(mode + "-crash-policy"));
+        if (crashPolicy.open(QIODevice::ReadOnly)) {
+            const auto policy = QString::fromUtf8(crashPolicy.readAll()).trimmed();
+            const auto runtimeEvent = [&](const char *phase) {
+                const QJsonObject runtime{{"requestedBackend", requestedBackend}, {"packagedBackend", "cuda"},
+                    {"buildVariant", "test-cuda"}, {"loaded", policy == "reload"},
+                    {"gpuSelected", policy != "reload" && requestedBackend != "cpu"}};
+                const auto event = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"event", "runtime"},
+                    {"data", QJsonObject{{"phase", phase}, {"activity", policy == "reload" ? "model-load" : "encode"},
+                        {"runtime", runtime}}}}).toJson(QJsonDocument::Compact);
+                std::cout << event.constData() << '\n' << std::flush;
+            };
+            if (policy != "parser") runtimeEvent("inference-start");
+            if (policy == "finished") runtimeEvent("inference-end");
+            if ((policy != "gpu" && policy != "reload") || requestedBackend != "cpu") {
+                if (!record({{"event", "aborted"}, {"backend", requestedBackend}})) return 3;
+                // A nonzero child exit models an SDK's fatal termination while
+                // keeping CI free of OS crash dialogs and core dump files.
+                return 71;
+            }
+            runtimeEvent("inference-end");
+        }
         QJsonObject result;
         if (operation == "extract") {
             const QString path = request.value("path").toString();
@@ -110,6 +133,12 @@ int controlledWorker(const QStringList &arguments) {
             for (int i = 0; i < embeddingDimensions; ++i) embedding.append(i == 0 ? 1.0 : 0.0);
             result = {{"embedding", embedding}, {"modelFingerprint", embeddingPipelineFingerprint()}};
         } else return 6;
+        // Deliberately identify this protocol test peer as CPU. This makes
+        // strict GPU service tests detect a peer that silently fell back.
+        result.insert("runtime", QJsonObject{{"buildVariant", "test-cpu"}, {"requestedBackend", "auto"},
+            {"packagedBackend", "cpu"}, {"selectedBackend", "cpu"}, {"deviceName", "Protocol test CPU"},
+            {"deviceDescription", "Lifecycle test peer"}, {"gpuSelected", false},
+            {"fallbackReason", "Test fixture has no GPU"}, {"loaded", true}, {"error", ""}});
         if (delayMs > 0) QThread::msleep(static_cast<unsigned long>(delayMs));
         const auto response = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"ok", true}, {"result", result}})
             .toJson(QJsonDocument::Compact);
@@ -1534,7 +1563,16 @@ private slots:
         QVERIFY(firstQuery.value("ok").toBool());
         QVERIFY(firstQuery.value("result").toObject().value("semantic").toBool());
         QVERIFY(firstQuery.value("result").toObject().value("warning").toString().isEmpty());
+        const auto diagnosticStatus = localCall(client, "status").value("result").toObject();
+        const auto queryRuntime = diagnosticStatus.value("runtimeWorkers").toObject().value("query").toObject();
+        QCOMPARE(queryRuntime.value("buildVariant").toString(), QString("test-cpu"));
+        QCOMPARE(queryRuntime.value("selectedBackend").toString(), QString("cpu"));
+        QCOMPARE(queryRuntime.value("deviceName").toString(), QString("Protocol test CPU"));
+        QCOMPARE(queryRuntime.value("fallbackReason").toString(), QString("Test fixture has no GPU"));
+        QVERIFY(!queryRuntime.value("gpuSelected").toBool());
         QTRY_COMPARE_WITH_TIMEOUT(workers.events(true, "exited").size(), 1, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!localCall(client, "status").value("result").toObject()
+            .value("runtimeWorkers").toObject().value("query").toObject().value("loaded").toBool(), 5000);
         QVERIFY(environment.writeFile("selected/second.txt", controlledDocument("idlesecondkeyword")));
         QVERIFY(localCall(client, "index.start").value("ok").toBool());
         QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "exited").size(), 2, 5000);
@@ -1552,6 +1590,108 @@ private slots:
         const auto progress = localCall(client, "status").value("result").toObject().value("progress").toObject();
         QCOMPARE(progress.value("failed").toInteger(), 0);
         QVERIFY(progress.value("error").toString().isEmpty());
+        client.disconnectFromService(); service.stop();
+    }
+
+    void strictGpuDoesNotAcceptACpuWorkerResponse() {
+        TestEnvironment environment("service-strict-gpu");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment backend("QCOPILOTS_SEARCH_BACKEND", "gpu");
+        QVERIFY(environment.writeFile("selected/entry.txt", controlledDocument("strictquerykeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        ServiceServer service(paths, workers.dependencies(true));
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("catalogReady").toBool(), 5000);
+        const auto reply = localCall(client, "search", {{"query", "strictquerykeyword"}, {"semantic", true}});
+        QVERIFY(!reply.value("ok").toBool());
+        QCOMPARE(reply.value("error").toObject().value("code").toString(), QString("gpu_unavailable"));
+        QVERIFY(localCall(client, "search", {{"query", "strictquerykeyword"}, {"semantic", false}}).value("ok").toBool());
+        client.disconnectFromService(); service.stop();
+    }
+
+    void gpuWorkerTerminationRetriesCpuOnlyWithInferenceEvidence_data() {
+        QTest::addColumn<bool>("queryWorker");
+        QTest::addColumn<QString>("mode");
+        QTest::addColumn<QString>("policy");
+        QTest::addColumn<int>("expectedStarts");
+        QTest::addColumn<bool>("succeeds");
+        for (bool query : {false, true}) {
+            const QByteArray role = query ? "query-" : "index-";
+            QTest::newRow((role + "auto-gpu-crash").constData()) << query << QString("auto") << QString("gpu") << 2 << true;
+            QTest::newRow((role + "normalized-auto-gpu-crash").constData()) << query << QString(" AuTo ") << QString("gpu") << 2 << true;
+            QTest::newRow((role + "auto-reload-after-cpu").constData()) << query << QString("auto") << QString("reload") << 2 << true;
+            QTest::newRow((role + "cpu-retry-also-crashes").constData()) << query << QString("auto") << QString("always") << 2 << false;
+            QTest::newRow((role + "parser-crash").constData()) << query << QString("auto") << QString("parser") << 1 << false;
+            QTest::newRow((role + "after-inference-crash").constData()) << query << QString("auto") << QString("finished") << 1 << false;
+            QTest::newRow((role + "strict-gpu-crash").constData()) << query << QString("gpu") << QString("gpu") << 1 << false;
+            QTest::newRow((role + "explicit-cpu-crash").constData()) << query << QString("cpu") << QString("always") << 1 << false;
+        }
+    }
+
+    void gpuWorkerTerminationRetriesCpuOnlyWithInferenceEvidence() {
+        QFETCH(bool, queryWorker);
+        QFETCH(QString, mode);
+        QFETCH(QString, policy);
+        QFETCH(int, expectedStarts);
+        QFETCH(bool, succeeds);
+        TestEnvironment environment("service-gpu-crash-recovery");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment selectedBackend("QCOPILOTS_SEARCH_BACKEND", mode.toUtf8());
+        QVERIFY(environment.writeFile("selected/entry.txt", controlledDocument("gpurecoverykeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(environment.writeFile(QString("worker-control/%1-crash-policy").arg(queryWorker ? "query" : "index"), policy.toUtf8()));
+        auto dependencies = workers.dependencies(true);
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("catalogReady").toBool(), 5000);
+        if (queryWorker) {
+            const auto reply = localCall(client, "search", {{"query", "gpurecoverykeyword"}, {"semantic", true}});
+            if (succeeds) {
+                QVERIFY2(reply.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(reply).toJson())));
+                QVERIFY(reply.value("result").toObject().value("semantic").toBool());
+            } else if (mode == "gpu") {
+                QVERIFY(!reply.value("ok").toBool());
+                QCOMPARE(reply.value("error").toObject().value("code").toString(), QString("gpu_unavailable"));
+            } else {
+                QVERIFY(reply.value("ok").toBool());
+                QVERIFY(!reply.value("result").toObject().value("semantic").toBool());
+                QVERIFY(!reply.value("result").toObject().value("warning").toString().isEmpty());
+            }
+        } else {
+            QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("progress").toObject()
+                .value(succeeds ? "completed" : "failed").toInteger() == 1, 5000);
+        }
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(queryWorker, "started").size(), expectedStarts, 5000);
+        const auto starts = workers.events(queryWorker, "started");
+        QCOMPARE(starts.first().value("backend").toString(), mode);
+        if (expectedStarts == 2) {
+            QCOMPARE(starts.last().value("backend").toString(), QString("cpu"));
+            const auto runtime = localCall(client, "status").value("result").toObject()
+                .value("runtimeWorkers").toObject().value(queryWorker ? "query" : "index").toObject();
+            QVERIFY(runtime.value("fallbackReason").toString().contains("GPU worker exited"));
+            if (succeeds) {
+                QCOMPARE(runtime.value("selectedBackend").toString(), QString("cpu"));
+                QCOMPARE(runtime.value("requestedBackend").toString(), QString("auto"));
+                QCOMPARE(runtime.value("effectiveBackendRequest").toString(), QString("cpu"));
+            }
+        }
+        QTest::qWait(100);
+        QCOMPARE(workers.events(queryWorker, "started").size(), expectedStarts);
         client.disconnectFromService(); service.stop();
     }
 

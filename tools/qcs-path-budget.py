@@ -19,7 +19,7 @@ GENERATED_BUDGET = 240
 NinjaTarget = namedtuple("NinjaTarget", ("name", "path"))
 SKIP_DIRECTORIES = frozenset({
     ".git", "models", "deps", "dependencies", "source-cache", "sources",
-    "runs", "test-runs", "capacity-runs", "profiles", "reports", "Testing",
+    "runs", "test-runs", "profiles", "reports", "Testing",
 })
 
 

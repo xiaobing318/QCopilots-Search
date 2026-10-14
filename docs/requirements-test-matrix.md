@@ -12,7 +12,7 @@
 | 每次 CTest 调用使用独立 cwd | `tools/qcs-test-runner.py`、测试支持库 | `qcs-tests-runner`，同一构建树并发执行同一测试，核对 cwd 和可写配置不共享 | 已建立回归，以本轮逐用例报告为准 |
 | 真实只读源码与双 checkout | `tools/acceptance/qcs-two-checkout-portability.py`、开发脚本 | 实际只读权限下 configure/build/test，源码哈希不变，两个独立 checkout 并行构建 | 必需验收，不能用只读夹具替代 |
 | Windows 逐节点只读与恢复 | `tools/acceptance/qcs-test-portability-runners.py` | 显式允许、继承保护、父子删除权限、只读属性、共享冲突、节点丢失与替换、恢复差异及原始错误保留 | 原生 Windows 用例，恢复差异必须使专项验收失败 |
-| Windows 权限测试进程上下文 | `tools/acceptance/qcs-token-context.py` 与三个验收入口 | `qcs-test-token-context.py`，仅在受控暂停子进程中移除 Backup/Restore 特权、构建后代继承、父令牌不变、已有线程令牌拒绝、真实五探针及失败进程收尾 | 原生 Windows 用例与跨平台错误回归，实际结果待同一冻结候选报告，诊断分支不能替代验收 |
+| Windows 权限测试进程上下文 | `tools/acceptance/qcs-token-context.py` 与受控验收入口 | `qcs-test-token-context.py`，仅在受控暂停子进程中移除 Backup/Restore 特权、构建后代继承、父令牌不变、已有线程令牌拒绝、真实五探针及失败进程收尾 | 原生 Windows 用例与跨平台错误回归，实际结果待同一冻结候选报告，诊断分支不能替代验收 |
 | 正式应用同时运行时隔离 | RuntimePaths、服务锁和 IPC | 启动受控正式实例并运行独立测试，核对其 PID、状态和数据未变 | 必需回归，以本轮进程报告为准 |
 | 唯一临时根与失败不回退 | 测试支持库、runtime 夹具 | temporaryRootsUnique、customTemporaryRoot、temporaryFailureDoesNotFallback、temporaryDirectoryUsesConfiguredRoot、temporaryDirectoryRejectsFileAsRoot | 已建立用例 |
 | Python 临时根空值与失败边界 | `tests/support/temp_paths.py` | `qcs-tests-temp-paths`，未设置或空值不写 cwd，中文目录隔离，阻塞路径明确失败 | 已建立回归，以本轮逐用例报告为准 |
@@ -35,10 +35,10 @@
 | 旧 DOC | legacy_doc_extractor | extraction-legacy_doc | 已建立入口，格式结果待报告 |
 | 图片、PDF、OCR | image_extractor | pdfPaginationAndPosition、scannedPdfRendersImage、realOcrWithUnicodeDataDirectory | 已建立用例 |
 | HEIC、RAW 格式范围 | libheif、LibRaw | 真实格式探针与包级运行 | 待明确夹具与执行证据 |
-| 音频窗口、环境声、视频时间 | media_extractor、runtime | extraction-media、reference-vectors、独立语义集 | 数值和窗口用例已建立，真实语义待报告 |
+| 音频窗口、环境声、视频时间 | media_extractor、runtime | extraction-media、reference-vectors、多模态功能集 | 数值和窗口用例已建立，真实链路结果待报告 |
 | 可选代码、Git ignore、未跟踪源码 | file_catalog、document_extractor | gitIgnoreKeepsTrackedAndUntrackedSource、codeLocationsAndNotebookSources | 已建立用例 |
 | 普通与代码扫描的独立资格 | `core/file_catalog.*`、服务扫描合并 | `independentScopesAllowSharedTextAndRejectCodeData`、`codeScanningWorksWithoutGitExecutable`、`codeScopeSkipsNestedWorktreeUnlessExplicitlySelected`、服务 `newProjectMarkerWithdrawsQueuedOrdinaryFile` | 已建立回归，目录资格变动需同步撤销过时排队任务 |
-| 九条黄金向量 cosine ≥ 0.999 | runtime | tests-reference-vectors | 已建立用例，四组合结果待 CI |
+| 九条黄金向量 cosine ≥ 0.999 | runtime | tests-reference-vectors | 已建立用例，各变体结果待 CI |
 | 中文、截断、损坏媒体 | runtime | chineseInputsAreNormalizedAndDistinct、truncationPreservesThePrefix、malformedAndMismatchedMediaAreRejected | 已建立用例 |
 | 中文关键词与定位 | storage/text_index | tests-index_repository 的 keywordSearch、locationAndFileAggregation | 已建立用例 |
 | 无模型关键词搜索 | worker、storage | unicodePathsAndKeywordOnlyWithoutModels | 已建立用例 |
@@ -65,23 +65,27 @@
 | 登录启动与隔离配置限制 | `app/login_startup.*`、`PlatformIntegration::canSetStartAtLogin`、设置页显式变更意图 | `qcs-tests-login-startup` 的 desktop-entry 编码、禁用覆盖、测试隔离用例，`qcs-tests-platform` 的 `isolatedProfilesCannotChangeLoginStartup` | 测试不写真实系统启动项，Windows/macOS/Linux 实际登录行为需原生验收 |
 | 指定外部 PDF 与媒体应用定位 | `app/platform_external_open.*`、外部应用设置 | `platformPdfPresetUsesPhysicalPage`、`mediaStartUsesExactMilliseconds`、`actualProcessReceivesLiteralFileAndLocationArguments`、`missingApplicationNeverSilentlyFallsBack` | 参数构造和进程传参已有回归，实际查看器/播放器定位需安装相应应用验证 |
 | 系统默认打开的定位边界 | `PlatformIntegration::openHit` 与 GUI 通知 | `ordinaryOpenExplicitlyReportsLocationLimit`、外部打开 Computer Use 场景 | 不保证默认应用页码或时间定位，指定应用失败不得伪装成默认打开成功 |
-| 十万个物理文件 | file_catalog 容量入口 | tests-file-capacity，独立全规模运行 | 已建立入口，规模结果待报告 |
-| 百万 768 维向量 | qcs-benchmark | 写入、ANN、重开、精确 top-20 对照及 500 次计时 | 已建立入口，本机实测待报告 |
-| 真实语义质量与相关性校准 | `core/relevance_policy.*`、`tests/semantic` 真实模型采样与校准器 | `qcs-tests-relevance-calibration`、`qcs-tests-semantic-manifest`、完整 `qcs-tests-semantic`，calibration 与 holdout 分离并绑定模型和语料身份 | v1 留出集未通过，当前策略仍未校准，v2 独立样本扩充与续验不能写作通过 |
-| 保持相关性门槛与生产重验 | 校准策略生成和生产候选过滤 | 总体 Recall@10 ≥ 0.90、语言及模态分组 ≥ 0.80、无答案误返回率 ≤ 0.10，生成策略后重新编译并运行生产检索 | 门槛不降低，原始候选导出或模拟拟合通过不能替代生产质量验收 |
 | 磁盘不足、提交中断与失效版本零返回 | storage、service | 故障注入及恢复检查 | 部分存储用例已建立，全流程待报告 |
 | 安装布局与依赖部署 | install、CPack、verify-package | 原生 CI 与重定位包级启动 | 已建立流程，包级结果待报告 |
 | 包报告绑定实际源码 checkout | `tools/qcs-verify-package.py` | `qcs-tests-workflow`，真实 Git HEAD、linked worktree、候选声明失配、dirty 状态、无 Git 归档与错误提前失败 | 已建立回归，真实包级结果待新冻结候选报告 |
-| 验收运行器入库后契约 | `tools/acceptance` | qcs-tests-acceptance-runners，候选身份、fixture 拷贝、容量守卫、来源清单和可移植性运行器检查 | 已建立回归，实际专项验收仍单独执行 |
+| 验收运行器入库后契约 | `tools/acceptance` | qcs-tests-acceptance-runners，候选身份、fixture 拷贝、来源清单和可移植性运行器检查 | 已建立回归，实际专项验收仍单独执行 |
 | 用例结果与诊断输出完整性 | `tools/acceptance/qcs-test-diagnostics.py` | 独立和聚合入口的真实合流管道，大段 JSON、失败、中断、重复执行及输出错误，严格逐例解析不放宽 | 已建立回归，执行结果以同一候选的原始日志为准 |
 | 许可证、源码材料与签名状态 | packaging、依赖锁、第三方声明 | 包清单、源码材料清单、unsigned/signed 字段 | 待最终包审查 |
 | Linux Qt FFmpeg 源码元数据加载 | `tools/qcs-source-bundle.py` | `qcs-tests-acceptance-runners` 中的 `qcs-test-source-checksums.py`，同目录 avformat 先加载、局部符号范围、句柄生命周期、错误传播及许可拒绝的模拟回归 | 已建立回归，真实 Linux SDK 与源码材料结果待原生 CI |
 | QtTest 内部跳过和平台不适用分类 | CI CTest 证据解析器 | qcs-tests-ci-evidence.py，注册程序集合、逐用例与汇总核对、精确平台分类及日志截断拦截 | 已建立回归，短名候选结果以本轮报告为准 |
 | 本地完整自动化门槛 | CTest、QtTest、工具与包验证 | 全量注册清单、逐用例明细、真实模型及安装报告，缺失不放行 | 同一冻结候选的独立门槛 |
-| 日常快速与完整验收范围 | `qcs-dev`、CTest 标签及 preset、原生 CI | 默认 fast 排除 slow、显式 full、标签交集、空选择失败、慢 fixture 拒绝、实际清单核对和快速报告不可通过发行门禁 | 已建立回归，快速通过与完整验收分别报告 |
-| 四组合远端 Actions 门槛 | qcs-native.yml、required 汇总 | 四组合 configure/build/test/真实模型/package/verify 全部 success，记录实际 run URL | 同一冻结候选的独立门槛 |
 | Windows Computer Use 门槛 | 最终 Windows 包、@oai/sky | CU-01 至 CU-10，真实枚举与窗口操作，包及程序哈希、截图和结果 | 同一最终包的独立门槛 |
+| 正式语义候选与多模态链 | storage、runtime、`tests/semantic` | 小型固定输入实际提取、编码、持久化、重载，隔离单文件范围关闭关键词兜底检索 | 检查实际来源与定位，不设置排名或相关度接受线 |
+| 扫描与提取格式一致 | core 共享格式定义、extraction 路由 | 音频、RAW、QML、Dockerfile 命名规则和扫描路由一致性 | 按本轮功能测试判定 |
+| 查询上限统一为 500 | core 共享约束、CLI、服务 | 500 接受、501 拒绝、帮助及协议一致 | 按本轮 CLI/服务测试判定 |
+| 快捷窗保留完整查询上下文 | quick search 与主窗口 | 转移 query、代码空间、类型和目录，覆盖旧主窗口过滤条件 | 按本轮 GUI 测试判定 |
+| GUI 按规范化 profile 单实例 | GUI 启动协调 | 相同 profile 激活已有窗口，不同 profile 并行，重复启动不停止服务 | 按本轮双进程测试判定 |
+| 默认全部保留测试 | `qcs-dev`、CTest preset、原生 CI | 完整注册清单、标签筛选、空选择失败、局部结果不可冒充完整 | 以实际选择记录和逐用例结果为准 |
+| 11 变体远端 Actions | 共同变体清单、`qcs-native.yml` | 全部变体构建、测试、模型、安装、打包、验包及汇总成功 | 记录真实 run URL、attempt 和原始 job |
+| 真实后端与 GPU 回退 | runtime、worker、服务诊断与 GUI | 自动选择、CPU 回退原因、严格 GPU 模式不能静默回退 | 无设备时明确记录硬件未实测 |
+| CI 用户包白名单 | CI、artifact 选择器、release 工具 | 11 artifacts、21 用户文件，包类型与身份一致，无额外文件 | 以实际 artifacts 及 digest 为准 |
+| 发布来源与冻结字节 | `qcs-release.py` | 部分重跑、失败不能借旧成功、错误候选、digest 失配、缺包和冻结后变化 | 工具回归与真实准备分别记录 |
 
-完整验收需要本地自动化、四组合原生 CI、当前 Windows Computer Use 和必需容量测试分别完成。源码中存在入口、触发 Actions 或执行相近用例均不能替代实际证据，失败、未运行和平台不适用必须分别记录。所有报告绑定执行时的同一候选，不复用旧长命名候选的报告。
+完整交付要求本机全部保留自动化、11 变体原生 CI、最终 Windows CPU 包的 Computer Use 和用户包验证。源码中存在入口、触发 Actions 或执行相近用例不能替代实际证据。所有记录绑定执行时的同一不可变候选，分别报告失败、未运行和平台不适用。
 
-相关性质量门禁与构建、单元测试和容量门禁独立。当前策略头文件的 `calibrated=false` 会关闭语义候选接受，关键词分支继续工作。v1 留出失败后的 v2 扩充需保留新的样本来源、固定分组和语料哈希，不能继续把已经观察过结果的 v1 留出集称为未触碰的独立留出集。尚未取得同一候选的完整模型质量证据时，不能宣布多模态检索质量或发布就绪已经通过。
+模型与向量的数值完整性继续验证。语义检索不设置相关度接受线，低相似度结果可能出现。GPU 构建、依赖闭包和 CPU 回退通过不等于 GPU 实机通过，没有设备的变体明确记录硬件未实测。

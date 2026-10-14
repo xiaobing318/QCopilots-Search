@@ -33,9 +33,8 @@ struct FileMetadata {
 };
 
 struct StorageOptions {
-  // Applications may override this budget for a selected volume. The capacity
-  // benchmark uses 3 GiB. Ordinary installations do not inherit that machine's
-  // disk requirement. An injected provider makes disk-full tests deterministic.
+  // Applications may override this budget for a selected volume. An injected
+  // provider makes disk-full tests deterministic.
   qint64 diskReserveBytes = 64LL * 1024 * 1024;
   std::function<qint64(const QString &)> availableBytes;
   std::function<void(const QString &)> faultHook;

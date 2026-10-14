@@ -136,6 +136,54 @@ private slots:
         worker.send({{QStringLiteral("operation"), QStringLiteral("query")}});
         QCOMPARE(errorCode(worker.receive()), QStringLiteral("invalid_request"));
     }
+    void runtimeDiagnosticsDoNotRequireModels_data()
+    {
+        QTest::addColumn<QString>("backend");
+        QTest::newRow("automatic") << QStringLiteral("auto");
+        QTest::newRow("explicit-cpu") << QStringLiteral("cpu");
+        QTest::newRow("strict-gpu") << QStringLiteral("gpu");
+    }
+    void runtimeDiagnosticsDoNotRequireModels()
+    {
+        QFETCH(QString, backend);
+        TestEnvironment environment(QStringLiteral("worker runtime diagnostics"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment selectedBackend("QCOPILOTS_SEARCH_BACKEND", backend.toUtf8());
+        WorkerProcess worker;
+        QVERIFY(worker.start(environment, QStringLiteral("query")));
+        worker.send({{"id", "state"}, {"operation", "diagnostics"}});
+        const auto reply = worker.receive();
+        QVERIFY2(reply.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(reply).toJson())));
+        const auto runtime = reply.value("result").toObject().value("runtime").toObject();
+        QCOMPARE(runtime.value("requestedBackend").toString(), backend);
+        QVERIFY(!runtime.value("buildVariant").toString().isEmpty());
+        QVERIFY(!runtime.value("packagedBackend").toString().isEmpty());
+        QVERIFY(!runtime.value("loaded").toBool());
+        QVERIFY(!runtime.value("gpuSelected").toBool());
+        for (const auto *key : {"selectedBackend", "deviceName", "deviceDescription", "fallbackReason", "error"})
+            QVERIFY2(runtime.contains(QLatin1String(key)), key);
+        worker.send({{"id", "load"}, {"operation", "diagnostics"}, {"load", true}, {"textOnly", true}});
+        const auto failed = worker.receive();
+        QVERIFY(!failed.value("ok").toBool());
+        QCOMPARE(errorCode(failed), QStringLiteral("model_unavailable"));
+        const auto diagnostic = failed.value("error").toObject().value("runtime").toObject();
+        QCOMPARE(diagnostic.value("requestedBackend").toString(), backend);
+        QVERIFY(!diagnostic.value("loaded").toBool());
+        QVERIFY(!diagnostic.value("error").toString().isEmpty());
+        QVERIFY(!failed.value("result").toObject().contains("embedding"));
+        worker.send({{"id", "events"}, {"operation", "diagnostics"}, {"load", true},
+            {"textOnly", true}, {"runtimeEvents", true}});
+        const auto begin = worker.receive();
+        QCOMPARE(begin.value("event").toString(), QString("runtime"));
+        QCOMPARE(begin.value("id").toString(), QString("events"));
+        QCOMPARE(begin.value("data").toObject().value("phase").toString(), QString("inference-start"));
+        QCOMPARE(begin.value("data").toObject().value("activity").toString(), QString("model-load"));
+        QCOMPARE(begin.value("data").toObject().value("runtime").toObject().value("requestedBackend").toString(), backend);
+        const auto end = worker.receive();
+        QCOMPARE(end.value("event").toString(), QString("runtime"));
+        QCOMPARE(end.value("data").toObject().value("phase").toString(), QString("inference-end"));
+        QCOMPARE(errorCode(worker.receive()), QStringLiteral("model_unavailable"));
+    }
     void unicodePathsAndKeywordOnlyWithoutModels_data()
     {
         QTest::addColumn<bool>("longPath");

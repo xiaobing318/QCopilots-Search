@@ -103,16 +103,18 @@ def validate_vector(embedding, expected):
 
 def inference_library_role(path):
     name = Path(path).name.lower()
+    if re.fullmatch(r"(?:lib)?ggml-(?:cuda|hip|vulkan|metal)(?:\.dll|\.so(?:\.[0-9.]+)?|(?:\.[0-9.]+)?\.dylib)", name):
+        return "gpu-backend"
     for role in ("cpu-backend", "ggml-base", "ggml", "llama", "mtmd"):
-        stem = "ggml-cpu-" if role == "cpu-backend" else role
-        pattern = (r"^(?:lib)?ggml-cpu-[a-z0-9_-]+(?:\.dll|\.so(?:\.[0-9.]+)?|(?:\.[0-9.]+)?\.dylib)$"
+        stem = "ggml-cpu" if role == "cpu-backend" else role
+        pattern = (r"^(?:lib)?ggml-cpu(?:-[a-z0-9_-]+)?(?:\.dll|\.so(?:\.[0-9.]+)?|(?:\.[0-9.]+)?\.dylib)$"
                    if role == "cpu-backend" else rf"^(?:lib)?{re.escape(stem)}(?:\.dll|\.so(?:\.[0-9.]+)?|(?:\.[0-9.]+)?\.dylib)$")
         if re.fullmatch(pattern, name):
             return role
     return None
 
 
-def inference_runtime_origins(worker, executable, application, installed_files=None):
+def inference_runtime_origins(worker, executable, application, installed_files=None, diagnostics=None):
     if (application.resolve() not in executable.resolve().parents or
             (installed_files is not None and executable.resolve() not in installed_files)):
         raise RuntimeError("Inference worker executable is outside the installed package layout")
@@ -137,17 +139,30 @@ def inference_runtime_origins(worker, executable, application, installed_files=N
             if any(entry["role"] == "cpu-backend" and Path(entry["path"]).parent != plugin_root.resolve() for entry in mapped):
                 raise RuntimeError("Installed macOS CPU backend did not load from Contents/PlugIns/ggml")
     elif sys.platform == "darwin" and architecture in ("arm64", "aarch64"):
-        linkage = "static-cpu"
-        if mapped:
-            raise RuntimeError("Apple Silicon package unexpectedly loaded shared inference libraries")
+        if diagnostics is None:
+            linkage = "static-cpu"
+            if mapped:
+                raise RuntimeError("Apple Silicon package unexpectedly loaded shared inference libraries")
+        else:
+            linkage = "shared-metal" if mapped else "static-metal"
+            if mapped and not {"llama", "mtmd", "ggml", "ggml-base"}.issubset({entry["role"] for entry in mapped}):
+                raise RuntimeError("Apple Silicon package has an incomplete shared inference runtime")
     else:
         raise RuntimeError(f"No verified inference packaging contract for {sys.platform}/{architecture}")
+    if diagnostics is not None:
+        linkage = "shared-backend-dispatch"
+        if not {"llama", "mtmd", "ggml", "ggml-base", "cpu-backend"}.issubset({entry["role"] for entry in mapped}):
+            raise RuntimeError("Installed worker did not map all shared inference runtime roles")
+        if diagnostics.get("gpuSelected") and "gpu-backend" not in {entry["role"] for entry in mapped}:
+            raise RuntimeError("GPU inference did not load its packaged backend module")
     return {"linkage": linkage, "architecture": architecture, "cpuBaselineForced": False,
+            "cpuDispatch": {"x64": architecture in ("x86_64", "amd64"), "arm64": False},
+            "diagnostics": diagnostics,
             "workerExecutable": {"path": str(executable.resolve()), "bytes": executable.stat().st_size,
                                  "sha256": file_digest(executable)}, "libraries": mapped}
 
 
-def worker_request(worker, replies, request, report_dir, timeout=180):
+def worker_request(worker, replies, request, report_dir, timeout=180, accept_failure=False):
     worker.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
     worker.stdin.flush()
     try:
@@ -159,9 +174,9 @@ def worker_request(worker, replies, request, report_dir, timeout=180):
     reply = json.loads(raw)
     path = report_dir / (request["id"] + "-reply.json")
     path.write_text(raw, encoding="utf-8")
-    if reply.get("id") != request["id"] or reply.get("ok") is not True:
+    if reply.get("id") != request["id"] or (not accept_failure and reply.get("ok") is not True):
         raise RuntimeError(f"Packaged worker request failed: {reply}")
-    return reply["result"], {"path": path.name, "sha256": file_digest(path)}
+    return (reply if accept_failure else reply["result"]), {"path": path.name, "sha256": file_digest(path)}
 
 
 def read_worker_replies(worker, replies):
@@ -208,7 +223,7 @@ def force_stop(process):
 
 
 def real_model_smoke(worker, replies, executable, application, work, report_dir, verified_models, installed_files=None,
-                     timeout=600):
+                     timeout=600, build_identity=None):
     fixtures = work / "模型 参考"
     references = reference_inputs(fixtures)
     vectors = []
@@ -238,10 +253,14 @@ def real_model_smoke(worker, replies, executable, application, work, report_dir,
         fingerprints = {vector[key] for vector in vectors}
         if len(fingerprints) != 1 or not next(iter(fingerprints)):
             raise RuntimeError(f"Installed query and multimodal worker disagree on {key}")
+    diagnostic_result, _ = worker_request(worker, replies, {"id": "runtime-diagnostics", "operation": "diagnostics"}, report_dir)
+    diagnostics = diagnostic_result.get("runtime")
+    if build_identity:
+        validate_backend_diagnostics(diagnostics, build_identity, "auto")
     return {"passed": True, "dimensions": 768, "minimumCosine": 0.999,
             "modelDirectory": verified_models["directory"], "modelVerification": verified_models,
             "referenceHashes": REFERENCE_HASHES, "vectors": vectors,
-            "runtime": inference_runtime_origins(worker, executable, application, installed_files)}
+            "runtime": inference_runtime_origins(worker, executable, application, installed_files, diagnostics)}
 
 
 def verify_license_materials(binary, application, report_dir, installed_files=None):
@@ -413,7 +432,8 @@ def mapped_macos_paths(output):
 
 
 def verify_library_origins(process, application, installed_files=None):
-    names = ("qt6", "qtcore", "qtgui", "qtwidgets", "qtmultimedia", "qtpdf", "avcodec", "avformat", "avutil", "swscale", "swresample", "tesseract", "leptonica", "heif", "libraw", "de265", "ggml", "llama", "mtmd", "git2")
+    names = ("qt6", "qtcore", "qtgui", "qtwidgets", "qtmultimedia", "qtpdf", "avcodec", "avformat", "avutil", "swscale", "swresample", "tesseract", "leptonica", "heif", "libraw", "de265", "ggml", "llama", "mtmd", "git2",
+             "cudart", "cublas", "nvrtc", "nvjitlink", "amdhip", "hipblas", "rocblas", "rocm_kpack", "amd_comgr")
     checked = []
     for library in loaded_libraries(process):
         path = Path(library)
@@ -427,6 +447,176 @@ def verify_library_origins(process, application, installed_files=None):
     if not checked:
         raise RuntimeError("Cannot verify loaded package library origins")
     return checked
+
+
+def isolated_environment():
+    environment = os.environ.copy()
+    for key in tuple(environment):
+        if (key.startswith(("QT_", "QML_", "QML2_", "QCOPILOTS_SEARCH_", "CUDA_", "CUDACXX", "HIP_", "HIPCXX", "ROCM_", "ROCBLAS_", "HIPBLASLT_", "VULKAN_", "VK_"))
+                or key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_INSERT_LIBRARIES", "LIBRARY_PATH", "LIB", "INCLUDE")):
+            environment.pop(key, None)
+    environment["PATH"] = os.pathsep.join((str(Path(os.environ["SystemRoot"]) / "System32"), os.environ["SystemRoot"])) if os.name == "nt" else "/usr/bin:/bin"
+    return environment
+
+
+def validate_build_identity(binary, application, source_identity, expected_variant=None):
+    roots = (binary.parent / "share/qcs", binary.parent / "Resources/qcs")
+    candidates = [root / "build-identity.json" for root in roots if (root / "build-identity.json").is_file()]
+    if len(candidates) != 1:
+        raise RuntimeError("Distribution must contain exactly one build identity")
+    path = candidates[0]
+    if application.resolve() not in path.resolve().parents:
+        raise RuntimeError("Packaged build identity escapes the installed application")
+    identity = json.loads(path.read_text(encoding="utf-8"))
+    manifest = path.with_name("build-variants.json")
+    variants = json.loads(manifest.read_text(encoding="utf-8"))["variants"]
+    matching = [entry for entry in variants if entry["id"] == identity.get("variant")]
+    if (type(identity.get("schemaVersion")) is not int or identity["schemaVersion"] != 1 or len(matching) != 1
+            or matching[0]["backend"] != identity.get("backend")
+            or type(identity.get("attempt")) is not int or identity["attempt"] < 1
+            or not isinstance(identity.get("version"), str) or not identity["version"]):
+        raise RuntimeError("Packaged build identity has an unknown variant or invalid metadata")
+    if expected_variant and identity["variant"] != expected_variant:
+        raise RuntimeError("Packaged variant differs from the requested verification variant")
+    if file_digest(manifest) != identity.get("variantsSha256"):
+        raise RuntimeError("Packaged variant manifest differs from its build identity")
+    for filename, field in (("dependencies.lock.json", "dependencyLockSha256"),
+                            ("gpu-sdk.lock.json", "gpuSdkLockSha256"),
+                            ("gpu-license-sources.lock.json", "gpuLicenseLockSha256")):
+        if file_digest(path.with_name(filename)) != identity.get(field):
+            raise RuntimeError(f"Packaged dependency lock differs from its build identity: {filename}")
+    commit = identity.get("candidateCommit")
+    if commit is not None and (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+        raise RuntimeError("Packaged candidate identity is not a complete Git SHA")
+    if source_identity.get("commit") and commit != source_identity["commit"]:
+        raise RuntimeError("Packaged candidate differs from the verifier source checkout")
+    if identity.get("workingTreeModified") is not None and type(identity["workingTreeModified"]) is not bool:
+        raise RuntimeError("Packaged source modification state is invalid")
+    return identity
+
+
+def validate_backend_diagnostics(diagnostics, identity, requested, loaded=True):
+    if not isinstance(diagnostics, dict):
+        raise RuntimeError("Packaged worker did not return runtime backend diagnostics")
+    if (diagnostics.get("buildVariant") != identity["variant"]
+            or diagnostics.get("packagedBackend") != identity["backend"]
+            or diagnostics.get("requestedBackend") != requested
+            or diagnostics.get("loaded") is not loaded
+            or type(diagnostics.get("gpuSelected")) is not bool):
+        raise RuntimeError(f"Packaged runtime diagnostics differ from the installed identity or request: {diagnostics}")
+    if not loaded:
+        if diagnostics["gpuSelected"] or diagnostics.get("selectedBackend"):
+            raise RuntimeError("Failed strict GPU initialization reported an active inference backend")
+        return diagnostics
+    selected = diagnostics.get("selectedBackend")
+    if selected not in ("cpu", identity["backend"]) or not diagnostics.get("deviceName"):
+        raise RuntimeError("Packaged runtime did not identify its actual selected device")
+    if diagnostics["gpuSelected"] is not (selected != "cpu"):
+        raise RuntimeError("Packaged runtime backend and GPU state disagree")
+    if requested == "cpu" and selected != "cpu":
+        raise RuntimeError("Explicit CPU inference unexpectedly used a GPU")
+    if requested == "gpu" and (selected == "cpu" or not diagnostics["gpuSelected"]):
+        raise RuntimeError("Strict GPU inference silently fell back to CPU")
+    if requested == "auto" and selected == "cpu" and identity["backend"] != "cpu" and not diagnostics.get("fallbackReason"):
+        raise RuntimeError("Automatic CPU fallback did not report its reason")
+    return diagnostics
+
+
+def verify_gpu_payload(binary, application, identity, installed_files=None):
+    manifest = binary / "qcs-gpu-runtime.json"
+    if identity["backend"] in ("cpu", "metal"):
+        return {"passed": True, "required": False}
+    if not manifest.is_file():
+        raise RuntimeError("GPU distribution has no runtime dependency manifest")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    if (type(payload.get("schemaVersion")) is not int or payload["schemaVersion"] != 1 or payload.get("variant") != identity["variant"]
+            or payload.get("backend") != identity["backend"] or not payload.get("files")):
+        raise RuntimeError("GPU dependency manifest differs from the installed variant")
+    if payload.get("verification", {}).get("dependencyClosure") != "verified":
+        raise RuntimeError("Packaged GPU dependency closure was not verified during deployment")
+    # The manifest is next to the executable. Its paths are relative to the
+    # installation prefix, which may be nested inside a portable archive.
+    prefix = binary.parent.resolve()
+    seen = set()
+    for record in payload["files"]:
+        relative = checked_relative(record["path"])
+        path = (prefix / relative).resolve()
+        if prefix not in path.parents or path in seen or not path.is_file():
+            raise RuntimeError(f"GPU runtime dependency has an invalid path: {record['path']}")
+        if (type(record.get("size")) is not int or record["size"] < 1
+                or path.stat().st_size != record["size"] or file_digest(path) != record["sha256"]):
+            raise RuntimeError(f"GPU runtime dependency bytes differ: {record['path']}")
+        if installed_files is not None and path not in installed_files:
+            raise RuntimeError(f"GPU dependency is absent from the package manager manifest: {path}")
+        seen.add(path)
+    for name in payload.get("applicationDependencies", []):
+        relative = checked_relative(name)
+        if len(relative.parts) != 1:
+            raise RuntimeError("GPU application dependency must be a library filename")
+        candidates = [root / relative for root in (prefix / "bin", prefix / "lib")]
+        resolved = [path.resolve() for path in candidates if path.is_file() and prefix in path.resolve().parents]
+        if not resolved or (installed_files is not None and not any(path in installed_files for path in resolved)):
+            raise RuntimeError(f"GPU runtime is missing its application-local dependency: {name}")
+    if identity["backend"] == "hip" and set(payload.get("gpuTargets", [])) != {"gfx1200", "gfx1201"}:
+        raise RuntimeError("ROCm package does not preserve the two required RDNA4 targets")
+    resources = payload.get("resources", [])
+    components = [item.get("name") for item in resources if isinstance(item, dict)]
+    if (not components or len(components) != len(resources)
+            or any(not isinstance(name, str) or not name for name in components)
+            or len(set(components)) != len(components)):
+        raise RuntimeError("GPU runtime manifest does not identify its actual license resources")
+    return {"passed": True, "required": True, "manifestSha256": file_digest(manifest), "files": len(seen),
+            "runtimeComponents": sorted(components)}
+
+
+def verify_backend_modes(executable, application, work, report_dir, environment, model_arguments,
+                         identity, reference, installed_files, timeout):
+    outcomes = {}
+    for mode in ("cpu", "gpu"):
+        current_environment = dict(environment, QT_QPA_PLATFORM="offscreen", QCOPILOTS_SEARCH_BACKEND=mode)
+        with (report_dir / ("backend-" + mode + ".log")).open("w", encoding="utf-8") as log:
+            child = subprocess.Popen([str(executable), "--mode", "full", "--profile-dir", str(work / ("backend-" + mode)),
+                                      *model_arguments], cwd=work, env=current_environment, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=log, text=True, encoding="utf-8")
+            replies = queue.Queue()
+            reader = threading.Thread(target=read_worker_replies, args=(child, replies), daemon=True)
+            reader.start()
+            try:
+                reply, raw = worker_request(child, replies, {"id": "backend-" + mode, "operation": "query",
+                    "query": "payment declined error"}, report_dir, timeout, accept_failure=True)
+                if reply.get("ok") is True:
+                    result = reply.get("result", {})
+                    diagnostics = validate_backend_diagnostics(result.get("runtime"), identity, mode)
+                    numerical = validate_vector(result.get("embedding"), reference)
+                    origins = inference_runtime_origins(child, executable, application, installed_files, diagnostics)
+                    outcome = {"passed": True, "diagnostics": diagnostics, "rawReply": raw,
+                               "numericalCosine": numerical["cosine"], "runtime": origins}
+                    if mode == "gpu":
+                        outcome["hardwareTested"] = True
+                elif mode == "gpu":
+                    error = reply.get("error", {})
+                    diagnostics = validate_backend_diagnostics(error.get("runtime"), identity, mode, loaded=False)
+                    reason = error.get("message", "")
+                    if not reason or "strict gpu" not in reason.lower() or reply.get("result", {}).get("embedding"):
+                        raise RuntimeError(f"Strict GPU request failed without an explicit backend rejection: {reply}")
+                    outcome = {"passed": True, "hardwareTested": False, "diagnostics": diagnostics,
+                               "reason": reason, "rawReply": raw}
+                else:
+                    raise RuntimeError(f"Explicit CPU fallback failed: {reply}")
+                outcomes["strictGpu" if mode == "gpu" else "cpu"] = outcome
+            finally:
+                try:
+                    stop_worker(child, replies, reader, report_dir)
+                finally:
+                    cleanup_error = force_stop(child)
+                    if child.stdin and not child.stdin.closed:
+                        child.stdin.close()
+                    reader.join(timeout=5)
+                    if child.stdout:
+                        child.stdout.close()
+                    if cleanup_error or reader.is_alive():
+                        raise RuntimeError("Backend verification child could not be cleaned up: " + str(cleanup_error))
+    return outcomes
 
 
 def checked_relative(name):
@@ -469,6 +659,34 @@ def unpack(package, destination):
                 subprocess.run(["hdiutil", "detach", mount], check=True)
     else:
         raise RuntimeError("Verification expects a ZIP, TGZ, native macOS DMG or Windows NSIS distribution")
+
+
+def validate_setup_payload(directory):
+    if {entry.name for entry in directory.iterdir()} != {"setup.exe", "payload-manifest.json", "payload"}:
+        raise RuntimeError("External-payload installer must contain only setup.exe, its manifest and payload")
+    manifest = json.loads((directory / "payload-manifest.json").read_text(encoding="utf-8"))
+    if (type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 1
+            or manifest.get("variant") != "windows-x64-rocm"
+            or type(manifest.get("totalBytes")) is not int or manifest["totalBytes"] < 1
+            or not isinstance(manifest.get("files"), list) or not manifest["files"]):
+        raise RuntimeError("External-payload installer has an invalid ROCm manifest")
+    payload = directory / "payload"
+    seen, total = set(), 0
+    for record in manifest["files"]:
+        relative = checked_relative(record["path"])
+        name = relative.as_posix()
+        path = (payload / relative).resolve()
+        if (name != record["path"] or name.casefold() in seen or not path.is_file()
+                or payload.resolve() not in path.parents or type(record.get("bytes")) is not int
+                or record["bytes"] < 0 or path.stat().st_size != record["bytes"]
+                or file_digest(path) != record.get("sha256")):
+            raise RuntimeError(f"External installer payload is missing, changed or ambiguous: {record['path']}")
+        seen.add(name.casefold())
+        total += record["bytes"]
+    actual = {path.relative_to(payload).as_posix().casefold() for path in payload.rglob("*") if path.is_file()}
+    if actual != seen or total != manifest["totalBytes"] or "bin/qcs-gui.exe" not in seen:
+        raise RuntimeError("External installer payload inventory differs from its manifest")
+    return manifest
 
 
 def create_fixtures(directory):
@@ -529,7 +747,7 @@ def package_source_identity(source=None, environment=None):
     source = (Path(source) if source is not None else SOURCE).resolve()
     environment = os.environ if environment is None else environment
     declarations = {name: environment[name] for name in
-                    ("QCOPILOTS_SEARCH_SOURCE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD")
+                    ("QCOPILOTS_SEARCH_SOURCE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD", "QCOPILOTS_SEARCH_CANDIDATE_COMMIT")
                     if name in environment}
     for name, value in declarations.items():
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
@@ -563,7 +781,7 @@ def package_source_identity(source=None, environment=None):
 
 
 def verify(package, build_root, explicit_report=None, installed_root=None, explicit_profile=None, installed_manifest=None,
-           model_dir=None, keyword_only=False, model_timeout=600):
+           model_dir=None, keyword_only=False, model_timeout=600, expected_variant=None):
     source_identity = package_source_identity()
     run_id = str(uuid.uuid4())
     if explicit_report:
@@ -573,7 +791,9 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         report_root = build_root / "reports"
         report_root.mkdir(parents=True, exist_ok=True)
         report_dir = Path(tempfile.mkdtemp(prefix="qcs-pkg-", dir=report_root))
-    run_root = build_root / "runs"
+    run_root = Path(os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or build_root / "runs").expanduser().resolve()
+    if run_root == SOURCE or SOURCE in run_root.parents or run_root == Path(run_root.anchor):
+        raise RuntimeError("Package verification test root must be a dedicated directory outside the source checkout")
     run_root.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="qcs-pkg 中文 空格-", dir=run_root))
     report = {"package":str(package) if package else None, "installedRoot":str(installed_root) if installed_root else None,
@@ -593,11 +813,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     service_started = False
     cli = None
     logs = []
-    environment = os.environ.copy()
-    for key in tuple(environment):
-        if key.startswith(("QT_", "QML_", "QML2_", "QCOPILOTS_SEARCH_")) or key in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH"):
-            environment.pop(key, None)
-    environment["PATH"] = os.pathsep.join((str(Path(os.environ["SystemRoot"])/"System32"),os.environ["SystemRoot"])) if os.name == "nt" else "/usr/bin:/bin"
+    environment = isolated_environment()
     profile = explicit_profile or work / "独立配置"
     report["profileDirectory"] = str(profile)
     if explicit_profile and profile.exists() and (not profile.is_dir() or any(profile.iterdir())):
@@ -628,6 +844,14 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
             report["checks"].append("NSIS installed for this user into an isolated Unicode directory")
         else:
             unpack(package,work/"应用")
+            if package.name.endswith("-setup.zip"):
+                setup = work / "应用/setup.exe"
+                validate_setup_payload(work / "应用")
+                installer = NsisInstallation(setup, work / "已安装应用")
+                installer.install()
+                application = work / "已安装应用"
+                report["applicationRoot"] = str(application)
+                report["checks"].append("external-payload NSIS installed from its complete offline setup archive")
         suffix=".exe" if os.name=="nt" else ""
         candidates = [candidate for candidate in (
             application/"bin"/(PRODUCT+"-cli"+suffix),
@@ -639,7 +863,17 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
             raise RuntimeError(f"Expected exactly one installed CLI, found {len(candidates)}")
         cli=candidates[0]
         binary=cli.parent
+        report["buildIdentity"] = validate_build_identity(binary, application, source_identity, expected_variant)
+        expected_attempt = os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_ATTEMPT") or os.environ.get("QCOPILOTS_SEARCH_ATTEMPT")
+        if expected_attempt and (not re.fullmatch(r"[1-9][0-9]*", expected_attempt)
+                                 or report["buildIdentity"]["attempt"] != int(expected_attempt)):
+            raise RuntimeError("Packaged build attempt differs from the requested candidate attempt")
+        report["variant"] = report["buildIdentity"]["variant"]
+        report["gpuPayload"] = verify_gpu_payload(binary, application, report["buildIdentity"], installed_files)
         report["licenseMaterials"] = verify_license_materials(binary, application, report_dir, installed_files)
+        if (report["gpuPayload"].get("required") and
+                report["gpuPayload"]["runtimeComponents"] != report["licenseMaterials"].get("runtimeComponents")):
+            raise RuntimeError("Packaged GPU runtime and collected license component inventories differ")
         report["checks"].append("complete packaged runtime license materials and SBOM coverage verified")
         if os.name == "nt":
             for runtime in ("msvcp140.dll", "vcruntime140.dll", "vcomp140.dll"):
@@ -693,18 +927,30 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         report["workerLibraries"]=verify_library_origins(worker,application,installed_files)
         if not keyword_only:
             report["modelSmoke"] = real_model_smoke(worker, replies, binary/(PRODUCT+"-worker"+suffix),
-                application, work, report_dir, verified_models, installed_files, model_timeout)
+                application, work, report_dir, verified_models, installed_files, model_timeout, report["buildIdentity"])
             report["checks"].append("installed inference runtime matched immutable text, image and audio reference vectors")
         stop_worker(worker, replies, reader, report_dir)
         worker = None
+        if not keyword_only:
+            reference = json.loads((work / "模型 参考/vectors.json").read_text(encoding="utf-8"))["vectors"]["query"]
+            report["backendVerification"] = verify_backend_modes(binary / (PRODUCT + "-worker" + suffix),
+                application, work, report_dir, environment, model_arguments, report["buildIdentity"], reference,
+                installed_files, model_timeout)
+            report["checks"].append("explicit CPU inference and strict GPU acceptance or rejection verified")
         invoke("index",fixtures,"--wait","--timeout","120000")
         hits=invoke("search","qcopilots_package_4317","--keyword-only").get("hits",[])
         if not any(hit.get("path","").endswith("中文 package notes.txt") for hit in hits):
             raise RuntimeError("Packaged index/search did not retrieve its text fixture")
         report["checks"].append("packaged service index and exact keyword retrieval")
         if not keyword_only:
-            semantic = invoke("search", "portable document search", "--timeout", "120000")
-            if semantic.get("semantic") is not True or semantic.get("warning") or not semantic.get("hits"):
+            # None of these terms occurs in the fixture text. Require a real
+            # stored-vector candidate, without imposing a relevance threshold.
+            semantic = invoke("search", "A coastal lighthouse beneath moonlit clouds", "--root", fixtures,
+                              "--timeout", "120000")
+            semantic_hits = semantic.get("hits", [])
+            if (semantic.get("semantic") is not True or semantic.get("warning") or not semantic_hits
+                    or any(hit.get("matchSource") != "semantic" or fixtures.resolve() not in Path(hit.get("path", "")).resolve().parents
+                           for hit in semantic_hits)):
                 raise RuntimeError(f"Packaged service query encoder did not provide semantic retrieval: {semantic}")
             report["modelSmoke"]["serviceSemantic"] = semantic
             report["checks"].append("installed service completed semantic retrieval with its isolated model directory")
@@ -791,7 +1037,10 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
                 report["cleanupError"] = str(error)
                 report["passed"] = False
         report["releaseComplete"] = (report["passed"] and not keyword_only and
-            report.get("licenseMaterials", {}).get("passed") is True and report.get("modelSmoke", {}).get("passed") is True)
+            report.get("licenseMaterials", {}).get("passed") is True and report.get("modelSmoke", {}).get("passed") is True
+            and report.get("buildIdentity", {}).get("workingTreeModified") is False
+            and report.get("backendVerification", {}).get("cpu", {}).get("passed") is True
+            and report.get("backendVerification", {}).get("strictGpu", {}).get("passed") is True)
         (report_dir/"report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding="utf-8")
         print(json.dumps(report,indent=2,ensure_ascii=False),flush=True)
     if not report["passed"]:
@@ -809,6 +1058,7 @@ def main():
     parser.add_argument("--model-dir",type=Path,help="Read-only cache of both locked GGUF artifacts, required for release verification")
     parser.add_argument("--keyword-only",action="store_true",help="Explicit partial developer verification without real model inference, insufficient for release")
     parser.add_argument("--model-timeout",type=int,default=600,help="Seconds allowed for each real-model worker request (default 600)")
+    parser.add_argument("--variant", help="Require the downloaded package to match this build variant")
     args=parser.parse_args()
     root=args.build_root.resolve()
     source=Path(__file__).resolve().parent.parent
@@ -822,7 +1072,7 @@ def main():
     if package is None and not args.installed_root:
         suffix=".zip" if os.name=="nt" else ".dmg" if sys.platform=="darwin" else ".tar.gz"
         packages=[path for path in (root/"pkg").glob(PRODUCT+"-*"+suffix)
-                  if "-source-materials-" not in path.name and "-symbols-" not in path.name]
+                  if "-source-materials-" not in path.name and "-symbols-" not in path.name and not path.name.endswith("-setup.zip")]
         if not packages: raise RuntimeError("No distribution archive exists. Run package first.")
         package=max(packages,key=lambda value:value.stat().st_mtime)
     report=args.report_dir.expanduser().resolve() if args.report_dir else None
@@ -838,7 +1088,7 @@ def main():
         raise RuntimeError("Choose full verification with --model-dir or partial --keyword-only, not both")
     if args.model_timeout < 1 or args.model_timeout > 3600:
         raise RuntimeError("--model-timeout must be between 1 and 3600 seconds")
-    verify(package.resolve() if package else None,root,report,installed,profile,manifest,model_dir,args.keyword_only,args.model_timeout)
+    verify(package.resolve() if package else None,root,report,installed,profile,manifest,model_dir,args.keyword_only,args.model_timeout,args.variant)
 
 
 if __name__=="__main__":

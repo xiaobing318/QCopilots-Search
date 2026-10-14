@@ -17,7 +17,3 @@ if(QCOPILOTS_SEARCH_CPPJIEBA_DICT_DIR)
     endif()
     file(COPY "${QCOPILOTS_SEARCH_CPPJIEBA_DICT_DIR}/" DESTINATION "${_qcopilots_dict_destination}")
 endif()
-
-add_executable(qcs-benchmark "${PROJECT_SOURCE_DIR}/tools/qcs-benchmark.cpp")
-target_link_libraries(qcs-benchmark PRIVATE qcs-storage SQLite::SQLite3)
-install(TARGETS qcs-benchmark RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")

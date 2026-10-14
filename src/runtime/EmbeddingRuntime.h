@@ -2,6 +2,7 @@
 
 #include <QVector>
 #include <QString>
+#include <QJsonObject>
 #include <memory>
 #include <functional>
 
@@ -25,6 +26,10 @@ public:
     bool isLoaded() const;
     bool isTextOnly() const;
     QString lastError() const;
+    // GPU mode is strict: initialization must succeed on the packaged GPU
+    // backend. Auto may retry on CPU and records the reason in diagnostics().
+    bool setBackendMode(const QString& mode, QString* error = nullptr);
+    QJsonObject diagnostics() const;
     // Set these on the owner thread before load. The callback may read a shared atomic flag.
     void setThreadCount(int threads);
     void setCancellationCallback(std::function<bool()> cancelled);

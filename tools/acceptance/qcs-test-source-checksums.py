@@ -1,5 +1,7 @@
 import argparse
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -81,6 +83,86 @@ class ChecksumRegression(unittest.TestCase):
     def test_checksum_file_cannot_include_itself(self):
         with self.assertRaisesRegex(RuntimeError, 'Invalid source checksum entry'):
             module.refresh_package_checksums(self.root, [self.checksums])
+
+
+class CandidateSourceRegression(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='qcs-source-candidate-',
+            dir=os.environ.get('QCOPILOTS_SEARCH_TEST_ROOT') or None)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.source = self.root / 'project'
+        self.source.mkdir()
+        self.lock = self.source / 'dependencies.lock.json'
+        self.lock.write_bytes(b'{"schemaVersion":1}\n')
+        (self.source / 'README.md').write_bytes(b'SYNTHETIC corresponding source fixture\n')
+        source = patch.object(module, 'SOURCE', self.source)
+        source.start()
+        self.addCleanup(source.stop)
+        self.git('init', '--quiet')
+        self.git('add', '.')
+        self.git('-c', 'user.name=QCS synthetic test', '-c', 'user.email=synthetic@example.invalid',
+                 'commit', '--quiet', '-m', 'Synthetic source fixture')
+        self.commit = self.git('rev-parse', 'HEAD')
+
+    def git(self, *arguments):
+        return module.subprocess.check_output(['git', '-c', 'core.autocrlf=false', '-C', str(self.source),
+                                               *arguments], text=True).strip()
+
+    def test_exact_clean_candidate_and_source_tree_are_recorded(self):
+        identity = module.checkout_identity(self.commit)
+        self.assertEqual(identity['commit'], self.commit)
+        self.assertEqual(identity['sourceTree'], self.git('rev-parse', 'HEAD^{tree}'))
+        self.assertFalse(identity['workingTreeModified'])
+
+    def test_gpu_and_variant_identity_files_are_dependency_locks(self):
+        names = ['dependencies.lock.json', 'config/build-variants.json', 'config/gpu-sdk.lock.json',
+                 'config/gpu-license-sources.lock.json', 'cmake/qcs-native-deps.cmake', 'README.md']
+        records = [{'path': name, 'sha256': '1' * 64, 'size': 42} for name in names]
+        self.assertEqual([entry['path'] for entry in module.dependency_locks(records)], names[:-1])
+
+    def test_wrong_candidate_or_dirty_checkout_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'does not match'):
+            module.checkout_identity('0' * 40)
+        self.lock.write_bytes(b'changed source lock\n')
+        with self.assertRaisesRegex(RuntimeError, 'clean checkout'):
+            module.checkout_identity(self.commit)
+
+    def test_source_change_after_snapshot_is_rejected(self):
+        identity = module.checkout_identity()
+        records = [{'path': relative, 'sha256': module.digest(path), 'size': path.stat().st_size}
+                   for relative, path in module.project_files()]
+        self.lock.write_bytes(b'changed source lock\n')
+        with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+            module.verify_source_snapshot(identity, records)
+
+    def test_candidate_bundle_is_platform_neutral_without_qt_sdk(self):
+        build = self.root / 'external build'
+        cache = build / 'deps/sources'
+        cache.mkdir(parents=True)
+        upstream = cache / 'synthetic.tar.gz'
+        upstream.write_bytes(b'SYNTHETIC immutable source archive bytes')
+        entry = {'name': 'synthetic', 'filename': upstream.name, 'sha256': module.digest(upstream),
+                 'size': upstream.stat().st_size, 'url': 'https://example.invalid/source'}
+        arguments = ['qcs-source-bundle.py', '--build-root', str(build), '--candidate-commit', self.commit,
+                     '--reserve-gib', '0']
+        with patch.object(sys, 'argv', arguments), patch.object(module, 'entries', return_value=[entry]), \
+                patch.object(sys, 'stdout', new_callable=io.StringIO) as output:
+            module.main()
+        bundle = build / 'pkg' / f'qcs-source-materials-{self.commit[:12]}.zip'
+        produced = json.loads(output.getvalue())
+        self.assertTrue(produced['ok'])
+        self.assertEqual(produced['bundle'], str(bundle))
+        self.assertEqual(produced['sha256'], module.digest(bundle))
+        result = module.verify_bundle(bundle, candidate_commit=self.commit)
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['platform'], 'source')
+        manifest = json.loads((build / 'pkg/qcs-source-manifest.json').read_text())
+        self.assertEqual(manifest['architecture'], 'any')
+        self.assertNotIn('qtSdkMetadata', manifest)
+        self.assertEqual([entry['path'] for entry in manifest['dependencyLocks']], ['dependencies.lock.json'])
+        with self.assertRaisesRegex(RuntimeError, 'does not match'):
+            module.verify_bundle(bundle, candidate_commit='0' * 40)
 
 
 class FFmpegMetadataRegression(unittest.TestCase):

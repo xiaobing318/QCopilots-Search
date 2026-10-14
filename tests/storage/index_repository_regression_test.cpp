@@ -1,5 +1,4 @@
 #include "storage/index_repository.h"
-#include "core/embedding_math.h"
 #include "support/test_environment.h"
 #include "support/sqlite_database.h"
 
@@ -18,7 +17,6 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
-#include <limits>
 #include <future>
 #include <mutex>
 #include <stdexcept>
@@ -870,27 +868,45 @@ private slots:
         }
     }
 
-    void exactCosineUsesTheSameFloatBoundaryForCalibration()
+    void semanticSearchRanksCandidatesWithoutARelevanceThreshold()
     {
-        QVector<float> query(embeddingDimensions, 0.0f);
-        query[0] = 0.6f;
-        query[1] = 0.8f;
-        QVector<float> stored(embeddingDimensions, 0.0f);
-        stored[0] = 1.0f;
-        const auto normalized = embedding_math::normalized(query);
-        const double production = embedding_math::cosine(normalized, stored);
-        const double calibration = embedding_math::cosine(embedding_math::normalized(query), stored);
-        QCOMPARE(production, calibration);
-        QCOMPARE(production, double(normalized[0]));
-        const double threshold = std::nextafter(calibration, std::numeric_limits<double>::infinity());
-        QVERIFY(production < threshold);
-        // Re-normalizing the rounded float query in double precision changes
-        // the boundary and cannot be used to fit production thresholds.
-        const double doubleNorm = double(normalized[0]) * normalized[0]
-            + double(normalized[1]) * normalized[1];
-        const double otherCosine = double(normalized[0]) / std::sqrt(doubleNorm);
-        QVERIFY(otherCosine < production);
-        QVERIFY(std::nextafter(otherCosine, std::numeric_limits<double>::infinity()) < production);
+        TestEnvironment environment(QStringLiteral("semantic-ranking"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        QVector<float> positive(embeddingDimensions, 0.0f);
+        positive[0] = 1.0f;
+        QVector<float> orthogonal(embeddingDimensions, 0.0f);
+        orthogonal[1] = 1.0f;
+        QVector<float> negative(embeddingDimensions, 0.0f);
+        negative[0] = -1.0f;
+        const QString first = environment.path(QStringLiteral("first.txt"));
+        const QString second = environment.path(QStringLiteral("second.txt"));
+        const QString third = environment.path(QStringLiteral("third.txt"));
+        QVERIFY2(repository.replaceFiles({
+            {third, QStringLiteral("one"), false, {makeSegment({}, negative)}},
+            {second, QStringLiteral("one"), false, {makeSegment({}, orthogonal)}},
+            {first, QStringLiteral("one"), false, {makeSegment({}, positive)}}
+        }, &error), qPrintable(error));
+
+        SearchOptions options;
+        options.queryEmbedding = positive;
+        options.limit = 3;
+        const auto hits = repository.search(options, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hitPaths(hits), (QStringList{first, second, third}));
+        for (const auto &hit : hits) {
+            QCOMPARE(hit.matchSource, QStringLiteral("semantic"));
+            QVERIFY(std::isfinite(hit.score));
+        }
+        QVERIFY(hits[0].score > hits[1].score);
+        QVERIFY(hits[1].score > hits[2].score);
+
+        options.limit = 2;
+        const auto limited = repository.search(options, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hitPaths(limited), (QStringList{first, second}));
     }
 
     void tokenlessSemanticQueriesKeepProvidedEmbedding()
@@ -911,7 +927,6 @@ private slots:
         SearchOptions options;
         options.query = QString::fromUtf8("\xf0\x9f\x90\xb1");
         options.queryEmbedding = embedding;
-        options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = repository.search(options, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(1));
@@ -949,7 +964,6 @@ private slots:
         SearchOptions options;
         options.query = QStringLiteral("where can I find a bicycle beside a bridge");
         options.queryEmbedding = queryVector;
-        options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         options.limit = 10;
         const auto hits = repository.search(options, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
@@ -1090,7 +1104,6 @@ private slots:
         options.limit = 1;
         if (semantic) {
             options.queryEmbedding = nearest;
-            options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         } else
             options.query = QStringLiteral("needle");
         const auto withoutRules = repository.search(options, &error);
@@ -1146,7 +1159,6 @@ private slots:
             options.limit = 20;
             if (semantic) {
                 options.queryEmbedding = embedding;
-                options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
             } else
                 options.query = QStringLiteral("needle");
             options.root = root + u'/';
@@ -1196,7 +1208,6 @@ private slots:
             SearchOptions options;
             if (semantic) {
                 options.queryEmbedding = embedding;
-                options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
             } else
                 options.query = QStringLiteral("needle");
             options.enforceFolderRules = true;
@@ -1293,7 +1304,6 @@ private slots:
 
         SearchOptions options;
         options.queryEmbedding = queryVector;
-        options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         options.limit = 2;
         // No text, root or kind filter: FTS and allow-list construction must not
         // accidentally hide either regression in the unfiltered ANN path.

@@ -1,159 +1,63 @@
-# 发布指南
+# 构建、安装包与发布
 
-发布流程从通过测试的不可变提交生成安装布局，再自动生成平台包、校验和、依赖清单和测试报告。开发分支和草稿 PR 可以推送，合并、签名、公证及公开发布由维护者决定。仓库 CI 不自动创建公开 release。
+本项目在开发分支形成可审查的候选，完成测试后再由发布负责人决定合并和公开发布。普通构建只生成当前变体的用户包，发布准备自动获取 CI 成品并冻结来源与字节。
 
-## 发行门槛
+## 固定构建矩阵
 
-| 门槛 | 必需证据 |
-| --- | --- |
-| 本地 Windows | 同一候选的完整 CTest、QtTest、工具测试、真实模型、路径与清理回归及安装报告 |
-| Windows x64、Linux x64、macOS arm64 / x86_64 | 四个原生 CI job 的构建、CTest、真实模型和包级结果 |
-| 推理兼容性 | 九条固定黄金向量 cosine ≥ 0.999，CPU 基线与当前分发路径 |
-| 语义质量 | 真实片段与查询集来源、逐查询及分组 Recall@10、无答案结果 |
-| 容量和恢复 | 当前 Windows 百万向量、十万物理文件、性能与故障结果 |
-| 用户操作 | 最终 Windows 包的 Computer Use 十个场景及截图 |
-| 运行依赖 | 脱离开发路径的程序、服务、worker、Qt 插件、OCR 数据和字典验证 |
-| 许可与源码材料 | 实际部署依赖的许可证、版本、源归档、补丁及重建说明 |
-| 签名状态 | macOS 对实际 staging APP 执行 `codesign --verify --deep --strict` 并读取身份，区分 ad-hoc、Developer ID、其他证书、未签名、无效与未知状态，公证单独记录 |
+平台、后端、SDK 和产物规则由 `config/build-variants.json` 统一提供，开发入口、CI、验包和发布工具共同读取。正常完整运行包含 11 个构建条目、11 个 package artifacts 和 21 个用户文件。
 
-本地自动化、四组合 Actions 和当前 Windows Computer Use 必须分别完成。发行候选显式使用 `full` 测试范围，日常本地或普通 PR 的 `fast` 通过只说明所选范围通过。每个必需完整 CI job 和汇总 job 必须实际结束为 success，并提供对应 run 链接。任一必需证据缺失时，保持草稿或测试包状态。部分 runner 的系统版本高于最低发行目标，因此原生 CI 通过不自动证明所有最低操作系统版本已经过实机验收。
+| 变体 | 后端与 SDK | 系统基线 | 用户文件 |
+| --- | --- | --- | --- |
+| `windows-x64-cpu` | CPU ALL | Windows x64 / MSVC 2022 | EXE + portable ZIP |
+| `windows-x64-vulkan` | Vulkan + CPU，上游 Vulkan 配方 | Windows x64 / MSVC 2022 | EXE + portable ZIP |
+| `windows-x64-rocm` | HIP + CPU，ROCm 10.0.0，gfx1200、gfx1201 | Windows x64 / MSVC 主程序 | EXE + portable ZIP |
+| `windows-x64-cuda-12.4` | CUDA 12.4 + CPU | Windows x64 / MSVC 主程序 | EXE + portable ZIP |
+| `windows-x64-cuda-13.4` | CUDA 13.4 + CPU | Windows x64 / MSVC 主程序 | EXE + portable ZIP |
+| `linux-x64-cpu` | CPU ALL | Ubuntu 22.04 | DEB + portable TGZ |
+| `linux-x64-vulkan` | Vulkan + CPU，上游 Vulkan 配方 | Ubuntu 22.04 | DEB + portable TGZ |
+| `linux-x64-rocm` | HIP + CPU，ROCm 10.0.0，gfx1200、gfx1201 | Ubuntu 24.04 | DEB + portable TGZ |
+| `linux-x64-cuda-12.8` | CUDA 12.8.2 + CPU | Ubuntu 24.04 | DEB + portable TGZ |
+| `linux-x64-cuda-13.4` | CUDA 13.4.1 + CPU | Ubuntu 24.04 | DEB + portable TGZ |
+| `macos-arm64-metal` | Metal + CPU，内嵌 Metal library | macOS 14.4 / Apple Silicon | DMG |
 
-在 Actions 的 `qcs native acceptance` 中选择冻结候选所在分支，手动运行时将 `test_profile` 设为 `full`，并核对实际运行的完整提交 SHA。普通 PR 和手动运行的默认范围均为 `fast`，只有推送到 `main` 默认执行 `full`。完整运行需取得四份 `qcs-native-<platform>-<sha>` 及 `qcs-native-aggregate-<sha>`，不能混入 `qcs-fast-*` 报告或不同提交、不同运行的通过结果。快速运行不生成发行包或对应源码归档，其报告的 `releaseComplete` 保持 false。
+llama.cpp 固定为 b11461，提交 `4d756bc72bf00a4aacf410ae15a2d315f3db400d`。CUDA 双版本、默认 GPU 架构和 Windows 独立后端编译参考该提交的 [上游发布流程](https://github.com/ggml-org/llama.cpp/blob/4d756bc72bf00a4aacf410ae15a2d315f3db400d/.github/workflows/release.yml)。Windows SDK setup actions 按完整 SHA 引用，其他步骤只作项目必要适配。ROCm 明确保留 RDNA4 两个目标，不因包体积悄悄减少。
 
-发布检查同时读取 CTest 进程结果和 QtTest 用例明细。测试程序退出码为零不能替代内部用例执行证据。`reports/tests/qt-test-cases.json` 必须没有未执行的必需用例或缺失明细。唯一经过明确分类的平台不适用用例及其精确匹配规则见 [测试指南](testing.md)，这类用例保留单独计数，不计为通过。
+## 部署与安装规则
 
-## 构建与安装布局
+保留 no-logits 和 Windows UTF-8 后端路径补丁。Windows 主程序使用 MSVC/Qt，CUDA/HIP 后端位于外置子构建，最终只部署主构建的一份 `ggml-base`。后端必须匹配同一上游版本、ABI 与运行库，不能从任意开发 SDK 或当前目录动态补齐。
 
-先执行开发脚本的 `configure`、`build` 和 `test --test-profile full --model-dir <已校验模型目录>`。完整候选运行器也显式选择 `full`，并核对完整注册清单。`install` 调用 `cmake --install`，将程序及依赖放入 `<build-root>/stage`。安装布局是后续部署和打包的依据，不手动复制开发目录里的 DLL 来补包。
+CUDA 部署对应运行库，ROCm 部署 HIP、BLAS 和两个 RDNA4 目标实际需要的资源，Vulkan 只携带运行必需组件。模型经首次使用下载或离线导入后校验，不内置到各个安装包。实际许可证和 notices 随用户包部署。
 
-```powershell
-./qcs-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
-./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
-./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator NSIS
-./qcs-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
-```
+Windows 默认单 EXE 安装器。若 ROCm 包实际触及 NSIS 单 EXE 容量限制，仅该安装器改为 `setup.zip`，内含小型 `setup.exe` 和完整 `payload/`。用户解压后离线安装，独立 portable ZIP 仍保留。安装器核对载荷清单、磁盘空间和路径，按清单安装与卸载，不能在线补齐缺失运行库。容量边界见 [NSIS 文档](https://nsis.sourceforge.io/Docs/Chapter1.html)。
 
-Windows NSIS 生成器需要安装 NSIS。macOS 使用 `DragNDrop`，分架构生成 `.app` 和 `.dmg`。Linux 分别使用 `TGZ` 和 `DEB`。包位于 `<build-root>/pkg`，文件统一采用 `qcs` 前缀，校验和写入 `SHA256SUMS`。
+ROCm 编译与打包分阶段进行，只提取目标资源。Windows 完整检查先生成 NSIS 安装器，再生成便携 ZIP。每个 CPack 生成器使用本次调用的独立工作目录，完成后只清理本次生成的受控 stage，避免多份完整载荷同时驻留，保留已有历史产物与用户安装 stage。所有平台卸载均保留用户模型、索引和配置。
 
-## 包级验收
+Windows 沿用开发包签名条件。macOS 使用 ad-hoc，部署修改、strip 和链接校验完成后从内到外签名，最终执行严格验证。签名后不再修改 APP。ad-hoc 不等于 Developer ID 签名或公证，商业签名不属于本轮范围。
 
-使用新的目录解压或安装最终包。测试路径应与源码、SDK、构建树和 staging 不同。运行时清除开发 Qt 插件环境和工具链 PATH，仅保留系统及安装目录。使用新的 profile 启动 GUI、服务、worker 和 CLI，验证索引与查询、PDF 和媒体资源定位、OCR 数据、字典、重启以及卸载后数据保留策略。
+## CI 产物协议
 
-自动部署检查和用户操作验收分别报告。只运行 `--version` 可以证明一部分动态库加载，不能替代 GUI 插件加载、后台索引或多媒体预览。`verify-package` 的实际执行范围需要在报告中注明，缺少的完整流程由包级测试补齐。
+每个变体顺序执行工具链准备、构建、全部保留测试、stage 安装、打包和最终包验证。GPU 开发运行也先生成完整 stage，避免裸构建目录依赖 SDK 环境补齐运行库。PR、主分支推送及手动运行使用同一流程。汇总 job 核对所有变体状态及用户文件，不下载大型测试报告重复聚合。
 
-`verify-package` 从验证器源码目录的真实 Git checkout 读取 `HEAD` 和工作树状态，正常 checkout 与 linked worktree 均可使用。报告记录 `commit`、`workingTreeModified` 和 `sourceIdentityStatus`，不从 `GITHUB_SHA` 推断来源。若设置 `QCOPILOTS_SEARCH_SOURCE_COMMIT` 或 `QCOPILOTS_SEARCH_CANDIDATE_HEAD`，每项必须是完整的 40 位小写十六进制 SHA，且与实际 `HEAD` 相同。声明失配、Git 查询失败或 checkout 根不符时，在创建报告和启动产品前明确失败。
+仅上传通过验证的安装器和便携包。artifact 名为 `qcs-packages-<variant>-<候选SHA>-attempt<N>`，用户文件包含变体、版本及候选身份。artifact 不包含日志、报告、截图、源码、符号、测试数据或独立校验和。失败诊断保留在 GitHub 原生日志，需要时通过 API 读取。
 
-源码归档或没有 Git 程序的环境仍可在未声明候选身份时执行功能验收，此时报告中的 `commit` 和 `workingTreeModified` 为 `null`，`sourceIdentityStatus` 为 `unavailable`，不能独立满足发布来源门槛。复制的源码归档不会继承上层其他 Git 仓库的身份。DEB 容器内层报告同样遵循此规则，外层安装与卸载报告的候选及包哈希绑定仍由原生证据流程核验。
+现有托管 runner 无 GPU 时完成所有适用测试、CPU 回退及依赖验证，明确记录硬件未实测。有设备时执行严格 GPU 模式，不能用 CPU 回退冒充设备通过。
 
-默认包级验收必须读取已校验的模型目录，执行 `query`、`screen-280` 和 `speech` 三条原始黄金输入，并保存全部 768 维结果和 worker 原始回复。发布门禁独立重算归一化长度和 cosine，要求 cosine ≥ 0.999，并核对安装目录内推理库的来源、实际字节哈希及服务语义检索结果。Windows 和 x64 Unix 包验证实际加载的共享 CPU 后端，Apple Silicon 验证静态 CPU 实现。本步骤不替代单独的九条黄金向量和强制基线后端测试。`--keyword-only` 只生成开发阶段的部分验收报告，发布门禁会拒绝它。
+## 发行准备与候选身份
 
-包中 Qt SDK 的许可清单、对应许可文本和 llama/ggml 许可会完整复制到验收报告目录。`record-package` 同时保留这些材料和三份原始 worker 回复，检查清单哈希、模块覆盖及每份附件的实际字节。DEB 验收容器以只读方式挂载模型目录，不把模型写入安装包。
+`release-prepare` 接受 CI run ID、attempt 和完整候选 SHA，自动选择并下载 11 个 artifacts。它校验 workflow、run、原始 job 执行、attempt、artifact ID 和 digest，下载后验证包白名单及每个用户文件的 SHA-256。部分重跑可保留未重跑的原成功 job，最新失败不能借用历史成功产物。
 
-Windows 完整 CI 分别验证 ZIP 和最终 NSIS。NSIS 验证真实执行单用户安装、GUI / 服务 / worker / 提取及搜索测试，再执行卸载并检查独立用户配置保留。若检查到已有产品安装，验证器会停止，不修改已有安装。
+工具从同一干净候选和依赖锁独立生成一份平台无关的对应源码材料。冻结输出包含用户包、源码包、校验和、发布 manifest，以及本地来源快照。CI 不承担源码材料上传。符号通过独立动作按需生成，不作为每次打包的附带产物。
 
-Linux 完整 CI 在固定 Ubuntu 22.04 容器中使用 `dpkg --install` 安装最终 DEB，随后以普通用户从 `/usr` 运行共同包级验证器。验证器根据 `dpkg-query --listfiles` 的清单核对实际加载的库，避免系统中已有 Qt 掩盖漏包。完成后执行 `dpkg --remove`，确认包文件已移除且独立 profile 的文件哈希全部保留。源码和 DEB 以只读方式挂载，开发机和 CI 宿主不安装该 DEB。
+发布准备是 CI 成品的获取与冻结过程，不能替代本机完整测试和最终 Windows CPU 包的 Computer Use。项目完成结论仍需这些独立检查对应同一源码和实际包身份，实际操作不得复用另一包的截图或报告。
 
-相应报告分别为 `reports/package-nsis/report.json` 和 `reports/package-deb/report.json`。后者同时保存容器日志及普通用户 smoke 报告。容器方案与脚本存在不代表验收已经通过，实际结果以对应原生 CI 为准。
+显式 `release-upload-draft` 上传前再次核对冻结字节，只创建或续传草稿，不合并分支、不公开发布。每个 Release 附件必须小于 2 GiB，超限明确失败，本轮不提供附件分卷，也不裁剪 GPU 目标绕过限制。限制见 [GitHub Releases 文档](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)。
 
-## 材料清单
-
-每个发行候选至少保留：
-
-- 平台安装包、SHA-256 和源码提交。
-- CTest JUnit、原生 CI 链接、模型与语义质量报告、容量报告、Computer Use 报告。
-- 构建配置、工具链版本、依赖锁、运行库和插件清单。
-- 调试符号，独立于普通用户包存放。
-- 对应源码归档、上游源归档校验值、应用补丁、可复现的构建脚本和 `source-integrity.json`。
-- 应用 MIT、DigUp MIT、各动态库及其随附第三方组件的许可证材料。
-- 签名与公证状态及验证结果。
-
-模型由下载或离线导入获得，不放进安装包。OCR 数据和中文分词字典是正常运行资源，需要随包部署并保留归属。
-
-运行 `tools/qcs-source-bundle.py --build-root <root> --qt-root <sdk> --download` 生成实际对应源码包及校验清单，详见 [对应源码材料](source-materials.md)。生成最终材料时要求使用干净的发行提交，开发阶段的 `workingTreeModified` 标记不能被删除来伪装不可变来源。
-
-## CI 和人工发布
-
-`.github/workflows/qcs-native.yml` 在 PR 创建或同步、main 推送时运行四个原生组合，也支持手动触发。每个 job 使用独立外置根。`fast` 运行构建和所选测试，上传快速报告。`full` 还执行校验过的模型下载、全套测试、小规模容量、平台打包及安装验收，并上传报告与测试包。
-
-full CI 的安装、打包和源码步骤按真实前置结果调度，语义质量失败后仍可完成其它独立验收。测试失败不会被忽略，也不会因后续包验证成功而变成完整通过。测试超时、缺少原始日志或任何必需验收失败时，native job 和总门禁保持失败，上传材料只供开发检查，不能交给 `release-prepare` 作为通过的发行候选。具体依赖见 [原生 CI 与包级测试](testing.md#原生-ci-与包级测试)。
-
-完整 CI 的 `required` job 下载当前运行选中的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。快速汇总使用独立的 fast artifact，只验证快速范围，报告明确保留 `releaseComplete: false`。这两种结果都不能代替最终 Windows 百万规模和 Computer Use，后两项由下面的本机门禁单独核验。
-
-PR 的候选提交使用事件中的 `pull_request.head.sha`，其他事件使用 `github.sha`。四个原生 job 和汇总 job 都显式检出该候选，分别记录候选 head 与实际 checkout commit，并核对 Git tree 和依赖锁哈希。PR 事件的 `GITHUB_SHA` 可能是 GitHub 生成的临时合并提交，不能替代实际 checkout 身份写入包报告。最终本机候选必须与原生证据一致，不能将旧报告事后绑定到新的 HEAD。
-
-原生平台包和汇总 artifact 均带 `-attempt<N>` 后缀，重试不会删除或覆盖旧证据。汇总中的 `selection.json` 绑定同一 run、候选和范围的四个平台执行，保留每个平台实际 `sourceAttempt`、job ID、artifact ID、摘要及原始 API 快照。下载发行输入时保留四个选中平台 artifact 的原目录名，同时下载对应的一个 `qcs-native-aggregate-<sha>-attempt<N>` artifact。发行准备会验证其选择链并自动复制快照，不需要手工搬动报告。最新失败不能用较早成功覆盖，多个聚合目录也不会被自动猜选。完整规则见 [原生 CI 与包级测试](testing.md#原生-ci-与包级测试)。
+完整命令、输出布局和恢复规则见 [发布命令](release-command.md)。
 
 ## 本机最终证据流程
 
-使用 `tools/qcs-release-evidence.py` 记录构建与验收。它使用 Python 标准库，所有运行创建外置唯一目录，保留执行前来源、实际命令、退出码、原始 stdout / stderr、执行时间和产物 SHA-256。聚合器不执行发布，也不根据报告中的单个 `passed` 字段放行。
+候选记录工具保留 `record-build`、`record-package`、`collect-local` 等现有职责。构建记录绑定真实构建命令、执行前后源码身份及 `qcs-gui`、`qcs-service`、`qcs-worker`、`qcs-cli` 四个程序。包记录核对最终 ZIP 内程序字节，记录模型和提取指纹。
 
-先提交并冻结候选，然后在干净 checkout 下记录一次实际完整构建。路径均由调用者提供，下面的 `$source`、`$buildRoot`、`$qtRoot`、`$evidenceRoot` 和 `$python` 分别指向当前源码、外置构建根、SDK、证据根及 Python。`--program` 至少记录四个应用程序、百万容量程序和物理文件测试程序，程序的实际生成路径以当前构建为准。
+Windows Computer Use 从这一最终 CPU 包启动独立 profile，完成 CU-01 至 CU-10 并保留实际操作、截图、时间和包哈希。`collect-local` 仅收集候选与 Computer Use 记录，按附件清单校验字节，不导入整个数据库目录。详细命令见 [候选验收运行器](../tools/acceptance/README.md)。
 
-```powershell
-$tool = Join-Path $source 'tools/qcs-release-evidence.py'
-& $python $tool record-build --source $source --output-root $evidenceRoot `
-  --program "qcs-gui=$buildRoot/release/bin/qcs-gui.exe" `
-  --program "qcs-service=$buildRoot/release/bin/qcs-service.exe" `
-  --program "qcs-worker=$buildRoot/release/bin/qcs-worker.exe" `
-  --program "qcs-cli=$buildRoot/release/bin/qcs-cli.exe" `
-  --program "qcs-benchmark=$buildRoot/release/bin/qcs-benchmark.exe" `
-  --program "qcs-tests-file-capacity=$physicalTest" `
-  -- pwsh -NoProfile -File "$source/qcs-dev.ps1" build `
-       --build-root $buildRoot --qt-root $qtRoot
-```
-
-命令输出新的 `build-record.json` 路径。将它保存为 `$buildRecord`，后续 `run-local` 在实际启动前核对 clean source 和 producer 的 SHA-256，在进程结束后再次核对。`{program}`、`{evidence}`、`{report}` 由工具展开，分别表示已经核验的程序、本次唯一目录和报告路径。不要将旧报告复制到新目录冒充新执行。
-
-Windows 的 `CreateProcessW` 对工作目录仍有 `MAX_PATH` 限制，即使证据文件本身支持长路径。工具默认在本次证据目录执行，路径过长时仅采用经文件身份核验、指向同一目录的现有 8.3 短名称，并记录 `requestedWorkingDirectory` 和 `actualWorkingDirectory`。文件系统未提供可用短名称时会明确失败。此时可以在 `record-build` 或 `run-local` 的 `--` 之前显式指定 `--working-directory <已有的较短目录>`。只有这个选项会改变命令中相对路径的基准，证据和报告继续写入原来的绝对路径。建议命令的输入文件使用绝对路径。该限制见 [Microsoft 的工作目录文档](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setcurrentdirectory)。
-
-```powershell
-& $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot `
-  --kind physical --program-name qcs-tests-file-capacity `
-  --report physical.json --env 'QCOPILOTS_SEARCH_PHYSICAL_FILE_COUNT=100000' `
-  --env 'QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT={report}' `
-  --env 'QCOPILOTS_SEARCH_TEST_ROOT={evidence}/temporary' `
-  --env 'QT_FORCE_STDERR_LOGGING=1' -- '{program}' -o -,txt
-```
-
-物理测试需要由运行环境提供构建依赖的位置，且 `QCOPILOTS_SEARCH_TEST_ROOT` 的父目录必须可写。百万向量测试使用独立监控器，通过 `--input` 保留监控脚本原文和执行前后哈希。监控器的 `ExternalRoot` 指向六个 producer 所属的真实构建根，`ReportRoot` 使用 `{evidence}`，让原始 benchmark JSON、采样 JSONL 和输出日志从运行开始就保存在本次证据目录。百万运行的 `$evidenceRoot` 必须位于 `$buildRoot/reports` 内。下面的 `$millionRunner` 由当前源码目录派生，完整示例见 [候选验收运行器](../tools/acceptance/README.md#百万验收的完整执行记录)。
-
-```powershell
-$millionRunner = Join-Path $source 'tools/acceptance/qcs-run-million.ps1'
-$millionPreflight = Join-Path $source 'tools/acceptance/qcs-physical-preflight.py'
-& $python $tool run-local --build-record $buildRecord --output-root $evidenceRoot --working-directory $buildRoot `
-  --kind million --program-name qcs-benchmark `
-  --report '*.monitor.json' --input $millionRunner --input $millionPreflight `
-  -- pwsh -NoProfile -File $millionRunner -BenchmarkExe '{program}' `
-       -ExternalRoot $buildRoot -ReportRoot '{evidence}' -QtBin $qtBin -Source $source `
-       -ExpectedCommit $candidateHead -BuildRecord $buildRecord -Python $python -Mode Run
-```
-
-百万验收要求实际写入和重载至少 1,000,000 个 768 维向量、至少 100 条不同 oracle 查询和 500 次预热后计时，同时验证过滤、CRUD、后台重建、四个崩溃恢复边界及独立磁盘采样。原始报告和监控报告均保留，绝对路径只作为原始记录，由附件映射对应到可移植相对路径。采样峰值不冒充连续测量峰值。
-
-执行 `package` 和 `verify-package` 后，将最终 ZIP、验证报告和上述 build record 交给 `record-package`。该命令核对 ZIP 内四个可执行文件与本次构建的字节一致，生成 `package-candidate.json`。`$modelFingerprint` 和 `$extractionFingerprint` 来自相同候选实际语义验收，不使用人工编造的版本名称。
-
-```powershell
-& $python $tool record-package --build-record $buildRecord --package $finalZip `
-  --verification $packageReport --output-root $evidenceRoot `
-  --model-fingerprint $modelFingerprint --extraction-fingerprint $extractionFingerprint
-```
-
-以新生成的 package candidate 初始化 Windows Computer Use 记录，再对这一个最终包完成十个场景。报告必须带相同候选身份、包哈希、四个程序哈希、模型和提取指纹，每个场景保留预期、实际操作、结果、时间、截图与操作日志。原始 JSON 必须在顶层内嵌 `files` 清单，所有附件路径均相对于该 JSON 所在目录，使用 POSIX 路径。`--computer-use` 传入这份自包含原始报告，不能传入附加的 `-files.json`。完整字段与路径规则见 [Windows 用户操作验收](windows-user-acceptance.md#报告字段)。旧长命名候选及跨包报告已退出本轮验收范围，不能通过改名或补写来源充当新候选的实际操作证据。
-
-将 `record-package`、两个 `run-local` 和 Computer Use 的原始 JSON 路径分别赋给下列变量。`collect-local` 只复制已列入哈希清单的证据，不导入整个数据库目录。四份 GitHub 原生 artifact 分别解压到 `$nativeArtifacts` 的四个子目录，保持各自 `reports` 和 `pkg` 布局。
-
-```powershell
-& $python $tool collect-local --candidate $candidateRecord --million $millionRecord `
-  --physical $physicalRecord --computer-use $computerUseRecord --output-root $evidenceRoot
-& $python $tool preflight --candidate-commit $candidateHead `
-  --native-artifacts-dir $nativeArtifacts --local-evidence-dir $collectedLocalRoot `
-  --output "$evidenceRoot/final-preflight.json"
-```
-
-最终命令只有在四组合原生证据及全部本机门槛满足时返回 0。其失败报告逐项保留缺失、规模不足、原始结果不一致或来源失配的原因。纯粹整理旧报告、合成验证器 fixture 通过、部分平台测试通过，都不会成为最终发布完成证明。
-
-macOS 部署默认使用 ad-hoc 签名。Qt 先通过 `-no-codesign` 完成依赖复制、路径修改和 strip，然后项目签名工具扫描整个 APP 中的实际 Mach-O 文件，包括无链接引用的完整版本 dylib、动态加载模块和 universal binary。独立代码文件和嵌套 framework、APP 从内到外签名，最外层 APP 最后签。工具逐个验证代码文件和 bundle，再执行 `codesign --verify --deep --strict`。签名不使用 `--deep`，也不允许签名后再次修改 APP 内容。签名清单和命令记录写到 APP 外部的 `reports/qcs-macos-signing-<配置>.json`。
-
-`QCOPILOTS_SEARCH_MACOS_CODESIGN_IDENTITY` 默认为 `-`，可以显式指定受控钥匙串中的证书身份。指定证书但不可用时构建失败，不回退到 ad-hoc。证书模式启用 secure timestamp，并为 executable 启用 Hardened Runtime。可选 `QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP` 指向 JSON 文件，键为 APP 内 executable 的相对路径，例如 `Contents/MacOS/qcs-gui`，值为相对于该 JSON 文件的 entitlement plist 路径。只有映射中明确列出的 executable 会附加这些权限，库和 framework 不接受 entitlement 映射。未配置时不自动继承第三方代码的旧 entitlements，已有权限需求必须在该映射中明确列出。私钥和签名凭据不能写入仓库、日志或普通测试产物。
-
-验收报告以实际 `codesign` 命令及退出码为依据。ad-hoc 不等于 Developer ID 分发签名，签名验证也不证明已公证。报告中的签名范围是 staging APP，未生成 APP、命令不可用或身份无法识别时记为未知，其他平台尚未配置签名验证时同样记为未知。当前仓库默认验收的是 ad-hoc 包，配置证书的分发与公证仍须在受控发布环境单独验证。签名后重新计算包校验和，并验证签名后的最终包。维护者确认全部验收和许可材料后再决定公开发布。
+Windows 工作目录仍受 `CreateProcessW` 限制。记录器可使用明确指定的短工作目录，或在验证指向相同目录后使用已有 8.3 名称，不通过改写来源或手工补报告掩盖失败。

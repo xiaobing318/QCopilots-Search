@@ -257,10 +257,10 @@ def prepare_source(source_root):
     root = external_output(source_root)
     require(not root.exists(), "Fixture source output already exists")
     # Only these named, repository-owned inputs are read. In particular, no
-    # previous profile, semantic run or holdout result is discovered implicitly.
-    input_names = ("tests/semantic/assets.json", "tests/semantic/assets/NOTICE.md",
-                   "tests/semantic/assets/photo-002.jpg", "tests/semantic/assets/speech-001.wav",
-                   "tests/semantic/assets/speech-002.wav")
+    # previous profile or test output is discovered implicitly.
+    input_names = ("tests/acceptance/fixtures/assets.json", "tests/acceptance/fixtures/media/NOTICE.md",
+                   "tests/acceptance/fixtures/media/photo-002.jpg", "tests/acceptance/fixtures/media/speech-001.wav",
+                   "tests/acceptance/fixtures/media/speech-002.wav")
     inputs, source_bytes = [], {}
     for name in input_names:
         path = unlinked(REPOSITORY_ROOT / name)
@@ -270,7 +270,7 @@ def prepare_source(source_root):
     assets = json.loads(source_bytes[input_names[0]])
     locked = {item["path"]: item for item in assets["assets"]} if "assets" in assets else {}
     for name in input_names[2:]:
-        key = name.removeprefix("tests/semantic/")
+        key = name.removeprefix("tests/acceptance/fixtures/")
         row = locked.get(key)
         require(row is not None and row["bytes"] == len(source_bytes[name])
                 and row["sha256"] == hashlib.sha256(source_bytes[name]).hexdigest(), "Fixed CU input does not match assets.json: " + name)
@@ -349,7 +349,7 @@ def prepare_source(source_root):
                 "browseOrder": {"primary": "mtimeMs DESC", "tie": "actual indexed file_id DESC", "tieGroupsZeroBased": [[98, 99, 100, 101], [198, 199, 200, 201]], "pageSizes": [100, 100, 5]},
                 "files": files, "acceptancePassed": False,
                 "license": "Original generated text, code, PDF, DOCX, BMP and AVI use the repository MIT license. Photo and source audio retain their recorded asset licenses.",
-                "limits": ["Media target regions are authored expectations. Actual search hits and external positions must be observed.", "Generated UI fixtures are not semantic-quality or capacity acceptance evidence.", "Index only browseRoot first. Add the other roots for later scenarios."]}
+                "limits": ["Media target regions are authored expectations. Actual search hits and external positions must be observed.", "Generated fixtures support functional UI validation only.", "Index only browseRoot first. Add the other roots for later scenarios."]}
     path = target(root, SOURCE_MANIFEST)
     write_json(path, manifest)
     os.utime(path, ns=(FIXTURE_EPOCH_MS * 1_000_000, FIXTURE_EPOCH_MS * 1_000_000))

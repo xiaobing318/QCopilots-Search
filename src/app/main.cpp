@@ -1,4 +1,5 @@
 #include "app_backend.h"
+#include "gui_instance.h"
 #include "main_window.h"
 #include "login_startup.h"
 #include "core/runtime_paths.h"
@@ -77,8 +78,18 @@ int main(int argc, char **argv) {
         prompt.exec();
         return 2;
     }
+    qcopilots_search::GuiInstance instance(paths);
+    const auto instanceResult = instance.start(&error);
+    if (instanceResult == qcopilots_search::GuiInstance::Result::ActivatedExisting) return 0;
+    if (instanceResult == qcopilots_search::GuiInstance::Result::Failed) {
+        writeCommandLineOutput(error + QLatin1Char('\n'), true);
+        QMessageBox::critical(nullptr, QStringLiteral("QCopilots Search"), error);
+        return 2;
+    }
     qcopilots_search::ServiceBackend backend(paths);
     qcopilots_search::MainWindow window(paths, &backend, !parser.isSet("no-tray"), !parser.isSet("no-onboarding"));
+    QObject::connect(&instance, &qcopilots_search::GuiInstance::showRequested,
+                     &window, &qcopilots_search::MainWindow::showSearch);
     application.setQuitOnLastWindowClosed(false);
     const bool explicitBackground = parser.isSet("background");
     const bool disableTray = parser.isSet("no-tray");

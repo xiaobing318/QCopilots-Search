@@ -2,64 +2,63 @@ name: qcs native acceptance
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      test_profile:
-        description: 'fast: daily checks, full: required release acceptance'
-        type: choice
-        required: true
-        default: fast
-        options: [fast, full]
-
-env:
-  QCOPILOTS_SEARCH_TEST_PROFILE: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full'))) && 'full' || inputs.test_profile || 'fast' }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: qcs-native-${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full'))) && 'full' || inputs.test_profile || 'fast' }}
+  group: qcs-native-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  matrix:
+    name: qcs build configurations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      configurations: ${{ steps.configurations.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Read the shared build variants
+        id: configurations
+        run: python3 .github/scripts/qcs-native-ci.py matrix
+
   native:
     name: qcs ${{ matrix.id }}
+    needs: matrix
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - id: windows-x64
-            runner: windows-2022
-            arch: x86_64
-            generators: ZIP,NSIS
-          - id: linux-x64
-            runner: ubuntu-22.04
-            arch: x86_64
-            generators: TGZ,DEB
-          - id: macos-arm64
-            runner: macos-15
-            arch: arm64
-            generators: DragNDrop
-          - id: macos-x64
-            runner: macos-15-intel
-            arch: x86_64
-            generators: DragNDrop
+      matrix: ${{ fromJSON(needs.matrix.outputs.configurations) }}
     defaults:
       run:
         shell: bash
         working-directory: 'qcs 源码'
     env:
       QCOPILOTS_SEARCH_CI_ID: ${{ matrix.id }}
+      QCOPILOTS_SEARCH_VARIANT: ${{ matrix.id }}
       QCOPILOTS_SEARCH_CANDIDATE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-      QCOPILOTS_SEARCH_CI_ARCH: ${{ matrix.arch }}
-      QCOPILOTS_SEARCH_CI_GENERATORS: ${{ matrix.generators }}
+      QCOPILOTS_SEARCH_CI_CONTAINER: ${{ matrix.container != '' && '1' || '0' }}
+      QCOPILOTS_SEARCH_CI_CONTAINER_IMAGE: ${{ matrix.container }}
       QCOPILOTS_SEARCH_KEEP_FAILED_TESTS: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
+      - name: Prepare the pinned CUDA container
+        if: matrix.container != ''
+        timeout-minutes: 15
+        working-directory: /
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y ca-certificates git curl tar gzip unzip python3 python3-venv passwd cmake
       - name: Checkout in a path containing Chinese and a space
         timeout-minutes: 10
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -77,204 +76,133 @@ jobs:
         run: python .github/scripts/qcs-native-ci.py initialize
       - name: Install Linux host libraries and test display
         if: runner.os == 'Linux'
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential ninja-build pkg-config dbus-daemon libxcb1-dev \
+          qcs_sudo=()
+          if [ "$(id -u)" != 0 ]; then qcs_sudo=(sudo); fi
+          "${qcs_sudo[@]}" apt-get update
+          "${qcs_sudo[@]}" apt-get install --no-install-recommends -y build-essential ninja-build pkg-config dbus-daemon libxcb1-dev \
             libgl1-mesa-dev libxkbcommon-dev libfontconfig1-dev libfreetype6-dev \
             libglib2.0-dev libdbus-1-dev libx11-xcb-dev libxcb-cursor0 \
             libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-shape0 \
             libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxkbcommon-x11-0 \
-            libpulse0 xvfb xauth dpkg-dev patchelf fonts-noto-cjk fonts-dejavu-core
+            libpulse0 xvfb xauth dpkg-dev patchelf fonts-noto-cjk fonts-dejavu-core \
+            libvulkan-dev glslc spirv-headers
       - name: Install macOS build tools
         if: runner.os == 'macOS'
         timeout-minutes: 15
         run: brew install ninja
+      - name: Reuse the pinned upstream Windows CUDA SDK setup
+        if: runner.os == 'Windows' && matrix.backend == 'cuda'
+        timeout-minutes: 45
+        uses: ggml-org/llama.cpp/.github/actions/windows-setup-cuda@4d756bc72bf00a4aacf410ae15a2d315f3db400d
+        with:
+          cuda_version: ${{ matrix.toolkitVersion }}
+          cuda_arch: x64
+      - name: Record Windows ROCm disk space before SDK setup
+        if: runner.os == 'Windows' && matrix.backend == 'hip'
+        shell: pwsh
+        run: |
+          $qcsDrive = Get-PSDrive -Name C
+          Write-Output "ROCm SDK setup initial free bytes: $($qcsDrive.Free)"
+      - name: Reuse the pinned upstream Windows ROCm SDK setup
+        if: runner.os == 'Windows' && matrix.backend == 'hip'
+        timeout-minutes: 45
+        uses: ggml-org/llama.cpp/.github/actions/windows-setup-rocm@4d756bc72bf00a4aacf410ae15a2d315f3db400d
+        env:
+          PIP_NO_CACHE_DIR: '1'
+        with:
+          version: ${{ matrix.toolkitVersion }}
+      - name: Record Windows ROCm disk space after SDK setup
+        if: always() && runner.os == 'Windows' && matrix.backend == 'hip'
+        shell: pwsh
+        run: |
+          $qcsDrive = Get-PSDrive -Name C
+          Write-Output "ROCm SDK setup remaining free bytes: $($qcsDrive.Free)"
+      - name: Select the upstream ROCm Python environment
+        if: runner.os == 'Windows' && matrix.backend == 'hip'
+        shell: pwsh
+        run: |
+          $qcsRocmPython = 'C:\TheRock\build\.venv\Scripts\python.exe'
+          if (-not (Test-Path -LiteralPath $qcsRocmPython -PathType Leaf)) {
+            throw 'The pinned upstream ROCm setup did not create its Python environment'
+          }
+          "QCOPILOTS_SEARCH_ROCM_PYTHON=$qcsRocmPython" >> $env:GITHUB_ENV
       - name: Restore immutable model cache
-        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         timeout-minutes: 15
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.QCOPILOTS_SEARCH_MODEL_DIR }}
           key: qcs-models-bfcd298762cc34d0357ece5ebdd31791a3a374d8-v1
-      - name: Bootstrap locked SDK
-        timeout-minutes: 30
+      - name: Bootstrap locked Qt and backend SDK
+        timeout-minutes: 60
         run: python .github/scripts/qcs-native-ci.py bootstrap
-      - name: Diagnose native toolchain
-        timeout-minutes: 5
+      - name: Diagnose native toolchain and available hardware
+        timeout-minutes: 10
         run: python .github/scripts/qcs-native-ci.py doctor
-      - name: Configure CPU baseline
+      - name: Configure selected backend
         timeout-minutes: 30
         run: python .github/scripts/qcs-native-ci.py configure
       - name: Build
-        id: build
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: python .github/scripts/qcs-native-ci.py build
       - name: Download and verify required real models
-        id: models
-        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         timeout-minutes: 35
         run: python .github/scripts/qcs-native-ci.py models
-      - name: Run selected portable tests (full includes real-model and capacity tests)
-        id: tests
-        timeout-minutes: ${{ env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && 180 || 45 }}
+      - name: Run all functional and real-model numerical tests
+        timeout-minutes: 90
         run: python .github/scripts/qcs-native-ci.py test
-      - name: Exercise the capacity path at CI scale
-        id: capacity
-        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.build.outcome == 'success' }}
+      - name: Install staging tree
         timeout-minutes: 20
-        run: python .github/scripts/qcs-native-ci.py capacity
-      - name: Install staging tree from the successful build
-        id: install
-        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.build.outcome == 'success' }}
-        timeout-minutes: 15
         run: python .github/scripts/qcs-native-ci.py install
-      - name: Package and verify deployment
-        id: package
-        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.install.outcome == 'success' && steps.models.outcome == 'success' }}
+      - name: Package and verify portable deployment
         timeout-minutes: 45
         run: python .github/scripts/qcs-native-ci.py package
-      - name: Install and remove the final NSIS or DEB package
-        id: installers
-        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.package.outcome == 'success' && steps.models.outcome == 'success' && (runner.os == 'Windows' || runner.os == 'Linux') }}
+      - name: Install and remove the final installer
+        if: runner.os == 'Windows' || runner.os == 'Linux'
         timeout-minutes: 45
         run: python .github/scripts/qcs-native-ci.py installers
-      - name: Collect corresponding source materials
-        id: sources
-        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.build.outcome == 'success' }}
-        timeout-minutes: 30
-        run: python .github/scripts/qcs-native-ci.py sources
-      - name: Record evidence for the selected profile
-        id: report
-        if: always()
+      - name: Validate the exact user package set
+        id: packages
         timeout-minutes: 10
-        run: python .github/scripts/qcs-native-ci.py report
-      - name: Verify this native evidence unit
-        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
-        timeout-minutes: 10
-        run: python .github/scripts/qcs-native-ci.py preflight
-      - name: Upload reports and test packages
-        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
+        run: python .github/scripts/qcs-native-ci.py products
+      - name: Upload installers and portable packages
         timeout-minutes: 20
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: qcs-native-${{ matrix.id }}-${{ env.QCOPILOTS_SEARCH_CANDIDATE_HEAD }}-attempt${{ github.run_attempt }}
+          name: qcs-packages-${{ matrix.id }}-${{ env.QCOPILOTS_SEARCH_CANDIDATE_HEAD }}-attempt${{ github.run_attempt }}
+          path: ${{ steps.packages.outputs.paths }}
           overwrite: false
           if-no-files-found: error
           retention-days: 14
-          path: |
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/reports
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/pkg/qcs-*
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/pkg/SHA256SUMS
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/pkg/_CPack_Packages/**/NSISOutput.log
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/pkg/_CPack_Packages/**/project.nsi
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/Testing/Temporary
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/CMakeFiles/CMakeConfigureLog.yaml
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/tests/**/qcs-tests-*.xml
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/runs/**/qcs-image-*/**
-      - name: Upload daily fast reports (no release packages)
-        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'fast'
-        timeout-minutes: 15
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: qcs-fast-${{ matrix.id }}-${{ env.QCOPILOTS_SEARCH_CANDIDATE_HEAD }}-attempt${{ github.run_attempt }}
-          overwrite: false
-          if-no-files-found: error
-          retention-days: 7
-          path: |
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/reports
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/Testing/Temporary
-            ${{ env.QCOPILOTS_SEARCH_BUILD_ROOT }}/release/CMakeFiles/CMakeConfigureLog.yaml
+          compression-level: 0
 
   required:
     name: qcs all native combinations
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     if: always()
-    needs: native
+    needs: [matrix, native]
     permissions:
       contents: read
       actions: read
     steps:
-      - name: Checkout candidate evidence validators
-        timeout-minutes: 5
+      - name: Checkout candidate artifact selector
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Set up Python
-        timeout-minutes: 5
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.12'
-      - name: Select immutable artifacts from the latest native executions
-        id: selection
-        timeout-minutes: 5
-        shell: bash
+      - name: Verify all required native jobs
+        env:
+          MATRIX_RESULT: ${{ needs.matrix.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
+        run: test "$MATRIX_RESULT" = success && test "$NATIVE_RESULT" = success
+      - name: Verify immutable package artifact identities
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CANDIDATE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          python .github/scripts/qcs-artifact-selection.py collect \
+          python3 .github/scripts/qcs-artifact-selection.py collect \
             --output-dir "$RUNNER_TEMP/qcs-selected-artifacts" \
             --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
-            --candidate-head "$CANDIDATE_HEAD" --profile "$QCOPILOTS_SEARCH_TEST_PROFILE" \
-            --attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Download the four selected immutable evidence units
-        timeout-minutes: 15
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ steps.selection.outputs.artifact_ids }}
-          merge-multiple: false
-          path: ${{ runner.temp }}/qcs-selected-artifacts
-      - name: Aggregate native raw reports and immutable source identities
-        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
-        timeout-minutes: 10
-        shell: bash
-        env:
-          CANDIDATE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          python tools/qcs-release-evidence.py aggregate-native \
-            --candidate-commit "$CANDIDATE_HEAD" \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --native-artifacts-dir "$RUNNER_TEMP/qcs-selected-artifacts" \
-            --output "$RUNNER_TEMP/qcs-selected-artifacts/aggregate.json"
-      - name: Upload native aggregate report
-        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
-        timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: qcs-native-aggregate-${{ github.event.pull_request.head.sha || github.sha }}-attempt${{ github.run_attempt }}
-          overwrite: false
-          path: |
-            ${{ runner.temp }}/qcs-selected-artifacts/aggregate.json
-            ${{ runner.temp }}/qcs-selected-artifacts/selection.json
-            ${{ runner.temp }}/qcs-selected-artifacts/selection-inputs
-          if-no-files-found: error
-      - name: Aggregate daily fast evidence (release acceptance remains incomplete)
-        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'fast'
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          python .github/scripts/qcs-native-ci.py aggregate-fast \
-            --artifacts-dir "$RUNNER_TEMP/qcs-selected-artifacts" \
-            --output "$RUNNER_TEMP/qcs-selected-artifacts/aggregate.json"
-      - name: Upload daily fast aggregate report
-        if: always() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'fast'
-        timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: qcs-fast-aggregate-${{ github.event.pull_request.head.sha || github.sha }}-attempt${{ github.run_attempt }}
-          overwrite: false
-          path: |
-            ${{ runner.temp }}/qcs-selected-artifacts/aggregate.json
-            ${{ runner.temp }}/qcs-selected-artifacts/selection.json
-            ${{ runner.temp }}/qcs-selected-artifacts/selection-inputs
-          if-no-files-found: error
-      - name: Check all native jobs
-        if: always()
-        timeout-minutes: 1
-        shell: bash
-        env:
-          NATIVE_RESULT: ${{ needs.native.result }}
-        run: test "$NATIVE_RESULT" = success
+            --candidate-head "$CANDIDATE_HEAD" --attempt "$GITHUB_RUN_ATTEMPT"

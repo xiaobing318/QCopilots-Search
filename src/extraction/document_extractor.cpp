@@ -1,5 +1,6 @@
 #include "document_extractor.h"
 #include "legacy_doc_extractor.h"
+#include "core/file_formats.h"
 
 #include <QFile>
 #include <QFileInfo>
@@ -23,20 +24,6 @@
 
 namespace qcopilots_search {
 namespace {
-const QSet<QString> &sourceExtensions() {
-    static const auto extensions = [] {
-        const auto words = QStringLiteral("py pyi pyx c h cc cpp cxx hpp hh hxx m mm swift ts tsx mts cts js jsx mjs cjs go rs java kt kts scala groovy rb php cs fs sh bash zsh fish ps1 lua pl pm r jl dart sql vue svelte astro html htm css scss sass less gradle cmake mk proto graphql gql tf hcl nix zig hs ex exs erl clj cljs elm ml mli vim el lisp asm s metal glsl hlsl wgsl cu cuh ino v sv tex qml").split(' ');
-        return QSet<QString>(words.begin(), words.end());
-    }();
-    return extensions;
-}
-const QSet<QString> &codeTextExtensions() {
-    static const auto extensions = [] {
-        const auto words = QStringLiteral("md markdown rst adoc org txt yaml yml toml").split(' ');
-        return QSet<QString>(words.begin(), words.end());
-    }();
-    return extensions;
-}
 class DocumentError : public std::runtime_error {
 public:
     explicit DocumentError(const QString &s) : std::runtime_error(s.toStdString()) {}
@@ -403,23 +390,15 @@ void appendChunks(QList<Segment> &segments, const QString &path, QString text, c
 } // namespace
 
 bool supportsDocument(QString suffix) {
-    static const QSet<QString> extensions{QStringLiteral("txt"), QStringLiteral("text"), QStringLiteral("md"), QStringLiteral("markdown"),
-        QStringLiteral("html"), QStringLiteral("htm"), QStringLiteral("rtf"), QStringLiteral("docx"), QStringLiteral("odt"), QStringLiteral("doc")};
-    return extensions.contains(suffix.toLower());
+    return file_formats::documentExtensions().contains(suffix.toLower());
 }
 bool supportsCode(QString suffix, QString filename) {
     suffix = suffix.toLower(); filename = filename.toLower();
-    const QStringList excludedPrefixes{QStringLiteral("license"), QStringLiteral("licence"), QStringLiteral("copying"), QStringLiteral("notice"),
-        QStringLiteral("id_rsa"), QStringLiteral("id_dsa"), QStringLiteral("id_ecdsa"), QStringLiteral("id_ed25519"), QStringLiteral(".env"),
-        QStringLiteral("secret"), QStringLiteral("credential"), QStringLiteral(".netrc"), QStringLiteral(".npmrc"), QStringLiteral(".pypirc"),
-        QStringLiteral("htpasswd"), QStringLiteral(".htpasswd")};
+    if (file_formats::isSensitiveFilename(filename)) return false;
+    const QStringList excludedPrefixes{QStringLiteral("license"), QStringLiteral("licence"), QStringLiteral("copying"), QStringLiteral("notice")};
     for (const auto &prefix : excludedPrefixes) if (filename.startsWith(prefix)) return false;
     if (filename.endsWith(QStringLiteral(".min.js")) || filename.endsWith(QStringLiteral(".min.mjs")) || filename.endsWith(QStringLiteral(".min.css"))) return false;
-    const QSet<QString> names{QStringLiteral("makefile"), QStringLiteral("gnumakefile"), QStringLiteral("dockerfile"), QStringLiteral("containerfile"),
-        QStringLiteral("justfile"), QStringLiteral("rakefile"), QStringLiteral("gemfile"), QStringLiteral("podfile"), QStringLiteral("brewfile"),
-        QStringLiteral("procfile"), QStringLiteral("vagrantfile"), QStringLiteral("jenkinsfile"), QStringLiteral("cmakelists.txt")};
-    return sourceExtensions().contains(suffix) || codeTextExtensions().contains(suffix) || suffix == QStringLiteral("ipynb") ||
-           names.contains(filename) || filename.startsWith(QStringLiteral("dockerfile"));
+    return file_formats::isCode(suffix, filename);
 }
 ExtractionResult extractDocument(QString path, const ExtractionOptions &options) {
     ExtractionResult result;
@@ -497,7 +476,7 @@ ExtractionResult extractDocument(QString path, const ExtractionOptions &options)
                     document.setHtml(QTextCodec::codecForHtml(bytes, QTextCodec::codecForName("UTF-8"))->toUnicode(bytes));
                     text = document.toPlainText();
                 } else text = decode(bytes);
-                if (options.code) checkCode(text, sourceExtensions().contains(suffix));
+                if (options.code) checkCode(text, file_formats::sourceExtensions().contains(suffix));
                 appendChunks(all, path, std::move(text), options);
             }
         } catch (const DocumentSegmentLimitReached &) {

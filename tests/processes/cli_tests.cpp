@@ -109,6 +109,7 @@ private slots:
         QVERIFY(result.output.contains("qcs-cli"));
         QVERIFY(result.output.contains("model"));
         QVERIFY(result.output.contains("--profile-dir"));
+        QVERIFY(result.output.contains("(1..500)"));
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile"))));
     }
 
@@ -122,6 +123,7 @@ private slots:
         QTest::newRow("negative-timeout") << QStringList{QStringLiteral("status"), QStringLiteral("--timeout=-1")};
         QTest::newRow("empty-query") << QStringList{QStringLiteral("search"), QStringLiteral(" ")};
         QTest::newRow("invalid-limit") << QStringList{QStringLiteral("search"), QStringLiteral("中文"), QStringLiteral("--limit"), QStringLiteral("0")};
+        QTest::newRow("over-maximum-limit") << QStringList{QStringLiteral("search"), QStringLiteral("中文"), QStringLiteral("--limit"), QStringLiteral("501")};
         QTest::newRow("invalid-config") << QStringList{QStringLiteral("config"), QStringLiteral("set"), QStringLiteral("{invalid}")};
         QTest::newRow("array-config") << QStringList{QStringLiteral("config"), QStringLiteral("set"), QStringLiteral("[]")};
         QTest::newRow("missing-import-source") << QStringList{QStringLiteral("model"), QStringLiteral("import")};
@@ -257,7 +259,8 @@ private slots:
         QVERIFY(settings.value(QStringLiteral("roots")).toArray().isEmpty());
         QVERIFY(settings.value(QStringLiteral("excludes")).toArray().isEmpty());
         const auto search = invoke(environment, {QStringLiteral("search"), QStringLiteral("clifreshcodekeyword"),
-            QStringLiteral("--code"), QStringLiteral("--keyword-only"), QStringLiteral("--no-start")});
+            QStringLiteral("--code"), QStringLiteral("--keyword-only"), QStringLiteral("--no-start"),
+            QStringLiteral("--limit"), QStringLiteral("500")});
         QCOMPARE(search.exitCode, 0);
         const auto hits = search.json().value(QStringLiteral("result")).toObject().value(QStringLiteral("hits")).toArray();
         QCOMPARE(hits.size(), 1);

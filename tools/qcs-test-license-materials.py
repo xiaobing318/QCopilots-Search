@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 
@@ -509,6 +510,109 @@ class LicenseMaterialsTests(unittest.TestCase):
         self.assertNotIn(removed.relative_to(self.output).as_posix(),
                          {item["path"] for item in manifest["files"]})
         materials.verify_materials(self.output)
+
+
+    def runtime_manifest(self):
+        license_path = self.root / "GPU SDK/NOTICE.txt"
+        license_path.parent.mkdir()
+        license_path.write_bytes(synthetic_license("runtime-component"))
+        selection = self.root / "runtime-licenses.json"
+        document = {"schemaVersion": 1, "resources": [{"name": "synthetic-runtime", "version": "1.0",
+                    "files": [{"path": "NOTICE.txt", "source": "GPU SDK/NOTICE.txt",
+                               "sha256": sha(license_path.read_bytes())}]}]}
+        selection.write_bytes(json_bytes(document))
+        return selection, document, license_path
+
+    def test_runtime_originals_are_bound_to_component_manifest(self):
+        selection, _, original = self.runtime_manifest()
+        materials.collect(self.sdk, self.llama, self.cache, self.output, self.lock,
+                          runtime_license_manifests=[selection])
+        self.assertEqual((self.output / "runtime/synthetic-runtime/NOTICE.txt").read_bytes(), original.read_bytes())
+        result = materials.verify_materials(self.output)
+        self.assertEqual(result["runtimeComponents"], ["synthetic-runtime"])
+        manifest = self.saved_manifest()
+        manifest["runtimeResources"] = []
+        self.save_manifest(manifest)
+        with self.assertRaisesRegex(ValueError, "notices differ"):
+            materials.verify_materials(self.output)
+
+    def test_runtime_changed_source_is_rejected(self):
+        selection, _, original = self.runtime_manifest()
+        original.write_bytes(b"SYNTHETIC changed notice")
+        with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
+            materials.runtime_license_materials([selection])
+
+    def test_runtime_missing_notices_or_unsafe_destination_is_rejected(self):
+        selection, document, _ = self.runtime_manifest()
+        document["resources"][0]["files"][0]["path"] = "../escaped.txt"
+        selection.write_bytes(json_bytes(document))
+        with self.assertRaisesRegex(ValueError, "Unsafe license path"):
+            materials.runtime_license_materials([selection])
+        document["resources"][0]["files"] = []
+        selection.write_bytes(json_bytes(document))
+        with self.assertRaisesRegex(ValueError, "no redistribution notices"):
+            materials.runtime_license_materials([selection])
+
+    def test_duplicate_components_across_selections_are_rejected(self):
+        selection, _, _ = self.runtime_manifest()
+        with self.assertRaisesRegex(ValueError, "duplicate runtime license component"):
+            materials.runtime_license_materials([selection, selection])
+
+    def gpu_source_lock(self, files, archives=None):
+        path = self.root / "gpu-license-sources.lock.json"
+        path.write_bytes(json_bytes({"schemaVersion": 1, "rocm": {"10.0.0": {
+            "resources": [{"name": "synthetic-gpu", "version": "10.0.0", "files": files}],
+            "sourceArchives": archives or []}}}))
+        return patch.object(materials, "GPU_LICENSE_LOCK", path)
+
+    def test_pinned_gpu_notice_is_loaded_offline_and_checked(self):
+        data = synthetic_license("fixed GPU source")
+        checksum = sha(data)
+        (self.cache / checksum).write_bytes(data)
+        record = {"path": "LICENSE.txt", "url": "https://invalid.example/fixed/LICENSE.txt",
+                  "sha256": checksum, "size": len(data)}
+        with self.gpu_source_lock([record]):
+            selected = materials.fetch_gpu_license_sources("hip", "10.0.0", self.cache)
+            self.assertEqual(Path(selected["resources"][0]["files"][0]["source"]).read_bytes(), data)
+            (self.cache / checksum).write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "Cached GPU license source"):
+                materials.fetch_gpu_license_sources("hip", "10.0.0", self.cache)
+
+    def test_pinned_gpu_notice_missing_cache_or_unreviewed_version_fails(self):
+        record = {"path": "LICENSE", "url": "https://invalid.example/fixed/LICENSE",
+                  "sha256": "1" * 64, "size": 10}
+        with self.gpu_source_lock([record]):
+            with self.assertRaisesRegex(ValueError, "source is missing"):
+                materials.fetch_gpu_license_sources("rocm", "10.0.0", self.cache)
+            with self.assertRaisesRegex(ValueError, "No reviewed"):
+                materials.fetch_gpu_license_sources("hip", "10.0.1", self.cache)
+
+    def test_pinned_gpu_archive_extracts_only_bound_notice(self):
+        data = synthetic_license("archive notice")
+        archive_path = self.root / "source.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("source/LICENSE", data)
+            archive.writestr("source/unrelated.txt", b"SYNTHETIC not deployed")
+        archive_hash = sha(archive_path.read_bytes())
+        (self.cache / archive_hash).write_bytes(archive_path.read_bytes())
+        record = {"path": "LICENSE", "archive": "test-source", "member": "source/LICENSE",
+                  "sha256": sha(data), "size": len(data)}
+        source = {"name": "test-source", "url": "https://invalid.example/fixed/source.zip",
+                  "sha256": archive_hash, "size": archive_path.stat().st_size}
+        with self.gpu_source_lock([record], [source]):
+            result = materials.fetch_gpu_license_sources("hip", "10.0.0", self.cache)
+        self.assertEqual(Path(result["resources"][0]["files"][0]["source"]).read_bytes(), data)
+        self.assertFalse((self.cache / "source").exists())
+
+    def test_pinned_gpu_download_with_wrong_bytes_leaves_no_completed_cache(self):
+        record = {"path": "LICENSE", "url": "https://invalid.example/fixed/LICENSE",
+                  "sha256": "1" * 64, "size": 10}
+        with self.gpu_source_lock([record]), patch.object(materials.urllib.request, "urlopen",
+                                                        return_value=io.BytesIO(b"wrongbytes")):
+            with self.assertRaisesRegex(ValueError, "Downloaded GPU license source"):
+                materials.fetch_gpu_license_sources("hip", "10.0.0", self.cache, download=True)
+        self.assertFalse((self.cache / ("1" * 64)).exists())
+        self.assertFalse(list(self.cache.glob("qcs-gpu-license-*.part")))
 
 
 if __name__ == "__main__":

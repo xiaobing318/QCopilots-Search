@@ -1,4 +1,5 @@
 #include "media_extractor.h"
+#include "core/file_formats.h"
 
 #include <QCoreApplication>
 #include <QDataStream>
@@ -7,7 +8,6 @@
 #include <QImage>
 #include <QLibrary>
 #include <QSaveFile>
-#include <QSet>
 #include <QTransform>
 #include <QUuid>
 #include <QtEndian>
@@ -509,18 +509,11 @@ QString extension(const QString &path) {
 } // namespace
 
 bool supportsAudio(const QString &path) {
-    static const QSet<QString> extensions{QStringLiteral("wav"), QStringLiteral("mp3"), QStringLiteral("m4a"),
-        QStringLiteral("flac"), QStringLiteral("aac"), QStringLiteral("ogg"), QStringLiteral("opus"),
-        QStringLiteral("aiff"), QStringLiteral("aif"), QStringLiteral("aifc"), QStringLiteral("wma"),
-        QStringLiteral("caf"), QStringLiteral("mka"), QStringLiteral("m4b")};
-    return extensions.contains(extension(path));
+    return file_formats::isAudio(extension(path));
 }
 
 bool supportsVideo(const QString &path) {
-    static const QSet<QString> extensions{QStringLiteral("mp4"), QStringLiteral("mkv"), QStringLiteral("mov"),
-        QStringLiteral("webm"), QStringLiteral("avi"), QStringLiteral("m4v"), QStringLiteral("mpeg"),
-        QStringLiteral("mpg"), QStringLiteral("wmv"), QStringLiteral("ts"), QStringLiteral("mts"), QStringLiteral("m2ts")};
-    return extensions.contains(extension(path));
+    return file_formats::isVideo(extension(path));
 }
 
 QString mediaBackendError() { return ffmpeg().error; }

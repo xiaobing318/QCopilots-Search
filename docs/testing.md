@@ -1,175 +1,62 @@
 # 测试指南
 
-测试按数据和运行边界分层。单元测试、真实模型、语义质量、物理文件遍历、合成向量容量、安装包和 Windows 用户操作分别保留证据。一个层级通过，不能替代另一个层级。
+默认测试执行当前平台全部保留的功能用例。测试程序存在、manifest 校验成功、筛选用例通过与真实应用链通过是不同结论，报告必须记录实际执行范围。
 
-## 路径隔离
+## 独立运行目录
 
-每个有可写状态的测试创建唯一的 `QTemporaryDir` 并检查 `isValid()`。默认临时根来自系统，`QCOPILOTS_SEARCH_TEST_ROOT` 可以覆盖到外置构建目录。创建失败必须失败退出，不能回退到源码或真实用户目录。
+有可写状态的测试创建唯一 `QTemporaryDir` 或等价的原子临时根，并检查创建与清理结果。`QCOPILOTS_SEARCH_TEST_ROOT` 可覆盖系统临时根，创建失败不能回退到源码或用户 profile。
 
-测试支持库集中管理配置、源文件样本、模型缓存引用和子进程生命周期。只读静态夹具由资源系统或 CMake 提供绝对路径。数据库、配置、日志和索引写入独立根，模型缓存只能在完整校验后共享。测试直接使用配置文件，不向 Windows 用户注册表写入正式设置。
+每次 CTest 调用拥有独立 cwd、profile、数据库、日志和工作文件，程序路径来自实际 CMake target。只读夹具从源码读取，模型只能在大小和 SHA-256 验证后共享。正式应用同时运行时，测试不得连接、修改或终止其服务。
 
-CTest 的每次程序调用使用原子创建的独立工作目录，不能只用固定测试名称区分。相同构建树的并发 CTest 运行也不能共享可写 cwd。测试不能把工作目录当作数据根，也不能在源码夹具旁写临时文件。程序路径来自 CMake target，子进程显式接收当前测试的 `--profile-dir` 和 `--model-dir`。
+路径回归覆盖中文、空格、长路径、任意 cwd、不同 checkout 和安装位置。只读源码与双 checkout 检查使用实际权限和独立输出目录。清理先停止本次子进程、关闭文件，再核对目录边界和归属，失败必须影响退出状态。
 
-测试入口启用 `QStandardPaths::setTestModeEnabled(true)` 作为附加保护。运行上下文明确传递 profile、数据库、ANN、提取缓存和报告路径，网络模拟服务由系统分配端口。IPC 使用本次独立实例身份，正式应用同时运行时不连接、修改或终止正式实例。
+## 模型与执行入口
 
-可移植性验收在运行时生成中文、空格及所需长度的路径，覆盖显式临时根、任意 cwd、不同源码和安装位置、真实只读源码树与两个 checkout 并行构建。Windows 盘符和 UNC 字面量只作为路径解析的纯数据用例，实际文件操作不得依赖固定盘符或用户名。模型缺失及无法创建临时根必须失败，不能改用用户目录或源码树作为后备目录。
-
-## 准备真实模型
-
-构建完成后，可以运行 `qcs-dev models --build-root <root> --qt-root <sdk> --model-dir <models>`，由构建目录中的 CLI 下载并验证模型。`check --test-profile full` 自动包含这个阶段，无需先安装应用。也可以使用安装布局中的 CLI，Windows / Linux 通常位于 `stage/bin`，macOS 位于 `stage/qcs-gui.app/Contents/MacOS`。CLI 不需要 GUI 或后台服务：
+`check` 自动准备模型。单独 `test` 前可运行 `models`，随后执行完整测试：
 
 ```powershell
-$cli = Join-Path $buildRoot 'stage/bin/qcs-cli.exe'
+$variant = 'windows-x64-cpu'
 $modelDir = Join-Path $buildRoot 'models'
-$profileDir = Join-Path $buildRoot 'model-setup-profile'
-& $cli models manifest
-& $cli --model-dir $modelDir --profile-dir $profileDir --timeout 1800000 --progress models download
-& $cli --model-dir $modelDir models verify
+./qcs-dev.ps1 models --variant $variant --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 test --variant $variant --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 check --variant $variant --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
 ```
 
-离线环境可使用 `models import FILE_OR_DIRECTORY`。导入与下载都校验锁定文件大小及 SHA-256，不能仅按文件名或文件是否存在判断完成。CLI 的成功与错误结果为 JSON，进度写入标准错误，便于脚本处理。
+离线环境可用 `qcs-cli models import FILE_OR_DIRECTORY`，导入与下载均核对锁定字节数及 SHA-256。缺模型、OCR 数据或必需夹具是失败，不能记为跳过后通过。完整模型契约见 [依赖说明](dependencies.md)。
 
-模型契约来自 `ModelFiles::manifest()`，固定 revision 和两个 GGUF 的校验值见 [依赖说明](dependencies.md)。发行验收中，模型、OCR 数据或必需夹具缺失是失败，不是跳过后通过。
+`test --test-label unit` 或 `test --test-label real-model` 用于局部排查。标签筛选记录实际选择和未运行项，空选择失败，筛选结果不能成为完整验收。`qcs-release` 与 `qcs-debug` CTest preset 默认执行全部已注册用例。需要列出清单时执行 `ctest --test-dir <当前变体构建目录> -N`。
 
-## 运行测试
+`--keep-failed-tests` 保留失败用例的独立数据。JUnit、逐用例明细、选择清单及日志位于当前变体与配置的外置报告目录，CTest 原始日志位于构建树 `Testing/Temporary`。`check` 另外绑定阶段命令、来源、退出状态和实际用户包哈希，后续未执行阶段不能被补写为成功。
 
-整套本地流程使用 `qcs-dev check`，默认 fast 只执行环境检查、配置、构建和快速测试。`qcs-dev check --test-profile full` 还执行模型准备、全部 CTest、安装、平台包与安装器验证、源码材料及完整性验证。准备 Qt SDK 仍使用独立 `bootstrap` 动作。需要局部测试时使用下面的 `test` 命令。
+## 保留的验证范围
 
-```powershell
-./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot
-./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --test-label unit
-./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --test-profile full --model-dir $modelDir
-./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --test-profile full --model-dir $modelDir --test-label real-model
-```
-
-`test` 默认 `--test-profile fast`，通过 CTest `-LE '^slow$'` 排除耗时层。`--test-profile full` 不排除任何标签。`--test-label` 始终在当前范围内继续筛选，不会隐式切换到 `full`。例如在 `fast` 下单独选择 `real-model` 不会执行被排除的真实推理用例，没有匹配用例时明确失败。
-
-| 范围 | 实际覆盖 | 用途 |
+| 范围 | 实际行为 | 主要入口 |
 | --- | --- | --- |
-| `fast` | GUI 与 GUI/服务集成、IPC/worker/CLI、SQLite/FTS/ANN、恢复、提取、模型文件管理、开发工具、路径与验收运行器 pure 回归 | 日常本地测试及普通 PR 反馈 |
-| `slow` 标签 | `qcs-tests-semantic`、`qcs-tests-reference-vectors`、x64 的 `qcs-tests-reference-vectors-baseline`、`qcs-tests-acceptance-native`、`qcs-tests-file-capacity` | 由 `full` 纳入，也可在 `full` 中按标签单独选择 |
-| `full` | 当前平台全部注册的 CTest 程序 | 完整候选的本地及原生 CI 测试阶段 |
+| 核心与提取 | 配置、模型下载校验、格式扫描路由、Office/PDF/OCR/媒体解码、定位与损坏输入 | `tests/core`、`tests/extraction` |
+| 存储 | 小规模增删改、过滤、分页、取消、SQL/ANN 快照、事务和故障恢复 | `tests/storage` |
+| 服务与进程 | IPC、超时、取消、独立 profile、任务调度、worker 生命周期、500/501 边界 | `tests/service`、`tests/processes` |
+| GUI | 浏览、搜索、预览、快捷窗完整上下文、同/不同 profile 单实例 | `tests/gui` |
+| 真实推理数值 | 锁定参考向量、768 维、有限值、归一化、非恒定输出、损坏输入及取消恢复 | `tests/runtime` |
+| 真实多模态链 | 文档、PDF、代码、图片、OCR、语音、环境音和视频的提取、编码、存储、重载、正式检索 | `tests/semantic` |
+| 工具与发布 | 外置路径、测试清单、完整 check、11 变体矩阵、包白名单、attempt 选择、摘要与字节稳定性 | `tools`、`.github/scripts` |
+| 部署与安装 | 最终包重定位、依赖闭包、许可证、签名、安装卸载与用户数据保留 | 包验证器及平台安装器测试 |
 
-耗时测试保留注册和完整断言，`fast` 的排除项是未运行，不是通过。`qcs-tests-file-capacity` 的默认小规模运行也属于 `slow`，十万文件和百万向量专项仍使用独立验收入口。全套 CTest 通过也不能单独证明 Computer Use、最终包或完整容量验收通过。
+黄金向量的 cosine 一致性检查用于验证数值实现，并非检索相关度接受线。多模态功能测试使用固定小集合，每个输入在隔离的单文件范围内关闭关键词兜底，以真实 query embedding 调用正式搜索。测试要求返回来源文件及有效页码、行号或时间字段，不要求特定排名、召回率或无答案比例。
 
-测试 preset `qcs-release` 和 `qcs-debug` 默认选择 `fast`，`qcs-release-full` 和 `qcs-debug-full` 选择全套。直接执行无过滤的 `ctest --test-dir <build>/release` 仍运行全部注册测试。筛选不改变 CMake 的测试注册清单，也不把用例永久设为禁用。
+静态媒体集中在 `tests/acceptance/fixtures`，清单包含来源、许可和哈希。功能测试与 Windows 场景共同使用保留媒体，生成输入仍通过生产提取和真实推理，不使用伪造 embedding。`--validate-only` 只能验证夹具完整性，不能代替真实模型执行。
 
-`--keep-failed-tests` 将保留失败用例的独立产物。脚本默认将 JUnit 写入 `<build-root>/reports/<run-id>/ctest.xml`，可用 `--report-dir` 指定独立报告目录。`test-selection.json` 记录完整注册清单、实际选择、排除项、命令和退出状态，`fullSuitePassed` 仅在无标签筛选的 `full` 全部 CTest 程序成功时成立，`releaseComplete` 始终为 false。完整候选还必须核对程序内部逐用例明细。CTest 原始日志位于构建树的 `Testing/Temporary`，需要保留多次原始日志时复制到对应运行报告目录。
+## GPU 与最终包
 
-`check` 另存 `check-report.json`，绑定阶段日志、测试和平台产物，`reports/latest-check.json` 提供最近一次报告路径。完整流程失败时后续阶段保持未运行。本地 full 成功也不表示发行完成，其 `releaseComplete` 始终为 false。`release-prepare --local-full-report ...` 会重新校验原始 full 报告及附件，同时还要求四组合 CI、容量与 Computer Use 证据，详见 [发布命令](release-command.md)。
+默认后端策略为自动选择，GPU 可用时启用文本模型和多模态 projector，不可用时明确回退 CPU。诊断报告构建变体、实际后端、设备与回退原因。严格 GPU 模式要求真实设备执行，CPU 回退不能冒充成功。
 
-CTest 中列出实际注册的用例：
+GPU 包在无设备的托管 runner 上执行全部适用功能测试和 CPU 回退验包，同时验证模块、依赖和受控加载目录。记录“GPU 硬件未实测”，不能把编译成功或库存在写成 GPU 运行通过。有设备时再执行严格 GPU 测试。
 
-```bash
-ctest --test-dir "$build_root/release" -N
-ctest --test-dir "$build_root/release" --show-only=json-v1
-```
+最终包从中文和空格路径、独立 cwd、独立 profile 启动，排除开发 SDK 对依赖加载的补齐。Windows 验证安装卸载和便携包移动，Linux 验证 DEB 安装卸载及便携 TGZ，macOS 验证 DMG、bundle 布局与 ad-hoc 签名。卸载保留用户模型、索引和配置。
 
-## 已建立的测试入口
+## 原生 CI 与用户操作
 
-| 入口 | 主要验证 |
-| --- | --- |
-| `qcs-tests-core` | 路径、临时根、设置原子写入、指纹、序列化 |
-| `qcs-tests-file-catalog` | 根目录去重、排除边界、Git ignore、文件身份、中文和长路径 |
-| `qcs-tests-model-files` | 下载、续传、校验、取消、发布失败和离线导入 |
-| `qcs-tests-image-sizing` | 图像预算、缩放及 Pillow 数值契约 |
-| `qcs-tests-runtime` | 提示、未加载和损坏模型、运行目录 |
-| `qcs-tests-reference-vectors` | 九条黄金向量、中文、截断、损坏媒体、取消恢复 |
-| `qcs-tests-reference-vectors-baseline` | x64 强制基础 CPU 后端的九条黄金向量 |
-| `qcs-tests-extraction-document` | 编码、分块、长文件续读、HTML、RTF、DOCX、ODT、代码和 Notebook |
-| `qcs-tests-extraction-image` | 图片准备、PDF 页码、扫描页、OCR、临时目录失败 |
-| `qcs-tests-extraction-media` | 音频窗口、重采样、视频分页、音轨、取消和损坏输入 |
-| `qcs-tests-extraction-legacy_doc` | 旧 DOC 读取与夹具 |
-| `qcs-tests-index_repository` | FTS、过滤、替换删除、定位、重开、schema、并发提交 |
-| `qcs-tests-index_repository_regression` | 文件聚合上限、平台路径键、索引一致性与回归边界 |
-| `qcs-tests-vector_index` | 分片、精确过滤、快照、重建、manifest、校验和及 FP16 |
-| `qcs-tests-search_cancellation` | 检索取消与后续查询恢复 |
-| `qcs-tests-recovery_process` | 独立进程中断后的存储恢复 |
-| `qcs-tests-worker` | 进程协议、损坏帧、取消、续读、隔离和无模型行为 |
-| `qcs-tests-cli` | 机器可读错误、离线 manifest、模型目录和只连接模式 |
-| `qcs-tests-client` | IPC 分帧、请求超时、取消、认证 token、断线和重连 |
-| `qcs-tests-service` | 真实服务和 worker 的索引与进程集成 |
-| `qcs-tests-gui` | Qt Widgets 控件、交互状态和输入事件 |
-| `qcs-tests-gui-service` | GUI 与真实服务的集成 |
-| `qcs-tests-semantic-manifest` | 语义集 manifest 与夹具检查 |
-| `qcs-tests-semantic` | 真实模型对独立语义集的检索评估 |
-| `qcs-tests-file-capacity` | 动态生成物理文件的遍历、变化对账和排除 |
-| `qcs-tests-workflow` | 开发与包级验证脚本的路径和安全边界 |
-| `qcs-tests-runner` | 每次调用的独立 cwd、并发隔离、子进程结束及显式清理失败 |
-| `qcs-tests-temp-paths` | Python 夹具临时根解析，空值使用系统临时根，中文目录创建、实例唯一及创建失败不回退 |
-| `qcs-tests-path-budget` | 实际生成路径解析、UTF-16 长度、对象与生成物预算 |
-| `qcs-tests-output-paths` | 直接 CMake、安装和打包的源码外输出边界 |
-| `qcs-tests-configure-idempotency` | 重复配置及 libgit2 源码准备保持未变化文件的内容与时间戳 |
-| `qcs-tests-acceptance-runners` | 验收运行器 pure 参数、来源和报告契约，纳入 fast |
-| `qcs-tests-acceptance-native` | ACL、进程令牌、超时输出与自有进程清理，标记 slow |
-| `qcs-tests-ci-evidence`、`qcs-tests-release-evidence` | 注册为 CTest，验证缺失、跳过、篡改和来源失配不会误报通过 |
-| `qcs-tests-test-policy`、`qcs-tests-check` | 实际 CTest 清单的 profile 选择与本地流程编排 |
-| `qcs-tests-release-tool` | 冻结材料和草稿上传的合成契约，不实际公开发布 |
+PR、主分支推送与手动触发使用相同完整流程。每个变体依次准备工具链、构建、执行全部保留测试、安装、打包、验证最终包。汇总核对全部 11 个变体的状态与 21 个用户文件，不能以其他变体的成功覆盖失败。
 
-以 CTest 清单及 [需求矩阵](requirements-test-matrix.md) 维护完整映射。测试文件存在不代表已经在四个平台执行，通过记录必须包含提交与平台。
+每个成功变体上传一个仅含用户包的 artifact，文件名包含版本、变体和候选身份，artifact 区分重跑 attempt。失败诊断保留在 GitHub 原生日志，按需使用 API 获取。报告、截图、符号、源码和校验和不上传到 CI Artifacts。
 
-`tools/qcs-test-runner.py` 是 CTest 每次调用的隔离入口，其回归位于 `tools/qcs-test-runner-tests.py`。`tools/qcs-path-budget.py` 检查真实构建图，回归位于 `tools/qcs-test-path-budget.py`。运行器不会把成功退出但清理失败的用例当作通过。
-
-完整候选和本机专项运行器位于 `tools/acceptance`，包括 `qcs-candidate-ctest-run.py`、`qcs-two-checkout-portability.py`、`qcs-run-physical.ps1`、`qcs-run-million.ps1` 和 `qcs-service-latency.py`。候选 CTest 入口内部显式传递 `--test-profile full` 并核对完整注册清单，不能继承日常默认的快速范围。使用各工具的帮助查看显式源码、外置根、Qt、模型及来源参数。真实只读源码与双 checkout 验收必须运行专项入口，不能仅用运行器自身的单元测试替代。
-
-`qcs-test-runners.py` 的 native/all 范围、`qcs-test-portability-runners.py` 和 `qcs-two-checkout-portability.py` 通过 `qcs-token-context.py` 检查 Windows 执行上下文，pure 范围不改变原生令牌。若进程令牌持有 `SeBackupPrivilege` 或 `SeRestorePrivilege`，入口创建暂停的自有子进程，先纳入 Job Object，再仅从该子进程的独立主令牌中永久移除这两项特权，核对其他身份和令牌属性后才恢复执行。实际配置、构建和测试后代继承此上下文，父进程令牌始终不变。原本不持有这两项特权时直接执行，不能伪造移除记录或跳过原生用例。已有线程令牌会在创建子进程前被明确拒绝，不通过撤销线程身份继续执行。
-
-重新启动时，输出保留为 `QCS_TOKEN_CONTEXT` 诊断记录，包含移除项、子进程前后快照、父令牌一致性和清理错误。子进程非零退出需要透传，异常和中断必须收束本次 Job 内的后代、等待退出并关闭句柄。主错误与收尾错误都保留，清理失败不能记为成功。`qcs-test-token-context.py` 同时覆盖真实 Windows 子进程与后代、线程身份保留，以及跨平台模拟的调用顺序和失败边界。测试源码存在或诊断分支结论不代表最终候选已经通过。
-
-Windows 只读验收先保存独立 checkout 的全部节点身份和 ACL，再逐节点拒绝写入、删除及重命名。原 checkout 的权限始终只读取。五项实际权限探针包括在根目录新建文件、写入现有文件、在子目录新建文件、删除和重命名，每项都必须得到真实访问拒绝。文件占用、只读属性或只检查 ACL 文本不能替代这些探针，也不能减少删除与重命名检查。收尾时逐项恢复原 ACL，完成后重新比较所有节点，并执行实际读写和清理探针。
-
-无法精确恢复时，运行器保留原始和实际描述符、节点差异及首个错误，并将整个验收判为失败。回归测试同时覆盖继承保护目录、显式允许权限、只读文件属性和恢复失败路径，不通过忽略差异或减少探针满足门槛。权限快照及恢复比较必须保留实际描述符的条目顺序，不能用经过排序的显示文本代替原始状态。
-
-## 黄金向量和语义质量
-
-九条黄金向量验证 DigUp 推理兼容性，要求 cosine ≥ 0.999。输入及期望向量的文件校验值固定，不能用本次实现重新生成期望值。图片示例和合成音频是数值回归夹具，不能证明真实 OCR、语音或环境声语义检索质量。
-
-语义质量验收使用独立标注集，要求至少 1,000 个真实片段和 200 条有答案中英查询，另有无答案查询。整体 Recall@10 ≥ 0.90，主要语言与模态分组 ≥ 0.80。报告必须包含样本来源、去重规则、标签、模型与提取指纹、每条查询的结果及分组统计。不得用重复同一片段、查询答案泄漏或合成标签凑足真实样本数量。
-
-## 原生 CI 与包级测试
-
-CI 在 Windows x64、Linux x64、macOS arm64 和 macOS x86_64 分别原生编译并运行测试。构建和测试根来自 runner 临时目录与运行 ID，checkout 路径包含空格和中文。
-
-普通 PR 默认 `fast`，带 `ci:full` 标签的 PR 执行 full，标签保留时后续同步也继续 full。推送到 `main` 执行 full。默认分支已经包含工作流后，`workflow_dispatch` 也可选择 `test_profile`，默认 fast。两种范围都配置、构建四个原生组合并运行所选 CTest，fast 不执行安装暂存、模型缓存与下载、容量、打包、安装器验收和对应源码归档。full 保留这些阶段，模型缓存命中后仍由 CLI 校验内容。
-
-full CI 按阶段的实际前置条件继续独立验收。构建成功后可以执行合成容量、安装暂存和源码收集，暂存安装与模型校验成功后才执行打包及包验证，包验证成功后才执行适用平台的安装器验收。语义测试失败、测试超时或原始报告缺失都不会改记为通过，但不会单独阻止这些独立步骤。构建、安装或打包失败仍会停止依赖它的步骤，取消任务后不再启动这些步骤。测试步骤保持非零失败，完整 job、四平台聚合和发行门禁仍然失败。失败 job 上传的包只用于继续开发验收。
-
-本地 `check full` 保留遇到失败即停止后续组合步骤的契约，原报告明确保留失败和 `notRun`。需要补齐独立验收时，使用现有 `install`、`package`、`verify-package`、`installers`、`sources` 单阶段入口，分别保存新报告，不改写原 full 结论。符号包由 `package` 自动生成。
-
-快速 artifact 使用 `qcs-fast-<platform>-<sha>-attempt<N>` 与 `qcs-fast-aggregate-<sha>-attempt<N>`，完整 artifact 使用相同结构的 `qcs-native` 前缀。每次重试生成独立名称，明确禁用覆盖，旧失败材料继续保留。平台原始快速报告位于 `reports/fast-acceptance.json`、`fast-evidence.json` 和 `fast-gate.json`，聚合 artifact 包含 `aggregate.json`、`selection.json` 与原始 API 快照目录 `selection-inputs/`。快速证据可以记录 `testsComplete: true`，但 `releaseComplete` 始终为 false，不能代替完整发行验收。
-
-聚合先读取当前 workflow run 的完整 job 与 artifact 清单，逐平台锁定最新执行，再按候选 SHA、范围、平台和实际 `sourceAttempt` 选择精确 artifact ID。GitHub 为未重跑平台复制的 job 记录必须与原执行的 runner、时间和步骤证据唯一匹配，才可沿用原执行的材料。最新执行失败、未完成、缺件或身份有歧义都使聚合失败，不回退到旧成功记录。只重跑 Windows 时，其他平台可沿用同 run、同候选的已验证执行，不要求无关平台重复构建。旧无 attempt 名称的历史材料可继续读取调查，但缺少严格选择与 API 执行链时不能获得新的聚合或发行通过资格。
-
-macOS 原始 GUI 测试失败时，CI 最多用 LLDB 重放两次图片预览场景，每次 45 秒，分别使用独立测试目录。原始 JUnit 和失败结论保持不变，调试日志只用于定位问题。超时先中断调试器并请求终止其测试进程，无法确认进程退出时记录 `cleanupUnknown` 并停止后续重放。日志位于 `reports/mac-gui-debug`。CI 另有界收集本次构建之后生成的产品 `.ips` / `.crash` 文件，并上传失败图片提取用例保留的 `qcs-image-*` 目录。没有崩溃文件不代表没有发生崩溃。
-
-GUI 自动化在可用显示环境中执行，Linux 使用 Xvfb。QtTest 可以验证输入事件和界面状态，Windows 额外 Computer Use 验收记录真实窗口和系统输入法，见 [用户操作验收](windows-user-acceptance.md)。
-
-包级验证从安装或解压后的布局启动程序，清除开发 Qt 插件路径，使用独立 profile。服务与 worker 需要从安装布局正确找到资源，运行时不能从开发机 SDK 或源码目录补齐缺失文件。
-
-## 失败与报告
-
-每条报告标明实际执行结果、失败原因、被跳过或未运行的场景。平台能力不可用不能记为通过。临时目录清理失败、残留子进程、磁盘空间不足和模型缺失都要保留明确错误。
-
-QtTest 的 `QSKIP` 不会使测试程序退出失败，CTest JUnit 也不会自动将它转换成 `<skipped>`。CI 从 JUnit 的 `system-out` / `system-err` 中解析各条 `SKIP` 和 `Totals`，将所选范围的完整明细写入 `reports/tests/qt-test-cases.json`，并在对应范围的 acceptance 报告汇总。缺少 QtTest 输出、CTest 截断标志、汇总与明细不一致、失败、blacklisted 或所选必需用例未执行，都会使该 CI 测试阶段失败。发行验收另外要求完整范围全部执行。测试运行器将捕获上限设为 16 MiB，超过限制时仍必须重新取得完整证据。非 QtTest 的语义程序和 Python workflow 测试单独按其报告处理。
-
-目前唯一的 QtTest 平台不适用分类是 Windows 上 `IndexRepositoryRegressionTest::rootFilterRespectsCaseSensitivePlatformKeys()`，该用例验证非 Windows 的大小写敏感路径契约。分类同时匹配平台、CTest 名称、完整用例名和固定原因，仍记录为 `notApplicable`，不计入通过数。Windows 账户无法创建符号链接导致 `FileCatalogTest::symbolicLinksCannotEscapeOrLoop()` 跳过时，记录为 `requiredNotRun` 并阻断发布。需要在具备创建符号链接能力的测试环境执行该用例，不能把权限限制改记为通过。
-
-`qcs-tests-workflow` 的三个 POSIX 布局清理用例有单独的精确规则：`test_clean_unlinks_internal_framework_and_versioned_library_links`、`test_clean_rejects_external_symlink_without_deleting_any_target` 和 `test_clean_rejects_linked_top_level_target`。仅在 Windows 且原始原因完全匹配 `Windows symbolic-link creation privilege unavailable (WinError 1314), native macOS/Linux execution required` 时，记录为 `notApplicable` 并保留原始 skip，不能计为 PASS。Linux 和两种 macOS 架构必须实际通过这三个用例，缺失、跳过或失败均阻断各自原生门槛。
-
-Windows 必须实际通过 `test_clean_rejects_windows_junction_inside_generated_tree`，验证当前平台的真实重定向边界。该单一用例只有在 Linux / macOS 且原因完全匹配 `Windows junction semantics require Windows` 时才能记为不适用。以上规则不扩大到其他符号链接、清理测试或权限错误，完整覆盖仍需四组合原生证据共同闭合。
-
-在完整验收中，`qcs-tests-acceptance-native` 的 `qcs_test_token_context.TokenContextContracts.test_windows_owned_child_preserves_parent_and_contains_descendants` 必须在 Windows 实际通过。仅在 Linux / macOS，且完整用例名与原因 `Windows native process token and Job Object contract` 同时匹配时，才单独记为不适用并保留原始 skip。完整验收中任一平台缺少该用例都失败，Windows 缺少所需 API 或权限也不能转为不适用。原有三个 PowerShell/ACL 原生用例继续使用原有精确规则。
-
-每个 QtTest 日志还必须有匹配的开始与结束记录、非零实际执行数，并且逐条 PASS / FAIL / SKIP 等记录与汇总一致。只保留 `Totals` 行或截断后的日志不能作为完整通过证据。
-
-CI 在测试开始前保存完整注册清单 `reports/tests/ctest-inventory.json`，开发脚本另存 `test-inventory.json` 和实际选择的 `test-selected-inventory.json`。快速验证同时核对全注册清单、`slow` 标签和所选集合，完整验证继续核对全部注册程序。报告中的程序名称必须与相应清单完全一致，缺失、重复或额外程序都会使验收失败。开发者使用 `fast`、`--test-label` 或 `ctest -R` 得到的子集报告只能说明所选范围，不得称为整套测试完成。
-
-测试清理只允许作用于本次创建且边界校验通过的根。先结束本次启动的子进程，再释放文件句柄并清理数据。不能终止正在运行的正式应用来让测试通过。
-
-显式收尾检查必须将清理失败转为测试失败，不能只在析构中输出警告。创建失败、写入失败、文件被占用、目录替换、路径越界、重复清理和异常进程退出均属于必需回归范围。保留失败产物时，报告给出实际根、失败原因和保留策略，不把主动保留误报为清理成功。
-
-## 最终候选门槛
-
-本地完整自动化、四组合 GitHub Actions 和 Windows Computer Use 分别验收。`full` 四组合的构建、测试、真实模型、打包、包验证及汇总 job 必须实际结束为 success，快速 job 成功或启动完整工作流不代表完成。本机执行同一候选最终 Windows 包的十个用户操作场景，并继续十万物理文件和百万向量验收。
-
-所有结果绑定执行前记录的源码身份、依赖锁和实际程序或包哈希。旧长命名候选的报告已退出本轮验收，不通过重命名复用。只有新候选的全部必需门槛通过才能标记交付完成。
+Windows 最终 CPU 包另执行 [用户操作场景](windows-user-acceptance.md)。QtTest、CLI 或生成截图不能替代真实窗口操作。最终结果区分通过、失败、未运行和平台能力不适用，要求同一不可变源码与包身份。

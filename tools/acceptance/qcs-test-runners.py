@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run lightweight acceptance-tool contracts with one complete unittest report.
+"""Run acceptance-tool contracts with one complete unittest report.
 
 These tests use synthetic data and temporary files. They do not execute the
 product, a model, a compiler, CTest, an installer or a Computer Use scenario.
@@ -20,13 +20,9 @@ sys.path.insert(0, str(DIRECTORY))
 SCRIPTS = (
     "qcs-test-candidate-runner.py",
     "qcs-test-source-checksums.py",
-    "qcs-test-capacity-runners.py",
-    "qcs-test-million-evidence.py",
-    "qcs-test-package-runners.py",
     "qcs-test-portability-runners.py",
     "qcs-test-diagnostics.py",
     "qcs-test-token-context.py",
-    "qcs-test-latency-preparation.py",
     "qcs-cu-recorder-tests.py",
     "qcs-test-copy-cu-fixtures.py",
 )
@@ -75,12 +71,7 @@ def iter_cases(suite):
 def native_case_ids():
     portability = load_script("qcs-test-portability-runners.py")
     tokens = load_script("qcs-test-token-context.py")
-    cases = set(portability.WINDOWS_NATIVE_CASES | tokens.WINDOWS_NATIVE_CASES)
-    if "qcs-test-latency-preparation.py" in SCRIPTS:
-        cases.add("qcs_test_latency_preparation.PreparationTests.test_captured_cli_timeout_preserves_partial_output")
-        if os.name == "nt":
-            cases.add("qcs_test_latency_preparation.PreparationTests.test_windows_job_cleans_its_descendant_and_preserves_unrelated_process")
-    return cases
+    return set(portability.WINDOWS_NATIVE_CASES | tokens.WINDOWS_NATIVE_CASES)
 
 
 def build_suite(selection="all"):

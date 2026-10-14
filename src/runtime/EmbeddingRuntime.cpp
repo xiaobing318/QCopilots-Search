@@ -1,6 +1,8 @@
 // Adapted from DigUp LlamaRuntime, Copyright (c) 2026 Abdur Rahim, MIT.
 #include "EmbeddingRuntime.h"
 #include "BackendPaths.h"
+#include "BackendSelection.h"
+#include "BackendLoader.h"
 #include "ImageSizing.h"
 #include "core/pipeline_manifest.h"
 
@@ -14,12 +16,20 @@
 #include <mtmd.h>
 #include <mtmd-helper.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+
+#ifndef QCOPILOTS_SEARCH_GPU_BACKEND
+#define QCOPILOTS_SEARCH_GPU_BACKEND "cpu"
+#endif
+#ifndef QCOPILOTS_SEARCH_BUILD_VARIANT
+#define QCOPILOTS_SEARCH_BUILD_VARIANT "cpu"
+#endif
 
 namespace qcopilots_search {
 namespace {
@@ -43,17 +53,11 @@ int threadCount() {
     return std::clamp(ok ? requested : available / 2, 1, available);
 }
 
-void initializeBackend() {
-#ifdef QCOPILOTS_SEARCH_CPU_DISPATCH
-    // Load only an explicitly known CPU backend from the installation. Upstream's
-    // generic loader also consults cwd and GGML_BACKEND_PATH, which we don't use.
-    const bool baseline = qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_CPU_BASELINE") == 1;
-    QStringList variants = baseline ? QStringList{QStringLiteral("x64")} :
-        QStringList{QStringLiteral("sapphirerapids"), QStringLiteral("zen4"), QStringLiteral("cooperlake"),
-                    QStringLiteral("icelake"), QStringLiteral("cascadelake"), QStringLiteral("cannonlake"),
-                    QStringLiteral("skylakex"), QStringLiteral("alderlake"), QStringLiteral("haswell"),
-                    QStringLiteral("piledriver"), QStringLiteral("ivybridge"), QStringLiteral("sandybridge"),
-                    QStringLiteral("sse42"), QStringLiteral("x64")};
+QString packagedBackend() {
+    return detail::canonicalBackendName(QString::fromLatin1(QCOPILOTS_SEARCH_GPU_BACKEND));
+}
+
+QStringList backendSearchRoots() {
 #ifdef Q_OS_MACOS
     constexpr auto platform = detail::BackendPlatform::MacOS;
 #elif defined(Q_OS_WIN)
@@ -61,15 +65,33 @@ void initializeBackend() {
 #else
     constexpr auto platform = detail::BackendPlatform::Unix;
 #endif
-    const auto roots = detail::cpuBackendSearchRoots(QCoreApplication::applicationDirPath(), platform);
+    return detail::cpuBackendSearchRoots(QCoreApplication::applicationDirPath(), platform);
+}
+
+void initializeBackend() {
+    // Load only an explicitly known CPU backend from the installation. Upstream's
+    // generic loader also consults cwd and GGML_BACKEND_PATH, which we don't use.
+#ifdef QCOPILOTS_SEARCH_CPU_DISPATCH
+    const bool baseline = qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_CPU_BASELINE") == 1;
+    QStringList variants = baseline ? QStringList{QStringLiteral("x64")} :
+        QStringList{QStringLiteral("sapphirerapids"), QStringLiteral("zen4"), QStringLiteral("cooperlake"),
+                    QStringLiteral("icelake"), QStringLiteral("cascadelake"), QStringLiteral("cannonlake"),
+                    QStringLiteral("skylakex"), QStringLiteral("alderlake"), QStringLiteral("haswell"),
+                    QStringLiteral("piledriver"), QStringLiteral("ivybridge"), QStringLiteral("sandybridge"),
+                    QStringLiteral("sse42"), QStringLiteral("x64")};
+#else
+    // Apple Silicon has one CPU module rather than the x64 dispatch variants.
+    const QStringList variants{QString{}};
+#endif
+    const auto roots = backendSearchRoots();
     bool loaded = false;
     for (const auto& variant : variants) {
 #ifdef Q_OS_WIN
-        const QString name = QStringLiteral("ggml-cpu-%1.dll").arg(variant);
-#elif defined(Q_OS_MACOS)
-        const QString name = QStringLiteral("libggml-cpu-%1.so").arg(variant);
+        const QString name = variant.isEmpty() ? QStringLiteral("ggml-cpu.dll")
+                                               : QStringLiteral("ggml-cpu-%1.dll").arg(variant);
 #else
-        const QString name = QStringLiteral("libggml-cpu-%1.so").arg(variant);
+        const QString name = variant.isEmpty() ? QStringLiteral("libggml-cpu.so")
+                                               : QStringLiteral("libggml-cpu-%1.so").arg(variant);
 #endif
         for (const auto& root : roots) {
             const auto path = QDir(root).absoluteFilePath(name);
@@ -81,8 +103,107 @@ void initializeBackend() {
         if (loaded) break;
     }
     if (!loaded) throw std::runtime_error("No compatible packaged CPU backend was found");
-#endif
     llama_backend_init();
+}
+
+bool gpuBackendRegistered(const QString& backend) {
+    for (size_t index = 0; index < ggml_backend_reg_count(); ++index) {
+        const auto registry = ggml_backend_reg_get(index);
+        if (detail::canonicalBackendName(QString::fromUtf8(ggml_backend_reg_name(registry))) == backend)
+            return true;
+    }
+    return false;
+}
+
+QString initializeGpuBackend() {
+    const auto backend = packagedBackend();
+    if (backend != QStringLiteral("cpu")) {
+        const auto error = detail::prepareGpuRuntime(QCoreApplication::applicationDirPath(), backend);
+        if (!error.isEmpty()) return error;
+    }
+    // Metal can be linked statically. Never invoke ggml's cwd/environment loader.
+    if (backend == QStringLiteral("cpu") || gpuBackendRegistered(backend)) return {};
+#ifdef Q_OS_WIN
+    const auto name = QStringLiteral("ggml-%1.dll").arg(backend);
+#else
+    const auto name = QStringLiteral("libggml-%1.so").arg(backend);
+#endif
+    QStringList attempted;
+    for (const auto& root : backendSearchRoots()) {
+        const auto path = QDir(root).absoluteFilePath(name);
+        if (!QFileInfo::exists(path)) continue;
+        attempted.append(path);
+        if (ggml_backend_load(path.toUtf8().constData()) && gpuBackendRegistered(backend)) return {};
+    }
+    if (attempted.isEmpty())
+        return QStringLiteral("Packaged %1 GPU module %2 was not found in the installation.").arg(backend, name);
+    return QStringLiteral("Cannot load packaged %1 GPU module (%2). Check its runtime dependencies and GPU driver.")
+        .arg(backend, attempted.join(QStringLiteral(", ")));
+}
+
+struct RuntimeDevices {
+    QVector<ggml_backend_dev_t> handles;
+    QVector<detail::BackendDevice> descriptions;
+};
+
+RuntimeDevices enumerateDevices() {
+    RuntimeDevices result;
+    for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        const auto device = ggml_backend_dev_get(index);
+        const auto type = ggml_backend_dev_type(device);
+        const auto registry = ggml_backend_dev_backend_reg(device);
+        result.handles.append(device);
+        result.descriptions.append({detail::canonicalBackendName(QString::fromUtf8(ggml_backend_reg_name(registry))),
+            QString::fromUtf8(ggml_backend_dev_name(device)), QString::fromUtf8(ggml_backend_dev_description(device)),
+            type == GGML_BACKEND_DEVICE_TYPE_CPU,
+            type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU});
+    }
+    return result;
+}
+
+void verifyGpuComputation(ggml_backend_dev_t device) {
+    // This intentionally bypasses the scheduler. An unsupported or failing GPU
+    // operation must not be silently dispatched to CPU during this self-test.
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(
+        ggml_backend_dev_init(device, nullptr), &ggml_backend_free);
+    if (!backend || ggml_backend_get_device(backend.get()) != device)
+        throw std::runtime_error("Cannot initialize the selected GPU for its compute self-test");
+    constexpr size_t graphSize = 8;
+    const ggml_init_params params{3 * ggml_tensor_overhead() + ggml_graph_overhead_custom(graphSize, false), nullptr, true};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init(params), &ggml_free);
+    if (!context) throw std::runtime_error("Cannot allocate GPU self-test metadata");
+    // A full small tile avoids relying on every driver supporting odd or tiny
+    // matrix dimensions. Integer-valued operands have exact float references.
+    constexpr size_t side = 32;
+    auto* a = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, side, side);
+    auto* b = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, side, side);
+    auto* product = ggml_mul_mat(context.get(), a, b);
+    if (!ggml_backend_supports_op(backend.get(), product))
+        throw std::runtime_error("Selected GPU does not support the compute self-test operation");
+    auto* graph = ggml_new_graph_custom(context.get(), graphSize, false);
+    ggml_build_forward_expand(graph, product);
+    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
+        ggml_backend_alloc_ctx_tensors(context.get(), backend.get()), &ggml_backend_buffer_free);
+    if (!buffer) throw std::runtime_error("Cannot allocate GPU self-test tensors");
+    std::array<float, side * side> aValues{}, bValues{}, expected{}, actual{};
+    for (size_t index = 0; index < aValues.size(); ++index) {
+        aValues[index] = float(index % 7 + 1);
+        bValues[index] = float(index % 13 + 2);
+    }
+    for (size_t row = 0; row < side; ++row)
+        for (size_t column = 0; column < side; ++column)
+            for (size_t k = 0; k < side; ++k)
+                expected[row * side + column] += aValues[column * side + k] * bValues[row * side + k];
+    ggml_backend_tensor_set(a, aValues.data(), 0, sizeof(aValues));
+    ggml_backend_tensor_set(b, bValues.data(), 0, sizeof(bValues));
+    if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("Selected GPU failed its compute self-test");
+    ggml_backend_synchronize(backend.get());
+    ggml_backend_tensor_get(product, actual.data(), 0, sizeof(actual));
+    for (size_t index = 0; index < actual.size(); ++index) {
+        if (!std::isfinite(actual[index]) || std::abs(actual[index] - expected[index]) > 0.001f)
+            throw std::runtime_error("Selected GPU returned an incorrect compute self-test result");
+    }
 }
 
 bool verify(const QString& path, qint64 bytes, const char* expected, QString* error) {
@@ -121,6 +242,11 @@ public:
     int position = 0;
     bool textOnly = true;
     QString error;
+    QString requestedMode = qEnvironmentVariable("QCOPILOTS_SEARCH_BACKEND", QStringLiteral("auto"));
+    detail::BackendSelection selection;
+    detail::BackendDevice selectedDevice;
+    bool gpuSelfTestPassed = false;
+    bool textWarmupCompleted = false;
     int threads = threadCount();
     std::function<bool()> cancelled;
     static bool abortCallback(void* data) {
@@ -142,6 +268,74 @@ public:
         if (context) llama_free(context);
         if (model) llama_model_free(model);
         batch = nullptr; media = nullptr; context = nullptr; model = nullptr; vocab = nullptr;
+        textWarmupCompleted = false;
+    }
+    void loadModels(const QString& modelDir, ggml_backend_dev_t device) {
+        checkCancellation();
+        const bool gpu = selection.gpu;
+        gpuSelfTestPassed = false;
+        if (gpu) {
+            verifyGpuComputation(device);
+            checkCancellation();
+            gpuSelfTestPassed = true;
+        }
+        auto modelParams = llama_model_default_params();
+        // A terminated empty list forces CPU. Never let upstream auto-select a
+        // different GPU from the one recorded in our diagnostics.
+        ggml_backend_dev_t devices[] = {gpu ? device : nullptr, nullptr};
+        modelParams.devices = devices;
+        modelParams.n_gpu_layers = gpu ? -1 : 0;
+        modelParams.split_mode = LLAMA_SPLIT_MODE_NONE;
+        modelParams.main_gpu = 0;
+        modelParams.progress_callback = &Private::loadProgress;
+        modelParams.progress_callback_user_data = this;
+        const auto textPath = QDir(modelDir).filePath(EmbeddingRuntime::textModelName()).toUtf8();
+        model = llama_model_load_from_file(textPath.constData(), modelParams);
+        if (!model) throw std::runtime_error("Cannot load text model");
+        maxTokens = textOnly ? 512 : 2048;
+        auto params = llama_context_default_params();
+        params.n_ctx = uint32_t(maxTokens);
+        params.n_batch = uint32_t(maxTokens);
+        params.n_ubatch = uint32_t(maxTokens);
+        params.n_seq_max = 16;
+        params.kv_unified = true;
+        params.embeddings = true;
+        params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        params.n_threads = threads;
+        params.n_threads_batch = threads;
+        params.abort_callback = &Private::abortCallback;
+        params.abort_callback_data = this;
+        params.offload_kqv = gpu;
+        params.op_offload = gpu;
+        context = llama_init_from_model(model, params);
+        if (!context) throw std::runtime_error("Cannot create embedding context");
+        vocab = llama_model_get_vocab(model);
+        outputSize = llama_model_n_embd_out(model);
+        rowSize = llama_model_n_embd_inp(model);
+        if (outputSize != EmbeddingRuntime::Dimension) throw std::runtime_error("Unexpected embedding dimension");
+        batch = llama_batch_ext_init(context);
+        if (!batch) throw std::runtime_error("Cannot allocate embedding batch");
+        if (!textOnly) {
+            auto mediaParams = mtmd_context_params_default();
+            mediaParams.use_gpu = gpu;
+            mediaParams.device = gpu ? device : nullptr;
+            mediaParams.print_timings = false;
+            mediaParams.warmup = true;
+            mediaParams.n_threads = threads;
+            mediaParams.progress_callback = &Private::loadProgress;
+            mediaParams.progress_callback_user_data = this;
+            mediaParams.image_min_tokens = 1;
+            mediaParams.image_max_tokens = 1120;
+            const auto mediaPath = QDir(modelDir).filePath(EmbeddingRuntime::mediaModelName()).toUtf8();
+            media = mtmd_init_from_file(mediaPath.constData(), model, mediaParams);
+            if (!media) throw std::runtime_error("Cannot load image/audio model");
+        }
+        for (int i = 0; i < 2; ++i) {
+            reset();
+            text(EmbeddingRuntime::prompt(QStringLiteral("warm up"), PromptKind::Query));
+        }
+        reset();
+        textWarmupCompleted = true;
     }
     void place(int32_t index) {
         if (index < 0 || position >= maxTokens) throw std::runtime_error("Embedding batch is full");
@@ -292,6 +486,31 @@ void EmbeddingRuntime::close() { d->close(); }
 bool EmbeddingRuntime::isLoaded() const { return d->context && d->batch; }
 bool EmbeddingRuntime::isTextOnly() const { return d->textOnly; }
 QString EmbeddingRuntime::lastError() const { return d->error; }
+bool EmbeddingRuntime::setBackendMode(const QString& mode, QString* error) {
+    if (error) error->clear();
+    if (isLoaded()) {
+        if (error) *error = QStringLiteral("Close the embedding runtime before changing its backend mode.");
+        return false;
+    }
+    const auto parsed = detail::parseBackendMode(mode, error);
+    if (!parsed) return false;
+    d->requestedMode = detail::backendModeName(*parsed);
+    return true;
+}
+QJsonObject EmbeddingRuntime::diagnostics() const {
+    return {{QStringLiteral("buildVariant"), QString::fromLatin1(QCOPILOTS_SEARCH_BUILD_VARIANT)},
+            {QStringLiteral("requestedBackend"), d->requestedMode},
+            {QStringLiteral("packagedBackend"), packagedBackend()},
+            {QStringLiteral("selectedBackend"), d->selection.backend},
+            {QStringLiteral("deviceName"), d->selectedDevice.name},
+            {QStringLiteral("deviceDescription"), d->selectedDevice.description},
+            {QStringLiteral("gpuSelected"), d->selection.gpu},
+            {QStringLiteral("gpuSelfTestPassed"), d->gpuSelfTestPassed},
+            {QStringLiteral("fallbackReason"), d->selection.fallbackReason},
+            {QStringLiteral("loaded"), isLoaded()},
+            {QStringLiteral("textWarmupCompleted"), d->textWarmupCompleted},
+            {QStringLiteral("error"), d->error}};
+}
 void EmbeddingRuntime::setThreadCount(int threads) {
     d->threads = std::clamp(threads, 1, std::max(1, QThread::idealThreadCount()));
     if (d->context) llama_set_n_threads(d->context, d->threads, d->threads);
@@ -323,66 +542,46 @@ bool EmbeddingRuntime::verifyModels(const QString& modelDir, bool textOnly, QStr
 }
 bool EmbeddingRuntime::load(const QString& modelDir, bool textOnly, QString* error) {
     close(); d->error.clear(); d->textOnly = textOnly;
+    d->selection = {}; d->selectedDevice = {};
+    d->gpuSelfTestPassed = false;
     if (error) error->clear();
+    const auto mode = detail::parseBackendMode(d->requestedMode, &d->error);
+    if (!mode) { if (error) *error = d->error; return false; }
+    d->requestedMode = detail::backendModeName(*mode);
     if (!verifyModels(modelDir, textOnly, &d->error)) { if (error) *error = d->error; return false; }
     try {
+        // ggml's process-wide registry is mutable while a GPU module loads.
+        // Serialize initialization so a CPU instance cannot enumerate it midway.
+        static std::mutex initializationMutex;
+        const std::lock_guard initializationLock(initializationMutex);
         static std::once_flag backend;
         std::call_once(backend, [] {
             llama_log_set(&logCallback, nullptr);
             mtmd_helper_log_set(&logCallback, nullptr);
             initializeBackend();
         });
-        auto modelParams = llama_model_default_params();
-        ggml_backend_dev_t cpuOnly[] = {nullptr};
-        modelParams.devices = cpuOnly;
-        modelParams.n_gpu_layers = 0;
-        modelParams.progress_callback = &Private::loadProgress;
-        modelParams.progress_callback_user_data = d.get();
-        const auto textPath = QDir(modelDir).filePath(textModelName()).toUtf8();
-        d->model = llama_model_load_from_file(textPath.constData(), modelParams);
-        if (!d->model) throw std::runtime_error("Cannot load text model");
-        d->maxTokens = textOnly ? 512 : 2048;
-        auto params = llama_context_default_params();
-        params.n_ctx = uint32_t(d->maxTokens);
-        params.n_batch = uint32_t(d->maxTokens);
-        params.n_ubatch = uint32_t(d->maxTokens);
-        params.n_seq_max = 16;
-        params.kv_unified = true;
-        params.embeddings = true;
-        params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
-        params.n_threads = d->threads;
-        params.n_threads_batch = d->threads;
-        params.abort_callback = &Private::abortCallback;
-        params.abort_callback_data = d.get();
-        params.offload_kqv = false;
-        params.op_offload = false;
-        d->context = llama_init_from_model(d->model, params);
-        if (!d->context) throw std::runtime_error("Cannot create embedding context");
-        d->vocab = llama_model_get_vocab(d->model);
-        d->outputSize = llama_model_n_embd_out(d->model);
-        d->rowSize = llama_model_n_embd_inp(d->model);
-        if (d->outputSize != Dimension) throw std::runtime_error("Unexpected embedding dimension");
-        d->batch = llama_batch_ext_init(d->context);
-        if (!d->batch) throw std::runtime_error("Cannot allocate embedding batch");
-        if (!textOnly) {
-            auto mediaParams = mtmd_context_params_default();
-            mediaParams.use_gpu = false;
-            mediaParams.print_timings = false;
-            mediaParams.warmup = true;
-            mediaParams.n_threads = d->threads;
-            mediaParams.progress_callback = &Private::loadProgress;
-            mediaParams.progress_callback_user_data = d.get();
-            mediaParams.image_min_tokens = 1;
-            mediaParams.image_max_tokens = 1120;
-            const auto mediaPath = QDir(modelDir).filePath(mediaModelName()).toUtf8();
-            d->media = mtmd_init_from_file(mediaPath.constData(), d->model, mediaParams);
-            if (!d->media) throw std::runtime_error("Cannot load image/audio model");
+        static std::once_flag gpuBackend;
+        static QString gpuLoadError;
+        if (*mode != detail::BackendMode::Cpu)
+            std::call_once(gpuBackend, [] { gpuLoadError = initializeGpuBackend(); });
+        const auto devices = enumerateDevices();
+        d->selection = detail::selectBackend(*mode, packagedBackend(), devices.descriptions, gpuLoadError);
+        if (!d->selection.error.isEmpty()) throw std::runtime_error(d->selection.error.toStdString());
+        d->selectedDevice = devices.descriptions[d->selection.deviceIndex];
+        try {
+            d->loadModels(modelDir, devices.handles[d->selection.deviceIndex]);
+        } catch (const std::exception& gpuFailure) {
+            // A cancellation is not a GPU failure and must never restart loading.
+            if (*mode != detail::BackendMode::Auto || !d->selection.gpu || Private::abortCallback(d.get())) throw;
+            const auto reason = QStringLiteral("%1 GPU initialization or warmup failed: %2. Retrying on CPU.")
+                .arg(packagedBackend(), QString::fromUtf8(gpuFailure.what()));
+            d->close();
+            d->selection = detail::selectBackend(detail::BackendMode::Cpu, packagedBackend(), devices.descriptions);
+            d->selection.fallbackReason = reason;
+            if (!d->selection.error.isEmpty()) throw std::runtime_error(d->selection.error.toStdString());
+            d->selectedDevice = devices.descriptions[d->selection.deviceIndex];
+            d->loadModels(modelDir, devices.handles[d->selection.deviceIndex]);
         }
-        for (int i = 0; i < 2; ++i) {
-            d->reset();
-            d->text(prompt(QStringLiteral("warm up"), PromptKind::Query));
-        }
-        d->reset();
         return true;
     } catch (const std::exception& e) {
         d->error = QString::fromUtf8(e.what());

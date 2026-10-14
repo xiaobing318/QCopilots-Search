@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -28,10 +29,29 @@ PRODUCT = "qcs"
 GUI_EXECUTABLE = "qcs-gui"
 MARKER = ".qcs-build-root.json"
 OPERATION_LOCK = ".qcs-dev.lock"
-GENERATED_DIRECTORIES = frozenset({"release", "debug", "relwithdebinfo", "deps", "runs", "stage", "pkg", "reports", "bootstrap"})
+GENERATED_DIRECTORIES = frozenset({"Release", "Debug", "RelWithDebInfo", "deps", "runs", "stage", "pkg", "reports", "bootstrap", "symbols", "sources"})
 PRESERVED_DIRECTORIES = frozenset({"models", "sdk", "development-profile"})
-SLOW_TEST_LABEL_REGEX = "^slow$"
 _ACTIVE_LOG = None
+
+
+def build_variant(identifier=None):
+    """Resolve one native configuration from the shared build matrix."""
+    manifest = json.loads((SOURCE / "config/build-variants.json").read_text(encoding="utf-8"))
+    variants = {item["id"]: item for item in manifest["variants"]}
+    system = {"Windows": "windows", "Linux": "linux", "Darwin": "macos"}.get(platform.system())
+    architecture = {"amd64": "x64", "x86_64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower())
+    default = f"{system}-{architecture}-" + ("metal" if system == "macos" else "cpu")
+    identifier = identifier or os.environ.get("QCOPILOTS_SEARCH_VARIANT") or default
+    if identifier not in variants:
+        raise ValueError("Unsupported build variant: " + identifier)
+    variant = variants[identifier]
+    if variant["os"] != system or variant["arch"] != architecture:
+        raise ValueError(f"Build variant {identifier} does not match this native host")
+    return variant
+
+
+def package_directory(root, config):
+    return root / "pkg" / config
 
 
 def validate_owner(owner: object, root: Path):
@@ -162,7 +182,7 @@ def _clean_generated(root: Path, config: str, scope: str, dry_run: bool):
                 raise RuntimeError(f"Build root ownership changed during clean: {path}")
         if marker.read_bytes() != marker_content:
             raise RuntimeError(f"Build root marker changed during clean: {marker}")
-    names = {config.lower()} if scope == "build" else GENERATED_DIRECTORIES
+    names = {config} if scope == "build" else GENERATED_DIRECTORIES
     if scope == "generated":
         unknown = [item.name for item in root.iterdir()
                    if item.name not in GENERATED_DIRECTORIES | PRESERVED_DIRECTORIES | {MARKER, OPERATION_LOCK}]
@@ -176,7 +196,7 @@ def _clean_generated(root: Path, config: str, scope: str, dry_run: bool):
         if target.resolve().parent != root.resolve() or not target.is_dir():
             raise RuntimeError(f"Refusing unsafe clean target: {target}")
         verify_plain_tree(target)
-        if name in {"release", "debug", "relwithdebinfo"}:
+        if name in {"Release", "Debug", "RelWithDebInfo"}:
             cache = target / "CMakeCache.txt"
             expected = "CMAKE_HOME_DIRECTORY:INTERNAL=" + SOURCE.as_posix()
             if not cache.is_file() or expected not in cache.read_text(encoding="utf-8").splitlines():
@@ -222,7 +242,7 @@ def _clean_generated(root: Path, config: str, scope: str, dry_run: bool):
 
 def check_path_budget(root: Path, build: Path, stage: Path, reports: Path, *, configured: bool):
     command = [sys.executable, SOURCE / "tools/qcs-path-budget.py", "--source", SOURCE,
-               "--root", root, "--stage", stage, "--package-root", root / "pkg",
+               "--root", root, "--stage", stage, "--package-root", package_directory(root, build.name),
                "--report", reports / ("paths-configured.json" if configured else "paths-doctor.json")]
     if configured:
         command.extend(["--build", build])
@@ -249,8 +269,8 @@ def run(command, *, cwd=None, env=None):
         return subprocess.CompletedProcess(command, status)
 
 
-def report_package_errors(root: Path, started: float):
-    packaging = (root / "pkg/_CPack_Packages").resolve()
+def report_package_errors(package_root: Path, started: float):
+    packaging = (package_root / "_CPack_Packages").resolve()
     if not packaging.is_dir():
         return
     for name in ("NSISOutput.log", "CPackError.log"):
@@ -367,25 +387,24 @@ def helper_module(filename, name):
     return module
 
 
-def case_evidence(junit, inventory, profile):
+def case_evidence(junit, inventory):
     parser = helper_module(".github/scripts/qcs-ctest-evidence.py", "qcs_case_evidence")
-    return parser.inspect_junit(junit, platform.system(), inventory, profile)
+    return parser.inspect_junit(junit, platform.system(), inventory)
 
 
 def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
     """Use CTest itself to resolve labels, then record the exact selected scope."""
     run_id = str(uuid.uuid4())
-    test_root = Path(tempfile.mkdtemp(prefix="qcs-t-", dir=root / "runs"))
+    runs = root / "runs" / args.config
+    runs.mkdir(parents=True, exist_ok=True)
+    test_root = Path(tempfile.mkdtemp(prefix="qcs-t-", dir=runs))
     environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(test_root)
     run_report = args.report_dir.expanduser().resolve() if args.report_dir else reports / test_root.name
     assert_external(run_report)
     run_report.mkdir(parents=True, exist_ok=True)
-    latest = {"runId": run_id, "directory": str(run_report), "testRoot": str(test_root),
-              "profile": args.test_profile}
+    latest = {"runId": run_id, "directory": str(run_report), "testRoot": str(test_root)}
     (reports / "latest-test-run.json").write_text(json.dumps(latest, indent=2), encoding="utf-8")
     filters = []
-    if args.test_profile == "fast":
-        filters.extend(["-LE", SLOW_TEST_LABEL_REGEX])
     if args.test_label:
         filters.extend(["-L", args.test_label])
     base = ["ctest", "--test-dir", str(build), "-C", args.config]
@@ -431,14 +450,9 @@ def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
         if not set(selected_names).issubset(selection["registeredTests"]):
             raise RuntimeError("CTest registration changed while selecting tests")
         if not selected:
-            raise RuntimeError("No tests match the selected profile and label. Use --test-profile full to include slow tests.")
-        if args.test_profile == "fast":
-            slow = [test["name"] for test in selected if "slow" in next(
-                (prop["value"] for prop in test.get("properties", []) if prop["name"] == "LABELS"), [])]
-            if slow:
-                # CTest may automatically include fixture setup/cleanup despite
-                # label filters. Never execute that slow dependency implicitly.
-                raise RuntimeError("Fast tests require slow fixtures. Use --test-profile full: " + ", ".join(slow))
+            raise RuntimeError("No tests match the selected label")
+        if os.name == "nt" and "qcs-tests-windows-package" in selected_names:
+            ensure_nsis(root, environment)
         command = [*base, "--output-on-failure", "--no-tests=error", "--parallel", str(args.jobs),
                    "--test-output-size-passed", "16777216", "--test-output-size-failed", "16777216",
                    "--test-output-truncation", "middle", "--output-junit", str(run_report / "ctest.xml"), *filters]
@@ -447,7 +461,7 @@ def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
         selection["commands"].append({"purpose": "execute", "arguments": command})
         selection["status"] = "running"
         save()
-        print(f"CTest profile {args.test_profile}: {len(selected)} selected, "
+        print(f"CTest: {len(selected)} selected, "
               f"{len(selection['excludedTests'])} excluded. Release acceptance is incomplete.", flush=True)
         run(command, cwd=root, env=environment)
         cases = list(ET.parse(run_report / "ctest.xml").getroot().iter("testcase"))
@@ -459,35 +473,119 @@ def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
             raise RuntimeError("Selected CTest programs include failed or unexecuted tests")
         # The same parser is used locally and by native CI. CTest exit zero
         # alone cannot prove that QtTest ran every required case.
-        evidence = case_evidence(run_report / "ctest.xml", run_report / "test-selected-inventory.json",
-                                 args.test_profile)
+        evidence = case_evidence(run_report / "ctest.xml", run_report / "test-selected-inventory.json")
         (run_report / "qt-test-cases.json").write_text(
             json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if not evidence["testsComplete"]:
             raise RuntimeError("Selected test case evidence is incomplete: " + ", ".join(evidence["errors"]))
         selection.update(status="passed", passed=True, exitCode=0,
-                         fullSuitePassed=args.test_profile == "full" and not args.test_label
-                         and not selection["excludedTests"])
+                         fullSuitePassed=not args.test_label and not selection["excludedTests"])
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, ET.ParseError) as error:
         selection.update(status="failed", error=str(error),
                          exitCode=error.returncode if isinstance(error, subprocess.CalledProcessError) else 1)
         raise
     finally:
         if (run_report / "ctest.xml").is_file() and not (run_report / "qt-test-cases.json").is_file():
-            diagnostic = case_evidence(run_report / "ctest.xml", run_report / "test-selected-inventory.json",
-                                       args.test_profile)
+            diagnostic = case_evidence(run_report / "ctest.xml", run_report / "test-selected-inventory.json")
             (run_report / "qt-test-cases.json").write_text(
                 json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding="utf-8")
         save()
     return run_report
 
 
-def package_for_suffix(root, suffix):
-    candidates = [path for path in (root / "pkg").glob(PRODUCT + "-*" + suffix)
-                  if "-source-materials-" not in path.name and "-symbols-" not in path.name]
-    if len(candidates) != 1:
-        raise RuntimeError(f"Expected one final {suffix} package, found {len(candidates)}")
-    return candidates[0]
+def cpack_setting(root, config, name):
+    text = (root / config / "CPackConfig.cmake").read_text(encoding="utf-8-sig")
+    values = re.findall(r'^\s*set\(' + re.escape(name) + r'\s+"([^"\r\n]+)"\)\s*$', text, re.MULTILINE)
+    if len(values) != 1:
+        raise RuntimeError(f"Expected one literal {name} in the current CPack configuration")
+    return values[0]
+
+
+def package_path(root, suffix, config):
+    name = cpack_setting(root, config, "CPACK_PACKAGE_FILE_NAME")
+    if not re.fullmatch(r"qcs-[A-Za-z0-9_.+-]+", name):
+        raise RuntimeError("The current CPack package filename is unsafe")
+    package = package_directory(root, config) / (name + suffix)
+    if suffix == ".exe" and not package.is_file():
+        fallback = package.with_name(name + "-setup.zip")
+        if fallback.is_file():
+            return fallback
+    return package
+
+
+def package_for_suffix(root, suffix, config="Release"):
+    package = package_path(root, suffix, config)
+    if not package.is_file():
+        raise RuntimeError("Current candidate package is missing: " + str(package))
+    return package
+
+
+def candidate_packages(root, config):
+    suffixes = {"NSIS": ".exe", "ZIP": ".zip", "TGZ": ".tar.gz", "DEB": ".deb", "DragNDrop": ".dmg"}
+    generators = cpack_setting(root, config, "CPACK_GENERATOR").split(";")
+    return [path for generator in generators
+            if generator in suffixes and (path := package_path(root, suffixes[generator], config)).is_file()]
+
+
+def package_generator(root, build, config, generator, environment):
+    """Publish only this generator's finished candidate, then release its stage."""
+    suffixes = {"ZIP": ".zip", "TGZ": ".tar.gz", "DEB": ".deb", "DragNDrop": ".dmg"}
+    if generator not in suffixes:
+        raise ValueError("Unsupported package generator: " + generator)
+    destination = package_path(root, suffixes[generator], config)
+    output = destination.parent.resolve()
+    if destination.parent.absolute() != output or is_redirect(output):
+        raise RuntimeError("Package output directory is redirected: " + str(destination.parent))
+    temporary = Path(tempfile.mkdtemp(prefix="qcs-cpack-", dir=output)).absolute()
+    identity = (temporary.stat().st_dev, temporary.stat().st_ino)
+
+    def check_owned_directory():
+        if (temporary.parent != output or temporary.resolve() != temporary or is_redirect(temporary)
+                or (temporary.stat().st_dev, temporary.stat().st_ino) != identity):
+            raise RuntimeError("Refusing to use or remove a changed CPack temporary directory: " + str(temporary))
+
+    def remove_readonly(function, filename, failure):
+        target = Path(filename).absolute()
+        check_owned_directory()
+        if (not isinstance(failure[1], PermissionError) or function not in (os.unlink, os.rmdir)
+                or (target != temporary and temporary not in target.parents)
+                or target.resolve() != target or is_redirect(target)):
+            raise failure[1]
+        target.chmod(target.stat().st_mode | stat.S_IWRITE)
+        function(filename)
+
+    started = time.time()
+    try:
+        check_owned_directory()
+        run(["cpack", "--config", build / "CPackConfig.cmake", "-C", config,
+             "-B", temporary, "-G", generator], cwd=root, env=environment)
+        result = temporary / destination.name
+        if not result.is_file() or is_redirect(result) or result.resolve() != result:
+            raise RuntimeError("CPack did not produce the current candidate package: " + str(result))
+        check_owned_directory()
+        os.replace(result, destination)
+        return destination
+    except subprocess.CalledProcessError:
+        report_package_errors(temporary, started)
+        raise
+    finally:
+        # Never enumerate historical CPack roots or another invocation's stage.
+        # Framework/library symlinks may be unlinked but must not redirect cleanup.
+        check_owned_directory()
+        verify_plain_tree(temporary)
+        shutil.rmtree(temporary, onerror=remove_readonly)
+
+
+def ensure_nsis(root, environment):
+    """Prepare the pinned compiler before native tests or installer packaging."""
+    python = root / "bootstrap/python/Scripts/python.exe"
+    if not python.is_file():
+        venv.EnvBuilder(with_pip=True).create(python.parent.parent)
+    run([python, "-m", "pip", "install", "py7zr==1.1.3"], cwd=root, env=environment)
+    run([python, SOURCE / "tools/qcs-bootstrap-nsis.py", "--output-dir", root / "bootstrap/nsis",
+         "--cache-dir", root / "bootstrap/nsis-downloads"], cwd=root, env=environment)
+    environment["QCOPILOTS_SEARCH_NSIS_EXECUTABLE"] = str(root / "bootstrap/nsis/makensis.exe")
+    environment["PATH"] = str(root / "bootstrap/nsis") + os.pathsep + environment.get("PATH", "")
 
 
 def nsis_contract(root, reports, environment):
@@ -511,8 +609,29 @@ def nsis_contract(root, reports, environment):
         raise RuntimeError("NSIS compiler contract failed: " + ", ".join(errors))
 
 
+def gpu_sdk(args, root, reports, environment, *, install=False):
+    variant = build_variant(args.variant)
+    if variant["backend"] in ("cpu", "metal"):
+        return {}
+    sdk_root = getattr(args, "gpu_sdk_root", None) or root.parent / "gpu-sdk"
+    sdk_root = Path(sdk_root).expanduser().resolve()
+    assert_external(sdk_root)
+    manifest = root / "reports" / args.config / "gpu-sdk.json"
+    command = [sys.executable, "-B", SOURCE / "tools/qcs-gpu-sdk.py", "--variant", args.variant,
+               "--sdk-root", sdk_root, "--build-root", root / args.config, "--output", manifest]
+    if install:
+        command.append("--install")
+    run(command, cwd=root, env=environment)
+    configuration = json.loads(manifest.read_text(encoding="utf-8"))
+    if configuration.get("variant") != args.variant:
+        raise RuntimeError("GPU SDK manifest belongs to another build variant")
+    environment.update(configuration["environment"])
+    return {**configuration["cmakeCache"], "QCOPILOTS_SEARCH_GPU_SDK_MANIFEST": str(manifest)}
+
+
 def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, environment):
     """The only implementation of local and CI single-stage operations."""
+    packages = package_directory(root, args.config)
     if action == "bootstrap":
         tools_root = root / "bootstrap/python"
         python = tools_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -520,6 +639,7 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
             venv.EnvBuilder(with_pip=True).create(tools_root)
         run([python, "-m", "pip", "install", "py7zr==1.1.3"], cwd=root)
         run([python, SOURCE / "tools/qcs-bootstrap-qt.py", "--qt-root", sdk_root, "--cache-dir", root / "bootstrap/qt-downloads"], cwd=root)
+        gpu_sdk(args, root, reports, environment, install=True)
     elif action == "doctor":
         report = {"source": str(SOURCE), "buildRoot": str(root), "qtPrefix": str(prefix), "platform": platform.platform(), "freeGiB": round(shutil.disk_usage(root).free / 1024**3, 2), "tools": {name: shutil.which(name) for name in ("cmake", "ctest", "cpack", "ninja", "git", "cl" if os.name == "nt" else "c++")}}
         report["qtInstalled"] = (prefix / "lib/cmake/Qt6/Qt6Config.cmake").is_file()
@@ -529,7 +649,17 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
         if not report["qtInstalled"] or not all(report["tools"].values()):
             raise RuntimeError("Toolchain is incomplete. Install missing tools or run bootstrap.")
     elif action == "configure":
-        command = ["cmake", "-S", SOURCE, "-B", build, "-G", "Ninja", f"-DCMAKE_BUILD_TYPE={args.config}", f"-DCMAKE_PREFIX_PATH={prefix}", f"-DCMAKE_INSTALL_PREFIX={stage}", f"-DQCOPILOTS_SEARCH_DEPENDENCY_ROOT={root / 'deps'}", f"-DQCOPILOTS_SEARCH_TEST_ROOT={root / 'runs'}", f"-DPython3_EXECUTABLE={sys.executable}", "-DQCOPILOTS_SEARCH_BUILD_TESTS=ON"]
+        command = ["cmake", "-S", SOURCE, "-B", build, "-G", "Ninja", f"-DCMAKE_BUILD_TYPE={args.config}", f"-DCMAKE_PREFIX_PATH={prefix}", f"-DCMAKE_INSTALL_PREFIX={stage}", f"-DCPACK_PACKAGE_DIRECTORY={packages}", f"-DQCOPILOTS_SEARCH_DEPENDENCY_ROOT={root / 'deps' / args.config}", f"-DQCOPILOTS_SEARCH_TEST_ROOT={root / 'runs' / args.config}", f"-DPython3_EXECUTABLE={sys.executable}", "-DQCOPILOTS_SEARCH_BUILD_TESTS=ON", f"-DQCOPILOTS_SEARCH_VARIANT={args.variant}"]
+        for key, value in gpu_sdk(args, root, reports, environment).items():
+            if key == "CMAKE_PREFIX_PATH":
+                value = str(prefix) + ";" + str(value)
+            command.append(f"-D{key}={value}")
+        candidate = getattr(args, "candidate_commit", None) or environment.get("QCOPILOTS_SEARCH_CANDIDATE_COMMIT") or environment.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD")
+        attempt = getattr(args, "attempt", None) or environment.get("QCOPILOTS_SEARCH_CANDIDATE_ATTEMPT")
+        if candidate:
+            command.append(f"-DQCOPILOTS_SEARCH_CANDIDATE_COMMIT={candidate}")
+        if attempt:
+            command.append(f"-DQCOPILOTS_SEARCH_CANDIDATE_ATTEMPT={attempt}")
         if args.model_dir:
             command.append(f"-DQCOPILOTS_SEARCH_MODEL_DIR={args.model_dir.resolve()}")
         command.extend(args.cmake_arg)
@@ -541,33 +671,31 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
         run_tests(args, root, build, reports, environment)
     elif action == "run":
         runtime_environment = dict(environment, QCOPILOTS_SEARCH_TESSDATA_DIR=str(development_tessdata(build)))
-        run([executable(build, GUI_EXECUTABLE), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=runtime_environment)
+        runtime_root = build
+        if build_variant(args.variant)["backend"] != "cpu":
+            # Installation deploys the GPU manifest and its complete runtime dependencies.
+            run(["cmake", "--install", build, "--config", args.config, "--prefix", stage], cwd=root, env=environment)
+            runtime_root = stage
+        run([executable(runtime_root, GUI_EXECUTABLE), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=runtime_environment)
     elif action == "install":
         run(["cmake", "--install", build, "--config", args.config, "--prefix", stage], cwd=root, env=environment)
     elif action == "package":
         if os.name == "nt" and (not args.generator or "NSIS" in args.generator.split(";")):
-            python = root / "bootstrap/python/Scripts/python.exe"
-            if not python.is_file():
-                venv.EnvBuilder(with_pip=True).create(python.parent.parent)
-            run([python, "-m", "pip", "install", "py7zr==1.1.3"], cwd=root, env=environment)
-            run([python, SOURCE / "tools/qcs-bootstrap-nsis.py", "--output-dir", root / "bootstrap/nsis",
-                 "--cache-dir", root / "bootstrap/nsis-downloads"], cwd=root, env=environment)
+            ensure_nsis(root, environment)
             nsis_contract(root, reports, environment)
         check_path_budget(root, build, stage, reports, configured=True)
-        run([sys.executable, SOURCE / "tools/qcs-package-symbols.py",
-             "--manifest", build / f"qcs-symbol-inputs-{args.config}.json",
-             "--output-dir", root / "pkg"], cwd=root, env=environment)
-        command = ["cpack", "--config", build / "CPackConfig.cmake", "-C", args.config, "-B", root / "pkg"]
-        if args.generator:
-            command.extend(["-G", args.generator])
-        started = time.time()
-        try:
-            run(command, cwd=root, env=environment)
-        except subprocess.CalledProcessError:
-            report_package_errors(root, started)
-            raise
+        packages.mkdir(parents=True, exist_ok=True)
+        generators = args.generator.split(";") if args.generator else build_variant(args.variant)["generators"]
+        for generator in generators:
+            if os.name == "nt" and generator == "NSIS":
+                command = [sys.executable, "-B", SOURCE / "tools/qcs-package-windows.py",
+                           "--build-dir", build, "--package-dir", packages,
+                           "--config", args.config, "--variant", args.variant]
+                run(command, cwd=root, env=environment)
+            else:
+                package_generator(root, build, args.config, generator, environment)
         checksums = []
-        for package in sorted((root / "pkg").glob("qcs-*")):
+        for package in sorted(candidate_packages(root, args.config)):
             if package.is_file() and package.suffix != ".sha256":
                 with package.open("rb") as stream:
                     hasher = hashlib.sha256()
@@ -575,24 +703,29 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
                         hasher.update(chunk)
                     digest = hasher.hexdigest()
                 checksums.append(f"{digest}  {package.name}")
-        (root / "pkg/SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+        (packages / "SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+    elif action == "symbols":
+        run([sys.executable, SOURCE / "tools/qcs-package-symbols.py",
+             "--manifest", build / f"qcs-symbol-inputs-{args.config}.json",
+             "--output-dir", root / "symbols" / args.config], cwd=root, env=environment)
     elif action == "verify-package":
-        command = [sys.executable, SOURCE / "tools/qcs-verify-package.py", "--build-root", root]
+        command = [sys.executable, SOURCE / "tools/qcs-verify-package.py", "--build-root", root, "--variant", args.variant]
         if args.keyword_only:
             command.append("--keyword-only")
         elif args.model_dir:
             command.extend(["--model-dir", args.model_dir.expanduser().resolve()])
-        if args.package_file:
-            command.extend(["--package-file", args.package_file.expanduser().resolve()])
-        if args.report_dir:
-            command.extend(["--report-dir", args.report_dir.expanduser().resolve()])
-        run(command, cwd=root, env=environment)
+        package = args.package_file or package_for_suffix(root, {"Windows": ".zip", "Linux": ".tar.gz", "Darwin": ".dmg"}[platform.system()], args.config)
+        command.extend(["--package-file", package.expanduser().resolve()])
+        report_dir = args.report_dir.expanduser().resolve() if args.report_dir else reports / ("package-" + uuid.uuid4().hex)
+        command.extend(["--report-dir", report_dir])
+        package_environment = dict(environment, QCOPILOTS_SEARCH_TEST_ROOT=str(root / "runs" / args.config))
+        run(command, cwd=root, env=package_environment)
     elif action == "models":
-        models = (args.model_dir or root / "models").expanduser().resolve()
+        models = (args.model_dir or root.parent / "models").expanduser().resolve()
         assert_external(models)
         models.mkdir(parents=True, exist_ok=True)
         common = [executable(build, "qcs-cli"), "--model-dir", models,
-                  "--profile-dir", root / "runs/model-management"]
+                  "--profile-dir", root / "runs" / args.config / "model-management"]
         manifest = subprocess.run([str(item) for item in [*common, "models", "manifest"]], cwd=root,
                                   env=environment, capture_output=True, check=True)
         (reports / "models-manifest.json").write_bytes(manifest.stdout)
@@ -605,8 +738,8 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
             raise subprocess.CalledProcessError(result.returncode, common, result.stdout, result.stderr)
     elif action == "sources":
         run([sys.executable, SOURCE / "tools/qcs-source-bundle.py", "--build-root", root,
-             "--qt-root", sdk_root, "--download"], cwd=root, env=environment)
-        archives = [root / "deps/sources/llama.cpp-b11461.tar.gz", root / "deps/llama-b11461.tar.gz"]
+             "--qt-root", sdk_root, "--output-dir", root / "sources" / args.config, "--download"], cwd=root, env=environment)
+        archives = [root / "deps/sources/llama.cpp-b11461.tar.gz", root / "deps" / args.config / "llama-b11461.tar.gz"]
         archive = next((path for path in archives if path.is_file()), None)
         if archive is None:
             raise RuntimeError("Collected llama source archive is unavailable for rebuild verification")
@@ -617,7 +750,7 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
     elif action == "installers":
         if os.name == "nt":
             installer_args = copy.copy(args)
-            installer_args.package_file = package_for_suffix(root, ".exe")
+            installer_args.package_file = package_for_suffix(root, ".exe", args.config)
             installer_args.report_dir = reports / "package-nsis"
             execute_action("verify-package", installer_args, root, build, stage, reports, sdk_root, prefix, environment)
         elif platform.system() == "Linux":
@@ -628,32 +761,57 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
                 raise RuntimeError("Installer candidate differs from the current source checkout")
             installer_environment = dict(environment, QCOPILOTS_SEARCH_CANDIDATE_HEAD=identity["checkoutCommit"])
             run([sys.executable, SOURCE / ".github/scripts/qcs-deb-ci.py", "--build-root", root,
-                 "--package-file", package_for_suffix(root, ".deb"), "--model-dir", args.model_dir or root / "models",
+                 "--package-file", package_for_suffix(root, ".deb", args.config), "--model-dir", args.model_dir or root.parent / "models",
                  "--report-dir", reports / "package-deb"], cwd=root, env=installer_environment)
         else:
             raise RuntimeError("This platform has no additional installer beyond its DMG package verification")
 
 
-def check_plan(profile, system):
-    stages = [(action, None) for action in ("doctor", "configure", "build")]
-    if profile == "full":
-        stages.append(("models", None))
-    stages.append(("test", None))
-    if profile == "full":
-        stages.append(("install", None))
-        stages.extend(("package", generator) for generator in {
-            "Windows": ("ZIP", "NSIS"), "Linux": ("TGZ", "DEB"), "Darwin": ("DragNDrop",)}[system])
-        stages.append(("verify-package", None))
-        if system in ("Windows", "Linux"):
-            stages.append(("installers", None))
-        stages.append(("sources", None))
+def check_plan(system):
+    stages = [(action, None) for action in ("doctor", "configure", "build", "models", "test", "install")]
+    stages.extend(("package", generator) for generator in {
+        "Windows": ("NSIS", "ZIP"), "Linux": ("TGZ", "DEB"), "Darwin": ("DragNDrop",)}[system])
+    stages.append(("verify-package", None))
+    if system in ("Windows", "Linux"):
+        stages.append(("installers", None))
     return stages
+
+
+def file_snapshot(paths):
+    records = {}
+    for name, path in sorted(paths.items()):
+        with path.open("rb") as stream:
+            hasher = hashlib.sha256()
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(block)
+        records[name] = {"bytes": path.stat().st_size, "sha256": hasher.hexdigest()}
+    return records
+
+
+def source_snapshot():
+    listing = subprocess.check_output(["git", "-C", str(SOURCE), "ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+    names = set(listing.decode("utf-8").split("\0")) - {""}
+    return file_snapshot({name: SOURCE / name for name in names if (SOURCE / name).is_file()})
+
+
+def executable_snapshot(build):
+    return file_snapshot({name: executable(build, name) for name in (GUI_EXECUTABLE, "qcs-service", "qcs-worker", "qcs-cli")})
+
+
+def runtime_snapshot(build):
+    paths = {}
+    for folder in (build / "bin", build / "lib"):
+        if folder.is_dir():
+            for path in folder.rglob("*"):
+                if path.is_file() and (path.suffix.lower() in (".dll", ".dylib") or re.search(r"\.so(?:\.\d+)*$", path.name)):
+                    paths[path.relative_to(build).as_posix()] = path
+    return file_snapshot(paths)
 
 
 def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
     global _ACTIVE_LOG
     if args.test_label or args.keyword_only or args.generator or args.package_file:
-        raise ValueError("check requires the entire selected profile. Use individual actions for filtered work.")
+        raise ValueError("check requires the entire test suite. Use individual actions for filtered work.")
     directory = args.report_dir.expanduser().resolve() if args.report_dir else Path(tempfile.mkdtemp(prefix="check-", dir=reports))
     assert_external(directory)
     if root not in directory.parents:
@@ -663,20 +821,20 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
     directory.mkdir(parents=True, exist_ok=True)
     evidence = helper_module("tools/qcs-release-evidence.py", "qcs_check_release")
     identity = evidence.source_identity(SOURCE)
-    document = {"schemaVersion": 1, "kind": "developer-check", "testProfile": args.test_profile,
+    original_sources = source_snapshot()
+    document = {"schemaVersion": 2, "kind": "developer-check", "variant": args.variant, "config": args.config,
                 "system": platform.system(), "buildRoot": str(root), "identity": identity,
                 "passed": False, "releaseComplete": False, "startedAt": datetime.now(timezone.utc).isoformat(),
                 "stages": [{"action": action, "generator": generator, "status": "notRun"}
-                           for action, generator in check_plan(args.test_profile, platform.system())], "files": []}
+                           for action, generator in check_plan(platform.system())], "files": [],
+                "sourceFiles": original_sources, "executables": {}, "runtimeFiles": {}, "packages": {}, "stability": {}}
     report_path = directory / "check-report.json"
     document["reportPath"] = report_path.relative_to(root).as_posix()
-    evidence.write_json(reports / "latest-check.json", {"report": str(report_path), "testProfile": args.test_profile})
+    evidence.write_json(reports / "latest-check.json", {"report": str(report_path), "variant": args.variant})
     local_args = copy.copy(args)
-    if args.test_profile == "full":
-        local_args.model_dir = args.model_dir or root / "models"
-        environment["QCOPILOTS_SEARCH_MODEL_DIR"] = str(local_args.model_dir.resolve())
-        environment["QCOPILOTS_SEARCH_SEMANTIC_REPORT"] = str(directory / "semantic-quality.json")
-        environment["QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT"] = str(directory / "physical-files.json")
+    local_args.model_dir = args.model_dir or root.parent / "models"
+    environment = dict(environment, QCOPILOTS_SEARCH_MODEL_DIR=str(local_args.model_dir.resolve()),
+                       QCOPILOTS_SEARCH_SEMANTIC_REPORT=str(directory / "semantic-functional.json"))
     try:
         for index, record in enumerate(document["stages"]):
             local_args.generator = record["generator"]
@@ -690,6 +848,18 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
             _ACTIVE_LOG = log
             try:
                 execute_action(record["action"], local_args, root, build, stage, directory, sdk_root, prefix, environment)
+                if record["action"] == "build":
+                    document["executables"] = executable_snapshot(build)
+                    document["runtimeFiles"] = runtime_snapshot(build)
+                if record["action"] == "package":
+                    suffix = {"ZIP": ".zip", "NSIS": ".exe", "TGZ": ".tar.gz", "DEB": ".deb", "DragNDrop": ".dmg"}[record["generator"]]
+                    package = package_for_suffix(root, suffix, args.config)
+                    paths = {name: root / name for name in document["packages"]}
+                    paths[package.relative_to(root).as_posix()] = package
+                    for name, fingerprint in file_snapshot(paths).items():
+                        if name in document["packages"] and document["packages"][name] != fingerprint:
+                            raise RuntimeError("An earlier package changed during a later packaging stage: " + name)
+                        document["packages"].setdefault(name, fingerprint)
                 record.update(status="passed", exitCode=0)
             except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, ET.ParseError) as error:
                 record.update(status="failed", error=str(error),
@@ -702,23 +872,33 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
                 evidence.write_json(report_path, document)
         if evidence.source_identity(SOURCE) != identity:
             raise RuntimeError("Source identity changed during the developer check")
+        document["stability"] = {
+            "sourceUnchanged": source_snapshot() == original_sources,
+            "binariesUnchanged": executable_snapshot(build) == document["executables"],
+            "runtimeUnchanged": runtime_snapshot(build) == document["runtimeFiles"],
+            "packagesUnchanged": file_snapshot({name: root / name for name in document["packages"]}) == document["packages"],
+        }
+        if not all(document["stability"].values()):
+            raise RuntimeError("Source, executable or package bytes changed during the developer check")
         document["passed"] = True
     finally:
         _ACTIVE_LOG = None
         document["finishedAt"] = datetime.now(timezone.utc).isoformat()
         paths = [path for path in directory.rglob("*") if path.is_file() and path != report_path]
-        if args.test_profile == "full":
-            paths.extend(path for path in (root / "pkg").glob("qcs-*") if path.is_file())
-            if (root / "pkg/SHA256SUMS").is_file():
-                paths.append(root / "pkg/SHA256SUMS")
+        paths.extend(root / name for name in document["packages"] if (root / name).is_file())
+        sdk_manifest = root / "reports" / args.config / "gpu-sdk.json"
+        if sdk_manifest.is_file():
+            paths.append(sdk_manifest)
+        if (package_directory(root, args.config) / "SHA256SUMS").is_file():
+            paths.append(package_directory(root, args.config) / "SHA256SUMS")
         document["files"] = [evidence.file_record(root, path) for path in sorted(set(paths))]
         evidence.write_json(report_path, document)
-        print(f"Developer {args.test_profile} check report: {report_path}")
+        print(f"Developer check report: {report_path}")
     return report_path
 
 
 def inspect_check(report_path: Path, expected_head: str):
-    """Revalidate original local full evidence for release preparation."""
+    """Revalidate the original complete developer check and bound evidence."""
     evidence = helper_module("tools/qcs-release-evidence.py", "qcs_check_release")
     result = {"passed": False, "errors": [], "files": []}
     try:
@@ -731,37 +911,42 @@ def inspect_check(report_path: Path, expected_head: str):
             raise ValueError("Local check report was moved without its evidence tree")
         errors = evidence.verify_manifest(root, document)
         result.update(identity=document["identity"], files=document["files"], buildRoot=str(root))
-        if (document.get("kind") != "developer-check" or document.get("testProfile") != "full"
+        if (document.get("kind") != "developer-check" or document.get("schemaVersion") != 2
                 or document.get("passed") is not True or document.get("releaseComplete") is not False
                 or document["identity"].get("candidateHead") != expected_head
                 or document["identity"].get("checkoutCommit") != expected_head):
-            errors.append("Local check is not a successful full check of the immutable candidate")
-        expected = check_plan("full", document["system"])
+            errors.append("Local check is not a successful complete check of the immutable candidate")
+        errors.extend(evidence.valid_identity(document["identity"]))
+        if (not document.get("sourceFiles") or set(document.get("executables", {})) != {GUI_EXECUTABLE, "qcs-service", "qcs-worker", "qcs-cli"}
+                or not document.get("packages")
+                or "runtimeFiles" not in document
+                or document.get("stability") != {"sourceUnchanged": True, "binariesUnchanged": True, "runtimeUnchanged": True, "packagesUnchanged": True}):
+            errors.append("Local check source, executable and package stability evidence is incomplete")
+        expected = check_plan(document["system"])
         stages = document.get("stages", [])
         if [(item.get("action"), item.get("generator")) for item in stages] != expected:
-            errors.append("Local full stages are incomplete or changed")
+            errors.append("Local check stages are incomplete or changed")
         bound = {item["path"] for item in document["files"]}
         required = [report_path.parent / "tests" / name for name in (
             "test-selection.json", "test-inventory.json", "test-selected-inventory.json", "ctest.xml", "qt-test-cases.json")]
         required += [report_path.parent / name for name in (
-            "models.json", "models-manifest.json", "semantic-quality.json", "physical-files.json",
-            "source-integrity.json", "package/report.json")]
+            "models.json", "models-manifest.json", "semantic-functional.json", "package/report.json")]
         if document["system"] == "Windows":
             required += [report_path.parent / name for name in ("nsis-contract.json", "nsis-contract.log", "package-nsis/report.json")]
         if document["system"] == "Linux":
             required.append(report_path.parent / "package-deb/report.json")
         if not {path.relative_to(root).as_posix() for path in required}.issubset(bound):
-            errors.append("Local full check omits required bound original evidence")
+            errors.append("Local check omits required bound original evidence")
         for item in stages:
             if (item.get("status") != "passed" or item.get("exitCode") != 0
                     or item.get("log") not in bound or item.get("elapsedSeconds", -1) < 0):
-                errors.append("Local full stage failed, did not run, or lacks its bound raw log")
+                errors.append("Local stage failed, did not run, or lacks its bound raw log")
         selected = evidence.read_json(report_path.parent / "tests/test-selection.json")
         if selected.get("fullSuitePassed") is not True or selected.get("excludedTests"):
-            errors.append("Local full CTest selection is incomplete")
-        parser = helper_module(".github/scripts/qcs-ctest-evidence.py", "qcs_full_cases")
+            errors.append("Local CTest selection is incomplete")
+        parser = helper_module(".github/scripts/qcs-ctest-evidence.py", "qcs_complete_cases")
         cases = parser.inspect_junit(report_path.parent / "tests/ctest.xml", document["system"],
-                                     report_path.parent / "tests/test-inventory.json", "full")
+                                     report_path.parent / "tests/test-inventory.json")
         errors.extend(cases["errors"])
         models = evidence.read_json(report_path.parent / "models.json")
         model_manifest = evidence.read_json(report_path.parent / "models-manifest.json")
@@ -771,16 +956,15 @@ def inspect_check(report_path: Path, expected_head: str):
         if (models.get("ok") is not True or models.get("result", {}).get("valid") is not True
                 or len(actual_models) != len(pins) or len(expected_models) != len(pins)
                 or {item.get("name") for item in actual_models} != set(pins)):
-            errors.append("Local full model verification is incomplete")
+            errors.append("Local model verification is incomplete")
         for item in actual_models:
             if item.get("present") is not True or (item.get("bytes"), item.get("sha256")) != pins.get(item.get("name")):
-                errors.append("Local full model bytes differ from the immutable model lock")
+                errors.append("Local model bytes differ from the immutable model lock")
         for item in expected_models:
             if (item.get("size"), item.get("sha256")) != pins.get(item.get("name")):
-                errors.append("Local full model manifest differs from the immutable model lock")
-        semantic = evidence.read_json(report_path.parent / "semantic-quality.json")
+                errors.append("Local model manifest differs from the immutable model lock")
+        semantic = evidence.read_json(report_path.parent / "semantic-functional.json")
         errors.extend(evidence.validate_semantic(semantic))
-        errors.extend(evidence.validate_physical(evidence.read_json(report_path.parent / "physical-files.json"), minimum_files=1000))
         package_reports = [report_path.parent / "package/report.json"]
         if document["system"] == "Windows":
             package_reports.append(report_path.parent / "package-nsis/report.json")
@@ -793,52 +977,47 @@ def inspect_check(report_path: Path, expected_head: str):
                     or package.get("commit") != expected_head or package.get("workingTreeModified", False) is not False
                     or package.get("packageSha256") not in package_hashes
                     or len(package.get("checks", [])) < (3 if "package-deb" in str(package_path) else 9)):
-                errors.append("Local full package result is incomplete, stale or unbound")
+                errors.append("Local package result is incomplete, stale or unbound")
             smoke_path = package_path.parent / "smoke/report.json" if "package-deb" in str(package_path) else package_path
             if smoke_path.relative_to(root).as_posix() not in bound:
-                errors.append("Local full package smoke report is not bound")
+                errors.append("Local package smoke report is not bound")
             smoke = evidence.read_json(smoke_path)
             for name in evidence.package_evidence_paths(smoke, smoke_path.parent):
                 if (smoke_path.parent / name).relative_to(root).as_posix() not in bound:
-                    errors.append("Local full package raw reply or license material is not bound")
+                    errors.append("Local package raw reply or license material is not bound")
             errors.extend(evidence.validate_package_release(smoke, smoke_path.parent,
                 model_fingerprint=semantic.get("modelFingerprint"),
-                extraction_fingerprint=semantic.get("extractionFingerprint")))
-        integrity = evidence.read_json(report_path.parent / "source-integrity.json")
-        if (integrity.get("passed") is not True or integrity.get("tests_run", 0) < 10
-                or integrity.get("skipped") != 0 or len(integrity.get("cases", [])) != integrity.get("tests_run")
-                or any(item.get("status") != "passed" for item in integrity.get("cases", []))):
-            errors.append("Local full source-integrity cases are incomplete")
-        source_manifest = evidence.read_json(evidence.safe_file(root, "pkg/qcs-source-manifest.json"))
-        if (source_manifest.get("commit") != expected_head or source_manifest.get("workingTreeModified") is not False
-                or "pkg/qcs-source-manifest.json" not in bound
-                or not any("-source-materials-" in name and name.endswith(".zip") for name in bound)
-                or not any("-symbols-" in name and name.endswith(".zip") for name in bound)):
-            errors.append("Local full source archive or debug symbols are missing or stale")
+                extraction_fingerprint=semantic.get("extractionFingerprint"), platform_id=document["variant"],
+                worker_sha256=document.get("executables", {}).get("qcs-worker", {}).get("sha256")))
         if document["system"] == "Windows":
             native = evidence.read_json(report_path.parent / "nsis-contract.json")
             raw = (report_path.parent / "nsis-contract.log").read_text(encoding="utf-8")
             errors.extend(evidence.validate_nsis_contract(native, raw))
         result["errors"] = errors
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, ET.ParseError) as error:
-        result["errors"].append(f"Cannot inspect local full check: {error}")
+        result["errors"].append(f"Cannot inspect local check: {error}")
     result["passed"] = not result["errors"]
     return result
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("release-prepare", "release-upload-draft"):
+        action = "prepare" if sys.argv[1] == "release-prepare" else "upload-draft"
+        run([sys.executable, SOURCE / "tools/qcs-release.py", action, *sys.argv[2:]], cwd=SOURCE)
+        return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "models", "sources", "installers", "check", "release-prepare", "release-upload-draft", "clean"])
+    parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "models", "sources", "symbols", "installers", "check", "release-prepare", "release-upload-draft", "clean"])
     default_root = SOURCE.parent.parent / (SOURCE.parent.name + "-compilations") / PRODUCT
     parser.add_argument("--build-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_BUILD_ROOT") or default_root)
+    parser.add_argument("--variant", default=os.environ.get("QCOPILOTS_SEARCH_VARIANT") or None,
+                        help="Native configuration from config/build-variants.json")
     parser.add_argument("--qt-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_QT_ROOT") or None)
+    parser.add_argument("--gpu-sdk-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_GPU_SDK_ROOT") or None)
     parser.add_argument("--config", choices=["Release", "Debug", "RelWithDebInfo"], default="Release")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 2))
     parser.add_argument("--model-dir", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_MODEL_DIR") or None)
     parser.add_argument("--keyword-only", action="store_true", help="Partial verify-package without models, insufficient for release")
-    parser.add_argument("--test-profile", choices=("fast", "full"), default="fast",
-                        help="Test scope: fast excludes slow tests by default, full keeps all registered tests")
-    parser.add_argument("--test-label", help="CTest label regex, intersected with the selected test profile")
+    parser.add_argument("--test-label", help="CTest label regex for a partial developer run, never a complete check")
     parser.add_argument("--fail-fast", action="store_true",
                         help="Stop scheduling further tests after the first failure")
     parser.add_argument("--generator", help="CPack generator, for example ZIP, NSIS, TGZ, DEB or DragNDrop")
@@ -851,32 +1030,21 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Validate and list clean targets without deleting or creating files")
     parser.add_argument("--program-arg", action="append", default=[])
     parser.add_argument("--candidate-commit")
-    parser.add_argument("--native-artifacts-dir", type=Path)
-    parser.add_argument("--local-evidence-dir", type=Path)
-    parser.add_argument("--local-full-report", type=Path)
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--tag")
-    parser.add_argument("--title")
+    parser.add_argument("--attempt", type=int)
     args = parser.parse_args()
-    if args.action in ("release-prepare", "release-upload-draft"):
-        command = [sys.executable, SOURCE / "tools/qcs-release.py",
-                   "prepare" if args.action == "release-prepare" else "upload-draft"]
-        fields = (("candidate_commit", "native_artifacts_dir", "local_evidence_dir", "local_full_report", "output_dir")
-                  if args.action == "release-prepare" else ("manifest", "tag"))
-        for field in fields:
-            if getattr(args, field) is None:
-                parser.error("--" + field.replace("_", "-") + " is required for " + args.action)
-            command.extend(["--" + field.replace("_", "-"), getattr(args, field)])
-        if args.action == "release-upload-draft" and args.title:
-            command.extend(["--title", args.title])
-        run(command, cwd=SOURCE)
-        return
+    args.variant = build_variant(args.variant)["id"]
+    if args.candidate_commit and not re.fullmatch(r"[0-9a-f]{40}", args.candidate_commit):
+        parser.error("--candidate-commit must be a full Git commit SHA")
+    if args.attempt is not None and args.attempt < 1:
+        parser.error("--attempt must be a positive integer")
     selected_root = args.build_root.expanduser().absolute()
     if selected_root.exists() and is_redirect(selected_root):
         raise RuntimeError(f"Build root cannot be a symlink or junction: {selected_root}")
-    root = selected_root.resolve()
-    protect_input_paths(root, args.qt_root, args.model_dir)
+    parent = selected_root.resolve()
+    assert_external(parent)
+    root = parent / args.variant
+    args.model_dir = (args.model_dir or parent / "models").expanduser().resolve()
+    protect_input_paths(root, args.qt_root, args.model_dir, args.gpu_sdk_root)
     if args.action == "clean":
         clean_generated(root, args.config, args.scope, args.dry_run)
         return
@@ -884,18 +1052,32 @@ def main():
         parser.error("--scope and --dry-run apply only to clean")
     initialize_root(root)
     with root_lock(root):
-        sdk_root = (args.qt_root or root / "sdk").expanduser().resolve()
+        sdk_root = (args.qt_root or parent / "sdk").expanduser().resolve()
         prefix = qt_prefix(sdk_root)
-        build = root / args.config.lower()
-        stage = root / "stage"
-        reports = root / "reports"
-        reports.mkdir(exist_ok=True)
-        (root / "runs").mkdir(exist_ok=True)
+        build = root / args.config
+        stage = root / "stage" / args.config
+        reports = root / "reports" / args.config
+        reports.mkdir(parents=True, exist_ok=True)
+        (root / "runs" / args.config).mkdir(parents=True, exist_ok=True)
         environment = os.environ.copy()
-        environment["QCOPILOTS_SEARCH_BUILD_ROOT"] = str(root)
+        environment["QCOPILOTS_SEARCH_BUILD_ROOT"] = str(parent)
+        environment["QCOPILOTS_SEARCH_VARIANT_ROOT"] = str(root)
+        environment["QCOPILOTS_SEARCH_VARIANT"] = args.variant
         environment["QCOPILOTS_SEARCH_QT_PREFIX"] = str(prefix)
-        environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(root / "runs")
+        environment["QCOPILOTS_SEARCH_TEST_ROOT"] = str(root / "runs" / args.config)
+        if args.candidate_commit:
+            environment["QCOPILOTS_SEARCH_CANDIDATE_COMMIT"] = args.candidate_commit
+        if args.attempt:
+            environment["QCOPILOTS_SEARCH_CANDIDATE_ATTEMPT"] = str(args.attempt)
         environment["PATH"] = os.pathsep.join((str(build / "bin"), str(build / "lib"), str(prefix / "bin"), str(root / "bootstrap/nsis"), environment.get("PATH", "")))
+        if build_variant(args.variant)["backend"] not in ("cpu", "metal") and args.action not in ("bootstrap", "configure", "doctor", "check"):
+            sdk_manifest = reports / "gpu-sdk.json"
+            if not sdk_manifest.is_file():
+                raise RuntimeError("Configure this variant first to capture its GPU SDK environment")
+            sdk_configuration = json.loads(sdk_manifest.read_text(encoding="utf-8"))
+            if sdk_configuration.get("variant") != args.variant:
+                raise RuntimeError("GPU SDK environment belongs to another variant")
+            environment.update(sdk_configuration["environment"])
         if args.model_dir:
             environment["QCOPILOTS_SEARCH_MODEL_DIR"] = str(args.model_dir.expanduser().resolve())
         if args.keep_failed_tests:

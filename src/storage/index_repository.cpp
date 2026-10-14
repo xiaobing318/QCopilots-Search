@@ -1,7 +1,6 @@
 #include "index_repository.h"
 #include "core/file_catalog.h"
 #include "core/embedding_math.h"
-#include "core/relevance_policy.h"
 #include "text_index.h"
 #include "vector_index.h"
 #include <QDir>
@@ -1113,7 +1112,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
                        : 0;
           },
           &progress);
-    const int limit = std::clamp(options.limit, 1, 1000);
+    const int limit = std::clamp(options.limit, 1, maximumSearchResults);
     const int candidates = std::clamp(limit * 16, 256, 16000);
     const Filter filter(options);
     auto *db = reader.db;
@@ -1185,7 +1184,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
         outside.next();
         // This proof uses the same established SQLite snapshot as the vector
         // count and ANN pointer. Only complete file-filter coverage permits
-        // skipping the potentially million-entry allow-list. Kind filters
+        // skipping the potentially large allow-list. Kind filters
         // continue to build it, and pending tombstones are always applied.
         const bool filtered = !options.kind.isEmpty() || outside.integer(0) != 0;
         if (filtered) {
@@ -1282,7 +1281,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
                   return a.second == b.second ? a.first < b.first
                                               : a.second > b.second;
                 });
-      Statement get(db, QStringLiteral("SELECT ") + hitColumns + QStringLiteral(",s.modality") +
+      Statement get(db, QStringLiteral("SELECT ") + hitColumns +
                             QStringLiteral(" FROM segments s JOIN files f ON "
                                            "f.id=s.file_id WHERE s.id=?"));
       QSet<QString> paths;
@@ -1290,11 +1289,6 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
         get.bind(1, value.first);
         if (get.next()) {
           auto hit = readHit(get);
-          if (options.semanticCandidateMode == SemanticCandidateMode::MatchesOnly
-              && !acceptsSemanticCandidate(get.string(12), options.code, value.second)) {
-            get.reset();
-            continue;
-          }
           if (!paths.contains(hit.path)) {
             paths.insert(hit.path);
             hit.score = value.second;

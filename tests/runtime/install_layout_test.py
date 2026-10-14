@@ -49,23 +49,27 @@ def main():
             run(command)
             run([options.cmake, "--build", str(build), "--config", "Release", "--parallel", "2"])
             run([options.cmake, "--install", str(build), "--config", "Release", "--prefix", str(stage)])
-            base, cpu = (build / "files.txt").read_text(encoding="utf-8").splitlines()
+            base, cpu, gpu = (build / "files.txt").read_text(encoding="utf-8").splitlines()
             if apple:
                 base_dir = Path("qcs-gui.app/Contents/Frameworks")
                 cpu_dir = Path("qcs-gui.app/Contents/PlugIns/ggml")
+                gpu_dir = cpu_dir
                 assert (build / "cpu-rpath.txt").read_text() == "@loader_path/../../Frameworks"
+                assert (build / "gpu-rpath.txt").read_text() == "@loader_path/../../Frameworks"
                 assert not (stage / base_dir / cpu).exists(), "CPU module remained in Frameworks"
                 assert not (stage / "qcs-gui.app/Contents/MacOS" / cpu).exists()
             else:
                 base_dir = Path("bin" if os.name == "nt" else "lib")
                 cpu_dir = Path("lib")
+                gpu_dir = Path("bin" if os.name == "nt" else "lib")
                 assert (build / "cpu-rpath.txt").read_text() == ""
             assert (stage / base_dir / base).is_file(), "Missing installed base library"
             assert (stage / cpu_dir / cpu).is_file(), "Missing installed CPU module"
+            assert (stage / gpu_dir / gpu).is_file(), "Missing installed GPU module"
             installed = {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_file()}
-            assert installed == {(base_dir / base).as_posix(), (cpu_dir / cpu).as_posix()}, installed
+            assert installed == {(base_dir / base).as_posix(), (cpu_dir / cpu).as_posix(), (gpu_dir / gpu).as_posix()}, installed
             records.append({"case": name, "passed": True, "installed": sorted(installed)})
-            print(f"PASS {name}: actual cmake --install files and CPU RPATH verified", flush=True)
+            print(f"PASS {name}: actual cmake --install files and CPU/GPU module placement verified", flush=True)
         if sys.platform.startswith("linux"):
             from linux_deploy_test import check_linux_deployment
             records.extend(check_linux_deployment(options, source, repo, Path(root)))

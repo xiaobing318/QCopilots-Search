@@ -33,6 +33,7 @@ if(APPLE AND TARGET qcs-gui)
   get_property(_qcopilots_imported GLOBAL PROPERTY QCOPILOTS_SEARCH_IMAGE_IMPORTED_RUNTIME_TARGETS)
   get_property(_qcopilots_inference GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS)
   get_property(_qcopilots_inference_cpu GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_CPU_RUNTIME_TARGETS)
+  get_property(_qcopilots_inference_gpu GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_GPU_RUNTIME_TARGETS)
   set(_qcopilots_bundle_commands COMMAND "${CMAKE_COMMAND}" -E make_directory
     "$<TARGET_FILE_DIR:qcs-gui>/../Frameworks"
     "$<TARGET_FILE_DIR:qcs-gui>/../PlugIns/ggml")
@@ -49,7 +50,7 @@ if(APPLE AND TARGET qcs-gui)
       get_target_property(_kind ${_library} TYPE)
       if(_kind STREQUAL "SHARED_LIBRARY" OR _kind STREQUAL "MODULE_LIBRARY")
         list(APPEND _qcopilots_bundle_dependencies ${_library})
-        if(_library IN_LIST _qcopilots_inference_cpu)
+        if(_library IN_LIST _qcopilots_inference_cpu OR _library IN_LIST _qcopilots_inference_gpu)
           set(_qcopilots_library_directory "PlugIns/ggml")
           # Remove only this generated target's obsolete development copy.
           # Leaving it in Frameworks would also copy an unsigned duplicate

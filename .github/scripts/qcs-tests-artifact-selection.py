@@ -40,14 +40,14 @@ def job(platform, identifier, attempt=1, hour=1):
             "runner_group_name": "GitHub Actions", "labels": ["fixture-native-runner"],
             "steps": [{"number": 1, "name": "Build", "status": "completed", "conclusion": "success",
                        "started_at": iso(start + timedelta(minutes=1)), "completed_at": iso(start + timedelta(minutes=2))},
-                      {"number": 2, "name": "Upload reports", "status": "completed", "conclusion": "success",
+                      {"number": 2, "name": "Upload packages", "status": "completed", "conclusion": "success",
                        "started_at": iso(start + timedelta(minutes=9)), "completed_at": iso(start + timedelta(minutes=10))}]}
 
 
-def artifact(source, identifier, profile="fast"):
+def artifact(source, identifier):
     platform = source["name"].removeprefix("qcs ")
     return {"id": identifier,
-            "name": selection.artifact_name(platform, HEAD, profile, source["run_attempt"]),
+            "name": selection.artifact_name(platform, HEAD, source["run_attempt"]),
             "expired": False, "digest": "sha256:" + f"{identifier:064x}",
             "created_at": source["steps"][-1]["started_at"],
             "workflow_run": {"id": int(RUN), "head_sha": HEAD}}
@@ -69,28 +69,29 @@ class ArtifactSelectionTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="qcs-artifact-selection-", dir=configured)
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
-        self.jobs = [job(platform, index + 1) for index, platform in enumerate(selection.PLATFORMS)]
+        self.jobs = [job(platform, index + 1) for index, platform in enumerate(selection.CONFIGURATIONS)]
         self.artifacts = [artifact(source, index + 1001) for index, source in enumerate(self.jobs)]
 
-    def inspect(self, attempt=1, profile="fast"):
-        return selection.select(REPOSITORY, RUN, HEAD, profile, attempt, self.jobs, self.artifacts)
+    def inspect(self, attempt=1):
+        return selection.select(REPOSITORY, RUN, HEAD, attempt, self.jobs, self.artifacts)
 
     def partial_retry(self, *, cloned=True):
-        retried = job("windows-x64", 11, attempt=2, hour=2)
+        original = list(self.jobs)
+        retried = job("windows-x64-cpu", 101, attempt=2, hour=2)
         self.jobs.append(retried)
         self.artifacts.append(artifact(retried, 2001))
         if cloned:
-            self.jobs.extend(clone(source, index + 12, 2) for index, source in enumerate(self.jobs[1:4]))
+            self.jobs.extend(clone(source, index + 102, 2) for index, source in enumerate(original[1:]))
         return retried
 
     def pages(self, rows, kind):
         return [{"total_count": len(rows), kind: rows[index:index + selection.PAGE_SIZE]}
                 for index in range(0, max(1, len(rows)), selection.PAGE_SIZE)]
 
-    def write_snapshot(self, directory=None, attempt=1, profile="fast"):
+    def write_snapshot(self, directory=None, attempt=1):
         directory = directory or self.root / "evidence"
         (directory / "selection-inputs").mkdir(parents=True)
-        document = self.inspect(attempt, profile)
+        document = self.inspect(attempt)
         document.update(files=[], collectionErrors=[])
         for kind, rows in (("jobs", self.jobs), ("artifacts", self.artifacts)):
             for number, page in enumerate(self.pages(rows, kind), 1):
@@ -112,7 +113,7 @@ class ArtifactSelectionTests(unittest.TestCase):
         self.assertTrue(result["passed"], result["errors"])
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["excluded"], [])
-        for index, platform in enumerate(selection.PLATFORMS):
+        for index, platform in enumerate(selection.CONFIGURATIONS):
             entry = result["selected"][platform]
             self.assertEqual(entry["sourceAttempt"], 1)
             self.assertEqual(entry["sourceJobId"], index + 1)
@@ -120,18 +121,47 @@ class ArtifactSelectionTests(unittest.TestCase):
             self.assertEqual(entry["artifactId"], index + 1001)
             self.assertEqual(entry["artifactDigest"], self.artifacts[index]["digest"])
 
-    def test_full_uses_native_artifact_names_without_accepting_fast(self):
-        self.assertFalse(self.inspect(profile="full")["passed"])
-        self.artifacts = [artifact(source, index + 1001, "full") for index, source in enumerate(self.jobs)]
-        self.assertTrue(self.inspect(profile="full")["passed"])
+    def test_shared_manifest_defines_all_eleven_configurations(self):
+        manifest = json.loads((SCRIPT.parents[2] / "config/build-variants.json").read_text(encoding="utf-8"))
+        self.assertEqual(selection.CONFIGURATIONS, tuple(row["id"] for row in manifest["variants"]))
+        self.assertEqual(len(selection.CONFIGURATIONS), 11)
+        self.assertEqual(selection.PLATFORMS, selection.CONFIGURATIONS)
+        self.assertFalse(any(identifier.startswith("macos-x64") for identifier in selection.CONFIGURATIONS))
+
+    def test_only_packages_artifact_names_can_satisfy_gate(self):
+        expected = f"qcs-packages-windows-x64-cpu-{HEAD}-attempt1"
+        self.assertEqual(self.artifacts[0]["name"], expected)
+        self.artifacts[0]["name"] = expected.replace("qcs-packages-", "qcs-native-")
+        self.assertFalse(self.inspect()["passed"])
+        self.artifacts[0]["name"] = expected
+        result = self.inspect()
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["schemaVersion"], 2)
+        self.assertEqual(set(result), {"schemaVersion", "kind", "repository", "runId", "aggregateAttempt",
+                                      "candidateHead", "passed", "errors", "selected", "excluded"})
+
+    def test_every_configuration_requires_its_job_and_package_artifact(self):
+        original_jobs = list(self.jobs)
+        original_artifacts = list(self.artifacts)
+        for index, configuration in enumerate(selection.CONFIGURATIONS):
+            for missing in ("job", "artifact"):
+                with self.subTest(configuration=configuration, missing=missing):
+                    self.jobs = [row for number, row in enumerate(original_jobs)
+                                 if missing != "job" or number != index]
+                    self.artifacts = [row for number, row in enumerate(original_artifacts)
+                                      if missing != "artifact" or number != index]
+                    result = self.inspect()
+                    self.assertFalse(result["passed"])
+                    self.assertNotIn(configuration, result["selected"])
+                    self.assertEqual(len(result["selected"]), len(selection.CONFIGURATIONS) - 1)
 
     def test_partial_retry_reuses_original_execution_of_copied_jobs(self):
         self.partial_retry()
         result = self.inspect(2)
         self.assertTrue(result["passed"], result["errors"])
-        self.assertEqual(result["selected"]["windows-x64"]["sourceAttempt"], 2)
-        self.assertEqual(result["selected"]["windows-x64"]["artifactId"], 2001)
-        for platform, identifier in zip(selection.PLATFORMS[1:], (2, 3, 4)):
+        self.assertEqual(result["selected"]["windows-x64-cpu"]["sourceAttempt"], 2)
+        self.assertEqual(result["selected"]["windows-x64-cpu"]["artifactId"], 2001)
+        for identifier, platform in enumerate(selection.CONFIGURATIONS[1:], 2):
             entry = result["selected"][platform]
             self.assertEqual(entry["sourceAttempt"], 1)
             self.assertEqual(entry["sourceJobId"], identifier)
@@ -141,11 +171,12 @@ class ArtifactSelectionTests(unittest.TestCase):
     def test_aggregate_only_retry_and_chained_copies_keep_true_source_attempt(self):
         self.partial_retry()
         latest = [max((row for row in self.jobs if row["name"] == "qcs " + platform),
-                      key=lambda row: row["run_attempt"]) for platform in selection.PLATFORMS]
-        self.jobs.extend(clone(source, index + 21, 3) for index, source in enumerate(latest))
+                      key=lambda row: row["run_attempt"]) for platform in selection.CONFIGURATIONS]
+        self.jobs.extend(clone(source, index + 201, 3) for index, source in enumerate(latest))
         result = self.inspect(3)
         self.assertTrue(result["passed"], result["errors"])
-        self.assertEqual([result["selected"][platform]["sourceAttempt"] for platform in selection.PLATFORMS], [2, 1, 1, 1])
+        self.assertEqual([result["selected"][platform]["sourceAttempt"] for platform in selection.CONFIGURATIONS],
+                         [2] + [1] * (len(selection.CONFIGURATIONS) - 1))
 
     def test_old_success_never_replaces_failed_or_running_latest_job(self):
         retried = self.partial_retry()
@@ -154,7 +185,7 @@ class ArtifactSelectionTests(unittest.TestCase):
                 retried.update(status=status, conclusion=conclusion)
                 result = self.inspect(2)
                 self.assertFalse(result["passed"])
-                self.assertNotIn("windows-x64", result["selected"])
+                self.assertNotIn("windows-x64-cpu", result["selected"])
                 self.assertTrue(any("Earlier successful artifacts cannot replace" in error for error in result["errors"]))
 
     def test_successful_latest_job_without_its_artifact_cannot_fall_back(self):
@@ -162,7 +193,7 @@ class ArtifactSelectionTests(unittest.TestCase):
         self.artifacts.pop()
         result = self.inspect(2)
         self.assertFalse(result["passed"])
-        self.assertNotIn("windows-x64", result["selected"])
+        self.assertNotIn("windows-x64-cpu", result["selected"])
         self.assertTrue(any("attempt2" in error for error in result["errors"]))
 
     def test_a_copy_cannot_borrow_an_original_with_different_steps(self):
@@ -178,7 +209,7 @@ class ArtifactSelectionTests(unittest.TestCase):
         retried["runner_name"] = self.jobs[0]["runner_name"]
         result = self.inspect(2)
         self.assertTrue(result["passed"], result["errors"])
-        self.assertEqual(result["selected"]["windows-x64"]["sourceAttempt"], 2)
+        self.assertEqual(result["selected"]["windows-x64-cpu"]["sourceAttempt"], 2)
 
     def test_missing_current_attempt_observations_cannot_reuse_old_success(self):
         for attempt in (2, 999):
@@ -186,38 +217,41 @@ class ArtifactSelectionTests(unittest.TestCase):
                 result = self.inspect(attempt)
                 self.assertFalse(result["passed"])
                 self.assertEqual(result["selected"], {})
-                self.assertEqual(len(result["errors"]), 4)
+                self.assertEqual(len(result["errors"]), len(selection.CONFIGURATIONS))
                 self.assertTrue(all("Current aggregate attempt" in error for error in result["errors"]))
         self.partial_retry()
-        self.jobs = [row for row in self.jobs if not (row["name"] == "qcs linux-x64" and row["run_attempt"] == 2)]
+        self.jobs = [row for row in self.jobs if not (row["name"] == "qcs linux-x64-cpu" and row["run_attempt"] == 2)]
         result = self.inspect(2)
         self.assertFalse(result["passed"])
-        self.assertNotIn("linux-x64", result["selected"])
+        self.assertNotIn("linux-x64-cpu", result["selected"])
 
     def test_current_copy_cannot_bypass_a_newer_real_execution(self):
         retried = self.partial_retry()
-        self.jobs.extend(clone(source, index + 21, 3) for index, source in enumerate(self.jobs[:4]))
+        originals = self.jobs[:len(selection.CONFIGURATIONS)]
+        self.jobs.extend(clone(source, index + 201, 3) for index, source in enumerate(originals))
         for conclusion in ("failure", "success"):
             with self.subTest(conclusion=conclusion):
                 retried["conclusion"] = conclusion
                 result = self.inspect(3)
                 self.assertFalse(result["passed"])
-                self.assertNotIn("windows-x64", result["selected"])
+                self.assertNotIn("windows-x64-cpu", result["selected"])
                 self.assertTrue(any("bypasses a newer actual execution" in error for error in result["errors"]), result["errors"])
 
     def test_new_successful_execution_after_failure_can_supply_current_copy(self):
         retried = self.partial_retry()
         retried["conclusion"] = "failure"
-        recovered = job("windows-x64", 21, attempt=3, hour=3)
+        recovered = job("windows-x64-cpu", 201, attempt=3, hour=3)
         self.jobs.append(recovered)
         self.artifacts.append(artifact(recovered, 3001))
-        self.jobs.extend(clone(source, index + 22, 3) for index, source in enumerate(self.jobs[1:4]))
-        current = [recovered, *self.jobs[-3:]]
-        self.jobs.extend(clone(source, index + 31, 4) for index, source in enumerate(current))
+        copied = [clone(source, index + 202, 3)
+                  for index, source in enumerate(self.jobs[1:len(selection.CONFIGURATIONS)])]
+        self.jobs.extend(copied)
+        current = [recovered, *copied]
+        self.jobs.extend(clone(source, index + 301, 4) for index, source in enumerate(current))
         result = self.inspect(4)
         self.assertTrue(result["passed"], result["errors"])
-        self.assertEqual(result["selected"]["windows-x64"]["sourceAttempt"], 3)
-        self.assertEqual(result["selected"]["windows-x64"]["artifactId"], 3001)
+        self.assertEqual(result["selected"]["windows-x64-cpu"]["sourceAttempt"], 3)
+        self.assertEqual(result["selected"]["windows-x64-cpu"]["artifactId"], 3001)
 
     def test_copy_without_original_and_ambiguous_same_attempt_jobs_fail(self):
         self.partial_retry()
@@ -289,19 +323,29 @@ class ArtifactSelectionTests(unittest.TestCase):
     def test_load_recomputes_selection_and_allows_complete_tree_relocation(self):
         self.partial_retry()
         path = self.write_snapshot(attempt=2)
-        first = selection.load_selection(path, HEAD, "fast", RUN)
+        first = selection.load_selection(path, HEAD, RUN)
         moved = self.root / "moved"
         shutil.move(str(path.parent), moved)
-        second = selection.load_selection(moved / "selection.json", HEAD, "fast", RUN)
+        second = selection.load_selection(moved / "selection.json", HEAD, RUN)
         self.assertEqual(first, second)
 
     def test_load_rejects_changed_selection_even_when_snapshots_are_unchanged(self):
         path = self.write_snapshot()
         document = json.loads(path.read_text(encoding="utf-8"))
-        document["selected"]["windows-x64"]["sourceAttempt"] = 7
+        document["selected"]["windows-x64-cpu"]["sourceAttempt"] = 7
         self.write_document(path, document)
         with self.assertRaisesRegex(ValueError, "preserved API execution history"):
             selection.load_selection(path)
+
+    def test_load_rejects_incompatible_schema_versions(self):
+        path = self.write_snapshot()
+        document = json.loads(path.read_text(encoding="utf-8"))
+        for version in (1, 3, True, 2.0):
+            with self.subTest(version=version):
+                document["schemaVersion"] = version
+                self.write_document(path, document)
+                with self.assertRaisesRegex(ValueError, "Unsupported artifact selection document"):
+                    selection.load_selection(path)
 
     def test_load_rejects_boolean_or_float_substitution_for_integer_identities(self):
         path = self.write_snapshot()
@@ -309,14 +353,14 @@ class ArtifactSelectionTests(unittest.TestCase):
         for key, value in (("sourceJobId", True), ("sourceAttempt", True), ("artifactId", 1001.0)):
             with self.subTest(key=key):
                 document = deepcopy(original)
-                document["selected"]["windows-x64"][key] = value
+                document["selected"]["windows-x64-cpu"][key] = value
                 self.write_document(path, document)
                 with self.assertRaisesRegex(ValueError, "preserved API execution history"):
                     selection.load_selection(path)
 
     def test_load_rejects_changed_snapshot_and_unexpected_requested_identity(self):
         path = self.write_snapshot()
-        for kwargs in ({"expected_head": "b" * 40}, {"expected_profile": "full"}, {"expected_run": "9"}):
+        for kwargs in ({"expected_head": "b" * 40}, {"expected_run": "9"}):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "requested identity"):
                 selection.load_selection(path, **kwargs)
         data = path.parent / "selection-inputs/jobs-0001.json"
@@ -364,7 +408,7 @@ class ArtifactSelectionTests(unittest.TestCase):
 
     def test_collector_preserves_raw_pages_and_emits_only_exact_artifact_ids(self):
         args = argparse.Namespace(output_dir=self.root / "collected", repository=REPOSITORY,
-                                  run_id=RUN, candidate_head=HEAD, profile="fast", attempt=1)
+                                  run_id=RUN, candidate_head=HEAD, attempt=1)
         output = self.root / "github-output"
         self.jobs = [job("unrelated", index + 100) for index in range(105)] + self.jobs
         calls = []
@@ -387,12 +431,13 @@ class ArtifactSelectionTests(unittest.TestCase):
         document = selection.load_selection(path)
         self.assertEqual(len(calls), 3)
         self.assertEqual(len(document["files"]), 3)
-        self.assertEqual(output.read_text(encoding="utf-8"), "artifact_ids=1001,1002,1003,1004\n")
+        expected_ids = ",".join(str(1001 + index) for index in range(len(selection.CONFIGURATIONS)))
+        self.assertEqual(output.read_text(encoding="utf-8"), "artifact_ids=" + expected_ids + "\n")
         self.assertNotIn("synthetic-token-never-log", path.read_text(encoding="utf-8"))
 
     def test_collector_failure_preserves_report_and_never_emits_artifact_ids(self):
         args = argparse.Namespace(output_dir=self.root / "failed", repository=REPOSITORY,
-                                  run_id=RUN, candidate_head=HEAD, profile="fast", attempt=1)
+                                  run_id=RUN, candidate_head=HEAD, attempt=1)
         output = self.root / "github-output"
         with patch.dict(os.environ, {"GITHUB_TOKEN": "synthetic-token", "GITHUB_OUTPUT": str(output)}), \
                 patch.object(selection, "fetch_page", side_effect=ValueError("synthetic API unavailable")), \
@@ -408,7 +453,7 @@ class ArtifactSelectionTests(unittest.TestCase):
 
     def test_collector_non_object_api_reply_still_preserves_failure_report(self):
         args = argparse.Namespace(output_dir=self.root / "malformed", repository=REPOSITORY,
-                                  run_id=RUN, candidate_head=HEAD, profile="fast", attempt=1)
+                                  run_id=RUN, candidate_head=HEAD, attempt=1)
         with patch.dict(os.environ, {"GITHUB_TOKEN": "synthetic-token"}), \
                 patch.object(selection, "fetch_page", return_value=b"[]"), \
                 self.assertRaisesRegex(ValueError, "Preserved report"):

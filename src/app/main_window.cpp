@@ -106,6 +106,8 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
     });
     connect(backend_, &AppBackend::disconnected, this, [this] {
         connected_ = false;
+        runtime_.insert("loaded", false);
+        updateRuntimeStatus();
         if (quitting_) { QApplication::quit(); return; }
         indexButton_->setEnabled(false);
         showError(label("The local service disconnected. Restart the application to reconnect.", "本地服务已断开，请重新启动应用以连接。"));
@@ -115,6 +117,10 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
     connect(backend_, &AppBackend::eventReceived, this, [this](const QString &event, const QJsonObject &data) {
         if (event == "progress") updateProgress(data);
         else if (event == "settings") applySettings(data);
+        else if (event == "runtime") {
+            runtime_ = data.value("runtime").toObject();
+            updateRuntimeStatus();
+        }
         else if (event == "indexChanged") {
             const QString generation = data.value("browseGeneration").toString();
             const QString visibilityEpoch = data.value("visibilityEpoch").toString();
@@ -267,6 +273,12 @@ void MainWindow::buildUi() {
     indexRow->addWidget(pauseButton_);
     indexRow->addWidget(retryButton_);
     layout->addLayout(indexRow);
+    runtimeStatus_ = new QLabel(central);
+    runtimeStatus_->setObjectName("inferenceRuntimeStatus");
+    runtimeStatus_->setWordWrap(true);
+    runtimeStatus_->setTextFormat(Qt::PlainText);
+    runtimeStatus_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(runtimeStatus_);
     auto *footer = new QHBoxLayout;
     capability_ = new QLabel(central);
     capability_->setWordWrap(true);
@@ -329,6 +341,7 @@ void MainWindow::applyLanguage() {
         retryShortcut_->setEnabled(shortcut.state != GlobalShortcutState::Active && shortcut.state != GlobalShortcutState::Pending);
     } else capability_->setText(label("Search: Ctrl+F", "搜索：Ctrl+F"));
     if (useTray_ && !tray_) capability_->setText(capability_->text() + label(" · Tray unavailable, closing the window exits the app.", " · 系统托盘不可用，关闭窗口将退出应用。"));
+    updateRuntimeStatus();
     if (tray_) {
         traySearch_->setText(label("Open search", "打开搜索"));
         trayQuick_->setText(label("Quick search", "快速搜索"));
@@ -337,6 +350,27 @@ void MainWindow::applyLanguage() {
     }
     updateBrowseControls();
     if (popup_) updateBrowseControls(true);
+}
+void MainWindow::updateRuntimeStatus() {
+    const QString variant = runtime_.value("buildVariant").toString();
+    const QString backend = runtime_.value("selectedBackend").toString();
+    const QString device = runtime_.value("deviceName").toString();
+    const QString fallback = runtime_.value("fallbackReason").toString();
+    const QString error = runtime_.value("error").toString();
+    runtimeStatus_->setVisible(!variant.isEmpty() || !backend.isEmpty() || !error.isEmpty());
+    QStringList details;
+    if (!backend.isEmpty()) details.append(backend.toUpper());
+    if (!device.isEmpty()) details.append(device);
+    if (!variant.isEmpty()) details.append(variant);
+    QString text = runtime_.value("loaded").toBool()
+        ? label("Inference: ", "推理：")
+        : error.isEmpty() ? label("Last inference (idle): ", "上次推理（空闲）：")
+                          : label("Inference unavailable: ", "推理不可用：");
+    text += details.join(QStringLiteral(" · "));
+    if (!fallback.isEmpty()) text += '\n' + label("CPU fallback: ", "CPU 回退：") + fallback;
+    if (!error.isEmpty()) text += '\n' + error;
+    runtimeStatus_->setText(text);
+    runtimeStatus_->setToolTip(runtime_.value("deviceDescription").toString());
 }
 void MainWindow::createTray() {
     if (!QSystemTrayIcon::isSystemTrayAvailable()) return;
@@ -539,6 +573,7 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
         }
     } else if (method == "status") {
         modelAvailable_ = data.value("modelAvailable").toBool();
+        runtime_ = data.value("runtime").toObject();
         if (data.contains("progress")) updateProgress(data.value("progress").toObject());
         const QString watcherWarning = data.value("watcherWarning").toString();
         if (!watcherWarning.isEmpty()) showError(watcherWarning);
@@ -725,7 +760,23 @@ void MainWindow::showQuickSearch() {
         popupFullSearch_ = new QPushButton(label("Open full search", "打开完整搜索"), popup_);
         popupFullSearch_->setObjectName("openFullSearchButton");
         layout->addWidget(popupFullSearch_);
-        connect(popupFullSearch_, &QPushButton::clicked, this, [this] { query_->setText(popupQuery_->text()); popup_->hide(); showSearch(); });
+        connect(popupFullSearch_, &QPushButton::clicked, this, [this] {
+            popupDebounce_.stop();
+            if (!popupSearch_.isEmpty()) {
+                backend_->cancel(popupSearch_);
+                pending_.remove(popupSearch_);
+                resultRequests_.remove(popupSearch_);
+                popupSearch_.clear();
+            }
+            // Quick search always covers ordinary files of every type and folder.
+            code_->setChecked(false);
+            kind_->setCurrentIndex(0);
+            root_->setCurrentIndex(0);
+            query_->setText(popupQuery_->text());
+            popup_->hide();
+            showSearch();
+            sendSearch();
+        });
         connect(popupQuery_, &QLineEdit::textChanged, this, [this] {
             if (!popupQuery_->isComposing()) {
                 popupHits_.clear();

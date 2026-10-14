@@ -1,4 +1,5 @@
 #include "extractor.h"
+#include "core/file_formats.h"
 #include "core/pipeline_manifest.h"
 #include "document_extractor.h"
 #include "image_extractor.h"
@@ -58,15 +59,7 @@ QString Extractor::kindForPath(const QString &path, bool code)
         if (suffix == QStringLiteral("ts") || suffix == QStringLiteral("mts") || suffix == QStringLiteral("m2ts")) {
             QFile file(path);
             if (!file.open(QIODevice::ReadOnly)) return {};
-            const QByteArray head = file.read(600);
-            bool transport = false;
-            for (const int stride : {188, 192}) {
-                for (int offset = 0; offset <= 4; ++offset) {
-                    if (head.size() > offset + 2 * stride && uchar(head[offset]) == 0x47
-                        && uchar(head[offset + stride]) == 0x47 && uchar(head[offset + 2 * stride]) == 0x47)
-                        transport = true;
-                }
-            }
+            const bool transport = file_formats::isTransportStream(file.read(600));
             if (code) return !transport && supportsCode(suffix, info.fileName()) ? QStringLiteral("code") : QString();
             if (!transport) return {};
         }

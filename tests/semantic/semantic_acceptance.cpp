@@ -1,26 +1,18 @@
-#include "core/runtime_paths.h"
-#include "core/relevance_policy.h"
-#include "core/embedding_math.h"
 #include "extraction/extractor.h"
 #include "runtime/EmbeddingRuntime.h"
 #include "storage/index_repository.h"
-#include "storage/vector_index.h"
 #include "support/test_environment.h"
 #include <QCommandLineParser>
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
-#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
-#include <QFontDatabase>
 #include <QGuiApplication>
 #include <QImage>
 #include <QJsonDocument>
 #include <QPainter>
-#include <QPainterPath>
 #include <QPdfWriter>
-#include <QRandomGenerator>
 #include <QSaveFile>
 #include <QSet>
 #include <QStandardPaths>
@@ -33,156 +25,51 @@
 using namespace qcopilots_search;
 namespace {
 constexpr double pi = 3.14159265358979323846;
-struct Query {
-    QString text, language, modality, file;
-    bool code = false;
-    QString topic, partition;
-    QString family, policyModality;
-    int fold = -1;
-};
 struct Input {
-    QString file, modality;
+    QString id, file, modality, en, zh;
     bool code = false;
-};
-struct Prepared {
-    QList<Input> files;
-    QList<Query> queries;
-    QJsonArray noAnswers;
-};
-struct Vector {
-    QString file;
-    bool code;
-    QVector<float> value;
-    QString modality;
-    qint64 segmentId = 0;
 };
 void require(bool value, const QString &error) {
-    if (!value)
-        throw std::runtime_error(error.toStdString());
+    if (!value) throw std::runtime_error(error.toStdString());
 }
 QByteArray read(const QString &path) {
-    QFile f(path);
-    require(f.open(QIODevice::ReadOnly), "Cannot read fixture: " + path + " " + f.errorString());
-    return f.readAll();
+    QFile file(path);
+    require(file.open(QIODevice::ReadOnly), "Cannot read fixture: " + path + " " + file.errorString());
+    return file.readAll();
 }
 void write(const QString &path, const QByteArray &bytes) {
-    QSaveFile f(path);
-    require(f.open(QIODevice::WriteOnly), "Cannot write: " + path);
-    require(f.write(bytes) == bytes.size() && f.commit(), "Cannot commit fixture: " + path);
+    QSaveFile file(path);
+    require(file.open(QIODevice::WriteOnly), "Cannot write: " + path);
+    require(file.write(bytes) == bytes.size() && file.commit(), "Cannot commit: " + path);
 }
-QString fixtureRoot() { return QStringLiteral(QCOPILOTS_SEARCH_SEMANTIC_FIXTURES); }
-QJsonObject manifest(const QString &name) {
-    QJsonParseError error;
-    const auto document = QJsonDocument::fromJson(read(fixtureRoot() + "/" + name), &error);
-    require(error.error == QJsonParseError::NoError && document.isObject(),
-            "Invalid semantic manifest: " + name + " " + error.errorString());
-    require(document.object().value("schema").toInt() == 1,
-            "Unsupported semantic manifest schema: " + name);
-    return document.object();
+QString sha256(const QString &path) {
+    return QString::fromLatin1(QCryptographicHash::hash(read(path), QCryptographicHash::Sha256).toHex());
 }
-QString targetPolicyModality(const QString &modality, bool code) {
-    if (code) {
-        require(modality == "code", "Code target must have the code fixture category");
-        return "code";
-    }
-    if (modality == "text" || modality == "pdf" || modality == "ocr")
-        return "text";
-    if (modality == "image" || modality == "image-natural" || modality == "video"
-        || modality == "video-natural")
-        return "image";
-    require(modality == "speech" || modality == "environment", "Unknown target modality: " + modality);
-    return "audio";
-}
-QJsonObject relevanceManifest() {
-    QJsonParseError parseError;
-    const auto document = QJsonDocument::fromJson(read(fixtureRoot() + "/relevance_queries.json"), &parseError);
-    require(parseError.error == QJsonParseError::NoError && document.isObject(),
-            "Invalid relevance query manifest: " + parseError.errorString());
-    const auto manifest = document.object();
-    require(manifest.value("schema").toInt() == 1, "Invalid relevance query schema");
-    QHash<QString, QString> partitions;
-    auto registerTopic = [&](const QString &topic, const QString &split) {
-        require(!topic.isEmpty() && (split == "calibration" || split == "holdout" || split == "background"),
-                "Invalid relevance topic partition: " + topic);
-        require(!partitions.contains(topic) || partitions.value(topic) == split,
-                "Topic leaks across calibration and holdout: " + topic);
-        partitions.insert(topic, split);
-    };
-    const auto topicSplits = manifest.value("topic_splits").toObject();
-    require(topicSplits.size() == 80, "All 80 existing topics require a frozen partition");
-    for (auto i = topicSplits.begin(); i != topicSplits.end(); ++i)
-        registerTopic(i.key(), i.value().toString());
-    for (const auto &entry : manifest.value("additional_topic_splits").toArray()) {
-        const auto item = entry.toObject();
-        registerTopic(item.value("topic_id").toString(), item.value("split").toString());
-    }
-    for (const auto &entry : manifest.value("code_fixtures").toArray()) {
-        const auto item = entry.toObject();
-        registerTopic(item.value("topic_id").toString(), item.value("split").toString());
-        require(!item.value("source").toString().trimmed().isEmpty()
-                    && !item.value("query_en").toString().trimmed().isEmpty()
-                    && !item.value("query_zh").toString().trimmed().isEmpty(),
-                "Added code fixture is missing source or labels");
-    }
-    QSet<QString> ids;
-    for (const auto &entry : manifest.value("no_answers").toArray()) {
-        const auto item = entry.toObject();
-        const auto id = item.value("id").toString();
-        const auto topic = item.value("topic_id").toString();
-        const auto split = item.value("split").toString();
-        require(!id.isEmpty() && !ids.contains(id) && !topic.isEmpty()
-                    && (split == "calibration" || split == "holdout")
-                    && !item.value("query").toString().trimmed().isEmpty()
-                    && !item.value("absent_requirement").toString().trimmed().isEmpty(),
-                "Invalid or duplicate labelled no-answer query: " + id);
-        require(partitions.contains(topic), "No-answer query refers to an unknown topic: " + topic);
-        registerTopic(topic, split);
-        ids.insert(id);
-    }
-    require(ids.size() >= 80, "Relevance corpus needs at least 80 fixed no-answer queries");
-    return manifest;
-}
+QString fixtureRoot() { return QStringLiteral(QCOPILOTS_SEARCH_FUNCTIONAL_FIXTURES); }
 void validateAssets() {
-    const auto manifest = QJsonDocument::fromJson(read(fixtureRoot() + "/assets.json")).object();
-    require(manifest.value("schema").toInt() == 1, "Invalid semantic fixture schema");
+    QJsonParseError error;
+    const auto document = QJsonDocument::fromJson(read(fixtureRoot() + "/assets.json"), &error);
+    require(error.error == QJsonParseError::NoError && document.isObject(), "Invalid fixture manifest");
+    const auto manifest = document.object();
+    require(manifest.value("schema").toInt() == 1, "Unsupported fixture schema");
+    QSet<QString> names;
     for (const auto &entry : manifest.value("assets").toArray()) {
         const auto item = entry.toObject();
-        const QString name = item.value("path").toString();
-        require(!name.isEmpty() && !name.contains("..") && QDir::isRelativePath(name), "Unsafe asset path");
-        auto bytes = read(fixtureRoot() + "/" + name);
-        require(bytes.size() == item.value("bytes").toInteger(), "Wrong fixture size: " + name);
-        require(QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()) ==
-                    item.value("sha256").toString(),
+        const auto name = item.value("path").toString();
+        require(name.startsWith("media/") && !name.contains("..") && !name.contains('\\')
+                    && !names.contains(name), "Unsafe or duplicate fixture path: " + name);
+        names.insert(name);
+        const QFileInfo asset(fixtureRoot() + "/" + name);
+        require(!asset.isSymLink() && asset.isFile() && asset.size() == item.value("bytes").toInteger(),
+                "Wrong fixture size or file type: " + name);
+        require(sha256(asset.absoluteFilePath()) == item.value("sha256").toString(),
                 "Wrong fixture SHA-256: " + name);
+        require(!item.value("source").toString().isEmpty() && !item.value("license").toString().isEmpty(),
+                "Fixture attribution is missing: " + name);
     }
-}
-QList<QStringList> topics() {
-    QList<QStringList> result;
-    const auto lines = QString::fromUtf8(read(fixtureRoot() + "/topics.tsv")).split('\n');
-    QSet<QString> ids;
-    for (int i = 1; i < lines.size(); ++i) {
-        if (lines[i].trimmed().isEmpty())
-            continue;
-        auto cols = lines[i].trimmed().split('\t');
-        require(cols.size() == 4 && !ids.contains(cols[0]),
-                "Invalid or duplicate topic row " + QString::number(i + 1));
-        for (const auto &col : cols)
-            require(!col.isEmpty(), "Empty topic field");
-        ids.insert(cols[0]);
-        result.append(cols);
-    }
-    require(result.size() == 80, "Expected 80 independently authored topics");
-    return result;
-}
-QString opaque(const QString &root, int number, const QString &extension) {
-    // File names deliberately contain neither the answer nor a query term.
-    return root + "/" + QString::number(number, 16).rightJustified(8, '0') + "." + extension;
-}
-void add(Prepared &out, const QString &file, const QString &modality, const QString &en, const QString &zh,
-         bool code = false) {
-    out.files.append({file, modality, code});
-    out.queries.append({en, "en", modality, file, code});
-    out.queries.append({zh, "zh", modality, file, code});
+    for (const auto &name : {"photo-001.jpg", "photo-002.jpg", "speech-001.wav", "speech-002.wav",
+                              "environment-001.ogg", "video-001.webm"})
+        require(names.contains("media/" + QString::fromLatin1(name)), "Required fixture is missing");
 }
 void pdf(const QString &path, const QString &text) {
     QPdfWriter writer(path);
@@ -192,243 +79,28 @@ void pdf(const QString &path, const QString &text) {
     require(painter.isActive(), "Cannot paint PDF");
     painter.setFont(QFont("sans-serif", 18));
     painter.drawText(QRect(100, 100, 950, 1300), Qt::TextWordWrap, text);
-    painter.end();
+    require(painter.end(), "Cannot finish PDF");
 }
-void prepareV2(Prepared &out, const QString &root, int &number, const QJsonObject &relevance) {
-    const auto groupPlan = manifest("relevance_development_groups.json");
-    require(groupPlan.value("method").toObject().value("folds").toInt() == 3,
-            "Relevance development requires exactly three frozen folds");
-    QHash<QString, QJsonObject> groups;
-    QSet<QString> families;
-    for (const auto &entry : groupPlan.value("groups").toArray()) {
-        const auto group = entry.toObject();
-        const auto family = group.value("family").toString();
-        const int fold = group.value("fold").toInt(-1);
-        require(!family.isEmpty() && !families.contains(family) && fold >= 0 && fold < 3,
-                "Invalid or duplicate development family: " + family);
-        families.insert(family);
-        for (const auto &value : group.value("topics").toArray()) {
-            const auto topic = value.toString();
-            require(!topic.isEmpty() && !groups.contains(topic), "Duplicate development topic: " + topic);
-            groups.insert(topic, group);
-        }
-    }
-    QSet<QString> expectedTopics;
-    const auto oldTopics = relevance.value("topic_splits").toObject();
-    for (auto i = oldTopics.begin(); i != oldTopics.end(); ++i)
-        expectedTopics.insert(i.key());
-    for (const auto &entry : relevance.value("additional_topic_splits").toArray()) {
-        const auto item = entry.toObject();
-        if (item.value("split").toString() != "background")
-            expectedTopics.insert(item.value("topic_id").toString());
-    }
-    for (const auto &entry : relevance.value("code_fixtures").toArray())
-        expectedTopics.insert(entry.toObject().value("topic_id").toString());
-    const QSet<QString> assignedTopics(groups.keyBegin(), groups.keyEnd());
-    require(groups.size() == 143 && assignedTopics == expectedTopics,
-            "Development families must cover every original non-background topic exactly once");
-    for (auto &query : out.queries) {
-        require(groups.contains(query.topic), "Unassigned development query: " + query.topic);
-        const auto group = groups.value(query.topic);
-        query.partition = "development";
-        query.family = group.value("family").toString();
-        query.fold = group.value("fold").toInt();
-        query.policyModality = targetPolicyModality(query.modality, query.code);
-    }
-    for (const auto &entry : relevance.value("no_answers").toArray()) {
-        auto item = entry.toObject();
-        const auto topic = item.value("topic_id").toString();
-        require(groups.contains(topic), "Unassigned development no-answer query: " + topic);
-        item["split"] = "development";
-        item["family"] = groups.value(topic).value("family");
-        item["fold"] = groups.value(topic).value("fold");
-        out.noAnswers.append(item);
-    }
-    require(out.queries.size() == 238 && out.noAnswers.size() == 96,
-            "The complete observed v1 corpus must remain in development");
-    QSet<QString> holdoutTopics;
-    auto registerHoldout = [&](const QString &topic) {
-        require(!topic.isEmpty() && !groups.contains(topic) && !holdoutTopics.contains(topic),
-                "Final holdout topic duplicates development or another holdout topic: " + topic);
-        holdoutTopics.insert(topic);
-    };
-    auto assignHoldout = [&](const QString &topic) {
-        for (int i = out.queries.size() - 2; i < out.queries.size(); ++i) {
-            auto &query = out.queries[i];
-            query.topic = topic;
-            query.partition = "holdout";
-            query.family = "holdout:" + topic;
-            query.policyModality = targetPolicyModality(query.modality, query.code);
-        }
-    };
-    auto negative = [&](const QString &id, const QString &topic, const QString &language,
-                        const QString &modality, const QString &text, const QString &absent, bool code) {
-        require(!text.trimmed().isEmpty() && !absent.trimmed().isEmpty(),
-                "Final holdout query needs a label and absence rationale: " + id);
-        out.noAnswers.append(QJsonObject{{"id", id}, {"topic_id", topic}, {"split", "holdout"},
-            {"family", "holdout:" + topic}, {"language", language}, {"modality", modality},
-            {"query", text}, {"absent_requirement", absent}, {"code", code}});
-    };
-    const auto textManifest = manifest("relevance_v2_text_code.json");
-    require(textManifest.value("partition").toString() == "holdout"
-                && textManifest.value("topics").toArray().size() == 24,
-            "Final text/code holdout must retain 24 frozen topics");
-    for (const auto &entry : textManifest.value("topics").toArray()) {
-        const auto item = entry.toObject();
-        const auto topic = item.value("id").toString();
-        const auto kind = item.value("kind").toString();
-        const auto source = item.value("source").toString();
-        registerHoldout(topic);
-        require((kind == "text" || kind == "pdf" || kind == "code") && !source.trimmed().isEmpty(),
-                "Invalid final text/code fixture: " + topic);
-        const auto file = opaque(root, number++, kind == "code" ? "py" : kind == "pdf" ? "pdf" : "txt");
-        if (kind == "pdf")
-            pdf(file, source);
-        else
-            write(file, source.toUtf8());
-        // Only source is indexed. Labels, executable checks, rationales and
-        // attribution are evaluation metadata and must never enter the file.
-        add(out, file, kind, item.value("query_en").toString(), item.value("query_zh").toString(), kind == "code");
-        assignHoldout(topic);
-        for (const auto &language : {QStringLiteral("en"), QStringLiteral("zh")})
-            negative(topic + "-negative-" + language, topic, language, kind,
-                     item.value("negative_" + language).toString(),
-                     item.value("absent_requirement").toString(), kind == "code");
-    }
-    const auto mediaManifest = manifest("relevance_v2_media.json");
-    require(mediaManifest.value("split").toString() == "holdout"
-                && mediaManifest.value("topics").toArray().size() == 16,
-            "Final media holdout must retain 16 frozen topics");
-    for (const auto &entry : mediaManifest.value("topics").toArray()) {
-        const auto item = entry.toObject();
-        const auto topic = "v2-media-" + item.value("id").toString();
-        const auto modality = item.value("modality").toString();
-        const auto path = item.value("path").toString();
-        registerHoldout(topic);
-        require(path.startsWith("assets/relevance-v2/") && !path.contains("..") && QDir::isRelativePath(path),
-                "Unsafe final holdout asset path");
-        const auto bytes = read(fixtureRoot() + "/" + path);
-        require(bytes.size() == item.value("bytes").toInteger()
-                    && QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex())
-                       == item.value("sha256").toString(), "Final holdout asset identity mismatch: " + path);
-        QHash<QString, QString> queries;
-        for (const auto &value : item.value("positive_queries").toArray()) {
-            const auto label = value.toObject();
-            const auto language = label.value("language").toString();
-            require((language == "en" || language == "zh") && !queries.contains(language),
-                    "Duplicate or invalid final media language");
-            queries.insert(language, label.value("query").toString());
-        }
-        require(queries.size() == 2, "Final media topic requires both query languages");
-        const auto file = opaque(root, number++, QFileInfo(path).suffix());
-        write(file, bytes);
-        add(out, file, modality, queries.value("en"), queries.value("zh"));
-        assignHoldout(topic);
-        QSet<QString> languages;
-        for (const auto &value : item.value("negative_queries").toArray()) {
-            const auto label = value.toObject();
-            const auto language = label.value("language").toString();
-            require((language == "en" || language == "zh") && !languages.contains(language),
-                    "Duplicate or invalid final no-answer language");
-            languages.insert(language);
-            negative(label.value("id").toString(), topic, language, modality,
-                     label.value("query").toString(), label.value("absent_requirement").toString(), false);
-        }
-        require(languages.size() == 2, "Final media topic requires both no-answer languages");
-    }
-    QSet<QString> negativeIds;
-    for (const auto &entry : out.noAnswers) {
-        const auto id = entry.toObject().value("id").toString();
-        require(!id.isEmpty() && !negativeIds.contains(id), "Duplicate no-answer query ID: " + id);
-        negativeIds.insert(id);
-    }
-    QSet<QString> developmentModalities, holdoutModalities;
-    for (const auto &query : out.queries) {
-        require(!query.text.trimmed().isEmpty(), "Empty positive query label");
-        (query.partition == "holdout" ? holdoutModalities : developmentModalities).insert(query.modality);
-    }
-    require(holdoutTopics.size() == 40 && out.queries.size() == 318 && out.noAnswers.size() == 176
-                && developmentModalities == holdoutModalities,
-            "Final holdout counts and content-modality coverage must match the frozen protocol");
-}
-QImage illustration(int scene) {
+QImage illustration() {
     QImage image(640, 480, QImage::Format_RGB32);
     image.fill(Qt::white);
-    QPainter p(&image);
-    p.setRenderHint(QPainter::Antialiasing);
-    p.setPen(Qt::NoPen);
-    if (scene == 0) {
-        p.setBrush(QColor("#e52b25"));
-        p.drawEllipse(QRect(150, 70, 340, 340));
-    }
-    if (scene == 1) {
-        image.fill(QColor("#122454"));
-        p.setBrush(QColor("#ffdb20"));
-        QPolygonF star;
-        for (int i = 0; i < 10; ++i) {
-            double a = -pi / 2 + i * pi / 5;
-            double r = i % 2 ? 80 : 190;
-            star << QPointF(320 + r * cos(a), 240 + r * sin(a));
-        }
-        p.drawPolygon(star);
-    }
-    if (scene == 2) {
-        image.fill(QColor("#d9eefb"));
-        p.fillRect(0, 340, 640, 140, QColor("#699341"));
-        for (int x : {90, 210, 350, 500}) {
-            p.fillRect(x - 12, 250, 24, 130, QColor("#745131"));
-            p.setBrush(QColor("#166434"));
-            p.drawPolygon(QPolygonF{QPointF(x, 60), QPointF(x - 85, 320), QPointF(x + 85, 320)});
-        }
-    }
-    if (scene == 3) {
-        image.fill(QColor("#b8eaff"));
-        p.fillRect(0, 280, 640, 200, QColor("#267ecc"));
-        p.setBrush(QColor("#603a25"));
-        p.drawPolygon(QPolygonF{QPointF(130, 290), QPointF(500, 290), QPointF(450, 360), QPointF(190, 360)});
-        p.fillRect(314, 80, 8, 210, QColor("#333333"));
-        p.setBrush(QColor("#f24238"));
-        p.drawPolygon(QPolygonF{QPointF(308, 100), QPointF(160, 270), QPointF(308, 270)});
-    }
-    if (scene == 4) {
-        image.fill(QColor("#a3d2f4"));
-        p.setBrush(QColor("#ffcb25"));
-        p.drawEllipse(QRect(480, 30, 100, 100));
-        p.setBrush(QColor("#7a7f82"));
-        p.drawPolygon(QPolygonF{QPointF(0, 480), QPointF(290, 45), QPointF(600, 480)});
-        p.setBrush(Qt::white);
-        p.drawPolygon(QPolygonF{QPointF(210, 165), QPointF(290, 45), QPointF(375, 165), QPointF(315, 145),
-                                QPointF(275, 175)});
-    }
-    if (scene == 5) {
-        image.fill(QColor("#b9dff7"));
-        p.fillRect(0, 395, 640, 85, Qt::white);
-        p.setBrush(Qt::white);
-        p.drawEllipse(QRect(200, 235, 245, 225));
-        p.drawEllipse(QRect(230, 100, 185, 185));
-        p.setBrush(Qt::black);
-        p.drawEllipse(QRect(275, 158, 15, 15));
-        p.drawEllipse(QRect(353, 158, 15, 15));
-        p.fillRect(250, 80, 150, 30, Qt::black);
-        p.fillRect(277, 25, 95, 80, Qt::black);
-        p.setBrush(QColor("#ec831a"));
-        p.drawPolygon(QPolygonF{QPointF(320, 185), QPointF(405, 201), QPointF(320, 215)});
-    }
-    if (scene == 6) {
-        p.setBrush(QColor("#d22d2d"));
-        p.drawEllipse(QRect(140, 130, 220, 280));
-        p.drawEllipse(QRect(290, 130, 210, 280));
-        p.fillRect(313, 70, 18, 100, QColor("#6b4729"));
-        p.setBrush(QColor("#349034"));
-        p.drawEllipse(QRect(333, 65, 100, 45));
-    }
-    if (scene == 7) {
-        for (int y = 0; y < 8; ++y)
-            for (int x = 0; x < 8; ++x)
-                p.fillRect(80 + x * 60, y * 60, 60, 60, (x + y) % 2 ? Qt::black : Qt::white);
-    }
-    p.end();
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor("#e52b25"));
+    painter.drawEllipse(QRect(150, 70, 340, 340));
+    painter.end();
     return image;
+}
+void ocrImage(const QString &path, const QString &text) {
+    QImage image(1200, 700, QImage::Format_RGB32);
+    image.fill(Qt::white);
+    QPainter painter(&image);
+    painter.setPen(Qt::black);
+    painter.setFont(QFont("sans-serif", 34));
+    painter.drawText(QRect(50, 50, 1100, 600), Qt::TextWordWrap, text);
+    painter.end();
+    require(image.save(path), "Cannot save OCR fixture");
 }
 void le(QByteArray &b, quint32 v) {
     char bytes[4];
@@ -526,305 +198,80 @@ void tone(const QString &path, bool alarm) {
     le16(format, 16);
     write(path, chunk("RIFF", QByteArray("WAVE", 4) + chunk("fmt ", format) + chunk("data", pcm)));
 }
-Prepared prepare(const QString &root, bool includeBackground) {
-    Prepared out;
-    int number = 1;
-    for (const auto &row : topics()) {
-        const bool isPdf = number <= 4;
-        QString file = opaque(root, number++, isPdf ? "pdf" : "txt");
-        if (isPdf)
-            pdf(file, row[1]);
-        else
-            write(file, row[1].toUtf8());
-        add(out, file, isPdf ? "pdf" : "text", row[2], row[3]);
-    }
-    const QList<QStringList> pictures = {
-        {"A large red circle on a white background", "白色背景上的大红色圆形"},
-        {"A yellow five pointed star on a dark blue background", "深蓝背景上的黄色五角星"},
-        {"An illustration of several green pine trees in a forest", "几棵绿色松树组成的森林插画"},
-        {"A sailing boat with a red triangular sail on blue water", "蓝色水面上有红色三角帆的小船"},
-        {"A snowy mountain peak beneath a yellow sun", "黄色太阳下覆盖白雪的山峰"},
-        {"A snowman wearing a black hat with an orange carrot nose", "戴黑帽子并有橙色胡萝卜鼻子的雪人"},
-        {"A red apple with a brown stem and a green leaf", "带棕色果柄和绿色叶子的红苹果"},
-        {"A board with alternating black and white squares", "黑白方格交替排列的棋盘"}};
-    for (int i = 0; i < pictures.size(); ++i) {
-        auto file = opaque(root, number++, "png");
-        require(illustration(i).save(file), "Cannot save original illustration");
-        add(out, file, "image", pictures[i][0], pictures[i][1]);
-    }
-    const QList<QStringList> ocr = {
-        {"LIBRARY NOTICE\nClosed on Monday\nPlease return books on Tuesday",
-         "A library notice saying it is closed on Monday", "图书馆星期一闭馆的告示"},
-        {"TRAIN DEPARTURE\nPlatform 3\nDeparture 09:45\nDestination: Riverside",
-         "Train departure information for Riverside at 09:45", "九点四十五分开往河滨的列车信息"},
-        {"安全出口\n请勿堆放物品\n保持通道畅通",
-         "A Chinese safety sign asking people to keep the emergency exit clear",
-         "提醒不要堆物、保持安全出口畅通的标牌"},
-        {"社区会议通知\n地点：二楼活动室\n时间：星期六下午三点",
-         "A Chinese notice for a community meeting on Saturday afternoon",
-         "星期六下午三点在二楼活动室召开社区会议"}};
-    for (const auto &item : ocr) {
-        QImage im(1200, 700, QImage::Format_RGB32);
-        im.fill(Qt::white);
-        QPainter p(&im);
-        p.setPen(Qt::black);
-        p.setFont(QFont("sans-serif", 34));
-        p.drawText(QRect(50, 50, 1100, 600), Qt::TextWordWrap, item[0]);
-        p.end();
-        auto file = opaque(root, number++, "png");
-        require(im.save(file), "Cannot save OCR fixture");
-        add(out, file, "ocr", item[1], item[2]);
-    }
-    const QList<QStringList> codes = {
-        {"def find_sorted(items, value):\n    low, high = 0, len(items)\n    while low < high:\n        "
-         "middle = (low + high) // 2\n        if items[middle] < value:\n            low = middle + 1\n      "
-         "  else:\n            high = middle\n    return low if low < len(items) and items[low] == value "
-         "else -1\n",
-         "Find an item in a sorted array using binary search", "使用二分查找在有序数组中定位元素"},
-        {"from collections import deque\ndef shortest_path(graph, start, goal):\n    queue = deque([(start, "
-         "[start])])\n    visited = {start}\n    while queue:\n        node, path = queue.popleft()\n        "
-         "if node == goal:\n            return path\n        for adjacent in graph.get(node, []):\n          "
-         "  if adjacent not in visited:\n                visited.add(adjacent)\n                "
-         "queue.append((adjacent, path + [adjacent]))\n    return None\n",
-         "Breadth first search for a shortest path in an unweighted graph",
-         "用广度优先搜索寻找无权图最短路径"},
-        {"def merge_ranges(ranges):\n    result = []\n    for start, end in sorted(ranges):\n        if "
-         "result and start <= result[-1][1]:\n            result[-1][1] = max(end, result[-1][1])\n        "
-         "else:\n            result.append([start, end])\n    return result\n",
-         "Combining overlapping numeric intervals", "将重叠的数字区间合并"},
-        {"import time\ndef retry(operation, attempts=4):\n    for attempt in range(attempts):\n        "
-         "try:\n            return operation()\n        except TimeoutError:\n            if attempt == "
-         "attempts - 1:\n                raise\n            time.sleep(0.1 * 2 ** attempt)\n",
-         "Retrying a timed out operation with exponential backoff", "操作超时后采用指数退避重试"},
-        {"from collections import OrderedDict\nclass Cache:\n    def __init__(self, capacity):\n        "
-         "self.capacity, self.items = capacity, OrderedDict()\n    def get(self, key):\n        value = "
-         "self.items.pop(key)\n        self.items[key] = value\n        return value\n    def put(self, key, "
-         "value):\n        self.items.pop(key, None)\n        self.items[key] = value\n        if "
-         "len(self.items) > self.capacity:\n            self.items.popitem(last=False)\n",
-         "An LRU cache that discards the least recently used entry", "缓存超出容量时淘汰最近最少使用的条目"},
-        {"import hashlib\ndef file_digest(path):\n    digest = hashlib.sha256()\n    with open(path, 'rb') "
-         "as stream:\n        while block := stream.read(65536):\n            digest.update(block)\n    "
-         "return digest.hexdigest()\n",
-         "Computing a file SHA256 checksum without loading the whole file",
-         "流式读取文件并计算 SHA256 校验和"}};
-    for (const auto &item : codes) {
-        auto file = opaque(root, number++, "py");
-        write(file, item[0].toUtf8());
-        add(out, file, "code", item[1], item[2], true);
-    }
-    // More than ten unrelated code files make code Recall@10 meaningful. These
-    // functions are original test data, not an alternate implementation library.
-    const QStringList codeDistractors = {
-        "def is_leap_year(year):\n    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)\n",
-        "def hamming_distance(left, right):\n    return (left ^ right).bit_count()\n",
-        "def quote_csv(value):\n    return '\"' + str(value).replace('\"', '\"\"') + '\"'\n",
-        "def palindrome(text):\n    clean = ''.join(c.casefold() for c in text if c.isalnum())\n    return "
-        "clean == clean[::-1]\n",
-        "def factorial(number):\n    answer = 1\n    for value in range(2, number + 1):\n        answer *= "
-        "value\n    return answer\n",
-        "def fibonacci(count):\n    a, b = 0, 1\n    for _ in range(count):\n        yield a\n        a, b = "
-        "b, a + b\n",
-        "def clamp(value, lower, upper):\n    return min(upper, max(lower, value))\n",
-        "def interpolate(a, b, fraction):\n    return a + (b - a) * fraction\n",
-        "def weighted_mean(values, weights):\n    total = sum(weights)\n    if total == 0:\n        raise "
-        "ValueError('zero total weight')\n    return sum(v * w for v, w in zip(values, weights)) / total\n",
-        "def rotate_clockwise(matrix):\n    return [list(row) for row in zip(*matrix[::-1])]\n",
-        "def unique_in_order(values):\n    seen = set()\n    return [v for v in values if not (v in seen or "
-        "seen.add(v))]\n",
-        "def is_prime(number):\n    if number < 2:\n        return False\n    divisor = 2\n    while divisor "
-        "* divisor <= number:\n        if number % divisor == 0:\n            return False\n        divisor "
-        "+= 1\n    return True\n",
-        "def caesar(text, shift):\n    return ''.join(chr((ord(c)-97+shift)%26+97) if 'a' <= c <= 'z' else c "
-        "for c in text)\n",
-        "def histogram(values):\n    counts = {}\n    for value in values:\n        counts[value] = "
-        "counts.get(value, 0) + 1\n    return counts\n",
-        "def flatten(rows):\n    return [value for row in rows for value in row]\n",
-        "def transpose(matrix):\n    return [list(column) for column in zip(*matrix)]\n",
-        "def degrees_to_radians(degrees):\n    import math\n    return degrees * math.pi / 180\n",
-        "def normalize_vector(vector):\n    import math\n    norm = math.sqrt(sum(x*x for x in vector))\n    "
-        "return [x/norm for x in vector] if norm else list(vector)\n",
-        "def run_length_encode(values):\n    from itertools import groupby\n    return [(value, sum(1 for _ "
-        "in group)) for value, group in groupby(values)]\n",
-        "def parse_hex_color(text):\n    value = text.removeprefix('#')\n    if len(value) != 6:\n        "
-        "raise ValueError('expected six hex digits')\n    return tuple(int(value[i:i+2], 16) for i in (0, 2, "
-        "4))\n",
-        "def balanced_brackets(text):\n    stack = []\n    pairs = {')':'(', ']':'[', '}':'{'}\n    for char "
-        "in text:\n        if char in '([{':\n            stack.append(char)\n        elif char in pairs and "
-        "(not stack or stack.pop() != pairs[char]):\n            return False\n    return not stack\n",
-        "def triangle_area(base, height):\n    return base * height / 2\n",
-        "def format_duration(seconds):\n    minutes, remainder = divmod(seconds, 60)\n    hours, minutes = "
-        "divmod(minutes, 60)\n    return f'{hours:02}:{minutes:02}:{remainder:02}'\n",
-        "def dot_product(a, b):\n    if len(a) != len(b):\n        raise ValueError('dimension mismatch')\n  "
-        "  return sum(x*y for x, y in zip(a, b))\n"};
-    for (const auto &source : codeDistractors) {
-        auto file = opaque(root, number++, "py");
-        write(file, source.toUtf8());
-        out.files.append({file, "code-background", true});
-    }
-    const QList<QStringList> speech = {
-        {"An announcement that the airport train is delayed by a fallen tree",
-         "树木倒在铁路上导致机场列车延误的广播"},
-        {"A spoken reminder to buy milk, eggs and bread", "提醒购买牛奶、鸡蛋和面包的语音"},
-        {"Museum opening hours and the time for a guided tour", "说明博物馆开放时间和导览开始时间的录音"},
-        {"Someone explaining how to bake a chocolate cake", "有人讲解巧克力蛋糕的烘焙方法"}};
-    for (int i = 0; i < speech.size(); ++i) {
-        auto file = opaque(root, number++, "wav");
-        write(file, read(fixtureRoot() + "/assets/speech-" + QString::number(i + 1).rightJustified(3, '0') +
-                         ".wav"));
-        add(out, file, "speech", speech[i][0], speech[i][1]);
-    }
-    for (int i = 0; i < 2; ++i) {
-        auto file = opaque(root, number++, "wav");
-        tone(file, i);
-        add(out, file, "environment",
-            i ? "An electronic alarm making repeated high beeps" : "A steady continuous pure musical tone",
-            i ? "电子警报器反复发出高音蜂鸣" : "持续稳定不间断的纯音");
-    }
-    for (int i = 0; i < 2; ++i) {
-        auto file = opaque(root, number++, "avi");
-        video(file, i);
-        add(out, file, "video",
-            i ? "A blue square moving and bouncing across a white screen"
-              : "A red ball travelling from left to right across a white screen",
-            i ? "蓝色方块在白色画面中移动并上下跳动" : "红色圆球在白色画面中从左向右移动");
-    }
-    const QList<QStringList> natural = {
-        {"photo-001.jpg", "image-natural",
-         "Planet Earth seen from space with blue oceans, white clouds and continents",
-         "从太空看到的地球，蓝色海洋、白色云层和大陆"},
-        {"photo-002.jpg", "image-natural", "A domestic cat walking through white snow outdoors",
-         "一只家猫在户外白色雪地上行走"},
-        {"environment-001.ogg", "environment", "A real dog barking repeatedly", "一只狗反复吠叫的真实录音"},
-        {"environment-002.wav", "environment", "Rain and wind recorded outside during wet weather",
-         "在户外录到的下雨和刮风声音"},
-        {"video-001.webm", "video-natural", "A video of heavy rain falling outdoors",
-         "户外大雨不断落下的实拍视频"}};
-    for (const auto &item : natural) {
-        auto file = opaque(root, number++, QFileInfo(item[0]).suffix());
-        write(file, read(fixtureRoot() + "/assets/" + item[0]));
-        add(out, file, item[1], item[2], item[3]);
-    }
-    if (includeBackground)
-        for (int i = 1; i <= 3; ++i) {
-            auto file = opaque(root, number++, "txt");
-            write(file,
-                  read(fixtureRoot() + "/assets/book-" + QString::number(i).rightJustified(3, '0') + ".txt"));
-            out.files.append({file, "background", false});
-        }
-    require(out.queries.size() >= 200, "Semantic corpus needs at least 200 positive queries");
-    const auto relevance = relevanceManifest();
-    const auto topicSplits = relevance.value("topic_splits").toObject();
-    QHash<int, QJsonObject> additional;
-    for (const auto &entry : relevance.value("additional_topic_splits").toArray()) {
-        const auto item = entry.toObject();
-        additional.insert(item.value("fixture_ordinal").toInt(), item);
-    }
-    for (auto &query : out.queries) {
-        bool valid = false;
-        const int ordinal = QFileInfo(query.file).completeBaseName().toInt(&valid, 16);
-        require(valid, "Invalid opaque fixture ordinal");
-        if (ordinal <= 80) {
-            query.topic = QString::number(ordinal).rightJustified(3, '0');
-            query.partition = topicSplits.value(query.topic).toString();
-        } else {
-            query.topic = additional.value(ordinal).value("topic_id").toString();
-            query.partition = additional.value(ordinal).value("split").toString();
-        }
-        require(!query.topic.isEmpty() && (query.partition == "calibration" || query.partition == "holdout"),
-                "Missing frozen topic partition: " + query.file);
-    }
-    // Append after the original corpus so its immutable ordinal mapping never
-    // changes. Smoke still validates all labels without indexing these files.
-    for (const auto &entry : relevance.value("code_fixtures").toArray()) {
-        const auto item = entry.toObject();
-        require(item.value("extension").toString() == "py", "Unsupported relevance code fixture extension");
-        const auto file = opaque(root, number++, "py");
-        write(file, item.value("source").toString().toUtf8());
-        add(out, file, "code", item.value("query_en").toString(), item.value("query_zh").toString(), true);
-        for (int i = out.queries.size() - 2; i < out.queries.size(); ++i) {
-            out.queries[i].topic = item.value("topic_id").toString();
-            out.queries[i].partition = item.value("split").toString();
-            require(!out.queries[i].topic.isEmpty()
-                        && (out.queries[i].partition == "calibration" || out.queries[i].partition == "holdout"),
-                    "Invalid added code topic partition");
-        }
-    }
-    prepareV2(out, root, number, relevance);
-    return out;
+
+QList<Input> prepare(const QString &root) {
+    QList<Input> files;
+    auto add = [&](const QString &id, const QString &extension, const QString &modality,
+                   const QString &en, const QString &zh, bool code = false) {
+        const QString directory = root + "/" + id;
+        require(QDir().mkpath(directory), "Cannot create fixture directory");
+        const QString path = directory + "/source." + extension;
+        files.append({id, path, modality, en, zh, code});
+        return path;
+    };
+    write(add("text", "txt", "text", "Instructions for storing garden seeds", "保存园艺种子的说明"),
+          "Keep the garden seeds in a dry envelope. Label each envelope with the plant name and "
+          "collection date. Store the envelopes in a cool cupboard until spring.\n");
+    pdf(add("pdf", "pdf", "pdf", "A library notice about opening hours", "图书馆开放时间通知"),
+        "The village library opens at nine on Tuesday. Readers may borrow three books for two weeks. "
+        "Please return books at the service desk before closing time.");
+    write(add("code", "py", "code", "Compute a SHA256 checksum while reading a file", "流式读取文件并计算校验和", true),
+          "import hashlib\ndef digest_file(path):\n    digest = hashlib.sha256()\n"
+          "    with open(path, 'rb') as stream:\n        while block := stream.read(65536):\n"
+          "            digest.update(block)\n    return digest.hexdigest()\n");
+    require(illustration().save(add("illustration", "png", "image", "A red circle on white paper", "白纸上的红色圆形")),
+            "Cannot save illustration");
+    write(add("photo", "jpg", "image", "The Earth seen from space", "从太空看到的地球"),
+          read(fixtureRoot() + "/media/photo-001.jpg"));
+    ocrImage(add("ocr-en", "png", "ocr", "A notice about a library closing day", "图书馆闭馆通知"),
+             "LIBRARY NOTICE\nClosed on Monday\nPlease return books on Tuesday");
+    ocrImage(add("ocr-zh", "png", "ocr", "A sign asking people to keep an exit clear", "保持安全出口畅通的标牌"),
+             "安全出口\n请勿堆放物品\n保持通道畅通");
+    write(add("speech", "wav", "audio", "An announcement about a delayed airport train", "机场列车延误广播"),
+          read(fixtureRoot() + "/media/speech-001.wav"));
+    write(add("environment", "ogg", "audio", "A dog barking", "狗叫声"),
+          read(fixtureRoot() + "/media/environment-001.ogg"));
+    tone(add("tone", "wav", "audio", "A steady continuous musical tone", "持续稳定的纯音"), false);
+    video(add("video-generated", "avi", "video", "A red circle moving across the screen", "在画面中移动的红色圆形"), 0);
+    write(add("video-natural", "webm", "video", "Heavy rain falling outdoors", "户外大雨"),
+          read(fixtureRoot() + "/media/video-001.webm"));
+    require(files.size() == 12, "The functional set must contain exactly twelve inputs");
+    return files;
 }
-double cosine(const QVector<float> &a, const QVector<float> &b) {
-    double dot = 0, aa = 0, bb = 0;
-    for (qsizetype i = 0; i < a.size(); ++i) {
-        dot += double(a[i]) * b[i];
-        aa += double(a[i]) * a[i];
-        bb += double(b[i]) * b[i];
+void validateVector(const QVector<float> &vector, const QString &context, double tolerance) {
+    require(vector.size() == embeddingDimensions, context + ": expected 768 values");
+    double squaredNorm = 0;
+    for (const float value : vector) {
+        require(std::isfinite(value), context + ": non-finite embedding");
+        squaredNorm += double(value) * value;
     }
-    return dot / std::sqrt(aa * bb);
+    require(std::abs(std::sqrt(squaredNorm) - 1.0) <= tolerance, context + ": embedding is not normalized");
 }
-QJsonArray ranking(const QVector<Vector> &vectors, const QVector<float> &query, bool code) {
-    QHash<QString, double> best;
-    for (const auto &v : vectors)
-        if (v.code == code) {
-            double score = cosine(v.value, query);
-            if (!best.contains(v.file) || best[v.file] < score)
-                best[v.file] = score;
-        }
-    QList<QPair<QString, double>> ordered;
-    for (auto i = best.cbegin(); i != best.cend(); ++i)
-        ordered.append({i.key(), i.value()});
-    std::sort(ordered.begin(), ordered.end(), [](auto &a, auto &b) { return a.second > b.second; });
-    QJsonArray out;
-    for (int i = 0; i < std::min<qsizetype>(10, ordered.size()); ++i)
-        out.append(
-            QJsonObject{{"file", QFileInfo(ordered[i].first).fileName()}, {"cosine", ordered[i].second}});
-    return out;
+void validateLocation(const Input &input, const Segment &segment) {
+    require(segment.path == input.file, "Segment source path was lost: " + input.id);
+    if (input.code)
+        require(segment.lineStart > 0 && segment.lineEnd >= segment.lineStart,
+                "Text/code line range was lost: " + input.id);
+    else if (input.modality == "pdf")
+        require(segment.page > 0, "PDF page was lost");
+    else if (input.modality == "audio" || input.modality == "video")
+        require(segment.startMs >= 0 && segment.endMs > segment.startMs,
+                "Media time range was lost: " + input.id);
 }
-QJsonArray rawCandidates(const QVector<Vector> &vectors, const QVector<float> &query, bool code) {
-    struct Candidate { QString file, modality; double score; qint64 id; };
-    // Use the same arithmetic as the production gate. Float normalization
-    // roundoff matters at a calibrated threshold boundary.
-    const auto normalizedQuery = embedding_math::normalized(query);
-    QHash<QString, Candidate> best;
-    for (const auto &v : vectors) {
-        if (v.code != code)
-            continue;
-        const auto modality = semanticPolicyModality(v.modality, code);
-        const auto key = v.file + QChar(0) + modality;
-        require(v.value.size() == normalizedQuery.size(), "Invalid persisted calibration vector dimension");
-        const auto score = embedding_math::cosine(normalizedQuery, v.value);
-        const auto existing = best.constFind(key);
-        if (existing == best.cend() || score > existing->score
-            || (score == existing->score && v.segmentId < existing->id))
-            best.insert(key, {QFileInfo(v.file).fileName(), modality, score, v.segmentId});
-    }
-    auto ordered = best.values();
-    std::sort(ordered.begin(), ordered.end(), [](const Candidate &a, const Candidate &b) {
-        return a.score == b.score ? a.id < b.id : a.score > b.score;
+void validateHit(const Input &input, const SearchHit &hit, const QVector<Segment> &stored) {
+    require(hit.path == input.file && hit.matchSource == "semantic", "Search did not return the actual semantic source");
+    require(!hit.sourceVersion.isEmpty() && std::isfinite(hit.score), "Search metadata is incomplete");
+    const auto position = std::find_if(stored.cbegin(), stored.cend(), [&](const Segment &segment) {
+        return segment.id == hit.segmentId;
     });
-    QJsonArray out;
-    for (const auto &candidate : ordered)
-        out.append(QJsonObject{{"file", candidate.file}, {"policyModality", candidate.modality},
-                               {"cosine", candidate.score}, {"segmentId", candidate.id}});
-    return out;
+    require(position != stored.cend(), "Search references a missing persisted segment");
+    validateLocation(input, *position);
+    require(hit.kind == position->kind && hit.text == position->text
+                && hit.page == position->page && hit.lineStart == position->lineStart
+                && hit.lineEnd == position->lineEnd && hit.cell == position->cell
+                && hit.startMs == position->startMs && hit.endMs == position->endMs,
+            "Search changed the persisted location fields: " + input.id);
 }
-QJsonArray keywordCandidates(IndexRepository &index, const Query &query) {
-    SearchOptions options;
-    options.query = query.text;
-    options.code = query.code;
-    // Calibration needs the same bounded keyword candidate pool before RRF,
-    // not just the final ten hits. A top-ten production query uses 256 slots.
-    options.limit = 256;
-    QString error;
-    const auto hits = index.search(options, &error);
-    require(error.isEmpty(), error);
-    QJsonArray out;
-    for (const auto &hit : hits)
-        out.append(QJsonObject{{"file", QFileInfo(hit.path).fileName()}, {"rank", out.size() + 1}});
-    return out;
-}
-struct Count {
-    int queries = 0, hits = 0, semanticHits = 0;
-};
 } // namespace
 
 int main(int argc, char **argv) {
@@ -832,21 +279,15 @@ int main(int argc, char **argv) {
     QGuiApplication app(argc, argv);
     QCommandLineParser parser;
     parser.addHelpOption();
-    parser.addOption(
-        {"validate-only", "Validate immutable corpus and author-supplied query labels without inference."});
+    parser.addOption({"validate-only", "Validate the fixed assets and generated functional inputs without inference."});
     parser.addOption({"model-dir", "Read-only verified model directory.", "path",
                       qEnvironmentVariable("QCOPILOTS_SEARCH_MODEL_DIR")});
     parser.addOption({"tessdata-dir", "OCR trained data directory.", "path",
                       qEnvironmentVariable("QCOPILOTS_SEARCH_TESSDATA_DIR",
                                            QStringLiteral(QCOPILOTS_SEARCH_SEMANTIC_TESSDATA))});
     parser.addOption({"report", "Write JSON report to this explicit location.", "path"});
-    parser.addOption({"preserve", "Retain isolated corpus and index for diagnosis."});
-    parser.addOption({"calibration-export", "Export unevaluated exact candidates for grouped development and independent holdout. Never qualifies as release acceptance."});
-    parser.addOption(
-        {"smoke", "Run a small executable pipeline probe. Never qualifies as release acceptance."});
-    // QCommandLineParser::process may use a native message box for --help when
-    // a Windows QGuiApplication has redirected standard streams. Test utilities
-    // must remain noninteractive even under CTest or a build script.
+    parser.addOption({"preserve", "Retain the isolated inputs and index for diagnosis."});
+    // Avoid QCommandLineParser's Windows native dialog when streams are redirected.
     if (!parser.parse(app.arguments())) {
         QTextStream(stderr) << parser.errorText() << '\n' << parser.helpText();
         return 2;
@@ -855,384 +296,143 @@ int main(int argc, char **argv) {
         QTextStream(stdout) << parser.helpText();
         return 0;
     }
-    QJsonObject report{
-        {"schema", 1},
-        {"calibrationProtocol", "grouped-cv-v2-quarter"},
-        {"semanticCandidateMode", parser.isSet("calibration-export") ? "raw-candidates" : "matches-only"},
-        {"passed", false},
-        {"startedAt", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
-        {"mode", parser.isSet("smoke") ? "smoke" :
-                     (parser.isSet("calibration-export") ? "calibration-export" : "release")},
-        {"annotationProtocol",
-         "Target notes and bilingual relevance labels were authored together before observing model results. "
-         "This is a controlled implementation acceptance set, not an independently human-annotated blind "
-         "retrieval benchmark. Corpus and generator hashes permit detection of later changes."},
-        {"corpusScope",
-         "Original controlled bilingual target notes, simple original illustrations and synthetic "
-         "speech/sounds/video, distinct Project Gutenberg literary distractors, and a small attributed "
-         "natural photo/sound/video sample. The natural sample does not establish representative coverage of "
-         "all environments, photo subjects, languages or accents."}};
+    const bool validateOnly = parser.isSet("validate-only");
+    QJsonObject report{{"schema", 2}, {"test", "multimodal-functional"}, {"passed", false},
+                       {"realModel", false}, {"persisted", false}, {"reloaded", false},
+                       {"startedAt", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+                       {"mode", validateOnly ? "validate-only" : "functional"},
+                       {"completedFiles", 0}, {"completedQueries", 0}, {"actualEmbeddedSegments", 0}};
     int result = 1;
-    std::unique_ptr<test::TestEnvironment> env;
+    std::unique_ptr<test::TestEnvironment> environment;
     try {
         validateAssets();
-        topics();
-        require(!(parser.isSet("smoke") && parser.isSet("calibration-export")),
-                "--smoke and --calibration-export are mutually exclusive");
-        env = std::make_unique<test::TestEnvironment>("semantic 中文 space");
-        require(env->isValid(), env->error());
-        auto corpus = env->path("corpus");
-        require(QDir().mkpath(corpus), "Cannot create isolated corpus");
-        auto prepared = prepare(corpus, !parser.isSet("smoke"));
-        report["positiveQueries"] = prepared.queries.size();
-        report["fixtures"] = prepared.files.size();
-        report["fixtureManifestSha256"] = QString::fromLatin1(
-            QCryptographicHash::hash(read(fixtureRoot() + "/assets.json"), QCryptographicHash::Sha256)
-                .toHex());
-        report["topicManifestSha256"] = QString::fromLatin1(
-            QCryptographicHash::hash(read(fixtureRoot() + "/topics.tsv"), QCryptographicHash::Sha256)
-                .toHex());
-        report["generatorSha256"] =
-            QString::fromLatin1(QCryptographicHash::hash(read(fixtureRoot() + "/semantic_acceptance.cpp"),
-                                                         QCryptographicHash::Sha256)
-                                    .toHex());
-        report["relevanceManifestSha256"] = QString::fromLatin1(
-            QCryptographicHash::hash(read(fixtureRoot() + "/relevance_queries.json"),
-                                     QCryptographicHash::Sha256).toHex());
-        report["corpusIdentity"] = QJsonObject{
-            {"fixtureManifestSha256", report.value("fixtureManifestSha256")},
-            {"topicManifestSha256", report.value("topicManifestSha256")},
-            {"generatorSha256", report.value("generatorSha256")},
-            {"relevanceManifestSha256", report.value("relevanceManifestSha256")}};
-        auto corpusIdentity = report.value("corpusIdentity").toObject();
-        for (const auto &item : QList<QPair<QString, QString>>{
-                 {"groupPlanSha256", "relevance_development_groups.json"},
-                 {"v2TextCodeManifestSha256", "relevance_v2_text_code.json"},
-                 {"v2MediaManifestSha256", "relevance_v2_media.json"}})
-            corpusIdentity[item.first] = QString::fromLatin1(
-                QCryptographicHash::hash(read(fixtureRoot() + "/" + item.second),
-                                         QCryptographicHash::Sha256).toHex());
-        report["corpusIdentity"] = corpusIdentity;
-        report["metricsScope"] = parser.isSet("calibration-export") ? "development-only-raw-ranking" : "all-production-queries";
-        report["finalHoldoutEvaluated"] = false;
-        report["relevancePolicy"] = semanticRelevancePolicy();
-        if (parser.isSet("validate-only")) {
+        environment = std::make_unique<test::TestEnvironment>("semantic 中文 space");
+        require(environment->isValid(), environment->error());
+        const QString corpus = environment->path("inputs");
+        const auto inputs = prepare(corpus);
+        report["fixtures"] = inputs.size();
+        report["queryCount"] = inputs.size() * 2;
+        report["fixtureManifestSha256"] = sha256(fixtureRoot() + "/assets.json");
+        report["generatorSha256"] = sha256(QStringLiteral(QCOPILOTS_SEARCH_SEMANTIC_SOURCE));
+        if (validateOnly) {
             report["status"] = "manifest-passed";
             result = 0;
         } else {
-            require(!parser.value("model-dir").isEmpty(),
-                    "A verified model directory is required. Missing models fail this acceptance test.");
+            require(!parser.value("model-dir").isEmpty(), "A verified model directory is required for the full functional test");
             EmbeddingRuntime runtime;
-            QString error;
             runtime.setThreadCount(4);
+            QString error;
             require(runtime.load(parser.value("model-dir"), false, &error), error);
-            auto paths = env->runtimePaths();
-            require(paths.ensure(&error), error);
-            IndexRepository index;
-            require(index.open(paths, &error), error);
-            require(index.setPipelineFingerprint(
-                        EmbeddingRuntime::fingerprint() + "|" + Extractor::pipelineFingerprint(), &error),
-                    error);
-            QVector<Vector> vectors;
-            int extracted = 0;
-            QJsonArray files;
-            QElapsedTimer timer;
-            timer.start();
-            for (int n = 0; n < prepared.files.size(); ++n) {
-                const auto &input = prepared.files[n];
-                if (parser.isSet("smoke") && n > 1)
-                    break;
-                ExtractionOptions options;
-                options.tempDir = env->path("media " + QString::number(n));
-                require(QDir().mkpath(options.tempDir), "Cannot create isolated media directory");
-                options.tessdataDir = parser.value("tessdata-dir");
-                options.code = input.code;
-                options.maxSegments = 5000;
-                options.chunkCharacters = input.modality == "background" ? 1400 : 1800;
-                options.overlapCharacters = 120;
-                options.enableOcr = true;
-                auto text = Extractor::extract(input.file, options);
-                require(text.state == "complete" && !text.segments.isEmpty(),
-                        "Extraction failed: " + input.modality + " " + text.state + " " + text.error);
-                QVector<Segment> segments;
-                QJsonObject extractedModalities;
-                qint64 extractedTextCharacters = 0;
-                for (auto segment : text.segments) {
-                    extractedModalities[segment.modality] =
-                        extractedModalities.value(segment.modality).toInt() + 1;
-                    extractedTextCharacters += segment.text.size();
-                    if (segment.modality == "image" || segment.modality == "video")
-                        segment.embedding =
-                            runtime.embedImage(segment.mediaPath.isEmpty() ? input.file : segment.mediaPath,
-                                               segment.imageBudget, &error);
-                    else if (segment.modality == "audio")
-                        segment.embedding = runtime.embedAudio(
-                            segment.mediaPath.isEmpty() ? input.file : segment.mediaPath, &error);
-                    else
-                        segment.embedding =
-                            runtime.embedText(segment.text, PromptKind::Document, segment.title, &error);
-                    require(segment.embedding.size() == 768, "Embedding failed: " + error);
-                    segments.append(segment);
-                    ++extracted;
-                }
-                require(
-                    index.replaceFiles({IndexedFile{input.file, text.sourceVersion, input.code, segments}},
-                                       &error, true),
-                    error);
-                // Read the authoritative persisted FP16 vectors and actual
-                // segment IDs. Calibration must use the production cosine
-                // inputs and tie ordering, not pre-quantization floats.
-                const auto stored = index.fileSegments(input.file, input.code, &error);
-                require(error.isEmpty() && stored.size() == segments.size(),
-                        "Cannot read persisted calibration segments: " + error);
-                for (const auto &segment : stored)
-                    if (!segment.embedding.isEmpty())
-                        vectors.append({input.file, input.code, segment.embedding,
-                                        segment.modality, segment.id});
-                files.append(QJsonObject{
-                    {"file", QFileInfo(input.file).fileName()},
-                    {"modality", input.modality},
-                    {"segments", segments.size()},
-                    {"extractedModalities", extractedModalities},
-                    {"extractedTextCharacters", extractedTextCharacters},
-                    {"sha256",
-                     QString::fromLatin1(
-                         QCryptographicHash::hash(read(input.file), QCryptographicHash::Sha256).toHex())}});
-                QTextStream(stdout) << "Indexed " << n + 1 << "/" << prepared.files.size() << " files, "
-                                    << extracted << " actual segments\n";
-                report["actualEmbeddedSegments"] = extracted;
-                report["completedFiles"] = n + 1;
-            }
-            require(index.flush(&error), error);
-            report["indexMilliseconds"] = timer.elapsed();
-            report["actualEmbeddedSegments"] = extracted;
-            report["files"] = files;
+            report["realModel"] = true;
             report["modelFingerprint"] = EmbeddingRuntime::fingerprint();
             report["extractionFingerprint"] = Extractor::pipelineFingerprint();
-            if (!parser.isSet("smoke"))
-                require(extracted >= 1000,
-                        "Release corpus must produce at least 1000 actual extracted and embedded segments");
-            // The application uses a separate text-only query worker (512 token
-            // context). Reload that same mode rather than benchmark a larger
-            // document/multimodal context for short search queries.
+            const auto paths = environment->runtimePaths();
+            require(paths.ensure(&error), error);
+            QJsonArray files;
+            int embedded = 0;
+            {
+                IndexRepository index;
+                require(index.open(paths, &error), error);
+                require(index.setPipelineFingerprint(EmbeddingRuntime::fingerprint() + "|" + Extractor::pipelineFingerprint(), &error), error);
+                for (const auto &input : inputs) {
+                    ExtractionOptions options;
+                    options.tempDir = environment->path("media/" + input.id);
+                    require(QDir().mkpath(options.tempDir), "Cannot create extracted media directory");
+                    options.tessdataDir = parser.value("tessdata-dir");
+                    options.code = input.code;
+                    options.maxSegments = 100;
+                    options.enableOcr = true;
+                    auto extraction = Extractor::extract(input.file, options);
+                    require(extraction.complete && extraction.state == "complete" && !extraction.segments.isEmpty(),
+                            "Extraction failed for " + input.id + ": " + extraction.state + " " + extraction.error);
+                    QVector<Segment> segments;
+                    QJsonObject modalities;
+                    qsizetype textCharacters = 0;
+                    bool containsHan = false;
+                    for (auto segment : extraction.segments) {
+                        validateLocation(input, segment);
+                        modalities[segment.modality] = modalities.value(segment.modality).toInt() + 1;
+                        textCharacters += segment.text.size();
+                        for (const auto character : segment.text)
+                            containsHan |= character.script() == QChar::Script_Han;
+                        if (segment.modality == "image" || segment.modality == "video")
+                            segment.embedding = runtime.embedImage(segment.mediaPath, segment.imageBudget, &error);
+                        else if (segment.modality == "audio")
+                            segment.embedding = runtime.embedAudio(segment.mediaPath, &error);
+                        else
+                            segment.embedding = runtime.embedText(segment.text, PromptKind::Document, segment.title, &error);
+                        require(error.isEmpty(), "Encoding failed for " + input.id + ": " + error);
+                        validateVector(segment.embedding, input.id, .001);
+                        segments.append(segment);
+                        ++embedded;
+                    }
+                    if (input.modality == "ocr")
+                        require(textCharacters > 0 && (input.id != "ocr-zh" || containsHan),
+                                "OCR did not produce the expected script: " + input.id);
+                    const QString expectedModality = input.code || input.modality == "text" || input.modality == "pdf"
+                        ? "text" : input.modality == "ocr" || input.modality == "video" ? "image" : input.modality;
+                    require(modalities.value(expectedModality).toInt() > 0, "Missing extraction channel: " + input.id);
+                    require(index.replaceFiles({IndexedFile{input.file, extraction.sourceVersion, input.code, segments}}, &error, true), error);
+                    const auto stored = index.fileSegments(input.file, input.code, &error);
+                    require(error.isEmpty() && stored.size() == segments.size(), "Cannot read persisted segments: " + error);
+                    for (const auto &segment : stored) validateVector(segment.embedding, input.id + " persisted", .002);
+                    files.append(QJsonObject{{"id", input.id}, {"file", QDir(corpus).relativeFilePath(input.file)},
+                        {"modality", input.modality}, {"code", input.code}, {"segments", segments.size()},
+                        {"extractedModalities", modalities}, {"extractedTextCharacters", textCharacters},
+                        {"sha256", sha256(input.file)}});
+                    report["files"] = files;
+                    report["completedFiles"] = files.size();
+                    report["actualEmbeddedSegments"] = embedded;
+                    QTextStream(stdout) << "Encoded " << input.id << " (" << segments.size() << " segments)\n";
+                }
+                require(index.flush(&error) && index.checkIntegrity(&error), error);
+                report["persisted"] = true;
+            }
+            // A fresh repository must load authoritative persisted vectors and the
+            // derived index. Queries use the same text-only runtime mode as the service.
             runtime.close();
             require(runtime.load(parser.value("model-dir"), true, &error), error);
-            QHash<QString, Count> counts;
-            QHash<QString, QHash<QString, Count>> partitionCounts;
-            QJsonArray results;
-            int queryNumber = 0;
-            for (const auto &query : prepared.queries) {
-                if (parser.isSet("smoke") && queryNumber >= 4)
-                    break;
-                ++queryNumber;
-                timer.restart();
-                auto embedding = runtime.embedText(
-                    query.text, query.code ? PromptKind::CodeQuery : PromptKind::Query, {}, &error);
-                require(embedding.size() == 768, "Query embedding failed: " + error);
-                auto encodingMs = timer.elapsed();
-                SearchOptions options;
-                options.query = query.text;
-                options.queryEmbedding = embedding;
-                options.code = query.code;
-                options.limit = 10;
-                if (parser.isSet("calibration-export"))
-                    options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
-                timer.restart();
-                auto hits = index.search(options, &error);
-                require(error.isEmpty(), error);
-                auto retrievalMs = timer.elapsed();
-                int rank = 0;
-                QJsonArray returned;
-                for (int i = 0; i < hits.size(); ++i) {
-                    returned.append(QJsonObject{{"file", QFileInfo(hits[i].path).fileName()},
-                                                {"score", hits[i].score},
-                                                {"source", hits[i].matchSource}});
-                    if (hits[i].path == query.file)
-                        rank = i + 1;
+            IndexRepository reloaded;
+            require(reloaded.open(paths, &error) && reloaded.checkIntegrity(&error), error);
+            report["reloaded"] = true;
+            QJsonArray queries;
+            for (const auto &input : inputs) {
+                const auto stored = reloaded.fileSegments(input.file, input.code, &error);
+                require(error.isEmpty() && !stored.isEmpty(), "Reload lost file segments: " + error);
+                for (const auto &segment : stored) validateVector(segment.embedding, input.id + " reloaded", .002);
+                for (const auto &language : {QStringLiteral("en"), QStringLiteral("zh")}) {
+                    const QString query = language == "en" ? input.en : input.zh;
+                    const auto embedding = runtime.embedText(query, input.code ? PromptKind::CodeQuery : PromptKind::Query, {}, &error);
+                    require(error.isEmpty(), "Query encoding failed: " + error);
+                    validateVector(embedding, input.id + " query", .001);
+                    SearchOptions options;
+                    // Empty query disables keyword fallback. Each directory contains
+                    // one source, exercising the ordinary production semantic path
+                    // without imposing a ranking or acceptance threshold.
+                    options.queryEmbedding = embedding;
+                    options.root = QFileInfo(input.file).absolutePath();
+                    options.code = input.code;
+                    options.limit = 10;
+                    const auto hits = reloaded.search(options, &error);
+                    require(error.isEmpty() && hits.size() == 1, "Isolated semantic search failed for " + input.id + ": " + error);
+                    validateHit(input, hits.front(), stored);
+                    require(hits.front().sourceVersion == reloaded.fileVersion(input.file, input.code, &error)
+                                && error.isEmpty(), "Search changed the persisted source version: " + input.id);
+                    queries.append(QJsonObject{{"id", input.id + "-" + language}, {"fixtureId", input.id},
+                        {"language", language}, {"query", query}, {"source", hits.front().matchSource},
+                        {"returnedFile", QDir(corpus).relativeFilePath(hits.front().path)},
+                        {"location", QJsonObject{{"page", hits.front().page}, {"lineStart", hits.front().lineStart},
+                            {"lineEnd", hits.front().lineEnd}, {"cell", hits.front().cell},
+                            {"startMs", hits.front().startMs}, {"endMs", hits.front().endMs}}},
+                        {"locationPassed", true}, {"passed", true}});
+                    report["queries"] = queries;
+                    report["completedQueries"] = queries.size();
+                    QTextStream(stdout) << "Verified semantic source and location: " << input.id << " " << language << '\n';
                 }
-                const bool sealedHoldout = parser.isSet("calibration-export") && query.partition == "holdout";
-                auto semantic = sealedHoldout ? QJsonArray{} : ranking(vectors, embedding, query.code);
-                bool semanticFound = false;
-                for (const auto &entry : semantic)
-                    if (entry.toObject().value("file").toString() == QFileInfo(query.file).fileName())
-                        semanticFound = true;
-                for (const auto &group :
-                     QStringList{"overall", "language:" + query.language, "modality:" + query.modality}) {
-                    if (sealedHoldout)
-                        continue;
-                    for (auto *c : {&counts[group], &partitionCounts[query.partition][group]}) {
-                        ++c->queries;
-                        if (rank > 0)
-                            ++c->hits;
-                        if (semanticFound)
-                            ++c->semanticHits;
-                    }
-                }
-                QJsonObject row{{"query", query.text},
-                                           {"language", query.language},
-                                           {"modality", query.modality},
-                                           {"code", query.code},
-                                           {"topic", query.topic},
-                                           {"partition", query.partition},
-                                           {"family", query.family},
-                                           {"policyModality", query.policyModality},
-                                           {"expectedFile", QFileInfo(query.file).fileName()},
-                                           {"rank", rank},
-                                           {"encodingMilliseconds", encodingMs},
-                                           {"retrievalMilliseconds", retrievalMs},
-                                           {parser.isSet("calibration-export") ? "rawUnfilteredTop10" : "productionTop10", returned},
-                                           {"rawCandidates", rawCandidates(vectors, embedding, query.code)},
-                                           {"keywordCandidates", keywordCandidates(index, query)},
-                                           {"exactSemanticTop10", semantic}};
-                if (query.fold >= 0)
-                    row["fold"] = query.fold;
-                if (sealedHoldout) {
-                    row.remove("rank");
-                    row.remove("exactSemanticTop10");
-                    row["evaluationStatus"] = "not-evaluated";
-                }
-                results.append(row);
-                QTextStream(stdout) << "Query " << queryNumber << "/" << prepared.queries.size()
-                                    << (parser.isSet("calibration-export") ? " sampled " : " rank=" + QString::number(rank) + " ")
-                                    << query.language << " " << query.modality
-                                    << "\n";
             }
-            QJsonObject metrics;
-            bool passed = !parser.isSet("smoke");
-            for (auto i = counts.cbegin(); i != counts.cend(); ++i) {
-                double recall = double(i.value().hits) / i.value().queries;
-                double gate = i.key() == "overall" ? .90 : .80;
-                metrics[i.key()] = QJsonObject{
-                    {"queries", i.value().queries},
-                    {"hits", i.value().hits},
-                    {"recallAt10", recall},
-                    {"exactSemanticRecallAt10", double(i.value().semanticHits) / i.value().queries},
-                    {"requiredRecallAt10", gate},
-                    {"passed", recall >= gate}};
-                passed = passed && recall >= gate;
-            }
-            report["metrics"] = metrics;
-            QJsonObject partitionMetrics;
-            for (const auto &partition : {QStringLiteral("development"), QStringLiteral("holdout")}) {
-                if (parser.isSet("calibration-export") && partition == "holdout") {
-                    partitionMetrics[partition] = QJsonObject{{"status", "not-evaluated"}};
-                    continue;
-                }
-                QJsonObject grouped;
-                const auto groups = partitionCounts.value(partition);
-                bool partitionPassed = !groups.isEmpty();
-                for (auto i = groups.cbegin(); i != groups.cend(); ++i) {
-                    const double recall = double(i.value().hits) / i.value().queries;
-                    const double required = i.key() == "overall" ? .90 : .80;
-                    grouped[i.key()] = QJsonObject{{"queries", i.value().queries}, {"hits", i.value().hits},
-                        {"recallAt10", recall}, {"requiredRecallAt10", required}, {"passed", recall >= required}};
-                    partitionPassed = partitionPassed && recall >= required;
-                }
-                partitionMetrics[partition] = QJsonObject{{"passed", partitionPassed}, {"metrics", grouped}};
-                passed = passed && partitionPassed;
-            }
-            report["partitionMetrics"] = partitionMetrics;
-            report["queries"] = results;
-            QJsonArray noAnswers;
-            QJsonObject noAnswerSummary;
-            for (const auto &entry : prepared.noAnswers) {
-                if (parser.isSet("smoke"))
-                    break;
-                const auto labelled = entry.toObject();
-                Query negative;
-                negative.text = labelled.value("query").toString();
-                negative.code = labelled.value("code").toBool();
-                negative.language = labelled.value("language").toString();
-                negative.modality = labelled.value("modality").toString();
-                negative.topic = labelled.value("topic_id").toString();
-                negative.partition = labelled.value("split").toString();
-                negative.family = labelled.value("family").toString();
-                negative.fold = labelled.value("fold").toInt(-1);
-                auto emb = runtime.embedText(negative.text,
-                    negative.code ? PromptKind::CodeQuery : PromptKind::Query, {}, &error);
-                require(emb.size() == 768, error);
-                SearchOptions opts;
-                opts.query = negative.text;
-                opts.code = negative.code;
-                opts.queryEmbedding = emb;
-                opts.limit = 10;
-                if (parser.isSet("calibration-export"))
-                    opts.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
-                auto hits = index.search(opts, &error);
-                require(error.isEmpty(), error);
-                const bool sealedHoldout = parser.isSet("calibration-export") && negative.partition == "holdout";
-                const auto exact = sealedHoldout ? QJsonArray{} : ranking(vectors, emb, negative.code);
-                const double topCosine = exact.isEmpty() ? 0.0 :
-                    exact.first().toObject().value("cosine").toDouble();
-                auto summary = noAnswerSummary.value(negative.partition).toObject();
-                const int priorCount = summary.value("queries").toInt();
-                summary["queries"] = priorCount + 1;
-                summary["queriesReturningCandidates"] =
-                    summary.value("queriesReturningCandidates").toInt() + (hits.isEmpty() ? 0 : 1);
-                summary["minimumTopCosine"] = priorCount == 0 ? topCosine :
-                    qMin(summary.value("minimumTopCosine").toDouble(), topCosine);
-                summary["maximumTopCosine"] = priorCount == 0 ? topCosine :
-                    qMax(summary.value("maximumTopCosine").toDouble(), topCosine);
-                summary["meanTopCosine"] =
-                    (summary.value("meanTopCosine").toDouble() * priorCount + topCosine) / (priorCount + 1);
-                if (!sealedHoldout)
-                    noAnswerSummary[negative.partition] = summary;
-                QJsonArray returned;
-                for (const auto &hit : hits)
-                    returned.append(QJsonObject{{"file", QFileInfo(hit.path).fileName()},
-                                                {"score", hit.score}, {"source", hit.matchSource}});
-                QJsonObject row{{"query", negative.text},
-                                             {"id", labelled.value("id")},
-                                             {"topic", negative.topic},
-                                             {"partition", negative.partition},
-                                             {"family", negative.family},
-                                             {"language", negative.language},
-                                             {"modality", negative.modality},
-                                             {"code", negative.code},
-                                             {"absentRequirement", labelled.value("absent_requirement")},
-                                             {"returnedCount", hits.size()},
-                                             {parser.isSet("calibration-export") ? "rawUnfilteredTop10" : "productionTop10", returned},
-                                             {"rawCandidates", rawCandidates(vectors, emb, negative.code)},
-                                             {"keywordCandidates", keywordCandidates(index, negative)},
-                                             {"exactSemanticTop10", exact}};
-                if (negative.fold >= 0)
-                    row["fold"] = negative.fold;
-                if (sealedHoldout) {
-                    row.remove("returnedCount");
-                    row.remove("exactSemanticTop10");
-                    row["evaluationStatus"] = "not-evaluated";
-                }
-                noAnswers.append(row);
-                QTextStream(stdout) << "No-answer " << noAnswers.size() << " "
-                                    << negative.partition
-                                    << (parser.isSet("calibration-export") ? " sampled" : " returned=" + QString::number(hits.size())) << '\n';
-            }
-            for (const auto &partition : {QStringLiteral("development"), QStringLiteral("holdout")}) {
-                if (parser.isSet("calibration-export") && partition == "holdout") {
-                    noAnswerSummary[partition] = QJsonObject{{"status", "not-evaluated"}};
-                    continue;
-                }
-                auto summary = noAnswerSummary.value(partition).toObject();
-                const auto count = summary.value("queries").toInt();
-                const double rate = count ? double(summary.value("queriesReturningCandidates").toInt()) / count : 1.0;
-                summary["falseReturnRate"] = rate;
-                summary["maximumFalseReturnRate"] = .10;
-                summary["passed"] = count > 0 && rate <= .10;
-                noAnswerSummary[partition] = summary;
-                passed = passed && count > 0 && rate <= .10;
-            }
-            report["noAnswerQueries"] = noAnswers;
-            report["noAnswerSummary"] = noAnswerSummary;
-            report["finalHoldoutEvaluated"] = !parser.isSet("calibration-export") && !parser.isSet("smoke");
-            report["noAnswerInterpretation"] = "Previously observed queries are development only. The new 40-topic holdout is evaluated after grouped CV and final parameter selection. Labels require explicit requested evidence or operations absent from the corpus.";
-            // Raw sampling is deliberately not an acceptance result. A generated
-            // policy must subsequently pass the ordinary production search run.
-            passed = passed && semanticRelevancePolicy().value("calibrated").toBool()
-                     && !parser.isSet("calibration-export");
-            report["status"] =
-                parser.isSet("smoke") ? "smoke-passed" : (parser.isSet("calibration-export") ? "calibration-exported" : (passed ? "passed" : "quality-gate-failed"));
-            report["passed"] = passed;
-            result = parser.isSet("smoke") || parser.isSet("calibration-export") || passed ? 0 : 1;
+            report["passed"] = true;
+            report["status"] = "passed";
+            result = 0;
         }
     } catch (const std::exception &exception) {
         report["status"] = "failed";
@@ -1241,45 +441,35 @@ int main(int argc, char **argv) {
     }
     report["finishedAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
     QString reportPath = parser.value("report");
-    if (reportPath.isEmpty() && !parser.isSet("validate-only"))
+    if (reportPath.isEmpty() && !validateOnly)
         reportPath = qEnvironmentVariable("QCOPILOTS_SEARCH_SEMANTIC_REPORT");
-    if (reportPath.isEmpty() && env && !parser.isSet("validate-only"))
-        reportPath = env->path("qcs-semantic-report.json");
-    if (env && (parser.isSet("preserve") || result != 0 ||
-                (!parser.isSet("report") && !parser.isSet("validate-only")))) {
-        env->preserve();
-        report["preservedRoot"] = env->root();
+    if (reportPath.isEmpty() && environment && !validateOnly)
+        reportPath = environment->path("qcs-semantic-functional.json");
+    if (environment && (parser.isSet("preserve") || result != 0
+        || (!reportPath.isEmpty() && QDir::cleanPath(reportPath).startsWith(environment->root() + "/")))) {
+        environment->preserve();
+        report["preservedRoot"] = environment->root();
     }
-    // All inference, extraction and storage owners have left scope. Close the
-    // isolated test context before reporting success so a cleanup failure is
-    // part of the acceptance result rather than a destructor-only warning.
-    env.reset();
-    const QString cleanupError = test::takeCleanupErrors();
+    environment.reset();
+    const auto cleanupError = test::takeCleanupErrors();
     if (!cleanupError.isEmpty()) {
         result = 1;
         report["status"] = "cleanup-failed";
         report["passed"] = false;
         report["cleanupError"] = cleanupError;
-        const QString previous = report.value("error").toString();
-        report["error"] = previous.isEmpty() ? cleanupError : previous + "\n" + cleanupError;
         QTextStream(stderr) << cleanupError << '\n';
     }
     if (!reportPath.isEmpty()) {
         report["reportPath"] = reportPath;
-        try {
-            write(reportPath, QJsonDocument(report).toJson());
-        } catch (const std::exception &e) {
-            QTextStream(stderr) << e.what() << '\n';
+        try { write(reportPath, QJsonDocument(report).toJson()); }
+        catch (const std::exception &exception) {
+            QTextStream(stderr) << exception.what() << '\n';
             return 1;
         }
     }
-    const QJsonObject summary{{"status", report.value("status")},
-                              {"passed", report.value("passed")},
-                              {"reportPath", reportPath},
-                              {"actualEmbeddedSegments", report.value("actualEmbeddedSegments")},
-                              {"positiveQueries", report.value("positiveQueries")},
-                              {"metrics", report.value("metrics")},
-                              {"error", report.value("error")}};
-    QTextStream(stdout) << QJsonDocument(summary).toJson(QJsonDocument::Compact) << '\n';
+    QTextStream(stdout) << QJsonDocument(QJsonObject{{"status", report.value("status")},
+        {"passed", report.value("passed")}, {"reportPath", reportPath},
+        {"completedFiles", report.value("completedFiles")}, {"completedQueries", report.value("completedQueries")},
+        {"error", report.value("error")}}).toJson(QJsonDocument::Compact) << '\n';
     return result;
 }

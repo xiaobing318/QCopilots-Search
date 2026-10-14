@@ -1,8 +1,11 @@
 #include "extraction/document_extractor.h"
+#include "extraction/extractor.h"
+#include "core/file_catalog.h"
 #include "../support/test_environment.h"
 
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -406,6 +409,132 @@ private slots:
         QCOMPARE(extractDocument(write(QStringLiteral("generated.cpp"), "// Code generated. DO NOT EDIT.\nvoid f() {}"), options).state, QStringLiteral("failed"));
         QCOMPARE(extractDocument(write(QStringLiteral("secret.py"), "key = '''-----BEGIN RSA PRIVATE KEY-----xxx'''"), options).state, QStringLiteral("failed"));
         QVERIFY(supportsDocument(QStringLiteral("DOCX")));
+    }
+    void cataloguedFormatsReachExtractor_data() {
+        QTest::addColumn<QString>("filename");
+        QTest::addColumn<QString>("kind");
+        for (const QString &suffix : {QStringLiteral("oga"), QStringLiteral("aifc"), QStringLiteral("caf"),
+                QStringLiteral("mka"), QStringLiteral("m4b")})
+            QTest::newRow(qPrintable(suffix)) << QStringLiteral("sample.") + suffix.toUpper() << QStringLiteral("audio");
+        for (const QString &suffix : {QStringLiteral("3gp"), QStringLiteral("flv")})
+            QTest::newRow(qPrintable(suffix)) << QStringLiteral("sample.") + suffix.toUpper() << QStringLiteral("video");
+        for (const QString &suffix : {QStringLiteral("sr2"), QStringLiteral("srf"), QStringLiteral("srw"),
+                QStringLiteral("kdc"), QStringLiteral("mrw"), QStringLiteral("erf"), QStringLiteral("mos"), QStringLiteral("iiq")})
+            QTest::newRow(qPrintable(suffix)) << QStringLiteral("sample.") + suffix.toUpper() << QStringLiteral("image");
+        QTest::newRow("qml") << QStringLiteral("Sample.QML") << QStringLiteral("code");
+        QTest::newRow("dockerfile-exact") << QStringLiteral("DOCKERFILE") << QStringLiteral("code");
+        QTest::newRow("dockerfile-suffix") << QStringLiteral("dOcKeRfIlE.dev") << QStringLiteral("code");
+        QTest::newRow("containerfile") << QStringLiteral("containerfile") << QStringLiteral("code");
+        QTest::newRow("cmakelists") << QStringLiteral("CMAKELISTS.TXT") << QStringLiteral("code");
+    }
+    void cataloguedFormatsReachExtractor() {
+        QFETCH(QString, filename);
+        QFETCH(QString, kind);
+        const auto &root = *directory;
+        const QString path = root.filePath(filename);
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        const QByteArray content("import QtQuick\nItem { property string label: \"Search result\" }\n");
+        QCOMPARE(file.write(content), content.size());
+        file.close();
+        const bool code = kind == QStringLiteral("code");
+        const auto scanned = FileCatalog::scan({{root.path()}, {}, false,
+            code ? FolderRules::Scope::Code : FolderRules::Scope::General});
+        QVERIFY2(scanned.errors.isEmpty(), qPrintable(scanned.errors.join('\n')));
+        QCOMPARE(scanned.files.size(), 1);
+        QCOMPARE(scanned.files.first().kind, kind);
+        QCOMPARE(Extractor::kindForPath(scanned.files.first().path, code), kind);
+        FileRecord described;
+        QString error;
+        QVERIFY2(FileCatalog::describe(path, &described, &error), qPrintable(error));
+        QCOMPARE(described.kind, kind);
+        // Only source text is decoded here. Media and RAW rows verify routing,
+        // without treating arbitrary bytes as valid files for those decoders.
+        if (code) {
+            ExtractionOptions options;
+            options.code = true;
+            const auto extracted = Extractor::extract(path, options);
+            QVERIFY2(extracted.complete, qPrintable(extracted.error));
+            QVERIFY(!extracted.segments.isEmpty());
+            QCOMPARE(extracted.segments.first().kind, QStringLiteral("code"));
+            QVERIFY(allText(extracted).contains(QStringLiteral("Search result")));
+        }
+    }
+    void codeFilenameMatchingKeepsExclusions() {
+        for (const QString &name : {QStringLiteral("DockerfileBackup"), QStringLiteral("Dockerfile.pem"),
+                QStringLiteral("credentials.yaml"), QStringLiteral("SecretPicture.png"), QStringLiteral("bundle.MIN.JS")}) {
+            const QString path = write(name, "safe fixture content\n");
+            QVERIFY(!path.isEmpty());
+            QVERIFY(!supportsCode(QFileInfo(path).suffix(), name));
+            QVERIFY(Extractor::kindForPath(path, true).isEmpty());
+            FileRecord record;
+            QString error;
+            QVERIFY(!FileCatalog::describe(path, &record, &error));
+            QVERIFY(!error.isEmpty());
+        }
+    }
+    void transportClassificationMatchesExtraction() {
+        const auto &root = *directory;
+        int count = 0;
+        for (const QString &suffix : {QStringLiteral("ts"), QStringLiteral("mts"), QStringLiteral("m2ts")}) {
+            for (const int stride : {188, 192}) {
+                for (int offset = 0; offset <= 4; ++offset) {
+                    const QString path = root.filePath(QStringLiteral("transport-%1-%2.%3").arg(stride).arg(offset).arg(suffix));
+                    QByteArray bytes(offset + 2 * stride + 1, '\0');
+                    bytes[offset] = bytes[offset + stride] = bytes[offset + 2 * stride] = 0x47;
+                    QFile file(path);
+                    QVERIFY(file.open(QIODevice::WriteOnly));
+                    QCOMPARE(file.write(bytes), bytes.size());
+                    file.close();
+                    FileRecord record;
+                    QString error;
+                    QVERIFY2(FileCatalog::describe(path, &record, &error), qPrintable(error));
+                    QCOMPARE(record.kind, QStringLiteral("video"));
+                    QCOMPARE(Extractor::kindForPath(path, false), record.kind);
+                    QVERIFY(Extractor::kindForPath(path, true).isEmpty());
+                    ++count;
+                }
+            }
+        }
+        const auto general = FileCatalog::scan({{root.path()}, {}, false, FolderRules::Scope::General});
+        QVERIFY2(general.errors.isEmpty(), qPrintable(general.errors.join('\n')));
+        QCOMPARE(general.files.size(), count);
+        const auto code = FileCatalog::scan({{root.path()}, {}, false, FolderRules::Scope::Code});
+        QVERIFY2(code.errors.isEmpty(), qPrintable(code.errors.join('\n')));
+        QVERIFY(code.files.isEmpty());
+    }
+    void sourceAndTruncatedTransportAreNotVideo() {
+        const auto &root = *directory;
+        for (const QString &suffix : {QStringLiteral("ts"), QStringLiteral("mts"), QStringLiteral("m2ts")}) {
+            const QString source = write(QStringLiteral("source.") + suffix, "export const answer = 42;\n");
+            QVERIFY(!source.isEmpty());
+            QByteArray truncated(376, '\0');
+            truncated[0] = truncated[188] = 0x47;
+            const QString partial = write(QStringLiteral("truncated.") + suffix, truncated);
+            QVERIFY(!partial.isEmpty());
+            const bool code = suffix != QStringLiteral("m2ts");
+            for (const auto &path : {source, partial}) {
+                QVERIFY(Extractor::kindForPath(path, false).isEmpty());
+                QCOMPARE(Extractor::kindForPath(path, true), code ? QStringLiteral("code") : QString{});
+                FileRecord record;
+                QString error;
+                QCOMPARE(FileCatalog::describe(path, &record, &error), code);
+                if (code) QCOMPARE(record.kind, QStringLiteral("code"));
+            }
+            if (code) {
+                ExtractionOptions options;
+                options.code = true;
+                const auto extracted = Extractor::extract(source, options);
+                QVERIFY2(extracted.complete, qPrintable(extracted.error));
+                QVERIFY(allText(extracted).contains(QStringLiteral("answer")));
+            }
+        }
+        const auto general = FileCatalog::scan({{root.path()}, {}, false, FolderRules::Scope::General});
+        QVERIFY2(general.errors.isEmpty(), qPrintable(general.errors.join('\n')));
+        QVERIFY(general.files.isEmpty());
+        const auto code = FileCatalog::scan({{root.path()}, {}, false, FolderRules::Scope::Code});
+        QVERIFY2(code.errors.isEmpty(), qPrintable(code.errors.join('\n')));
+        QCOMPARE(code.files.size(), 4);
     }
 };
 

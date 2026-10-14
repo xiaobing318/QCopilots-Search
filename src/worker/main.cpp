@@ -13,6 +13,7 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QLockFile>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QThreadPool>
@@ -269,12 +270,14 @@ private:
             send(success(id, {{QStringLiteral("cancelled"), found}, {QStringLiteral("targetId"), activeId_}}));
             return;
         }
-        if (operation != QStringLiteral("extract") && operation != QStringLiteral("query")) {
-            send(failure(id, QStringLiteral("unknown_operation"), QStringLiteral("Supported operations: extract, query, cancel, shutdown")));
+        if (operation != QStringLiteral("extract") && operation != QStringLiteral("query")
+            && operation != QStringLiteral("diagnostics")) {
+            send(failure(id, QStringLiteral("unknown_operation"), QStringLiteral("Supported operations: extract, query, diagnostics, cancel, shutdown")));
             return;
         }
-        if ((mode_ == QStringLiteral("query") && operation != QStringLiteral("query"))
-            || (mode_ == QStringLiteral("extract") && operation != QStringLiteral("extract"))) {
+        if (operation != QStringLiteral("diagnostics")
+            && ((mode_ == QStringLiteral("query") && operation != QStringLiteral("query"))
+                || (mode_ == QStringLiteral("extract") && operation != QStringLiteral("extract")))) {
             send(failure(id, QStringLiteral("wrong_mode"), QStringLiteral("Operation is unavailable in this worker mode")));
             return;
         }
@@ -286,39 +289,78 @@ private:
         activeId_ = id;
         cancelled_.store(false);
         watcher_.setFuture(QtConcurrent::run(&pool_, [this, request] {
-            try { return run(request); }
+            QJsonObject response;
+            try { response = run(request); }
             catch (const std::exception &error) {
-                return failure(request.value(QStringLiteral("id")), QStringLiteral("worker_error"), QString::fromUtf8(error.what()));
+                response = failure(request.value(QStringLiteral("id")), QStringLiteral("worker_error"), QString::fromUtf8(error.what()));
             }
             catch (...) {
-                return failure(request.value(QStringLiteral("id")), QStringLiteral("worker_error"), QStringLiteral("Unexpected worker failure"));
+                response = failure(request.value(QStringLiteral("id")), QStringLiteral("worker_error"), QStringLiteral("Unexpected worker failure"));
             }
+            // Read runtime state on its owner thread, including failed model
+            // initialization. A strict GPU failure must remain an error reply.
+            if (runtime_) {
+                const QString key = response.value(QStringLiteral("ok")).toBool()
+                    ? QStringLiteral("result") : QStringLiteral("error");
+                auto payload = response.value(key).toObject();
+                payload.insert(QStringLiteral("runtime"), runtime_->diagnostics());
+                response.insert(key, payload);
+            }
+            return response;
         }));
     }
-    bool loadRuntime(bool textOnly, QString *error)
+    void ensureRuntime()
     {
         if (!runtime_) {
             runtime_ = std::make_unique<EmbeddingRuntime>();
             runtime_->setThreadCount(qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_THREADS"));
             runtime_->setCancellationCallback([this] { return cancelled_.load(); });
         }
+    }
+    void reportRuntime(const QJsonValue &id, const QString &phase, bool loadingModel)
+    {
+        if (!runtimeEvents_) return;
+        const QJsonObject event{{"id", id}, {"event", "runtime"},
+            {"data", QJsonObject{{"phase", phase}, {"activity", loadingModel ? "model-load" : "encode"},
+                {"runtime", runtime_->diagnostics()}}}};
+        // Flush the evidence before entering a vendor backend that may abort
+        // without unwinding. All stdout writes remain on the main thread.
+        QMetaObject::invokeMethod(this, [this, event] { send(event); }, Qt::BlockingQueuedConnection);
+    }
+    template<typename Function> auto infer(const QJsonValue &id, Function operation, bool loadingModel = false)
+    {
+        reportRuntime(id, QStringLiteral("inference-start"), loadingModel);
+        const auto finished = qScopeGuard([this, id, loadingModel] { reportRuntime(id, QStringLiteral("inference-end"), loadingModel); });
+        return operation();
+    }
+    bool loadRuntime(bool textOnly, QString *error, const QJsonValue &id)
+    {
+        ensureRuntime();
         if (runtime_->isLoaded() && runtime_->isTextOnly() == textOnly) return true;
-        runtime_->close();
-        return runtime_->load(paths_.modelDir, textOnly, error);
+        return infer(id, [this, textOnly, error] { return runtime_->load(paths_.modelDir, textOnly, error); }, true);
     }
     QJsonObject run(const QJsonObject &request)
     {
         const auto id = request.value(QStringLiteral("id"));
+        runtimeEvents_ = request.value(QStringLiteral("runtimeEvents")).toBool(false);
         if (cancelled_.load()) return failure(id, QStringLiteral("cancelled"), QStringLiteral("Job cancelled"));
+        if (request.value(QStringLiteral("operation")).toString() == QStringLiteral("diagnostics")) {
+            ensureRuntime();
+            QString error;
+            if (request.value(QStringLiteral("load")).toBool()
+                && !loadRuntime(request.value(QStringLiteral("textOnly")).toBool(mode_ != QStringLiteral("full")), &error, id))
+                return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("model_unavailable"), error);
+            return success(id, {});
+        }
         if (request.value(QStringLiteral("operation")).toString() == QStringLiteral("query")) {
             const auto text = request.value(QStringLiteral("query")).toString();
             if (text.trimmed().isEmpty() || text.size() > 65536)
                 return failure(id, QStringLiteral("invalid_query"), QStringLiteral("Query must contain between 1 and 65536 characters"));
             QString error;
-            if (!loadRuntime(true, &error))
+            if (!loadRuntime(true, &error, id))
                 return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("model_unavailable"), error);
-            const auto vector = runtime_->embedText(text, request.value(QStringLiteral("code")).toBool()
-                ? PromptKind::CodeQuery : PromptKind::Query, {}, &error);
+            const auto vector = infer(id, [&] { return runtime_->embedText(text, request.value(QStringLiteral("code")).toBool()
+                ? PromptKind::CodeQuery : PromptKind::Query, {}, &error); });
             if (cancelled_.load()) return failure(id, QStringLiteral("cancelled"), QStringLiteral("Query cancelled"));
             if (vector.size() != embeddingDimensions) return failure(id, QStringLiteral("inference_error"), error);
             QJsonArray values;
@@ -343,7 +385,7 @@ private:
         if (offset < 0 || limit < 1 || limit > 256)
             return failure(id, QStringLiteral("invalid_limits"), QStringLiteral("offset must be nonnegative and maxSegments must be between 1 and 256"));
         QString error;
-        if (embed && !loadRuntime(false, &error))
+        if (embed && !loadRuntime(false, &error, id))
             return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("model_unavailable"), error);
         QTemporaryDir temporary(QDir(paths_.tempDir).filePath(QStringLiteral("qcs-worker-XXXXXX")));
         if (!temporary.isValid())
@@ -380,11 +422,11 @@ private:
             if (!embed) continue;
             error.clear();
             if (segment.modality == QStringLiteral("image")) {
-                segment.embedding = runtime_->embedImage(segment.mediaPath, segment.imageBudget, &error);
+                segment.embedding = infer(id, [&] { return runtime_->embedImage(segment.mediaPath, segment.imageBudget, &error); });
             } else if (segment.modality == QStringLiteral("audio")) {
-                segment.embedding = runtime_->embedAudio(segment.mediaPath, &error);
+                segment.embedding = infer(id, [&] { return runtime_->embedAudio(segment.mediaPath, &error); });
             } else if (!segment.text.trimmed().isEmpty()) {
-                segment.embedding = runtime_->embedText(segment.text, PromptKind::Document, segment.title, &error);
+                segment.embedding = infer(id, [&] { return runtime_->embedText(segment.text, PromptKind::Document, segment.title, &error); });
             } else {
                 // A filename-only record carries no content embedding. Keyword
                 // retrieval remains available for the original source name.
@@ -433,6 +475,7 @@ private:
     std::atomic_bool cancelled_{false};
     QJsonValue activeId_;
     bool active_ = false;
+    bool runtimeEvents_ = false;
     bool stopping_ = false;
     int exitCode_ = 0;
 };

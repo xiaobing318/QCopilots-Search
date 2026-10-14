@@ -6,9 +6,9 @@
 
 namespace qcopilots_search::embedding_math {
 
-// Storage and calibration must share both operations, including the float
-// rounding after query normalization. A second double-precision query norm
-// changes scores at the nextafter boundary used by the relevance policy.
+// Normalize query vectors once in float precision before comparing them with
+// the persisted FP16 vectors. The same arithmetic is used by exact and ANN
+// candidate scoring.
 inline QVector<float> normalized(const QVector<float> &values)
 {
     if (values.size() != embeddingDimensions)

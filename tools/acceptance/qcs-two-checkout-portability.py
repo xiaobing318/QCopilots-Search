@@ -30,6 +30,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qcs_owned_processes import WindowsProcesses
 TARGETS = ["qcs-tests-" + suffix for suffix in ("core", "file-catalog", "model-files")]
+APPLICATIONS = {"qcs-gui", "qcs-cli", "qcs-service", "qcs-worker"}
+CONFIGURATIONS = ("Release", "Debug", "RelWithDebInfo")
 
 
 def utc():
@@ -52,6 +54,29 @@ def write(path, data):
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def select_variant(source, identifier=None):
+    """Resolve the Windows configuration without requiring execution on Windows."""
+    variants = json.loads((Path(source) / "config/build-variants.json").read_text(encoding="utf-8"))["variants"]
+    identifier = identifier or os.environ.get("QCOPILOTS_SEARCH_VARIANT")
+    if not identifier:
+        defaults = [item["id"] for item in variants
+                    if (item["os"], item["arch"], item["backend"]) == ("windows", "x64", "cpu")]
+        require(len(defaults) == 1, "The build manifest must contain one default Windows x64 CPU variant")
+        identifier = defaults[0]
+    selected = [item for item in variants if item["id"] == identifier]
+    require(len(selected) == 1 and selected[0]["os"] == "windows" and selected[0]["arch"] == "x64",
+            "Two-checkout portability requires a manifest Windows x64 variant: " + identifier)
+    require(re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", identifier), "Invalid build variant identifier")
+    return identifier
+
+
+def build_layout(base, variant, config):
+    require(config in CONFIGURATIONS, "Invalid build configuration")
+    root = Path(base).resolve() / variant
+    return {"root": root, "build": root / config,
+            **{name: root / name / config for name in ("stage", "pkg", "reports", "runs", "deps")}}
 
 
 def snapshot(directory, *, exclude_git=True):
@@ -91,8 +116,9 @@ def clone_executable_snapshot(build):
 
 def command_env(base, build, git_dll, *, main_build, qt_prefix, nsis_root):
     env = dict(base)
-    exclude = {str(main_build / "release/bin").casefold(), str(main_build / "release/lib").casefold()}
-    rest = [piece for piece in env.get("PATH", "").split(os.pathsep) if piece and piece.casefold() not in exclude]
+    exclude = {(main_build / name).resolve() for name in ("bin", "lib")}
+    rest = [piece for piece in env.get("PATH", "").split(os.pathsep)
+            if piece and Path(piece).resolve() not in exclude]
     env["PATH"] = os.pathsep.join([str(build / "bin"), str(Path(git_dll).parent), str(qt_prefix / "bin"), str(nsis_root), *rest])
     env["NSISDIR"] = str(nsis_root)
     env["QT_PLUGIN_PATH"] = str(qt_prefix / "plugins")
@@ -636,8 +662,12 @@ def main():
     for flag in ("build-root", "build-record", "run-parent", "qt-root", "qt-prefix", "calligra-source"):
         parser.add_argument("--" + flag, type=Path, required=True)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--variant", help="Windows x64 build variant, defaults to the environment or manifest CPU variant")
+    parser.add_argument("--config", choices=CONFIGURATIONS, default="Release")
     parser.add_argument("--dependency-root", type=Path)
-    parser.add_argument("--nsis-root", type=Path, help="Existing locked private NSIS, defaults to BUILD_ROOT/bootstrap/nsis")
+    parser.add_argument("--gpu-sdk-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_GPU_SDK_ROOT"),
+                        help="Existing shared GPU SDK cache, defaults to BUILD_ROOT/gpu-sdk")
+    parser.add_argument("--nsis-root", type=Path, help="Existing locked private NSIS, defaults to BUILD_ROOT/VARIANT/bootstrap/nsis")
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--sentinel-launch-record", type=Path,
                         help="Optional existing ordinary GUI/service launch record. Observer never starts or stops them")
@@ -650,13 +680,20 @@ def main():
     args = parser.parse_args()
     require(re.fullmatch(r"[0-9a-f]{40}", args.head) and re.fullmatch(r"[0-9a-f]{40}", args.source_tree),
             "Head and tree must be full lower-case Git identities")
+    args.variant = select_variant(args.source, args.variant)
+    main_layout = build_layout(args.build_root, args.variant, args.config)
+    main_build = main_layout["build"]
+    nsis_root = (args.nsis_root or main_layout["root"] / "bootstrap/nsis").resolve()
+    gpu_sdk_root = (args.gpu_sdk_root or args.build_root / "gpu-sdk").resolve()
     root = args.run_parent.resolve() / ("qcs-port-" + uuid.uuid4().hex[:12])
     plan = {"executeRequested": args.execute, "head": args.head, "sourceTree": args.source_tree,
             "source": str(args.source.resolve()), "buildRecord": str(args.build_record.resolve()), "uniqueRunRoot": str(root),
+            "variant": args.variant, "configuration": args.config,
+            "buildRoot": str(args.build_root.resolve()), "mainBuildDirectory": str(main_build),
             "newTargets": TARGETS, "readonlyCTestNames": TARGETS + ["qcs-tests-workflow"],
             "originalCTestNames": TARGETS, "scope": "Windows independent subset rebuild and actual concurrent two-checkout tests. No model inference, service startup or GUI control. Optional existing ordinary sentinel observation is reported separately.",
             "reserveGiB": args.reserve_gib, "budgetGiB": args.budget_gib,
-            "nsisRoot": str((args.nsis_root or args.build_root / "bootstrap/nsis").resolve()),
+            "nsisRoot": str(nsis_root), "gpuSdkRoot": str(gpu_sdk_root),
             "sentinelLaunchRecord": str(args.sentinel_launch_record.resolve()) if args.sentinel_launch_record else None}
     if not args.execute:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
@@ -669,8 +706,7 @@ def main():
         return child_code
     require(os.name == "nt" and sys.version_info >= (3, 12), "Windows and Python 3.12+ are required for junction-safe evidence")
     require(args.jobs > 0 and args.reserve_gib >= 3 and args.budget_gib > 0, "Invalid resource parameters")
-    source, main_build = args.source.resolve(), args.build_root.resolve()
-    nsis_root = (args.nsis_root or main_build / "bootstrap/nsis").resolve()
+    source = args.source.resolve()
     nsis_lock_path = source / "tools/nsis-package.lock.json"
     nsis_lock = json.loads(nsis_lock_path.read_text(encoding="utf-8"))
     nsis_marker_path = nsis_root / ".qcs-nsis.json"
@@ -692,11 +728,12 @@ def main():
     require(original_identity == receipt["identity"] and not evidence.verified_build(args.build_record.parent, receipt), "Source and successful build receipt disagree")
     require(Path(receipt["sourceDirectory"]).resolve() == source, "Build receipt belongs to another source checkout")
     require(original_identity["sourceTree"] == args.source_tree and original_identity["checkoutCommit"] == args.head
-            and not original_identity["workingTreeModified"] and len(receipt["programs"]) == 6, "The expected frozen clean candidate is not available")
+            and not original_identity["workingTreeModified"] and set(receipt["programs"]) == APPLICATIONS,
+            "The expected frozen clean four-application candidate is not available")
     original_producers = {name: sha(Path(item["originalPath"])) for name, item in receipt["programs"].items()}
     require(all(original_producers[name] == item["sha256"] for name, item in receipt["programs"].items()),
             "Actual main build producer bytes no longer match the frozen build receipt")
-    require(all(Path(item["originalPath"]).resolve().parent == (main_build / "release/bin").resolve()
+    require(all(Path(item["originalPath"]).resolve().parent == main_build / "bin"
                 for item in receipt["programs"].values()), "Producer paths do not belong to the selected main build")
     free = shutil.disk_usage(args.run_parent).free
     require(free >= (args.reserve_gib + args.budget_gib) * 1024**3, "Insufficient disk budget with required reserve")
@@ -708,9 +745,11 @@ def main():
     reports.mkdir()
     clone, external, caller = root / "中文 源码", root / "外置 构建", root / "任意 工作目录"
     caller.mkdir()
-    clone_build = external / "release"
-    dependency = (args.dependency_root or main_build / "deps").resolve()
-    model_dir = (args.model_dir or main_build / "models").resolve()
+    clone_layout = build_layout(external, args.variant, args.config)
+    clone_build = clone_layout["build"]
+    plan["cloneBuildDirectory"] = str(clone_build)
+    dependency = (args.dependency_root or main_layout["deps"]).resolve()
+    model_dir = (args.model_dir or args.build_root / "models").resolve()
     initial_receipt_sha, runner_sha = sha(args.build_record), sha(__file__)
     process_helper_path = Path(__file__).with_name("qcs_owned_processes.py")
     process_helper_sha = sha(process_helper_path)
@@ -816,7 +855,7 @@ def main():
         return command
 
     try:
-        before_original = executable_snapshot(main_build / "release/bin", main_build / "release/bin/git2.dll")
+        before_original = executable_snapshot(main_build / "bin", main_build / "bin/git2.dll")
         before_original_source = snapshot(source)
         record["originalBinariesBefore"] = before_original
         write(reports / "original-source-before.json", before_original_source)
@@ -849,7 +888,8 @@ def main():
         record["sharedSourceRoots"] = list(map(str, cached_sources))
         before_native = {str(path): snapshot(path) for path in cached_sources}
         write(reports / "shared-source-before.json", before_native)
-        common = ["--build-root", external, "--qt-root", args.qt_root, "--model-dir", model_dir]
+        common = ["--build-root", external, "--variant", args.variant, "--config", args.config,
+                  "--qt-root", args.qt_root, "--model-dir", model_dir, "--gpu-sdk-root", gpu_sdk_root]
         run(developer_command(clone, "doctor", ["doctor", *common]), "doctor", env, caller)
         configure = ["configure", *common,
                      "--cmake-arg=-DQCOPILOTS_SEARCH_DEPENDENCY_ROOT=" + str(dependency),
@@ -858,22 +898,22 @@ def main():
                      "--cmake-arg=-DQCOPILOTS_SEARCH_NATIVE_BINARY_ROOT=" + str(clone_build / "nd"),
                      "--cmake-arg=-DQCOPILOTS_SEARCH_LLAMA_BINARY_DIR=" + str(clone_build / "nd/llama")]
         run(developer_command(clone, "configure", configure), "configure", env, caller)
-        run(["cmake", "--build", clone_build, "--config", "Release", "--parallel", args.jobs, "--target", *TARGETS], "subset-build", env, caller)
+        run(["cmake", "--build", clone_build, "--config", args.config, "--parallel", args.jobs, "--target", *TARGETS], "subset-build", env, caller)
         clone_dll, clone_binaries = clone_executable_snapshot(clone_build)
-        main_dll = main_build / "release/bin/git2.dll"
+        main_dll = main_build / "bin/git2.dll"
         record["originalBinariesBefore"], record["cloneBinariesBefore"] = before_original, clone_binaries
         clone_env = command_env(env, clone_build, clone_dll, main_build=main_build, qt_prefix=args.qt_prefix, nsis_root=nsis_root)
-        main_env = command_env(env, main_build / "release", main_dll, main_build=main_build, qt_prefix=args.qt_prefix, nsis_root=nsis_root)
+        main_env = command_env(env, main_build, main_dll, main_build=main_build, qt_prefix=args.qt_prefix, nsis_root=nsis_root)
         record["cloneRuntime"] = {"gitDll": str(clone_dll.resolve()), "sha256": sha(clone_dll),
                                   "searchPath": clone_env["PATH"].split(os.pathsep)}
         inv_args = [("clone", clone_build, "^(core|workflow)$", clone_env, TARGETS + ["qcs-tests-workflow"]),
-                    ("original", main_build / "release", "^core$", main_env, TARGETS)]
+                    ("original", main_build, "^core$", main_env, TARGETS)]
         for label, build, regex, used_env, names in inv_args:
-            run(["ctest", "--test-dir", build, "-C", "Release", "--show-only=json-v1", "-L", regex], label + "-inventory", used_env, caller)
+            run(["ctest", "--test-dir", build, "-C", args.config, "--show-only=json-v1", "-L", regex], label + "-inventory", used_env, caller)
             inventory = json.loads((reports / (label + "-inventory.stdout.log")).read_text(encoding="utf-8-sig"))
             require({row["name"] for row in inventory["tests"]} == set(names), "Selected registered CTest set differs: " + label)
             checkout = clone if label == "clone" else source
-            configured_test_root = external / "runs" if label == "clone" else main_build / "runs"
+            configured_test_root = (clone_layout if label == "clone" else main_layout)["runs"]
             for row in inventory["tests"]:
                 wrapper_identity = validate_test_command(row.get("command", []), row["name"], checkout,
                                                          build, configured_test_root)
@@ -882,7 +922,8 @@ def main():
         # The workflow is registered first and runs much longer than core.
         # Give core a concurrent slot so both checkouts can overlap in QtTest.
         test_a = developer_command(clone, "clone-tests", ["test", *common, "--jobs", "2", "--test-label", "^(core|workflow)$", "--report-dir", reports / "clone-tests"])
-        test_b = developer_command(source, "original-tests", ["test", "--build-root", main_build,
+        test_b = developer_command(source, "original-tests", ["test", "--build-root", args.build_root.resolve(),
+                  "--variant", args.variant, "--config", args.config,
                   "--qt-root", args.qt_root, "--jobs", "1", "--test-label", "^core$", "--report-dir", reports / "original-tests"])
         if args.sentinel_launch_record:
             launch = json.loads(args.sentinel_launch_record.read_text(encoding="utf-8-sig"))
@@ -919,7 +960,7 @@ def main():
                     image = processes.image(pid)
                     if image:
                         observed[index][str(pid)]["imagePath"] = image
-                expected_bin = clone_build / "bin" if index == 0 else main_build / "release/bin"
+                expected_bin = clone_build / "bin" if index == 0 else main_build / "bin"
                 expected_images = {expected_bin / (name + ".exe") for name in TARGETS}
                 alive_tests.append([pid for pid, row in active.items()
                                     if Path(observed[index][str(pid)].get("imagePath", "")) in expected_images])
@@ -935,8 +976,8 @@ def main():
         write(reports / "actual-process-overlap.json", {"processes": observed, "simultaneousQtTestSamples": overlap})
         require(bool(overlap), "No actual simultaneous QtTest processes were observed, wrapper overlap alone is insufficient")
         roots = []
-        for label, build_root, used_env in (("clone", external, clone_env), ("original", main_build, main_env)):
-            latest = json.loads((build_root / "reports/latest-test-run.json").read_text(encoding="utf-8"))
+        for label, layout, used_env in (("clone", clone_layout, clone_env), ("original", main_layout, main_env)):
+            latest = json.loads((layout["reports"] / "latest-test-run.json").read_text(encoding="utf-8"))
             require(Path(latest["directory"]).resolve() == (reports / (label + "-tests")).resolve(), "Runner report was replaced by another invocation")
             roots.append(latest["testRoot"])
             write(reports / (label + "-run-context.json"), latest)
@@ -1006,7 +1047,7 @@ def main():
                 write(reports / "shared-source-after.json", after_native)
                 record["sharedSourceBytesUnchanged"] = after_native == before_native
             if before_original is not None:
-                record["originalBinariesAfter"] = executable_snapshot(main_build / "release/bin", main_build / "release/bin/git2.dll")
+                record["originalBinariesAfter"] = executable_snapshot(main_build / "bin", main_build / "bin/git2.dll")
                 record["originalBinariesUnchanged"] = before_original == record["originalBinariesAfter"]
             record["endIdentity"] = evidence.source_identity(source, args.head)
             record["originalSourceIdentityUnchanged"] = record["endIdentity"] == original_identity

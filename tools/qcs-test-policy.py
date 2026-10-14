@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select and classify owned tests from the actual CTest registration inventory."""
+"""Validate the complete owned CTest inventory and its evidence types."""
 from __future__ import annotations
 
 import argparse
@@ -43,9 +43,6 @@ def validate_inventory(inventory: dict) -> list[dict]:
             raise ValueError("Owned CTest names must use the qcs-tests- prefix")
         names.append(name)
         evidence_kind(entry)
-        test_labels = labels(entry)
-        if "real-model" in test_labels and "slow" not in test_labels:
-            raise ValueError(f"Real-model test must be marked slow: {name}")
         for prop in entry.get("properties", []):
             if prop.get("name") == "DISABLED" and prop.get("value") not in (False, "FALSE", "OFF", "0", 0):
                 raise ValueError(f"Required registered CTest is disabled: {name}")
@@ -54,21 +51,16 @@ def validate_inventory(inventory: dict) -> list[dict]:
     return entries
 
 
-def select_inventory(inventory: dict, profile: str = "full") -> dict:
-    if profile not in ("fast", "full"):
-        raise ValueError(f"Unknown test profile: {profile!r}")
+def select_inventory(inventory: dict) -> dict:
     entries = validate_inventory(inventory)
-    selected = [entry for entry in entries if profile == "full" or "slow" not in labels(entry)]
-    if not selected:
-        raise ValueError(f"The {profile} test profile selects no registered tests")
-    return {**inventory, "tests": selected}
+    return {**inventory, "tests": list(entries)}
 
 
-def describe_inventory(inventory: dict, profile: str = "full") -> dict:
-    selected = select_inventory(inventory, profile)
+def describe_inventory(inventory: dict) -> dict:
+    selected = select_inventory(inventory)
     registered_names = sorted(entry["name"] for entry in inventory["tests"])
     selected_names = sorted(entry["name"] for entry in selected["tests"])
-    return {"schemaVersion": 1, "testProfile": profile,
+    return {"schemaVersion": 1,
             "registeredPrograms": registered_names, "selectedPrograms": selected_names,
             "excludedPrograms": sorted(set(registered_names) - set(selected_names)),
             "evidenceKinds": {entry["name"]: evidence_kind(entry) for entry in inventory["tests"]}}
@@ -77,13 +69,12 @@ def describe_inventory(inventory: dict, profile: str = "full") -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", type=Path, required=True)
-    parser.add_argument("--test-profile", choices=("fast", "full"), default="fast")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--report", type=Path)
     options = parser.parse_args()
     inventory = json.loads(options.inventory.read_text(encoding="utf-8-sig"))
-    selected = select_inventory(inventory, options.test_profile)
-    report = describe_inventory(inventory, options.test_profile)
+    selected = select_inventory(inventory)
+    report = describe_inventory(inventory)
     for path, document in ((options.output, selected), (options.report, report)):
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)

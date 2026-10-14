@@ -1,5 +1,6 @@
 add_library(qcs-app-components STATIC
     app_backend.cpp app_backend.h
+    gui_instance.cpp gui_instance.h
     main_window.cpp main_window.h
     model_dialog.cpp model_dialog.h
     platform_integration.cpp platform_integration.h

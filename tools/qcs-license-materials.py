@@ -13,6 +13,7 @@ import shutil
 import tarfile
 import tempfile
 import urllib.request
+import zipfile
 
 SOURCE = Path(__file__).resolve().parent.parent
 MANIFEST = "qcs-license-manifest.json"
@@ -24,6 +25,7 @@ SOURCE_ARCHIVES = ("qtbase", "qtsvg", "qtimageformats", "qtmultimedia")
 VENDORED_HEADERS = ("vendor/stb/stb_image.h", "vendor/miniaudio/miniaudio.h", "vendor/sheredom/subprocess.h")
 MAX_FILE = 16 * 1024 * 1024
 MAX_MATERIALS = 64 * 1024 * 1024
+GPU_LICENSE_LOCK = SOURCE / "config/gpu-license-sources.lock.json"
 
 
 def digest(path):
@@ -223,7 +225,145 @@ def source_materials(archive, entry):
     return result, standards
 
 
-def collect(qt_prefix, llama_source, cache, output, source_lock, download=False):
+def runtime_license_materials(manifests):
+    """Read the exact redistribution notices selected by the runtime deployer."""
+    resources, files = [], []
+    seen = set()
+    for manifest_path in manifests:
+        manifest_path = Path(manifest_path).resolve()
+        document = read_json(manifest_path)
+        if (not isinstance(document, dict) or document.get("schemaVersion") != 1
+                or not isinstance(document.get("resources"), list)):
+            raise ValueError("Invalid runtime license selection manifest")
+        for resource in document["resources"]:
+            if not isinstance(resource, dict):
+                raise ValueError("Invalid runtime license component record")
+            name, version = resource.get("name", ""), resource.get("version", "")
+            if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._+-]*", name) or name in seen:
+                raise ValueError(f"Invalid or duplicate runtime license component: {name}")
+            if not isinstance(version, str) or not version.strip() or len(version) > 128:
+                raise ValueError(f"Invalid runtime license component version: {name}")
+            seen.add(name)
+            selected, names = [], set()
+            declarations = resource.get("files")
+            if not isinstance(declarations, list) or not declarations:
+                raise ValueError(f"Runtime component has no redistribution notices: {name}")
+            for entry in declarations:
+                if not isinstance(entry, dict) or not isinstance(entry.get("source"), str) or not entry["source"]:
+                    raise ValueError(f"Invalid runtime license file record: {name}")
+                relative = relative_path(entry["path"]).as_posix()
+                if relative in names:
+                    raise ValueError(f"Duplicate runtime license path: {name}/{relative}")
+                names.add(relative)
+                expected = entry.get("sha256", "")
+                if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+                    raise ValueError(f"Invalid runtime license SHA-256: {name}/{relative}")
+                source = Path(entry["source"])
+                source = source if source.is_absolute() else safe_file(manifest_path.parent, source.as_posix())
+                for item in (source, *source.parents):
+                    if item.is_symlink() or (hasattr(item, "is_junction") and item.is_junction()):
+                        raise ValueError(f"Linked runtime license source: {source}")
+                if not source.is_file() or not 0 < source.stat().st_size <= MAX_FILE:
+                    raise ValueError(f"Missing or oversized runtime license source: {source}")
+                data = source.read_bytes()
+                if hashlib.sha256(data).hexdigest() != expected:
+                    raise ValueError(f"Runtime license SHA-256 differs: {source}")
+                destination = f"runtime/{name}/{relative}"
+                selected.append({"path": destination, "sha256": expected})
+                files.append((destination, data, {"origin": "selected-runtime-redistribution-notice",
+                              "component": name, "version": version, "source": str(source.resolve()),
+                              "selectionManifest": str(manifest_path)}))
+            resources.append({"name": name, "version": version, "files": selected})
+    return resources, files
+
+
+def fetch_gpu_license_sources(backend, version, cache, download=False):
+    """Fetch pinned ROCm redistribution originals missing from its binary wheels."""
+    if backend not in {"hip", "rocm"}:
+        return {"schemaVersion": 1, "resources": []}
+    lock = read_json(GPU_LICENSE_LOCK)
+    if lock.get("schemaVersion") != 1 or version not in lock.get("rocm", {}):
+        raise ValueError(f"No reviewed runtime license sources for {backend} {version}")
+    selection = lock["rocm"][version]
+    cache = Path(cache).expanduser().resolve()
+    if cache == SOURCE or cache.is_relative_to(SOURCE) or cache == Path(cache.anchor):
+        raise ValueError("GPU license cache must be outside the checkout and filesystem root")
+    cache.mkdir(parents=True, exist_ok=True)
+
+    def fetch(entry, maximum):
+        expected, size, url = entry.get("sha256", ""), entry.get("size"), entry.get("url", "")
+        if (not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected)
+                or not isinstance(size, int) or not 0 < size <= maximum
+                or not isinstance(url, str) or not url.startswith("https://")):
+            raise ValueError("Invalid pinned GPU license source record")
+        destination = safe_file(cache, expected)
+        if destination.exists():
+            if not destination.is_file() or destination.stat().st_size != size or digest(destination) != expected:
+                raise ValueError(f"Cached GPU license source SHA-256/size differs: {url}")
+            return destination
+        if not download:
+            raise ValueError(f"Verified GPU license source is missing: {url}")
+        descriptor, filename = tempfile.mkstemp(prefix="qcs-gpu-license-", suffix=".part", dir=cache)
+        temporary = Path(filename)
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "qcopilots-search/license-materials"})
+            with os.fdopen(descriptor, "wb") as output, urllib.request.urlopen(request, timeout=120) as response:
+                received = 0
+                for block in iter(lambda: response.read(1024 * 1024), b""):
+                    received += len(block)
+                    if received > size:
+                        raise ValueError(f"GPU license source exceeds locked size: {url}")
+                    output.write(block)
+            if temporary.stat().st_size != size or digest(temporary) != expected:
+                raise ValueError(f"Downloaded GPU license source SHA-256/size differs: {url}")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
+
+    archives = {entry["name"]: entry for entry in selection.get("sourceArchives", [])}
+    resources = []
+    for resource in selection["resources"]:
+        files = []
+        for entry in resource["files"]:
+            relative_path(entry["path"])
+            if "archive" in entry:
+                if entry["archive"] not in archives:
+                    raise ValueError(f"GPU license archive is not locked: {entry['archive']}")
+                archive_path = fetch(archives[entry["archive"]], 128 * 1024 * 1024)
+                member = relative_path(entry["member"]).as_posix()
+                size, expected = entry.get("size"), entry.get("sha256", "")
+                if (not isinstance(size, int) or not 0 < size <= MAX_FILE
+                        or not re.fullmatch(r"[0-9a-f]{64}", expected)):
+                    raise ValueError("Invalid GPU license archive member lock")
+                if zipfile.is_zipfile(archive_path):
+                    with zipfile.ZipFile(archive_path) as archive:
+                        matches = [info for info in archive.infolist() if info.filename == member]
+                        if (len(matches) != 1 or matches[0].file_size != size
+                                or (matches[0].external_attr >> 16) & 0o170000 == 0o120000):
+                            raise ValueError(f"Invalid GPU license ZIP member: {member}")
+                        data = archive.read(matches[0])
+                else:
+                    with tarfile.open(archive_path, "r:*") as archive:
+                        matches = [info for info in archive.getmembers() if info.name == member]
+                        if len(matches) != 1 or not matches[0].isfile() or matches[0].size != size:
+                            raise ValueError(f"Invalid GPU license tar member: {member}")
+                        data = archive.extractfile(matches[0]).read(MAX_FILE + 1)
+                if len(data) != size or hashlib.sha256(data).hexdigest() != expected:
+                    raise ValueError(f"GPU license archive member SHA-256 differs: {member}")
+                source = safe_file(cache, expected)
+                if source.exists() and source.read_bytes() != data:
+                    raise ValueError(f"Cached GPU license original differs: {member}")
+                if not source.exists():
+                    source.write_bytes(data)
+            else:
+                source = fetch(entry, MAX_FILE)
+            files.append({"path": entry["path"], "source": str(source), "sha256": entry["sha256"]})
+        resources.append({"name": resource["name"], "version": resource["version"], "files": files})
+    return {"schemaVersion": 1, "resources": resources}
+
+
+def collect(qt_prefix, llama_source, cache, output, source_lock, download=False, runtime_license_manifests=()):
     qt_prefix, llama_source, cache, output = map(Path, (qt_prefix, llama_source, cache, output))
     if output.resolve() == SOURCE or output.resolve().is_relative_to(SOURCE) or output.resolve() == Path(output.anchor):
         raise ValueError("License output must be outside the source checkout and filesystem root")
@@ -288,6 +428,9 @@ def collect(qt_prefix, llama_source, cache, output, source_lock, download=False)
                 relative = path.relative_to(llama_source).as_posix()
                 safe_file(llama_source, relative)
                 add("llama/" + relative, path.read_bytes(), {"origin": "verified-llama-source", "source": relative})
+    runtime_resources, runtime_files = runtime_license_materials(runtime_license_manifests)
+    for name, data, origin in runtime_files:
+        add(name, data, origin)
     notice = ("QCopilots Search runtime license materials\n\n"
               "llama/LICENSE is the unchanged pinned llama.cpp upstream MIT license, including its vendored ggml.\n"
               "llama/vendor preserves original stb_image, miniaudio and subprocess headers containing their distinct full license notices.\n"
@@ -295,6 +438,7 @@ def collect(qt_prefix, llama_source, cache, output, source_lock, download=False)
               "These module-level documents may describe optional or undeployed SDK features and external references. They are not a complete runtime dependency graph.\n"
               "qt/extracted retains their custom license texts. qt/sources contains verified upstream license/notice and attribution originals.\n"
               "Preserving alternative license texts does not change the selected distribution terms or enable optional GPL/nonfree codecs.\n"
+              "runtime contains the unchanged SDK redistribution notices selected for the deployed GPU runtime components, when present.\n"
               "Corresponding sources and build recipes are distributed in the separate qcs-source-materials archive.\n")
     add("README.txt", notice.encode(), {"origin": "project-generated-scope"})
     if sum(map(len, materials.values())) > MAX_MATERIALS:
@@ -302,6 +446,7 @@ def collect(qt_prefix, llama_source, cache, output, source_lock, download=False)
     manifest = {"schemaVersion": 1, "kind": KIND, "qtModules": QT_MODULES,
                 "standardLicenseIds": sorted(required), "standardLicenseFiles": {key: standards[key] for key in sorted(required)},
                 "customLicenseFiles": customs, "moduleCoverage": coverage, "sourceArchives": archives,
+                "runtimeResources": runtime_resources,
                 "sources": sources, "files": [{"path": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in sorted(materials.items())]}
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix="qcs-license-", dir=output.parent))
@@ -382,7 +527,24 @@ def verify_materials(root):
         allowed.add(f"qt/sources/qtmultimedia/src/3rdparty/ffmpeg/LICENSE.{identifier}.txt")
         if name not in allowed or name not in names or safe_file(root, name).stat().st_size < 16:
             raise ValueError(f"Required standard license text is absent: {identifier}")
-    return {"passed": True, "files": len(records), "qtModules": list(QT_MODULES), "standardLicenses": len(required)}
+    runtime_files, runtime_names = set(), set()
+    for resource in manifest.get("runtimeResources", []):
+        component = resource.get("name", "")
+        if (not isinstance(component, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._+-]*", component)
+                or component in runtime_names or not isinstance(resource.get("version"), str)
+                or not resource["version"].strip() or not resource.get("files")):
+            raise ValueError("Invalid or duplicate deployed runtime license component")
+        runtime_names.add(component)
+        for entry in resource["files"]:
+            name = relative_path(entry["path"]).as_posix()
+            if (name not in names or name in runtime_files or not name.startswith(f"runtime/{component}/")
+                    or entry.get("sha256") != digest(safe_file(root, name))):
+                raise ValueError(f"Deployed runtime license differs: {name}")
+            runtime_files.add(name)
+    if runtime_files != {name for name in names if name.startswith("runtime/")}:
+        raise ValueError("Deployed runtime notices differ from component manifest")
+    return {"passed": True, "files": len(records), "qtModules": list(QT_MODULES), "standardLicenses": len(required),
+            "runtimeComponents": sorted(runtime_names)}
 
 
 def validate_runtime_license_directory(root):
@@ -398,6 +560,7 @@ def main():
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--source-lock", type=Path, default=SOURCE / "tools/qcs-source-packages.lock.json")
     parser.add_argument("--download", action="store_true")
+    parser.add_argument("--runtime-license-manifest", type=Path, action="append", default=[])
     parser.add_argument("--verify", type=Path)
     args = parser.parse_args()
     if args.verify:
@@ -405,7 +568,8 @@ def main():
     else:
         if any(value is None for value in (args.qt_prefix, args.llama_source, args.cache_dir, args.output_dir)):
             parser.error("--qt-prefix, --llama-source, --cache-dir and --output-dir are required")
-        manifest = collect(args.qt_prefix, args.llama_source, args.cache_dir, args.output_dir, args.source_lock, args.download)
+        manifest = collect(args.qt_prefix, args.llama_source, args.cache_dir, args.output_dir, args.source_lock,
+                           args.download, args.runtime_license_manifest)
         result = {"output": str(args.output_dir.resolve()), "files": len(manifest["files"]), "standardLicenses": len(manifest["standardLicenseIds"])}
     print(json.dumps(result, ensure_ascii=False))
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract tests for CTest inventory driven profile and evidence selection."""
+"""Contract tests for the complete CTest inventory and evidence validation."""
 import copy
 import importlib.util
 from pathlib import Path
@@ -35,20 +35,20 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(groups["native"], aggregate.native_case_ids())
         self.assertTrue(groups["pure"])
 
-    def test_fast_selects_by_labels_and_preserves_the_registered_entry(self):
+    def test_inventory_preserves_every_registered_entry_and_metadata(self):
         source = inventory()
-        result = policy.select_inventory(source, "fast")
-        self.assertEqual(result["tests"], [source["tests"][0]])
+        result = policy.select_inventory(source)
+        self.assertEqual(result["tests"], source["tests"])
         self.assertEqual(result["version"], source["version"])
         self.assertEqual(len(source["tests"]), 3)
 
-    def test_full_keeps_every_registered_test(self):
+    def test_all_labels_are_included(self):
         self.assertEqual(policy.select_inventory(inventory()), inventory())
 
     def test_report_includes_selection_and_evidence_type_for_new_tests(self):
-        report = policy.describe_inventory(inventory(), "fast")
-        self.assertEqual(report["selectedPrograms"], ["qcs-tests-new-python-tool"])
-        self.assertEqual(len(report["excludedPrograms"]), 2)
+        report = policy.describe_inventory(inventory())
+        self.assertEqual(report["selectedPrograms"], report["registeredPrograms"])
+        self.assertEqual(report["excludedPrograms"], [])
         self.assertEqual(report["evidenceKinds"]["qcs-tests-new-model"], "program")
 
     def test_missing_or_ambiguous_evidence_labels_fail(self):
@@ -59,18 +59,17 @@ class PolicyTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     policy.select_inventory(source)
 
-    def test_disabled_tests_fail_even_when_excluded_by_fast(self):
+    def test_disabled_tests_fail(self):
         for disabled in (True, "TRUE", "ON", 1):
             source = inventory()
             source["tests"][1]["properties"].append({"name": "DISABLED", "value": disabled})
             with self.subTest(disabled=disabled), self.assertRaisesRegex(ValueError, "disabled"):
-                policy.select_inventory(source, "fast")
+                policy.select_inventory(source)
 
-    def test_real_model_without_slow_is_invalid(self):
+    def test_real_model_does_not_require_a_scheduling_label(self):
         source = inventory()
         source["tests"][2]["properties"][0]["value"].remove("slow")
-        with self.assertRaisesRegex(ValueError, "marked slow"):
-            policy.select_inventory(source, "fast")
+        self.assertEqual(policy.select_inventory(source), source)
 
     def test_empty_duplicate_unowned_or_malformed_inventory_fails(self):
         source = inventory()
@@ -81,18 +80,6 @@ class PolicyTests(unittest.TestCase):
         for value in ({}, [], {"kind": "ctestInfo", "tests": []}, duplicate, unowned):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 policy.select_inventory(value)
-
-    def test_empty_selection_fails(self):
-        source = inventory()
-        source["tests"].pop(0)
-        with self.assertRaisesRegex(ValueError, "selects no"):
-            policy.select_inventory(source, "fast")
-
-    def test_unknown_profile_is_not_silently_coerced(self):
-        for profile in ("FAST", "", None, "quick"):
-            with self.subTest(profile=profile), self.assertRaisesRegex(ValueError, "Unknown test profile"):
-                policy.select_inventory(inventory(), profile)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

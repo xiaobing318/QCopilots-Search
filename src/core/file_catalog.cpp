@@ -1,4 +1,5 @@
 #include "file_catalog.h"
+#include "file_formats.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -73,32 +74,6 @@ bool isCancelled(std::atomic_bool *cancel)
     return cancel && cancel->load(std::memory_order_relaxed);
 }
 
-const QSet<QString> &sourceExtensions()
-{
-    static const QSet<QString> extensions = {
-        "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm", "swift", "py", "pyi", "pyx",
-        "ipynb", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "go", "rs", "java", "kt", "kts",
-        "scala", "groovy", "rb", "php", "cs", "fs", "sh", "bash", "zsh", "fish", "ps1", "lua", "pl", "pm",
-        "r", "jl", "dart", "sql", "vue", "svelte", "astro", "css", "scss", "sass", "less", "gradle", "cmake",
-        "mk", "proto", "graphql", "gql", "tf", "hcl", "nix", "zig", "hs", "ex", "exs", "erl", "clj", "cljs",
-        "elm", "ml", "mli", "vim", "el", "lisp", "asm", "s", "metal", "glsl", "hlsl", "wgsl", "cu", "cuh",
-        "ino", "v", "sv", "tex", "yaml", "yml", "toml", "rst", "adoc", "org"
-    };
-    return extensions;
-}
-
-bool secretName(const QString &name)
-{
-    // Rules adapted from DigUp (MIT), Sources/DigUpKit/Rules.swift.
-    static const QStringList prefixes = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".env", "secret",
-        "credential", ".netrc", ".npmrc", ".pypirc", "htpasswd", ".htpasswd"};
-    const QString lower = name.toLower();
-    static const QSet<QString> secretExtensions = {"pem", "key", "p12", "pfx", "keystore", "jks", "ppk",
-        "kdbx", "gpg", "asc", "crt", "cer", "der", "p8", "mobileprovision"};
-    if (secretExtensions.contains(QFileInfo(name).suffix().toLower())) return true;
-    return std::any_of(prefixes.cbegin(), prefixes.cend(), [&lower](const auto &prefix) { return lower.startsWith(prefix); });
-}
-
 // This check precedes even transport-stream sniffing. Reading a placeholder can
 // ask its provider to download it, so metadata is inspected without file data.
 bool unavailablePlaceholder(const QFileInfo &info)
@@ -143,36 +118,25 @@ bool transportStream(const QString &path)
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
         return false;
-    const QByteArray bytes = file.read(600);
-    return bytes.size() >= 400
-        && ((bytes[0] == 0x47 && bytes[188] == 0x47 && bytes[376] == 0x47)
-            || (bytes[4] == 0x47 && bytes[196] == 0x47 && bytes[388] == 0x47));
+    return file_formats::isTransportStream(file.read(600));
 }
 
 QString classify(const QFileInfo &info, bool includeCode, bool codeOnly = false)
 {
     const QString extension = info.suffix().toLower();
     const QString name = info.fileName();
-    static const QSet<QString> texts = {"txt", "text", "md", "markdown", "rtf", "docx", "doc", "odt", "html", "htm"};
-    static const QSet<QString> images = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "ico", "ppm",
-        "pgm", "pbm", "heic", "heif", "avif", "dng", "cr2", "cr3", "nef", "nrw", "arw", "rw2", "raf", "orf", "pef", "raw"};
-    static const QSet<QString> audio = {"wav", "mp3", "flac", "ogg", "oga", "opus", "m4a", "aac", "aiff", "aif", "wma"};
-    static const QSet<QString> video = {"mp4", "m4v", "mov", "mkv", "avi", "webm", "wmv", "mpg", "mpeg", "3gp", "flv"};
-    static const QSet<QString> sourceNames = {"Makefile", "makefile", "GNUmakefile", "Dockerfile", "Containerfile",
-        "Justfile", "justfile", "Rakefile", "Gemfile", "Podfile", "Brewfile", "Procfile", "Vagrantfile", "Jenkinsfile",
-        "CMakeLists.txt"};
-    if (secretName(name))
+    if (file_formats::isSensitiveFilename(name))
         return {};
     if (extension == "ts" || extension == "mts" || extension == "m2ts") {
         if (transportStream(info.absoluteFilePath()))
             return codeOnly ? QString{} : QStringLiteral("video");
-        if (extension == "m2ts")
+        if (extension == "m2ts" || !includeCode)
             return {};
     }
-    const bool codeText = extension == "md" || extension == "markdown" || extension == "txt"
-        || extension == "html" || extension == "htm";
-    if (includeCode && (sourceExtensions().contains(extension) || sourceNames.contains(name)
-        || name.startsWith("Dockerfile.") || (codeOnly && codeText))) {
+    // Mixed discovery keeps ordinary documents as text. Explicit Code scope
+    // also indexes repository documentation, while named build files are code.
+    if (includeCode && file_formats::isCode(extension, name)
+        && (codeOnly || !file_formats::documentExtensions().contains(extension) || file_formats::isCodeFilename(name))) {
         if (name.endsWith(".min.js", Qt::CaseInsensitive) || name.endsWith(".min.mjs", Qt::CaseInsensitive)
             || name.endsWith(".min.css", Qt::CaseInsensitive))
             return {};
@@ -182,11 +146,11 @@ QString classify(const QFileInfo &info, bool includeCode, bool codeOnly = false)
         return "code";
     }
     if (codeOnly) return {};
-    if (texts.contains(extension)) return "text";
+    if (file_formats::documentExtensions().contains(extension)) return "text";
     if (extension == "pdf") return "pdf";
-    if (images.contains(extension)) return "image";
-    if (audio.contains(extension)) return "audio";
-    if (video.contains(extension)) return "video";
+    if (file_formats::isImage(extension)) return "image";
+    if (file_formats::isAudio(extension)) return "audio";
+    if (file_formats::isVideo(extension)) return "video";
     return {};
 }
 

@@ -40,9 +40,10 @@ if(APPLE)
   get_property(_qcopilots_native GLOBAL PROPERTY QCOPILOTS_SEARCH_NATIVE_RUNTIME_TARGETS)
   get_property(_qcopilots_inference GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS)
   get_property(_qcopilots_cpu GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_CPU_RUNTIME_TARGETS)
+  get_property(_qcopilots_gpu GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_GPU_RUNTIME_TARGETS)
   qcopilots_search_install_macos_runtime_after_bundle(
     NATIVE_TARGETS ${_qcopilots_native}
-    INFERENCE_TARGETS ${_qcopilots_inference} CPU_TARGETS ${_qcopilots_cpu})
+    INFERENCE_TARGETS ${_qcopilots_inference} CPU_TARGETS ${_qcopilots_cpu} GPU_TARGETS ${_qcopilots_gpu})
 endif()
 if(TARGET qcs-gui AND QCOPILOTS_SEARCH_DEPLOY_QT)
   if(NOT TARGET Qt6::QOffscreenIntegrationPlugin)
@@ -123,6 +124,13 @@ if(EXISTS "${PROJECT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md")
 endif()
 install(FILES "${PROJECT_SOURCE_DIR}/tools/qt-packages.lock.json"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs")
+include(qcs-package-identity)
+install(FILES "${CMAKE_BINARY_DIR}/qcs-build-identity-$<CONFIG>.json"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs" RENAME build-identity.json)
+install(FILES "${PROJECT_SOURCE_DIR}/config/build-variants.json"
+  "${PROJECT_SOURCE_DIR}/config/gpu-sdk.lock.json"
+  "${PROJECT_SOURCE_DIR}/config/gpu-license-sources.lock.json"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs")
 if(EXISTS "${PROJECT_SOURCE_DIR}/third_party")
   install(DIRECTORY "${PROJECT_SOURCE_DIR}/third_party/"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs/source-materials")
@@ -139,12 +147,15 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Local multilingual multimodal desktop sea
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "qcs")
 set(CPACK_RESOURCE_FILE_LICENSE "${PROJECT_SOURCE_DIR}/LICENSE")
-set(CPACK_PACKAGE_CHECKSUM SHA256)
-set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/../pkg")
+# Checksums belong to the frozen release manifest. Ordinary CPack invocations
+# produce only the downloadable installer or portable archive.
+unset(CPACK_PACKAGE_CHECKSUM)
+set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/pkg" CACHE PATH "External distribution output directory")
 set(CPACK_QCS_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
 set(CPACK_QCS_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
 qcopilots_search_require_external_path(CPACK_PACKAGE_DIRECTORY "${CPACK_PACKAGE_DIRECTORY}")
-set(CPACK_PACKAGE_FILE_NAME "qcs-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_PACKAGE_FILE_NAME "qcs-${PROJECT_VERSION}-${QCOPILOTS_SEARCH_VARIANT}-${_qcs_package_revision}-attempt${QCOPILOTS_SEARCH_CANDIDATE_ATTEMPT}")
+set(CPACK_QCS_VARIANT "${QCOPILOTS_SEARCH_VARIANT}")
 set(CPACK_STRIP_FILES TRUE)
 if(APPLE)
   # Qt strips before the final signing pass. Never strip signed Mach-O again.
@@ -152,7 +163,7 @@ if(APPLE)
 endif()
 set(CPACK_PROJECT_CONFIG_FILE "${PROJECT_SOURCE_DIR}/cmake/qcs-cpack.cmake")
 if(WIN32)
-  set(CPACK_GENERATOR ZIP)
+  set(CPACK_GENERATOR "NSIS;ZIP")
   set(CPACK_NSIS_DISPLAY_NAME "QCopilots Search")
   # CMake parses this value again from the generated CPackConfig.cmake.
   set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\qcs-gui.exe")

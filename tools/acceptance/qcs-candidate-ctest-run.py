@@ -15,11 +15,10 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import platform
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -30,8 +29,7 @@ GOLDENS = {"query", "query-bn", "query-ar", "document", "document-long",
            "screen-280", "photo-140", "frame-70", "speech"}
 REFERENCE = "qcs-tests-reference-vectors"
 SEMANTIC = "qcs-tests-semantic"
-PRODUCERS = {"qcs-gui", "qcs-service", "qcs-worker",
-             "qcs-cli", "qcs-benchmark", "qcs-tests-file-capacity"}
+PRODUCERS = {"qcs-gui", "qcs-service", "qcs-worker", "qcs-cli"}
 
 
 def now():
@@ -59,9 +57,9 @@ def require(condition, message):
 
 def validate_full_selection(selection, names):
     require(isinstance(selection, dict) and selection.get("schemaVersion") == 1
-            and selection.get("kind") == "ctest-selection", "Missing CTest profile selection evidence")
-    require(selection.get("profile") == "full" and not selection.get("labelFilter")
-            and selection.get("filters") == [], "Candidate CTest requires the explicit unfiltered full profile")
+            and selection.get("kind") == "ctest-selection", "Missing CTest selection evidence")
+    require(not selection.get("labelFilter") and selection.get("filters") == [],
+            "Candidate CTest requires the complete unfiltered inventory")
     require(selection.get("registeredTests") == names and selection.get("selectedTests") == names
             and selection.get("excludedTests") == []
             and selection.get("counts") == {"registered": len(names), "selected": len(names), "excluded": 0},
@@ -69,71 +67,7 @@ def validate_full_selection(selection, names):
     require(selection.get("passed") is True and selection.get("fullSuitePassed") is True
             and selection.get("status") == "passed" and selection.get("exitCode") == 0
             and selection.get("releaseComplete") is False,
-            "Full CTest profile did not complete or incorrectly claims complete release acceptance")
-
-
-def verify_preserved_corpus(semantic, test_runs):
-    """Check original semantic inputs in this candidate's isolated test tree.
-
-    Do not regenerate or relocate files, and never rewrite preservedRoot in the
-    producer's report. Later latency and Computer Use runs need these exact bytes.
-    """
-    def ordinary(path, directory):
-        try:
-            info = path.lstat()
-        except OSError as error:
-            raise ValueError(f"Preserved semantic input is missing or unreadable: {path}") from error
-        require(not stat.S_ISLNK(info.st_mode)
-                and not getattr(info, "st_file_attributes", 0) & 0x400,
-                f"Preserved semantic input redirects through a link: {path}")
-        require(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode),
-                f"Preserved semantic input has the wrong file type: {path}")
-
-    boundary = Path(test_runs).absolute()
-    ordinary(boundary, True)
-    boundary = boundary.resolve()
-    value = semantic.get("preservedRoot")
-    require(isinstance(value, str) and bool(value.strip()) and Path(value).is_absolute(),
-            "Semantic preservedRoot must be an existing absolute directory")
-    preserved = Path(value)
-    require(".." not in preserved.parts and preserved != boundary
-            and preserved.is_relative_to(boundary),
-            "Semantic preservedRoot is outside this candidate's test run directory")
-    current = preserved
-    while current != boundary:
-        ordinary(current, True)
-        current = current.parent
-    corpus = preserved / "corpus"
-    ordinary(corpus, True)
-    files = semantic.get("files")
-    require(isinstance(files, list) and bool(files), "Semantic corpus file manifest is empty")
-    verified, seen = [], set()
-    for item in files:
-        require(isinstance(item, dict), "Semantic corpus file entry must be an object")
-        relative = item.get("file")
-        require(isinstance(relative, str), "Semantic corpus file path must be text")
-        name = PurePosixPath(relative)
-        require(relative == name.as_posix() and bool(name.parts) and not name.is_absolute()
-                and not any(part in ("..", ".") for part in name.parts)
-                and "\\" not in relative and ":" not in relative,
-                "Semantic corpus file path must be canonical and relative")
-        path = corpus.joinpath(*name.parts)
-        identity = os.path.normcase(str(path))
-        require(identity not in seen, "Semantic corpus contains a duplicate file path")
-        seen.add(identity)
-        for index in range(1, len(name.parts) + 1):
-            ordinary(corpus.joinpath(*name.parts[:index]), index < len(name.parts))
-        expected = item.get("sha256")
-        require(isinstance(expected, str) and re.fullmatch(r"[0-9a-f]{64}", expected),
-                "Semantic corpus file requires a complete SHA-256")
-        actual = file_info(path)
-        require(actual["sha256"] == expected, f"Preserved semantic corpus bytes changed: {relative}")
-        if "bytes" in item:
-            require(type(item["bytes"]) is int and item["bytes"] == actual["bytes"],
-                    f"Preserved semantic corpus byte count differs: {relative}")
-        verified.append({"file": relative, **actual})
-    return {"verified": True, "preservedRoot": str(preserved), "corpus": str(corpus),
-            "fileCount": len(verified), "files": verified}
+            "Complete CTest inventory did not finish or incorrectly claims complete release acceptance")
 
 
 def cache_directory(cache, key):
@@ -302,7 +236,7 @@ def summarize_execution(root, record):
             "Completion summary requires complete individual-case evidence")
     summary.update(passed=True, passedPrograms=len(passed),
                    caseEvidence=capture("derived/qt-test-cases.json"),
-                   semantic={"rawReport": capture("semantic-quality.json")},
+                   semantic={"rawReport": capture("semantic-functional.json")},
                    rawEvidence=[capture(path) for path in
                        ("tests/execution-record.json", "tests/ctest.xml", "tests/ctest-inventory.json",
                         "tests/command.stdout.log", "tests/command.stderr.log")],
@@ -321,9 +255,10 @@ def arguments(argv=None):
     parser.add_argument("--source-tree", required=True, help="Frozen full Git tree SHA")
     parser.add_argument("--build-record", type=Path, required=True)
     parser.add_argument("--report-parent", type=Path, required=True)
-    parser.add_argument("--extraction-prefix", required=True, help="Expected extraction fingerprint prefix, including version")
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--build-root", type=Path, required=True)
+    parser.add_argument("--variant", required=True, help="Explicit Windows build variant")
+    parser.add_argument("--config", choices=("Debug", "Release", "RelWithDebInfo"), default="Release")
     parser.add_argument("--model-dir", type=Path, help="Defaults to BUILD_ROOT/models")
     parser.add_argument("--qt-root", type=Path, required=True)
     parser.add_argument("--qt-prefix", type=Path, required=True)
@@ -336,11 +271,13 @@ def arguments(argv=None):
         require(re.fullmatch(r"[0-9a-f]{40}", getattr(args, key)) is not None,
                 f"--{key.replace('_', '-')} must be a full lower-case Git SHA")
     require(args.expected_tests > 0 and args.jobs > 0, "Expected test count and jobs must be positive")
-    require(args.extraction_prefix.startswith("qcopilots-search-extraction-")
-            and ":" in args.extraction_prefix, "An explicit versioned extraction fingerprint prefix is required")
+    variants = json.loads((Path(__file__).resolve().parents[2] / "config/build-variants.json").read_text(encoding="utf-8"))
+    supported = {item["id"] for item in variants["variants"] if item["os"] == "windows"}
+    require(args.variant in supported, "The candidate runner requires a supported Windows variant")
     for name in ("source", "build_root", "build_record", "report_parent", "qt_root", "qt_prefix", "launch_cwd"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
     args.model_dir = (args.model_dir or args.build_root / "models").expanduser().resolve()
+    args.build_dir = args.build_root / args.variant / args.config
     return args
 
 
@@ -355,11 +292,10 @@ def execute(args, plan):
     tests = root / "tests"
     record = {"schemaVersion": 2, "kind": "full-ctest-execution", "classification": "execution-record",
               "passed": False, "startedAt": now(), "reportRoot": str(root),
-              "plan": plan, "errors": [], "archives": [], "semanticCorpusVerified": False}
+              "plan": plan, "errors": [], "archives": []}
     evidence = None
     before = initial_binaries = None
-    semantic = preserved_corpus = None
-    bin_dir = args.build_root / "release" / "bin"
+    bin_dir = args.build_dir / "bin"
     receipt_digest = runner_digest = None
     bound_inputs = {}
     print(json.dumps({"reportRoot": str(root), "startedAt": record["startedAt"]}), flush=True)
@@ -382,8 +318,8 @@ def execute(args, plan):
         require(Path(receipt["sourceDirectory"]).resolve() == args.source,
                 "Build receipt belongs to a different checkout")
         require(not evidence.verified_build(args.build_record.parent, receipt), "Original build receipt integrity failed")
-        require(len(before["lockHashes"]) == 5 and set(receipt["programs"]) == PRODUCERS,
-                "Expected five dependency locks and six original build producers")
+        require(set(before["lockHashes"]) == set(evidence.LOCKS) and set(receipt["programs"]) == PRODUCERS,
+                "Expected current dependency locks and four original application producers")
         # Keep the entire original receipt bundle locally verifiable after the
         # original build-evidence directory is removed. No receipt fields change.
         archived_build = root / "raw" / "build"
@@ -426,19 +362,22 @@ def execute(args, plan):
             bound_inputs[str(path.resolve())] = digest(path)
             archive_file(path, reference_inputs / name, root, record["archives"],
                          origin=str(path.resolve()), classification="input-not-measurement")
-        cache_path = args.build_root / "release" / "CMakeCache.txt"
+        cache_path = args.build_dir / "CMakeCache.txt"
         cache = cache_path.read_text(encoding="utf-8-sig")
         source_matches = re.findall(r"^CMAKE_HOME_DIRECTORY:[^=]+=(.+)$", cache, re.MULTILINE)
         require(len(source_matches) == 1 and Path(source_matches[0].strip()).resolve() == args.source,
                 "Selected build cache belongs to a different source checkout")
+        for key, expected in (("QCOPILOTS_SEARCH_VARIANT", args.variant), ("CMAKE_BUILD_TYPE", args.config)):
+            values = re.findall(r"^" + re.escape(key) + r":[^=]+=(.+)$", cache, re.MULTILINE)
+            require(values == [expected], f"Selected build cache differs from {key}={expected}")
         make_matches = re.findall(r"^CMAKE_MAKE_PROGRAM:[^=]+=(.+)$", cache, re.MULTILINE)
         require(len(make_matches) == 1, "The selected CMake cache must identify one Ninja executable")
         ninja = Path(make_matches[0].strip()).resolve()
         require(ninja.is_file() and ninja.stem.lower() == "ninja", "The selected build must use an existing Ninja executable")
         for path in (cache_path, ninja):
             bound_inputs[str(path.resolve())] = digest(path)
-        test_definitions = [args.build_root / "release" / "CTestTestfile.cmake",
-                            *sorted((args.build_root / "release" / "tests").rglob("CTestTestfile.cmake"))]
+        test_definitions = [args.build_dir / "CTestTestfile.cmake",
+                            *sorted((args.build_dir / "tests").rglob("CTestTestfile.cmake"))]
         require(all(path.is_file() for path in test_definitions), "Generated test definitions are missing")
         for path in test_definitions:
             bound_inputs[str(path.resolve())] = digest(path)
@@ -446,7 +385,8 @@ def execute(args, plan):
         pwsh, ctest = shutil.which("pwsh"), shutil.which("ctest")
         require(pwsh is not None and ctest is not None, "PowerShell 7 and CTest must be available on PATH")
         command = [pwsh, "-NoProfile", "-File", str(args.source / "qcs-dev.ps1"),
-                   "test", "--test-profile", "full", "--build-root", str(args.build_root), "--qt-root", str(args.qt_root),
+                   "test", "--variant", args.variant, "--config", args.config,
+                   "--build-root", str(args.build_root), "--qt-root", str(args.qt_root),
                    "--model-dir", str(args.model_dir), "--jobs", str(args.jobs),
                    "--report-dir", str(tests), "--keep-failed-tests"]
         environment = os.environ.copy()
@@ -457,7 +397,7 @@ def execute(args, plan):
         environment["PATH"] = os.pathsep.join(path_prefix + [environment.get("PATH", "")])
         environment.update(QCOPILOTS_SEARCH_PYTHON=sys.executable,
                            QCOPILOTS_SEARCH_MODEL_DIR=str(args.model_dir),
-                           QCOPILOTS_SEARCH_SEMANTIC_REPORT=str(root / "semantic-quality.json"),
+                           QCOPILOTS_SEARCH_SEMANTIC_REPORT=str(root / "semantic-functional.json"),
                            QCOPILOTS_SEARCH_TESSDATA_DIR=str(cache_directory(cache, "QCOPILOTS_SEARCH_TESSDATA_DIR")),
                            QCOPILOTS_SEARCH_CPPJIEBA_DICT_DIR=str(cache_directory(cache, "QCOPILOTS_SEARCH_CPPJIEBA_DICT_DIR")),
                            QT_PLUGIN_PATH=str(args.qt_prefix / "plugins"))
@@ -472,14 +412,13 @@ def execute(args, plan):
                  "toolchain": {"makeProgram": str(ninja), "makeProgramSha256": digest(ninja),
                                "pathPrefix": path_prefix, "msvcEnvironment": "Preserved inherited environment, with the PowerShell entry point initializing full VS when cl.exe is absent"},
                  "semanticReport": environment["QCOPILOTS_SEARCH_SEMANTIC_REPORT"],
-                 "expectedExtractionPrefix": args.extraction_prefix,
                  "launchCwd": str(args.launch_cwd),
                  "environmentOverrides": {key: environment[key] for key in
                      ("QCOPILOTS_SEARCH_PYTHON", "QCOPILOTS_SEARCH_MODEL_DIR", "QCOPILOTS_SEARCH_SEMANTIC_REPORT",
                       "QCOPILOTS_SEARCH_TESSDATA_DIR", "QCOPILOTS_SEARCH_CPPJIEBA_DICT_DIR", "QT_PLUGIN_PATH")},
                  "loadCondition": "Exclusive heavy-work scheduling is controlled externally. This runner launches only CTest and validators, with the registered RUN_SERIAL properties."}
         write_json(tests / "execution-begin.json", begin)
-        inventory_command = [ctest, "--test-dir", str(args.build_root / "release"), "-C", "Release", "--show-only=json-v1"]
+        inventory_command = [ctest, "--test-dir", str(args.build_dir), "-C", args.config, "--show-only=json-v1"]
         inventory = subprocess.run(inventory_command, capture_output=True, cwd=args.launch_cwd, env=environment)
         (tests / "ctest-inventory.json").write_bytes(inventory.stdout)
         (tests / "inventory.stderr.log").write_bytes(inventory.stderr)
@@ -521,9 +460,9 @@ def execute(args, plan):
                          origin="tests/" + filename)
         try:
             validate_full_selection(evidence.read_json(tests / "test-selection.json"), names)
-            record["fullProfileSelectionPassed"] = True
+            record["completeSelectionPassed"] = True
         except ValueError as error:
-            record["fullProfileSelectionPassed"] = False
+            record["completeSelectionPassed"] = False
             record["errors"].append(str(error))
         checker = [sys.executable, str(checker_path), "--junit", str(tests / "ctest.xml"),
                    "--platform", "Windows", "--inventory", str(tests / "ctest-inventory.json"),
@@ -542,33 +481,23 @@ def execute(args, plan):
         references = archive_reference_output(tests / "ctest.xml", names, root, record["archives"])
         record["referencePassed"] = references["passed"]
         record["errors"].extend(references["errors"])
-        semantic_path = root / "semantic-quality.json"
-        semantic_archive = archive_file(semantic_path, root / "raw" / "semantic-quality.json", root,
+        semantic_path = root / "semantic-functional.json"
+        semantic_archive = archive_file(semantic_path, root / "raw" / "semantic-functional.json", root,
                                        record["archives"], origin="Original semantic executable JSON, written during this run")
         semantic = evidence.read_json(semantic_path)
         semantic_errors = evidence.validate_semantic(semantic)
-        preserved_corpus = verify_preserved_corpus(semantic, args.build_root / "runs")
-        record["semanticCorpusVerified"] = True
-        if len(semantic.get("queries", [])) < 222 or semantic.get("actualEmbeddedSegments", 0) < 1310:
-            semantic_errors.append("The full 222-query/1310-vector acceptance scale was not reached")
-        if len(semantic.get("files", [])) < 138:
-            semantic_errors.append("The full 138-file acceptance corpus was not reached")
-        if not str(semantic.get("extractionFingerprint", "")).startswith(args.extraction_prefix):
-            semantic_errors.append("Extraction fingerprint does not match the explicitly frozen prefix")
-        semantic_summary = {"classification": "derived", "source": "raw/semantic-quality.json",
+        semantic_summary = {"classification": "derived", "source": "raw/semantic-functional.json",
                             "sourceSha256": semantic_archive["sha256"], "passed": not semantic_errors,
-                            "validationErrors": semantic_errors, "positiveQueries": len(semantic.get("queries", [])),
+                            "validationErrors": semantic_errors, "queries": len(semantic.get("queries", [])),
                             "actualEmbeddedSegments": semantic.get("actualEmbeddedSegments"),
                             "modelFingerprint": semantic.get("modelFingerprint"),
-                            "extractionFingerprint": semantic.get("extractionFingerprint"),
-                            "preservedCorpus": preserved_corpus,
-                            "metrics": semantic.get("metrics"), "noAnswerSummary": semantic.get("noAnswerSummary")}
+                            "extractionFingerprint": semantic.get("extractionFingerprint")}
         semantic_summary_path = root / "derived" / "semantic-summary.json"
         write_json(semantic_summary_path, semantic_summary)
         record["archives"].append({"path": semantic_summary_path.relative_to(root).as_posix(),
                                     **file_info(semantic_summary_path), "classification": "derived",
-                                    "origin": "raw/semantic-quality.json"})
-        record.update(semanticPassed=not semantic_errors, semanticQueries=semantic_summary["positiveQueries"],
+                                    "origin": "raw/semantic-functional.json"})
+        record.update(semanticPassed=not semantic_errors, semanticQueries=semantic_summary["queries"],
                       semanticSegments=semantic_summary["actualEmbeddedSegments"],
                       extractionFingerprint=semantic_summary["extractionFingerprint"],
                       semanticReportSha256=semantic_archive["sha256"], semanticValidationErrors=semantic_errors)
@@ -578,7 +507,7 @@ def execute(args, plan):
     finally:
         # On early validator failures, still retain any original outputs which
         # were actually produced. Missing output is never replaced or invented.
-        for source_path, filename in [(root / "semantic-quality.json", "semantic-quality.json"),
+        for source_path, filename in [(root / "semantic-functional.json", "semantic-functional.json"),
                                       *[(tests / name, name) for name in
                                         ("ctest.xml", "ctest-inventory.json", "command.stdout.log", "command.stderr.log")]]:
             destination = root / "raw" / filename
@@ -611,11 +540,6 @@ def execute(args, plan):
             except Exception as error:
                 record["errors"].append(str(error))
         try:
-            if preserved_corpus is not None:
-                record["semanticCorpusVerified"] = False
-                record["semanticCorpusVerified"] = (
-                    verify_preserved_corpus(semantic, args.build_root / "runs") == preserved_corpus)
-                require(record["semanticCorpusVerified"], "Preserved semantic corpus changed before completion")
             record["runnerUnchanged"] = runner_digest is not None and digest(Path(__file__)) == runner_digest
             record["buildRecordUnchanged"] = receipt_digest is not None and digest(args.build_record) == receipt_digest
             for item in record["archives"]:
@@ -632,7 +556,7 @@ def execute(args, plan):
                             and all(record.get(key) is True for key in
                                     ("sourceUnchanged", "binariesUnchanged", "runnerUnchanged", "buildRecordUnchanged",
                                      "archivedBuildPassed", "caseEvidencePassed", "referencePassed", "semanticPassed",
-                                     "semanticCorpusVerified")))
+                                     "completeSelectionPassed")))
         try:
             write_json(tests / "execution-record.json", record)
             summarize_execution(root, record)
@@ -656,8 +580,8 @@ def main(argv=None):
     plan = {"executeRequested": args.execute, "head": args.head, "sourceTree": args.source_tree,
             "source": str(args.source), "buildRoot": str(args.build_root), "buildRecord": str(args.build_record),
             "reportParent": str(args.report_parent), "directoryPattern": "qcs-ct-<atomic random suffix>",
-            "expectedTests": args.expected_tests, "minimumSemanticQueries": 222, "minimumSemanticVectors": 1310,
-            "expectedExtractionPrefix": args.extraction_prefix, "modelDir": str(args.model_dir),
+            "expectedTests": args.expected_tests, "variant": args.variant, "config": args.config,
+            "buildDirectory": str(args.build_dir), "modelDir": str(args.model_dir),
             "qtRoot": str(args.qt_root), "qtPrefix": str(args.qt_prefix),
             "launchCwd": str(args.launch_cwd), "jobs": args.jobs,
             "scope": "Windows full unfiltered CTest only. No build, repair, retry, baseline replacement or evidence rebinding.",

@@ -4,7 +4,7 @@
 # Reference fixtures and third-party inputs are verified byte for byte.
 tests/runtime/fixtures/** -text -whitespace
 tests/extraction/fixtures/** -text -whitespace
-tests/semantic/assets/** -text -whitespace
+tests/acceptance/fixtures/** -text -whitespace
 third_party/patches/*.patch text eol=lf -whitespace
 *.png -text
 *.jpg -text

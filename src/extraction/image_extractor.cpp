@@ -1,4 +1,5 @@
 #include "image_extractor.h"
+#include "core/file_formats.h"
 #include <QCoreApplication>
 #include <QColorSpace>
 #include <QDir>
@@ -9,7 +10,6 @@
 #include <QPdfDocument>
 #include <QPdfSelection>
 #include <QSaveFile>
-#include <QSet>
 #include <QStorageInfo>
 #include <QUuid>
 #include <memory>
@@ -25,11 +25,6 @@ namespace qcopilots_search {
 namespace {
 constexpr qint64 maximumPixels = 120'000'000;
 constexpr qint64 maximumCompressedImage = 256 * 1024 * 1024;
-const QSet<QString> rawFormats = {QStringLiteral("raw"), QStringLiteral("dng"), QStringLiteral("cr2"),
-    QStringLiteral("cr3"), QStringLiteral("nef"), QStringLiteral("nrw"), QStringLiteral("arw"),
-    QStringLiteral("sr2"), QStringLiteral("srf"), QStringLiteral("orf"), QStringLiteral("rw2"),
-    QStringLiteral("raf"), QStringLiteral("pef"), QStringLiteral("srw"), QStringLiteral("kdc"),
-    QStringLiteral("mrw"), QStringLiteral("erf"), QStringLiteral("mos"), QStringLiteral("iiq")};
 
 ExtractionResult failure(const ExtractionOptions &options, const QString &error)
 {
@@ -244,7 +239,7 @@ QImage decodeImage(const QString &path, QString *error, const ExtractionOptions 
     QImage image;
     if (suffix == QStringLiteral("heic") || suffix == QStringLiteral("heif") || suffix == QStringLiteral("avif"))
         image = decodeHeif(path, error, options, pixelLimit);
-    else if (rawFormats.contains(suffix)) image = decodeRaw(path, error, options, pixelLimit);
+    else if (file_formats::rawImageExtensions().contains(suffix)) image = decodeRaw(path, error, options, pixelLimit);
     else {
     QImageReader reader(path);
     reader.setAutoTransform(true);
@@ -265,11 +260,7 @@ QImage decodeImage(const QString &path, QString *error, const ExtractionOptions 
 
 bool supportsImage(const QString &suffix)
 {
-    static const QSet<QString> common = {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"),
-        QStringLiteral("webp"), QStringLiteral("bmp"), QStringLiteral("gif"), QStringLiteral("tif"),
-        QStringLiteral("tiff"), QStringLiteral("ico"), QStringLiteral("ppm"), QStringLiteral("pgm"),
-        QStringLiteral("pbm"), QStringLiteral("heic"), QStringLiteral("heif"), QStringLiteral("avif")};
-    return common.contains(suffix.toLower()) || rawFormats.contains(suffix.toLower());
+    return file_formats::isImage(suffix);
 }
 
 QImage loadPreviewImage(const QString &path, int maxPixels, QString *error, std::function<bool()> cancel)

@@ -1,5 +1,6 @@
 #include "core/model_files.h"
 #include "core/runtime_paths.h"
+#include "core/types.h"
 #include "service/service_client.h"
 
 #include <QCommandLineParser>
@@ -276,7 +277,7 @@ int main(int argc, char **argv)
         {{QStringLiteral("exclude")}, QStringLiteral("Excluded directory when indexing/configuring. Repeatable."), QStringLiteral("path")},
         {{QStringLiteral("code")}, QStringLiteral("Use the independent code space for search, roots and excludes")},
         {{QStringLiteral("keyword-only")}, QStringLiteral("Do not use the semantic query encoder")},
-        {{QStringLiteral("limit")}, QStringLiteral("Maximum search results (1..1000)"), QStringLiteral("count"), QStringLiteral("100")},
+        {{QStringLiteral("limit")}, QStringLiteral("Maximum search results (1..%1)").arg(maximumSearchResults), QStringLiteral("count"), QStringLiteral("100")},
         {{QStringLiteral("wait")}, QStringLiteral("Wait for indexing completion, bounded by --timeout")},
         {{QStringLiteral("file")}, QStringLiteral("Read config set JSON from a UTF-8 file"), QStringLiteral("path")},
         {{QStringLiteral("name")}, QStringLiteral("Locked artifact name for model file import"), QStringLiteral("name")},
@@ -334,9 +335,9 @@ int main(int argc, char **argv)
     if (command == QStringLiteral("search")) {
         bool validLimit = false;
         const int limit = parser.value(QStringLiteral("limit")).toInt(&validLimit);
-        if (arguments.isEmpty() || arguments.join(u' ').trimmed().isEmpty() || !validLimit || limit < 1 || limit > 1000
+        if (arguments.isEmpty() || arguments.join(u' ').trimmed().isEmpty() || !validLimit || limit < 1 || limit > maximumSearchResults
             || parser.values(QStringLiteral("root")).size() > 1)
-            return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("search requires a nonempty query, limit 1..1000 and at most one --root")), pretty);
+            return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("search requires a nonempty query, limit 1..%1 and at most one --root").arg(maximumSearchResults)), pretty);
         method = QStringLiteral("search");
         params = {{QStringLiteral("query"), arguments.join(u' ')}, {QStringLiteral("kind"), parser.value(QStringLiteral("kind"))},
                   {QStringLiteral("root"), parser.isSet(QStringLiteral("root")) ? QFileInfo(parser.value(QStringLiteral("root"))).absoluteFilePath() : QString()},

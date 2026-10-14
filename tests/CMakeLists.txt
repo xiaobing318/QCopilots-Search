@@ -44,7 +44,7 @@ if(NOT TARGET qcs-test-support)
   add_subdirectory(support)
 endif()
 
-foreach(_qcopilots_test_module core runtime extraction storage service processes gui acceptance semantic)
+foreach(_qcopilots_test_module core runtime extraction storage service processes gui semantic)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_qcopilots_test_module}/CMakeLists.txt")
     add_subdirectory("${_qcopilots_test_module}")
   endif()
@@ -91,24 +91,30 @@ set_tests_properties(qcs-tests-acceptance-native PROPERTIES LABELS "tooling;acce
 
 qcopilots_search_add_test(NAME qcs-tests-ci-evidence
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-ci-evidence.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-deb-ci
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-deb-ci.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-release-evidence
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-release-evidence.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-test-policy
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-policy-tests.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-check
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-check.py" -v)
-qcopilots_search_add_test(NAME qcs-tests-semantic-policy-evidence
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-semantic-policy-evidence-tests.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-artifact-selection
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-artifact-selection.py" -v)
-set_tests_properties(qcs-tests-ci-evidence qcs-tests-release-evidence qcs-tests-test-policy qcs-tests-check
-  qcs-tests-semantic-policy-evidence qcs-tests-artifact-selection
+set_tests_properties(qcs-tests-ci-evidence qcs-tests-deb-ci qcs-tests-release-evidence qcs-tests-test-policy qcs-tests-check
+  qcs-tests-artifact-selection
   PROPERTIES LABELS "unit;tooling;evidence" TIMEOUT 240)
 
 qcopilots_search_add_test(NAME qcs-tests-runner
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-runner-tests.py")
 qcopilots_search_add_test(NAME qcs-tests-path-budget
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-path-budget.py")
+qcopilots_search_add_test(NAME qcs-tests-windows-package
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-package-windows-tests.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-package-variants
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-package-variants.py")
+set_tests_properties(qcs-tests-windows-package qcs-tests-package-variants PROPERTIES
+  LABELS "unit;tooling;package" TIMEOUT 240)
 if(CMAKE_GENERATOR MATCHES "Ninja")
   set_property(TEST qcs-tests-path-budget APPEND PROPERTY ENVIRONMENT
     "QCOPILOTS_SEARCH_NINJA=${CMAKE_MAKE_PROGRAM}")

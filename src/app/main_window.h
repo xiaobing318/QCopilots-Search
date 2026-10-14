@@ -66,6 +66,7 @@ private:
     void handleFailure(const QString &id, const QString &code, const QString &message);
     void applySettings(const QJsonObject &json);
     void updateProgress(const QJsonObject &progress);
+    void updateRuntimeStatus();
     void showSettings(bool firstRun = false);
     void showModels();
     void openCurrent();
@@ -85,6 +86,8 @@ private:
     QListWidget *results_;
     PreviewPanel *preview_;
     QLabel *heading_, *subtitle_, *summary_, *error_, *progressText_, *capability_;
+    QLabel *runtimeStatus_;
+    QJsonObject runtime_;
     QPushButton *settingsButton_, *modelButton_, *indexButton_, *pauseButton_, *retryButton_, *quickButton_, *updateButton_;
     QPushButton *loadMore_, *refreshFiles_, *retryShortcut_;
     QProgressBar *progress_;

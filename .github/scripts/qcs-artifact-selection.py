@@ -21,7 +21,27 @@ import urllib.error
 import urllib.request
 
 
-PLATFORMS = ("windows-x64", "linux-x64", "macos-arm64", "macos-x64")
+def configurations():
+    path = Path(__file__).resolve().parents[2] / "config" / "build-variants.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 1:
+        raise ValueError("Unsupported build variant manifest")
+    variants = manifest.get("variants")
+    if not isinstance(variants, list) or not variants:
+        raise ValueError("Build variant manifest has no configurations")
+    identifiers = []
+    for variant in variants:
+        identifier = variant.get("id") if isinstance(variant, dict) else None
+        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", identifier):
+            raise ValueError("Build variant manifest contains an invalid configuration ID")
+        identifiers.append(identifier)
+    if len(identifiers) != len(set(identifiers)):
+        raise ValueError("Build variant manifest contains duplicate configuration IDs")
+    return tuple(identifiers)
+
+
+CONFIGURATIONS = configurations()
+PLATFORMS = CONFIGURATIONS
 API_ROOT = "https://api.github.com"
 PAGE_SIZE = 100
 MAX_PAGES = 100
@@ -49,15 +69,13 @@ def timestamp(value, label):
     return result
 
 
-def arguments(repository, run_id, candidate_head, profile, attempt):
+def arguments(repository, run_id, candidate_head, attempt):
     if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("Repository must be OWNER/REPO")
     if not isinstance(run_id, str) or not re.fullmatch(r"[1-9][0-9]*", run_id):
         raise ValueError("Workflow run ID must be a positive decimal string")
     if not isinstance(candidate_head, str) or not SHA.fullmatch(candidate_head):
         raise ValueError("Candidate head must be a complete lowercase Git SHA")
-    if profile not in ("fast", "full"):
-        raise ValueError("Test profile must be fast or full")
     integer(attempt, "Aggregate attempt")
 
 
@@ -150,17 +168,16 @@ def original_execution(observed, history):
     return source
 
 
-def artifact_name(platform, head, profile, attempt):
-    prefix = "fast" if profile == "fast" else "native"
-    return f"qcs-{prefix}-{platform}-{head}-attempt{attempt}"
+def artifact_name(variant, head, attempt):
+    return f"qcs-packages-{variant}-{head}-attempt{attempt}"
 
 
-def select(repository, run_id, head, profile, attempt, jobs, artifacts):
+def select(repository, run_id, head, attempt, jobs, artifacts):
     """Pure deterministic selection, suitable for revalidation without network."""
-    arguments(repository, run_id, head, profile, attempt)
-    result = {"schemaVersion": 1, "kind": "ci-artifact-selection", "repository": repository,
+    arguments(repository, run_id, head, attempt)
+    result = {"schemaVersion": 2, "kind": "ci-artifact-selection", "repository": repository,
               "runId": run_id, "aggregateAttempt": attempt, "candidateHead": head,
-              "testProfile": profile, "passed": False, "errors": [], "selected": {}, "excluded": []}
+              "passed": False, "errors": [], "selected": {}, "excluded": []}
     errors = result["errors"]
     try:
         for label, rows in (("Jobs", jobs), ("Artifacts", artifacts)):
@@ -173,9 +190,9 @@ def select(repository, run_id, head, profile, attempt, jobs, artifacts):
             integer(job.get("run_attempt"), "Job run_attempt")
             if str(job.get("run_id")) != run_id or job.get("head_sha") != head:
                 raise ValueError("Job inventory belongs to another workflow run or candidate")
-            if job.get("name") in {"qcs " + platform for platform in PLATFORMS} and job["run_attempt"] > attempt:
+            if job.get("name") in {"qcs " + platform for platform in CONFIGURATIONS} and job["run_attempt"] > attempt:
                 raise ValueError("Native execution history is newer than the requested aggregate attempt")
-        for platform in PLATFORMS:
+        for platform in CONFIGURATIONS:
             try:
                 history = [job for job in jobs if job.get("name") == "qcs " + platform
                            and job["run_attempt"] <= attempt]
@@ -183,7 +200,7 @@ def select(repository, run_id, head, profile, attempt, jobs, artifacts):
                     raise ValueError("No native job exists for the requested run and attempt")
                 attempts = [job["run_attempt"] for job in history]
                 if len(attempts) != len(set(attempts)):
-                    raise ValueError("Native job history is ambiguous within a platform attempt")
+                    raise ValueError("Native job history is ambiguous within a configuration attempt")
                 current = [job for job in history if job["run_attempt"] == attempt]
                 if len(current) != 1:
                     raise ValueError("Current aggregate attempt needs exactly one native job observation")
@@ -196,7 +213,7 @@ def select(repository, run_id, head, profile, attempt, jobs, artifacts):
                         later_source = original_execution(later, history)
                         if later_source["id"] != source["id"]:
                             raise ValueError("Current observation bypasses a newer actual execution. Earlier artifacts cannot replace it")
-                name = artifact_name(platform, head, profile, source["run_attempt"])
+                name = artifact_name(platform, head, source["run_attempt"])
                 matches = [item for item in artifacts if item.get("name") == name]
                 if len(matches) != 1:
                     raise ValueError("The original execution needs exactly one artifact named " + name)
@@ -223,7 +240,7 @@ def select(repository, run_id, head, profile, attempt, jobs, artifacts):
                               for item in sorted(artifacts, key=lambda item: item["id"]) if item["id"] not in selected_ids]
     except (ValueError, TypeError, KeyError) as error:
         errors.append(str(error))
-    result["passed"] = not errors and set(result["selected"]) == set(PLATFORMS)
+    result["passed"] = not errors and set(result["selected"]) == set(CONFIGURATIONS)
     return result
 
 
@@ -279,18 +296,18 @@ def snapshot_file(parent, relative):
     return candidate
 
 
-def load_selection(selection_path, expected_head=None, expected_profile=None, expected_run=None):
+def load_selection(selection_path, expected_head=None, expected_run=None):
     selection_path = Path(selection_path)
     try:
         if selection_path.stat().st_size > MAX_PAGE_BYTES:
             raise ValueError("Selection JSON is too large")
         document = read_json_bytes(selection_path.read_bytes())
-        if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 1 or document.get("kind") != "ci-artifact-selection":
+        if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 2 or document.get("kind") != "ci-artifact-selection":
             raise ValueError("Unsupported artifact selection document")
-        repository, run_id, head, profile, attempt = (document[key] for key in
-            ("repository", "runId", "candidateHead", "testProfile", "aggregateAttempt"))
-        arguments(repository, run_id, head, profile, attempt)
-        for actual, expected, label in ((head, expected_head, "candidate"), (profile, expected_profile, "profile"),
+        repository, run_id, head, attempt = (document[key] for key in
+            ("repository", "runId", "candidateHead", "aggregateAttempt"))
+        arguments(repository, run_id, head, attempt)
+        for actual, expected, label in ((head, expected_head, "candidate"),
                                         (run_id, expected_run, "run")):
             if expected is not None and actual != expected:
                 raise ValueError(f"Artifact selection {label} differs from the requested identity")
@@ -318,7 +335,7 @@ def load_selection(selection_path, expected_head=None, expected_profile=None, ex
                     or hashlib.sha256(data).hexdigest() != entry["sha256"]):
                 raise ValueError("API snapshot bytes or SHA-256 changed: " + relative)
             pages[kind].append(read_json_bytes(data))
-        recomputed = select(repository, run_id, head, profile, attempt,
+        recomputed = select(repository, run_id, head, attempt,
                             unpack_pages(pages["jobs"], "jobs"), unpack_pages(pages["artifacts"], "artifacts"))
         if canonical({key: document.get(key) for key in recomputed}) != canonical(recomputed):
             raise ValueError("Artifact selection differs from the preserved API execution history")
@@ -355,7 +372,7 @@ def fetch_page(url, token):
 
 
 def collect(args):
-    arguments(args.repository, args.run_id, args.candidate_head, args.profile, args.attempt)
+    arguments(args.repository, args.run_id, args.candidate_head, args.attempt)
     output = args.output_dir.expanduser().resolve()
     source = Path(__file__).resolve().parents[2]
     if output == source or source in output.parents:
@@ -391,11 +408,11 @@ def collect(args):
                         raise ValueError("GitHub inventory exceeds the supported page budget")
                 page += 1
             unpack_pages(pages[kind], kind)
-        document = select(args.repository, args.run_id, args.candidate_head, args.profile, args.attempt,
+        document = select(args.repository, args.run_id, args.candidate_head, args.attempt,
                           unpack_pages(pages["jobs"], "jobs"), unpack_pages(pages["artifacts"], "artifacts"))
     except (ValueError, TypeError, KeyError, OSError) as error:
         failures.append(str(error))
-        document = select(args.repository, args.run_id, args.candidate_head, args.profile, args.attempt, [], [])
+        document = select(args.repository, args.run_id, args.candidate_head, args.attempt, [], [])
         document["errors"] = failures + document["errors"]
         document["passed"] = False
     document.update(files=files, collectionErrors=failures)
@@ -403,10 +420,10 @@ def collect(args):
     path.write_text(json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     if not document["passed"]:
         raise ValueError("Artifact selection failed. Preserved report: " + str(path))
-    load_selection(path, args.candidate_head, args.profile, args.run_id)
+    load_selection(path, args.candidate_head, args.run_id)
     if os.environ.get("GITHUB_OUTPUT"):
         with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
-            ids = ",".join(str(document["selected"][platform]["artifactId"]) for platform in PLATFORMS)
+            ids = ",".join(str(document["selected"][platform]["artifactId"]) for platform in CONFIGURATIONS)
             stream.write("artifact_ids=" + ids + "\n")
     return path
 
@@ -418,7 +435,6 @@ def main():
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--candidate-head", required=True)
-    parser.add_argument("--profile", required=True, choices=("fast", "full"))
     parser.add_argument("--attempt", required=True, type=int)
     args = parser.parse_args()
     try:

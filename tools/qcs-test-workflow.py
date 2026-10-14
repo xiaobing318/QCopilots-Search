@@ -21,6 +21,8 @@ SCRIPT = Path(__file__).resolve().with_name("qcs-dev.py")
 spec = importlib.util.spec_from_file_location("qcopilots_search_dev", SCRIPT)
 workflow = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(workflow)
+DEFAULT_VARIANT = {"Windows": "windows-x64-cpu", "Linux": "linux-x64-cpu",
+                   "Darwin": "macos-arm64-metal"}[workflow.platform.system()]
 package_spec = importlib.util.spec_from_file_location("qcopilots_search_verify_package", SCRIPT.with_name("qcs-verify-package.py"))
 package_verifier = importlib.util.module_from_spec(package_spec)
 package_spec.loader.exec_module(package_verifier)
@@ -32,6 +34,11 @@ response_spec.loader.exec_module(msvc_response)
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
+        # Workflow contracts use a native CPU/Metal fixture even inside a GPU
+        # job, so they cannot accidentally inherit another variant's SDK setup.
+        self.environment = patch.dict(os.environ, {"QCOPILOTS_SEARCH_VARIANT": DEFAULT_VARIANT})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
         configured = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
         if configured:
             Path(configured).mkdir(parents=True, exist_ok=True)
@@ -45,6 +52,21 @@ class WorkflowTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, arguments)], cwd=self.root,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                               encoding="utf-8", errors="replace", timeout=30)
+
+    def copy_workflow_fixture(self, checkout):
+        tools = checkout / "tools"
+        tools.mkdir(parents=True)
+        for name in (SCRIPT.name, "qcs-test-policy.py", "qcs-path-budget.py"):
+            shutil.copy2(SCRIPT.with_name(name), tools / name)
+        evidence_scripts = checkout / ".github/scripts"
+        evidence_scripts.mkdir(parents=True)
+        shutil.copy2(workflow.SOURCE / ".github/scripts/qcs-ctest-evidence.py",
+                     evidence_scripts / "qcs-ctest-evidence.py")
+        configuration = checkout / "config"
+        configuration.mkdir()
+        shutil.copy2(workflow.SOURCE / "config/build-variants.json",
+                     configuration / "build-variants.json")
+        return tools
 
     def test_empty_temporary_root_never_uses_working_directory(self):
         fixtures = [("qcs-test-workflow.py", "WorkflowTests"),
@@ -84,9 +106,9 @@ finally:
 
     def test_empty_developer_path_environment_uses_defaults(self):
         empty = {name: "" for name in ("QCOPILOTS_SEARCH_BUILD_ROOT", "QCOPILOTS_SEARCH_QT_ROOT",
-                                      "QCOPILOTS_SEARCH_MODEL_DIR")}
+                                      "QCOPILOTS_SEARCH_MODEL_DIR", "QCOPILOTS_SEARCH_VARIANT")}
         expected = (workflow.SOURCE.parent.parent /
-                    (workflow.SOURCE.parent.name + "-compilations") / "qcs").resolve()
+                    (workflow.SOURCE.parent.name + "-compilations") / "qcs" / DEFAULT_VARIANT).resolve()
         # Exercise the real argparse/default handling, then stop before root
         # initialization so this regression never modifies a developer build.
         with patch.dict(os.environ, empty), patch.object(sys, "argv", [str(SCRIPT), "doctor"]), \
@@ -95,7 +117,7 @@ finally:
             with self.assertRaisesRegex(RuntimeError, "captured defaults"):
                 workflow.main()
         initialize.assert_called_once_with(expected)
-        protect.assert_called_once_with(expected, None, None)
+        protect.assert_called_once_with(expected, None, expected.parent / "models", None)
 
     def test_source_tree_and_descendant_rejected(self):
         for path in (workflow.SOURCE, workflow.SOURCE / "nested output"):
@@ -149,10 +171,84 @@ finally:
         os.utime(stale, (1, 1))
         output = io.StringIO()
         with contextlib.redirect_stderr(output):
-            workflow.report_package_errors(self.root, time.time())
+            workflow.report_package_errors(self.root / "pkg", time.time())
         self.assertIn("LicenseData: unable to open 中文路径", output.getvalue())
         self.assertNotIn("stale package failure", output.getvalue())
         self.assertTrue(current.is_file())
+
+    def test_package_generators_publish_only_current_candidate_and_remove_owned_stage(self):
+        build, packages = self.root / "Release", self.root / "pkg/Release"
+        build.mkdir()
+        packages.mkdir(parents=True)
+        (build / "CPackConfig.cmake").write_text('set(CPACK_PACKAGE_FILE_NAME "qcs-current")\n', encoding="utf-8")
+        historical = packages / "_CPack_Packages/old/payload.bin"
+        historical.parent.mkdir(parents=True)
+        historical.write_bytes(b"historic payload")
+        old = packages / "qcs-old.zip"
+        old.write_bytes(b"old package")
+        stages = []
+        for generator, suffix in (("ZIP", ".zip"), ("TGZ", ".tar.gz"), ("DEB", ".deb"), ("DragNDrop", ".dmg")):
+            with self.subTest(generator=generator):
+                def generate(command, **options):
+                    stage = command[command.index("-B") + 1]
+                    stages.append(stage)
+                    self.assertEqual(stage.parent, packages)
+                    self.assertEqual(command[command.index("-G") + 1], generator)
+                    self.assertEqual(options["cwd"], self.root)
+                    self.assertEqual(options["env"], {"PACKAGE_TEST": "1"})
+                    (stage / ("qcs-current" + suffix)).write_bytes(generator.encode())
+                    (stage / "unexpected-artifact.txt").write_bytes(b"must not publish")
+                    payload = stage / "_CPack_Packages/payload"
+                    payload.mkdir(parents=True)
+                    (payload / "readonly.bin").write_bytes(b"temporary")
+                    (payload / "readonly.bin").chmod(0o444)
+                with patch.object(workflow, "run", side_effect=generate):
+                    result = workflow.package_generator(self.root, build, "Release", generator, {"PACKAGE_TEST": "1"})
+                self.assertEqual(result, packages / ("qcs-current" + suffix))
+                self.assertEqual(result.read_bytes(), generator.encode())
+                self.assertFalse(stages[-1].exists())
+                self.assertFalse((packages / "unexpected-artifact.txt").exists())
+        self.assertEqual(len(set(stages)), 4)
+        self.assertEqual(historical.read_bytes(), b"historic payload")
+        self.assertEqual(old.read_bytes(), b"old package")
+
+    def test_failed_generator_preserves_existing_package_and_prints_diagnostic_before_cleanup(self):
+        import contextlib
+        import io
+        build, packages = self.root / "Release", self.root / "pkg/Release"
+        build.mkdir()
+        packages.mkdir(parents=True)
+        (build / "CPackConfig.cmake").write_text('set(CPACK_PACKAGE_FILE_NAME "qcs-current")\n', encoding="utf-8")
+        existing = packages / "qcs-current.zip"
+        existing.write_bytes(b"previous complete package")
+        stages = []
+        def fail(command, **options):
+            stage = command[command.index("-B") + 1]
+            stages.append(stage)
+            (stage / "qcs-current.zip").write_bytes(b"incomplete package")
+            log = stage / "_CPack_Packages/ZIP/CPackError.log"
+            log.parent.mkdir(parents=True)
+            log.write_text("native generator failed after staging", encoding="utf-8")
+            raise subprocess.CalledProcessError(1, command)
+        output = io.StringIO()
+        with patch.object(workflow, "run", side_effect=fail), contextlib.redirect_stderr(output), \
+                self.assertRaises(subprocess.CalledProcessError):
+            workflow.package_generator(self.root, build, "Release", "ZIP", {})
+        self.assertIn("native generator failed after staging", output.getvalue())
+        self.assertEqual(existing.read_bytes(), b"previous complete package")
+        self.assertFalse(stages[0].exists())
+
+    def test_generator_rejects_wrong_candidate_filename_without_publishing(self):
+        build, packages = self.root / "Release", self.root / "pkg/Release"
+        build.mkdir()
+        packages.mkdir(parents=True)
+        (build / "CPackConfig.cmake").write_text('set(CPACK_PACKAGE_FILE_NAME "qcs-current")\n', encoding="utf-8")
+        def wrong_candidate(command, **options):
+            (command[command.index("-B") + 1] / "qcs-other.zip").write_bytes(b"wrong candidate")
+        with patch.object(workflow, "run", side_effect=wrong_candidate), \
+                self.assertRaisesRegex(RuntimeError, "current candidate package"):
+            workflow.package_generator(self.root, build, "Release", "ZIP", {})
+        self.assertEqual(list(packages.iterdir()), [])
 
     def test_cpack_matches_full_install_before_final_bundle_hook(self):
         import zipfile
@@ -191,16 +287,19 @@ set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
 set(CPACK_PROJECT_CONFIG_FILE "''' + packaging.as_posix() + '''")
 include(CPack)
 ''', encoding="utf-8")
-        build, stage = self.root / "package build", self.root / "package stage"
+        build, stage = self.root / "Release", self.root / "package stage"
         for command in (["cmake", "-S", str(project), "-B", str(build), "-G", "Ninja"],
-                        ["cmake", "--install", str(build), "--prefix", str(stage)],
-                        ["cpack", "--config", str(build / "CPackConfig.cmake"), "-G", "ZIP"]):
+                        ["cmake", "--install", str(build), "--prefix", str(stage)]):
             result = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((stage / "qcs-gui.app/Contents/Resources/final-hook.txt").is_file())
         self.assertFalse(list(stage.rglob("*.cmake")))
-        with zipfile.ZipFile(self.root / "qcs-layout.zip") as archive:
+        packages = self.root / "pkg/Release"
+        packages.mkdir(parents=True)
+        package = workflow.package_generator(self.root, build, "Release", "ZIP", os.environ.copy())
+        self.assertEqual(list(packages.iterdir()), [package])
+        with zipfile.ZipFile(package) as archive:
             names = archive.namelist()
             for suffix in ("MacOS/application.txt", "Resources/runtime.txt", "Resources/final-hook.txt"):
                 self.assertEqual(len([name for name in names if name.endswith(suffix)]), 1)
@@ -300,7 +399,7 @@ include(CPack)
         self.assertEqual(result, {"commit": head, "workingTreeModified": False,
                                   "sourceIdentityStatus": "git-checkout"})
 
-    def test_package_identity_ignores_pr_merge_sha_and_accepts_phase1_head(self):
+    def test_package_identity_ignores_pr_merge_sha_and_accepts_candidate_head(self):
         source, head = self.package_git_fixture()
         result = package_verifier.package_source_identity(source, {"GITHUB_SHA": "b" * 40,
             "QCOPILOTS_SEARCH_CANDIDATE_HEAD": head, "QCOPILOTS_SEARCH_SOURCE_COMMIT": head})
@@ -556,20 +655,23 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         for partial in (False, True):
             with self.subTest(partial=partial):
                 models = self.root / "模型 cache"
+                package = self.root / "distribution.zip"
                 arguments = [str(SCRIPT), "verify-package", "--build-root", str(self.root / "output"),
-                             "--model-dir", str(models), *(["--keyword-only"] if partial else [])]
+                             "--model-dir", str(models), "--package-file", str(package),
+                             *(["--keyword-only"] if partial else [])]
                 with patch.object(sys, "argv", arguments), patch.object(workflow, "run") as run:
                     workflow.main()
                 command = list(map(str, run.call_args.args[0]))
                 self.assertEqual("--keyword-only" in command, partial)
                 self.assertEqual("--model-dir" in command, not partial)
+                self.assertEqual(command[command.index("--package-file") + 1], str(package.resolve()))
                 if not partial:
                     self.assertEqual(command[command.index("--model-dir") + 1], str(models.resolve()))
 
     def development_ocr_fixture(self, config="Release"):
-        root = self.root / ("开发 output " + config)
+        root = self.root / ("开发 output " + config) / DEFAULT_VARIANT
         workflow.initialize_root(root)
-        build = root / config.lower()
+        build = root / config
         build.mkdir()
         data = self.root / ("custom OCR 缓存 " + config)
         data.mkdir()
@@ -586,16 +688,21 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         for config in ("Release", "Debug"):
             with self.subTest(config=config):
                 build, data, cache = self.development_ocr_fixture(config)
-                arguments = [str(SCRIPT), "run", "--build-root", str(build.parent),
+                arguments = [str(SCRIPT), "run", "--build-root", str(build.parent.parent),
                              "--qt-root", str(self.root / "SDK"), "--config", config]
                 with patch.object(sys, "argv", arguments), patch.object(workflow, "run") as run, \
                         patch.dict(os.environ, {"QCOPILOTS_SEARCH_TESSDATA_DIR": "stale other checkout"}):
                     workflow.main()
                     self.assertEqual(os.environ["QCOPILOTS_SEARCH_TESSDATA_DIR"], "stale other checkout")
-                run.assert_called_once()
+                gpu = workflow.build_variant(DEFAULT_VARIANT)["backend"] != "cpu"
+                self.assertEqual(run.call_count, 2 if gpu else 1)
                 command = list(map(str, run.call_args.args[0]))
-                self.assertEqual(Path(command[0]).parent, build / "bin")
+                runtime_root = build.parent / "stage" / config if gpu else build
+                self.assertEqual(Path(command[0]).parent, runtime_root / "bin")
                 self.assertEqual(Path(command[0]).stem, "qcs-gui")
+                if gpu:
+                    self.assertEqual(run.call_args_list[0].args[0],
+                                     ["cmake", "--install", build, "--config", config, "--prefix", runtime_root])
                 self.assertEqual(run.call_args.kwargs["env"]["QCOPILOTS_SEARCH_TESSDATA_DIR"], str(data.resolve()))
                 self.assertEqual(run.call_args.kwargs["cwd"], build.parent)
 
@@ -622,7 +729,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
             "duplicate source": original + "CMAKE_HOME_DIRECTORY:PATH=" + workflow.SOURCE.as_posix() + "\n",
             "duplicate build": original + "CMAKE_CACHEFILE_DIR:PATH=" + build.as_posix() + "\n",
         }
-        arguments = [str(SCRIPT), "run", "--build-root", str(build.parent), "--qt-root", str(self.root / "SDK")]
+        arguments = [str(SCRIPT), "run", "--build-root", str(build.parent.parent), "--qt-root", str(self.root / "SDK")]
         for scenario, content in changes.items():
             with self.subTest(scenario=scenario):
                 cache.write_text(content, encoding="utf-8")
@@ -642,7 +749,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
 
     def test_development_run_requires_all_three_nonempty_language_files(self):
         build, data, cache = self.development_ocr_fixture()
-        arguments = [str(SCRIPT), "run", "--build-root", str(build.parent), "--qt-root", str(self.root / "SDK")]
+        arguments = [str(SCRIPT), "run", "--build-root", str(build.parent.parent), "--qt-root", str(self.root / "SDK")]
         for language in ("eng", "chi_sim", "chi_tra"):
             path = data / (language + ".traineddata")
             for condition in ("missing", "empty", "directory"):
@@ -663,7 +770,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
     def test_development_ocr_environment_does_not_leak_into_install(self):
         build, data, cache = self.development_ocr_fixture()
         environment = {"PATH": "unchanged", "QCOPILOTS_SEARCH_TESSDATA_DIR": "inherited"}
-        args = argparse.Namespace(config="Release", program_arg=[])
+        args = argparse.Namespace(config="Release", variant=DEFAULT_VARIANT, program_arg=[])
         paths = (build.parent, build, build.parent / "stage", build.parent / "reports",
                  self.root / "SDK", self.root / "SDK/kit")
         with patch.object(workflow, "run") as run:
@@ -892,72 +999,84 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         self.assertIn("--build-root", result.stdout)
 
     def test_clean_preserves_unowned_directory(self):
-        build = self.root / "build 中文 空间"
-        release = build / "release"
+        build = self.root / "build 中文 空间" / DEFAULT_VARIANT
+        release = build / "Release"
         release.mkdir(parents=True)
         sentinel = release / "user-data.txt"
         sentinel.write_text("preserve", encoding="utf-8")
-        result = self.invoke("clean", "--build-root", build)
+        result = self.invoke("clean", "--build-root", build.parent)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
 
     def test_clean_removes_only_owned_configuration(self):
-        build = self.root / "owned output"
+        build = self.root / "owned output" / DEFAULT_VARIANT
         workflow.initialize_root(build)
-        release = build / "release"
+        release = build / "Release"
         release.mkdir(parents=True)
         (release / "CMakeCache.txt").write_text("CMAKE_HOME_DIRECTORY:INTERNAL=" + workflow.SOURCE.as_posix() + "\n", encoding="utf-8")
+        debug = build / "Debug"
+        debug.mkdir()
+        (debug / "CMakeCache.txt").write_text("CMAKE_HOME_DIRECTORY:INTERNAL=" + workflow.SOURCE.as_posix() + "\n", encoding="utf-8")
         preserved = build / "development-profile"
         preserved.mkdir()
-        result = self.invoke("clean", "--build-root", build)
+        sibling = build.parent / "another-variant" / "Release"
+        sibling.mkdir(parents=True)
+        (sibling / "sentinel").write_text("preserve sibling", encoding="utf-8")
+        result = self.invoke("clean", "--build-root", build.parent)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(release.exists())
+        self.assertTrue((debug / "CMakeCache.txt").is_file())
         self.assertTrue(preserved.is_dir())
+        self.assertEqual((sibling / "sentinel").read_text(encoding="utf-8"), "preserve sibling")
 
     def test_generated_clean_dry_run_and_preserved_data(self):
-        build = self.root / "owned 生成目录"
+        build = self.root / "owned 生成目录" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         for name in ("deps", "runs", "stage", "pkg", "reports", "bootstrap", "models", "sdk", "development-profile"):
             (build / name).mkdir()
             (build / name / "sentinel").write_text(name, encoding="utf-8")
-        result = self.invoke("clean", "--build-root", build, "--scope", "generated", "--dry-run")
+        sibling = build.parent / "another-variant"
+        sibling.mkdir()
+        (sibling / "sentinel").write_text("preserve sibling", encoding="utf-8")
+        result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["removed"], [])
         self.assertTrue((build / "deps/sentinel").is_file())
-        result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+        result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
         self.assertEqual(result.returncode, 0, result.stderr)
         for name in ("deps", "runs", "stage", "pkg", "reports", "bootstrap"):
             self.assertFalse((build / name).exists())
         for name in ("models", "sdk", "development-profile"):
             self.assertEqual((build / name / "sentinel").read_text(encoding="utf-8"), name)
-        repeated = self.invoke("clean", "--build-root", build, "--scope", "generated")
+        self.assertEqual((sibling / "sentinel").read_text(encoding="utf-8"), "preserve sibling")
+        repeated = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertEqual(json.loads(repeated.stdout)["targets"], [])
 
     def test_generated_clean_rejects_unknown_before_any_deletion(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         (build / "deps").mkdir()
         (build / "unknown user data").mkdir()
-        result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+        result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unknown root entries", result.stderr)
         self.assertTrue((build / "deps").is_dir())
 
     def test_clean_never_adopts_unmarked_root_and_dry_run_creates_nothing(self):
-        build = self.root / "unmarked"
-        build.mkdir()
+        build = self.root / "unmarked" / DEFAULT_VARIANT
+        build.mkdir(parents=True)
         (build / "reports").mkdir()
-        result = self.invoke("clean", "--build-root", build, "--scope", "generated", "--dry-run")
+        result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated", "--dry-run")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((build / workflow.MARKER).exists())
-        missing = self.root / "missing"
-        result = self.invoke("clean", "--build-root", missing, "--dry-run")
+        missing = self.root / "missing" / DEFAULT_VARIANT
+        result = self.invoke("clean", "--build-root", missing.parent, "--dry-run")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(missing.exists())
 
     def test_clean_reports_permission_failure(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         (build / "deps").mkdir()
         with patch.object(workflow.shutil, "rmtree", side_effect=PermissionError("busy fixture")):
@@ -966,7 +1085,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         self.assertTrue((build / "deps").is_dir())
 
     def test_clean_rejects_reparse_entry_before_deletion(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         (build / "deps").mkdir()
         child = build / "deps/redirect"
@@ -986,7 +1105,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
             raise
 
     def test_clean_unlinks_internal_framework_and_versioned_library_links(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         owner_bytes = (build / workflow.MARKER).read_bytes()
         stage = build / "stage"
@@ -1005,14 +1124,14 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         (preserved / "sentinel").write_text("preserve", encoding="utf-8")
         self.make_symlink(stage / "model-reference", "../models", directory=True)
         self.make_symlink(stage / "dangling-internal", "lib/already-removed.so")
-        result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+        result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(stage.exists())
         self.assertEqual((preserved / "sentinel").read_text(encoding="utf-8"), "preserve")
         self.assertEqual((build / workflow.MARKER).read_bytes(), owner_bytes)
 
     def test_clean_rejects_external_symlink_without_deleting_any_target(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         stage = build / "stage"
         stage.mkdir()
@@ -1020,27 +1139,27 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         external.mkdir()
         (external / "sentinel").write_text("preserve", encoding="utf-8")
         self.make_symlink(stage / "external", external, directory=True)
-        result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+        result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("external generated symlink", result.stderr)
         self.assertTrue(stage.is_dir())
         self.assertEqual((external / "sentinel").read_text(encoding="utf-8"), "preserve")
 
     def test_clean_rejects_linked_top_level_target(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         preserved = build / "models"
         preserved.mkdir()
         (preserved / "sentinel").write_text("preserve", encoding="utf-8")
         self.make_symlink(build / "stage", "models", directory=True)
-        result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+        result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("linked or reparse clean target", result.stderr)
         self.assertEqual((preserved / "sentinel").read_text(encoding="utf-8"), "preserve")
 
     @unittest.skipUnless(os.name == "nt", "Windows junction semantics require Windows")
     def test_clean_rejects_windows_junction_inside_generated_tree(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         stage = build / "stage"
         stage.mkdir()
@@ -1059,7 +1178,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                                  env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
         try:
-            result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+            result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("reparse generated entry", result.stderr)
             self.assertEqual((preserved / "sentinel").read_text(encoding="utf-8"), "preserve")
@@ -1068,8 +1187,8 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                 junction.rmdir()
 
     def test_initialize_rejects_unknown_content_and_source_ancestor(self):
-        build = self.root / "unknown"
-        build.mkdir()
+        build = self.root / "unknown" / DEFAULT_VARIANT
+        build.mkdir(parents=True)
         (build / "sentinel").write_text("preserve", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "Unowned nonempty"):
             workflow.initialize_root(build)
@@ -1078,8 +1197,8 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
             workflow.assert_external(workflow.SOURCE.parent)
 
     def test_clean_rejects_malformed_markers(self):
-        build = self.root / "owned"
-        build.mkdir()
+        build = self.root / "owned" / DEFAULT_VARIANT
+        build.mkdir(parents=True)
         (build / "deps").mkdir()
         values = [{}, {"source": "", "schemaVersion": 1},
                   {"source": ".", "schemaVersion": 1},
@@ -1087,7 +1206,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         for owner in values:
             with self.subTest(owner=owner):
                 (build / workflow.MARKER).write_text(json.dumps(owner), encoding="utf-8")
-                result = subprocess.run([sys.executable, str(SCRIPT), "clean", "--build-root", str(build),
+                result = subprocess.run([sys.executable, str(SCRIPT), "clean", "--build-root", str(build.parent),
                                          "--scope", "generated"], cwd=workflow.SOURCE,
                                         capture_output=True, text=True, encoding="utf-8", timeout=30)
                 self.assertNotEqual(result.returncode, 0)
@@ -1095,34 +1214,34 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                 self.assertTrue((build / "deps").is_dir())
 
     def test_protected_inputs_reject_cleanable_descendants(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         for option in ("--model-dir", "--qt-root"):
-            result = self.invoke("clean", "--build-root", build, "--scope", "generated",
+            result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated",
                                  option, build / "deps/input")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("cannot be placed in a cleanable", result.stderr)
         for variable in ("QCOPILOTS_SEARCH_MODEL_DIR", "QCOPILOTS_SEARCH_QT_ROOT"):
             with patch.dict(os.environ, {variable: str(build / "runs/input")}):
-                result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+                result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("cannot be placed in a cleanable", result.stderr)
         workflow.protect_input_paths(build, build / "sdk", build / "models", self.root / "external")
 
     def test_developer_operation_lock_blocks_clean(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         (build / "deps").mkdir()
         with workflow.root_lock(build):
-            result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+            result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Another developer operation", result.stderr)
             self.assertTrue((build / "deps").exists())
-        result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+        result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_clean_rejects_target_replacement_during_second_scan(self):
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         target = build / "deps"
         target.mkdir()
@@ -1144,7 +1263,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
     def test_clean_preflight_failure_and_partial_failure_evidence(self):
         import contextlib
         import io
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         for name in ("bootstrap", "deps"):
             (build / name).mkdir()
@@ -1167,8 +1286,8 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         self.assertFalse(report["passed"])
 
     def test_initialize_exclusive_claim_cannot_overwrite_another_checkout(self):
-        build = self.root / "claim"
-        build.mkdir()
+        build = self.root / "claim" / DEFAULT_VARIANT
+        build.mkdir(parents=True)
         marker = build / workflow.MARKER
         original = Path.open
         foreign = {"source": str(self.root / "other source"), "schemaVersion": 1}
@@ -1184,7 +1303,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
 
     def test_clean_removes_readonly_owned_cache_files(self):
         import stat
-        build = self.root / "owned"
+        build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         target = build / "deps/cache/nested"
         target.mkdir(parents=True)
@@ -1192,7 +1311,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         cached.write_bytes(b"reproducible fixture")
         cached.chmod(stat.S_IREAD)
         try:
-            result = self.invoke("clean", "--build-root", build, "--scope", "generated")
+            result = self.invoke("clean", "--build-root", build.parent, "--scope", "generated")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse((build / "deps").exists())
         finally:
@@ -1207,14 +1326,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         import shutil
         import xml.etree.ElementTree as ET
         checkout = self.root / "测试源码 source"
-        tools = checkout / "tools"
-        tools.mkdir(parents=True)
-        shutil.copy2(SCRIPT, tools / SCRIPT.name)
-        shutil.copy2(SCRIPT.with_name("qcs-test-policy.py"), tools / "qcs-test-policy.py")
-        evidence_scripts = checkout / ".github/scripts"
-        evidence_scripts.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(workflow.SOURCE / ".github/scripts/qcs-ctest-evidence.py", evidence_scripts / "qcs-ctest-evidence.py")
-        shutil.copy2(SCRIPT.with_name("qcs-path-budget.py"), tools / "qcs-path-budget.py")
+        tools = self.copy_workflow_fixture(checkout)
         (checkout / "CMakeLists.txt").write_text('''
 cmake_minimum_required(VERSION 3.28)
 project(qcs-fail-fast-test LANGUAGES NONE)
@@ -1232,7 +1344,7 @@ add_test(NAME qcs-tests-second-marker
                                 cwd=self.root, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        marker = build / "release/second-ran.txt"
+        marker = build / DEFAULT_VARIANT / "Release/second-ran.txt"
         for fail_fast in (False, True):
             with self.subTest(fail_fast=fail_fast):
                 marker.unlink(missing_ok=True)
@@ -1249,26 +1361,19 @@ add_test(NAME qcs-tests-second-marker
                 self.assertEqual(len(cases), 1 if fail_fast else 2)
                 self.assertEqual(len([case for case in cases if case.find("failure") is not None]), 1)
 
-    def profile_fixture(self, extra=""):
+    def selection_fixture(self, extra=""):
         checkout = self.root / "配置源码 中文"
-        tools = checkout / "tools"
-        tools.mkdir(parents=True)
-        shutil.copy2(SCRIPT, tools / SCRIPT.name)
-        shutil.copy2(SCRIPT.with_name("qcs-test-policy.py"), tools / "qcs-test-policy.py")
-        evidence_scripts = checkout / ".github/scripts"
-        evidence_scripts.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(workflow.SOURCE / ".github/scripts/qcs-ctest-evidence.py", evidence_scripts / "qcs-ctest-evidence.py")
-        shutil.copy2(SCRIPT.with_name("qcs-path-budget.py"), tools / "qcs-path-budget.py")
+        tools = self.copy_workflow_fixture(checkout)
         (checkout / "CMakeLists.txt").write_text('''
 cmake_minimum_required(VERSION 3.28)
-project(qcs-test-profile-fixture LANGUAGES NONE)
+project(qcs-test-selection-fixture LANGUAGES NONE)
 enable_testing()
 foreach(name quick model similar)
   add_test(NAME "qcs-tests-${name}" COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/${name}-ran")
 endforeach()
-set_tests_properties(qcs-tests-quick PROPERTIES LABELS "unit;program")
-set_tests_properties(qcs-tests-model PROPERTIES LABELS "real-model;slow;unit;program")
-set_tests_properties(qcs-tests-similar PROPERTIES LABELS "slow-motion;program")
+set_tests_properties(qcs-tests-quick PROPERTIES LABELS "unit;smoke;program")
+set_tests_properties(qcs-tests-model PROPERTIES LABELS "real-model;unit;program")
+set_tests_properties(qcs-tests-similar PROPERTIES LABELS "integration;program")
 ''' + extra, encoding="utf-8")
         build = self.root / "构建 空格"
         command = [sys.executable, "-B", str(tools / SCRIPT.name)]
@@ -1277,8 +1382,8 @@ set_tests_properties(qcs-tests-similar PROPERTIES LABELS "slow-motion;program")
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         return command, build
 
-    def invoke_profile(self, command, build, *arguments):
-        report = Path(tempfile.mkdtemp(prefix="profile-report-", dir=self.root))
+    def invoke_test_selection(self, command, build, *arguments):
+        report = Path(tempfile.mkdtemp(prefix="selection-report-", dir=self.root))
         unrelated = self.root / "启动 cwd 中文"
         unrelated.mkdir(exist_ok=True)
         completed = subprocess.run([*command, "test", "--build-root", str(build), "--jobs", "1",
@@ -1289,80 +1394,86 @@ set_tests_properties(qcs-tests-similar PROPERTIES LABELS "slow-motion;program")
         self.assertEqual(list(unrelated.iterdir()), [], "An arbitrary launch directory must stay untouched")
         return completed, selection, report
 
-    def test_default_fast_profile_preserves_inventory_and_excludes_exact_slow_label(self):
-        command, build = self.profile_fixture()
-        completed, selection, report = self.invoke_profile(command, build)
+    def test_default_test_executes_complete_inventory(self):
+        command, build = self.selection_fixture()
+        completed, selection, report = self.invoke_test_selection(command, build)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        self.assertEqual(selection["profile"], "fast")
-        self.assertEqual(selection["counts"], {"registered": 3, "selected": 2, "excluded": 1})
-        self.assertEqual(selection["selectedTests"], ["qcs-tests-quick", "qcs-tests-similar"])
-        self.assertEqual(selection["excludedTests"], ["qcs-tests-model"])
+        self.assertNotIn("profile", selection)
+        self.assertNotIn("testProfile", selection)
+        self.assertEqual(selection["counts"], {"registered": 3, "selected": 3, "excluded": 0})
+        self.assertEqual(selection["selectedTests"], ["qcs-tests-quick", "qcs-tests-model", "qcs-tests-similar"])
+        self.assertEqual(selection["excludedTests"], [])
         self.assertTrue(selection["passed"])
-        self.assertFalse(selection["fullSuitePassed"])
-        self.assertFalse((build / "release/model-ran").exists())
-        self.assertTrue((build / "release/similar-ran").is_file(), "The slow label is an exact match")
+        self.assertTrue(selection["fullSuitePassed"])
+        for name in ("quick", "model", "similar"):
+            self.assertTrue((build / DEFAULT_VARIANT / "Release" / (name + "-ran")).is_file())
+        self.assertNotIn("-LE", selection["commands"][-1]["arguments"])
         all_tests = json.loads((report / "test-inventory.json").read_text(encoding="utf-8"))
         self.assertEqual(len(all_tests["tests"]), 3)
-        _, again, _ = self.invoke_profile(command, build)
+        _, again, _ = self.invoke_test_selection(command, build)
         self.assertNotEqual(selection["runId"], again["runId"])
         self.assertNotEqual(selection["testRoot"], again["testRoot"])
-        self.assertEqual(Path(selection["testRoot"]).parent, build / "runs")
+        self.assertEqual(Path(selection["testRoot"]).parent, build / DEFAULT_VARIANT / "runs/Release")
 
-    def test_full_profile_executes_all_registered_programs_and_explicit_slow_filter(self):
-        command, build = self.profile_fixture()
-        for arguments, expected, complete in (
-                (["--test-profile", "full"], ["qcs-tests-quick", "qcs-tests-model", "qcs-tests-similar"], True),
-                (["--test-profile", "full", "--test-label", "^real-model$"], ["qcs-tests-model"], False)):
-            with self.subTest(arguments=arguments):
-                completed, selection, _ = self.invoke_profile(command, build, *arguments)
+    def test_explicit_label_filter_never_claims_complete_suite(self):
+        command, build = self.selection_fixture()
+        for label, expected in (
+                ("^real-model$", ["qcs-tests-model"]),
+                ("^program$", ["qcs-tests-quick", "qcs-tests-model", "qcs-tests-similar"])):
+            with self.subTest(label=label):
+                completed, selection, _ = self.invoke_test_selection(command, build, "--test-label", label)
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertEqual(selection["selectedTests"], expected)
-                self.assertEqual(selection["fullSuitePassed"], complete)
-                self.assertTrue((build / "release/model-ran").is_file())
+                self.assertTrue(selection["passed"])
+                self.assertFalse(selection["fullSuitePassed"])
+                self.assertTrue((build / DEFAULT_VARIANT / "Release/model-ran").is_file())
                 self.assertNotIn("-LE", selection["commands"][-1]["arguments"])
 
-    def test_fast_label_is_intersection_and_no_match_fails_without_execution(self):
-        command, build = self.profile_fixture()
-        completed, selection, _ = self.invoke_profile(command, build, "--test-label", "^unit$")
+    def test_label_filter_selects_matching_tests_and_no_match_fails_without_execution(self):
+        command, build = self.selection_fixture()
+        completed, selection, _ = self.invoke_test_selection(command, build, "--test-label", "^unit$")
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        self.assertEqual(selection["selectedTests"], ["qcs-tests-quick"])
+        self.assertEqual(selection["selectedTests"], ["qcs-tests-quick", "qcs-tests-model"])
         self.assertFalse(selection["fullSuitePassed"])
-        for label in ("^slow$", "^no-such-label$"):
-            with self.subTest(label=label):
-                completed, selection, report = self.invoke_profile(command, build, "--test-label", label)
-                self.assertNotEqual(completed.returncode, 0)
-                self.assertIn("No tests match", completed.stderr)
-                self.assertEqual(selection["selectedTests"], [])
-                self.assertEqual(len(selection["excludedTests"]), 3)
-                self.assertFalse(selection["passed"])
-                self.assertFalse((report / "ctest.xml").exists())
-                self.assertFalse(any(item["purpose"] == "execute" for item in selection["commands"]))
-        self.assertFalse((build / "release/model-ran").exists())
+        for marker in (build / DEFAULT_VARIANT / "Release").glob("*-ran"):
+            marker.unlink()
+        completed, selection, report = self.invoke_test_selection(command, build, "--test-label", "^no-such-label$")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("No tests match", completed.stderr)
+        self.assertEqual(selection["selectedTests"], [])
+        self.assertEqual(len(selection["excludedTests"]), 3)
+        self.assertFalse(selection["passed"])
+        self.assertFalse((report / "ctest.xml").exists())
+        self.assertFalse(any(item["purpose"] == "execute" for item in selection["commands"]))
+        self.assertFalse(any((build / DEFAULT_VARIANT / "Release").glob("*-ran")))
 
-    def test_fast_rejects_automatically_required_slow_fixture(self):
-        command, build = self.profile_fixture('''
+    def test_label_filter_executes_automatically_required_fixture(self):
+        command, build = self.selection_fixture('''
 set_tests_properties(qcs-tests-model PROPERTIES FIXTURES_SETUP model-data)
 set_tests_properties(qcs-tests-quick PROPERTIES FIXTURES_REQUIRED model-data)
 ''')
-        completed, selection, _ = self.invoke_profile(command, build)
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("Fast tests require slow fixtures", completed.stderr)
-        self.assertIn("qcs-tests-model", selection["selectedTests"])
-        self.assertFalse(any((build / "release").glob("*-ran")))
+        completed, selection, _ = self.invoke_test_selection(command, build, "--test-label", "^smoke$")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(set(selection["selectedTests"]), {"qcs-tests-quick", "qcs-tests-model"})
+        self.assertTrue(selection["passed"])
+        self.assertFalse(selection["fullSuitePassed"])
+        self.assertTrue((build / DEFAULT_VARIANT / "Release/model-ran").is_file())
+        self.assertTrue((build / DEFAULT_VARIANT / "Release/quick-ran").is_file())
+        self.assertFalse((build / DEFAULT_VARIANT / "Release/similar-ran").exists())
 
-    def test_disabled_selected_program_is_not_a_passing_profile(self):
-        command, build = self.profile_fixture("set_tests_properties(qcs-tests-quick PROPERTIES DISABLED TRUE)\n")
-        completed, selection, _ = self.invoke_profile(command, build)
+    def test_disabled_selected_program_is_not_a_passing_suite(self):
+        command, build = self.selection_fixture("set_tests_properties(qcs-tests-quick PROPERTIES DISABLED TRUE)\n")
+        completed, selection, _ = self.invoke_test_selection(command, build)
         self.assertNotEqual(completed.returncode, 0)
         self.assertFalse(selection["passed"])
         self.assertFalse(selection["fullSuitePassed"])
         self.assertIn("unexecuted", completed.stderr)
 
-    def test_invalid_profile_is_rejected_before_build_root_creation(self):
+    def test_unknown_variant_is_rejected_before_build_root_creation(self):
         build = self.root / "must remain absent"
-        completed = self.invoke("test", "--build-root", build, "--test-profile", "unknown")
+        completed = self.invoke("test", "--build-root", build, "--variant", "unknown")
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("invalid choice", completed.stderr)
+        self.assertIn("Unsupported build variant: unknown", completed.stderr)
         self.assertFalse(build.exists())
 
     def test_temporary_test_root_failure_does_not_fall_back_to_cwd(self):
@@ -1371,26 +1482,34 @@ set_tests_properties(qcs-tests-quick PROPERTIES FIXTURES_REQUIRED model-data)
         build.mkdir()
         reports = build / "reports"
         reports.mkdir()
-        runs = build / "runs"
-        runs.mkdir()
+        runs = build / "runs/Release"
+        runs.mkdir(parents=True)
         with patch.object(workflow.tempfile, "mkdtemp", side_effect=PermissionError("test root denied")), \
                 patch.object(workflow.subprocess, "run") as execute:
             with self.assertRaisesRegex(PermissionError, "test root denied"):
-                workflow.run_tests(SimpleNamespace(), build, build / "release", reports, {})
+                workflow.run_tests(SimpleNamespace(config="Release"), build, build / "Release", reports, {})
         execute.assert_not_called()
         self.assertEqual(list(reports.iterdir()), [])
         self.assertEqual(list(runs.iterdir()), [])
 
-    def test_test_presets_select_fast_or_full_with_real_ctest_inventory(self):
-        command, build = self.profile_fixture()
+    def test_test_presets_select_complete_ctest_inventory(self):
+        command, build = self.selection_fixture()
         checkout = Path(command[-1]).parent.parent
         shutil.copy2(workflow.SOURCE / "CMakePresets.json", checkout / "CMakePresets.json")
-        environment = dict(os.environ, QCOPILOTS_SEARCH_BUILD_ROOT=str(build))
-        for preset, expected in (("qcs-release", 2), ("qcs-release-full", 3)):
-            result = subprocess.run(["ctest", "--preset", preset, "--show-only=json-v1"], cwd=checkout,
-                                    env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(len(json.loads(result.stdout)["tests"]), expected)
+        environment = dict(os.environ, QCOPILOTS_SEARCH_BUILD_ROOT=str(build),
+                           QCOPILOTS_SEARCH_VARIANT=DEFAULT_VARIANT)
+        for config in ("Release", "Debug"):
+            with self.subTest(config=config):
+                if config == "Debug":
+                    configured = subprocess.run([*command, "configure", "--build-root", str(build), "--config", config],
+                                                cwd=checkout, env=environment, capture_output=True, text=True,
+                                                encoding="utf-8", timeout=30)
+                    self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+                result = subprocess.run(["ctest", "--preset", "qcs-" + config.lower(), "--show-only=json-v1"],
+                                        cwd=checkout, env=environment, capture_output=True, text=True,
+                                        encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(json.loads(result.stdout)["tests"]), 3)
 
     def test_qt_sdk_relocation_with_unicode(self):
         sdk = self.root / "SDK 中文 空格"
@@ -1418,15 +1537,7 @@ set_tests_properties(qcs-tests-quick PROPERTIES FIXTURES_REQUIRED model-data)
         # A language-free CMake fixture exercises the real wrappers and CMake
         # path handling without duplicating the application's native build.
         checkout = self.root / "源码 中文 空格"
-        tools = checkout / "tools"
-        tools.mkdir(parents=True)
-        import shutil
-        shutil.copy2(SCRIPT, tools / SCRIPT.name)
-        shutil.copy2(SCRIPT.with_name("qcs-test-policy.py"), tools / "qcs-test-policy.py")
-        evidence_scripts = checkout / ".github/scripts"
-        evidence_scripts.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(workflow.SOURCE / ".github/scripts/qcs-ctest-evidence.py", evidence_scripts / "qcs-ctest-evidence.py")
-        shutil.copy2(SCRIPT.with_name("qcs-path-budget.py"), tools / "qcs-path-budget.py")
+        tools = self.copy_workflow_fixture(checkout)
         (checkout / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.28)\nproject(qcs-relocation-test NONE)\n", encoding="utf-8")
         environment = os.environ.copy()
         environment["QCOPILOTS_SEARCH_PYTHON"] = sys.executable
@@ -1444,11 +1555,11 @@ set_tests_properties(qcs-tests-quick PROPERTIES FIXTURES_REQUIRED model-data)
                                 text=True, encoding="utf-8", timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(checkout), result.stdout)
-        self.assertTrue((build / "release/CMakeCache.txt").is_file())
+        self.assertTrue((build / DEFAULT_VARIANT / "Release/CMakeCache.txt").is_file())
         result = subprocess.run([sys.executable, str(tools / SCRIPT.name), "clean", "--build-root", str(build)],
                                 cwd=self.root, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((build / "release").exists())
+        self.assertFalse((build / DEFAULT_VARIANT / "Release").exists())
 
 
 if __name__ == "__main__":

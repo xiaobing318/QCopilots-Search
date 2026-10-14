@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Regression checks for release evidence that can otherwise falsely pass."""
-import ast
+"""Regression checks for complete native tests, packaging and diagnostics."""
 import importlib.util
 import io
 import json
@@ -34,6 +33,7 @@ FIXTURE_PYTHON_TESTS = {
     "qcs-tests-acceptance-runners", "qcs-tests-acceptance-native", "qcs-tests-runner",
     "qcs-tests-path-budget", "qcs-tests-temp-paths", "qcs-tests-ci-evidence",
     "qcs-tests-release-evidence", "qcs-tests-test-policy",
+    "qcs-tests-gpu-configuration", "qcs-tests-windows-package",
 }
 FIXTURE_NON_QT_TESTS = FIXTURE_PYTHON_TESTS | {
     "qcs-tests-semantic-manifest", "qcs-tests-semantic", "qcs-tests-inference-install-layout",
@@ -118,7 +118,7 @@ def workflow_verbose(rows=None):
 class EvidenceTests(unittest.TestCase):
     def inspect(self, output="Totals: 3 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n",
                 *, name="qcs-tests-core", system="Windows", failure=None, raw=False,
-                expected=None, include_inventory=True, duplicate=False, test_profile="full", status=None,
+                expected=None, include_inventory=True, duplicate=False, status=None,
                 inventory_entries=None):
         if not raw and name not in FIXTURE_NON_QT_TESTS:
             output = ("********* Start testing of EvidenceTests *********\n"
@@ -146,14 +146,12 @@ class EvidenceTests(unittest.TestCase):
                 "tests": inventory_entries if inventory_entries is not None else
                     [fixture_test(value) for value in (expected if expected is not None else [name])]}),
                 encoding="utf-8")
-            return evidence.inspect_junit(path, system, inventory if include_inventory else None,
-                                          test_profile)
+            return evidence.inspect_junit(path, system, inventory if include_inventory else None)
 
     def test_complete_qt_cases_pass(self):
         result = self.inspect()
         self.assertTrue(result["releaseComplete"])
         self.assertTrue(result["testsComplete"])
-        self.assertEqual(result["testProfile"], "full")
         self.assertEqual(result["qtTestTotals"]["passed"], 3)
         self.assertTrue(result["inventoryVerified"])
 
@@ -176,19 +174,18 @@ class EvidenceTests(unittest.TestCase):
             entry = {"name": "qcs-tests-core", "properties": [{"name": "LABELS", "value": labels}]}
             self.assertFalse(self.inspect(inventory_entries=[entry])["testsComplete"])
 
-    def test_fast_uses_full_inventory_to_record_excluded_slow_tests(self):
-        entries = [fixture_test("qcs-tests-core"), fixture_test("qcs-tests-slow-fixture", ["slow"])]
-        result = self.inspect(test_profile="fast", inventory_entries=entries)
-        self.assertTrue(result["testsComplete"], result["errors"])
-        self.assertFalse(result["releaseComplete"])
-        self.assertEqual(result["registeredPrograms"], ["qcs-tests-core", "qcs-tests-slow-fixture"])
-        self.assertEqual(result["excludedPrograms"], ["qcs-tests-slow-fixture"])
-        self.assertFalse(self.inspect(test_profile="full", inventory_entries=entries)["testsComplete"])
+    def test_all_registered_programs_are_required_regardless_of_labels(self):
+        entries = [fixture_test("qcs-tests-core"), fixture_test("qcs-tests-numerical-fixture", ["model"])]
+        result = self.inspect(inventory_entries=entries)
+        self.assertFalse(result["testsComplete"])
+        self.assertEqual(result["registeredPrograms"], ["qcs-tests-core", "qcs-tests-numerical-fixture"])
+        self.assertEqual(result["expectedPrograms"], result["registeredPrograms"])
+        self.assertTrue(any("missing=['qcs-tests-numerical-fixture']" in error for error in result["errors"]))
 
-    def test_disabled_slow_registration_is_not_hidden_by_fast_selection(self):
-        entries = [fixture_test("qcs-tests-core"), fixture_test("qcs-tests-slow-fixture", ["slow"])]
-        entries[1]["properties"].append({"name": "DISABLED", "value": True})
-        self.assertFalse(self.inspect(test_profile="fast", inventory_entries=entries)["testsComplete"])
+    def test_disabled_registration_cannot_be_excluded_from_completion(self):
+        entry = fixture_test("qcs-tests-core")
+        entry["properties"].append({"name": "DISABLED", "value": True})
+        self.assertFalse(self.inspect(inventory_entries=[entry])["testsComplete"])
 
     def test_subset_report_cannot_claim_full_completion(self):
         self.assertFalse(self.inspect(expected=["qcs-tests-core",
@@ -283,92 +280,49 @@ class EvidenceTests(unittest.TestCase):
             self.assertFalse(self.inspect(failure=kind)["releaseComplete"])
 
 
-class TestProfileEvidenceTests(unittest.TestCase):
+class CompleteInventoryEvidenceTests(unittest.TestCase):
     def inspect(self, *args, **kwargs):
         return EvidenceTests.inspect(self, *args, **kwargs)
 
     def test_explicit_disabled_or_notrun_nonqt_case_without_skipped_node_fails(self):
-        # Actual CTest DISABLED shape: status="disabled", empty system-out and
-        # no failure, error or skipped element, even when CTest itself exits 0.
-        for profile in ("fast", "full"):
-            for status in ("disabled", "notrun", "skipped", "", "unknown"):
-                with self.subTest(profile=profile, status=status):
-                    result = self.inspect("", name="qcs-tests-semantic-manifest", raw=True,
-                                          test_profile=profile, status=status)
-                    self.assertFalse(result["testsComplete"])
-                    self.assertFalse(result["releaseComplete"])
-                    self.assertTrue(any("did not run" in error for error in result["errors"]))
+        # CTest can return zero for disabled programs without a skipped element.
+        for status in ("disabled", "notrun", "skipped", "", "unknown"):
+            with self.subTest(status=status):
+                result = self.inspect("", name="qcs-tests-semantic-manifest", raw=True, status=status)
+                self.assertFalse(result["testsComplete"])
+                self.assertFalse(result["releaseComplete"])
+                self.assertTrue(any("did not run" in error for error in result["errors"]))
 
     def test_explicit_run_and_legacy_absent_status_remain_supported(self):
-        for profile in ("fast", "full"):
-            for status in (None, "run"):
-                with self.subTest(profile=profile, status=status):
-                    result = self.inspect("Manifest passed\n", name="qcs-tests-semantic-manifest", raw=True,
-                                          test_profile=profile, status=status)
-                    self.assertTrue(result["testsComplete"], result["errors"])
-                    self.assertEqual(result["releaseComplete"], profile == "full")
+        for status in (None, "run"):
+            with self.subTest(status=status):
+                result = self.inspect("Manifest passed\n", name="qcs-tests-semantic-manifest", raw=True, status=status)
+                self.assertTrue(result["testsComplete"], result["errors"])
+                self.assertTrue(result["releaseComplete"])
 
-    def test_fast_success_completes_selected_tests_but_never_release(self):
-        result = self.inspect(test_profile="fast")
-        self.assertTrue(result["testsComplete"])
-        self.assertTrue(result["inventoryVerified"])
-        self.assertEqual(result["testProfile"], "fast")
-        self.assertFalse(result["releaseComplete"])
-        self.assertEqual(result["errors"], [])
-
-    def test_fast_inventory_remains_exact_and_nonempty(self):
+    def test_inventory_must_be_exact_and_nonempty(self):
         for change in ({"expected": ["qcs-tests-core", "qcs-tests-file-catalog"]},
                        {"expected": ["qcs-tests-other"]}, {"expected": []},
                        {"expected": ["qcs-tests-core", "qcs-tests-core"]},
                        {"duplicate": True}, {"include_inventory": False}):
             with self.subTest(change=change):
-                result = self.inspect(test_profile="fast", **change)
+                result = self.inspect(**change)
                 self.assertFalse(result["testsComplete"])
                 self.assertFalse(result["releaseComplete"])
                 self.assertTrue(result["errors"])
 
-    def test_fast_requires_complete_successful_case_evidence(self):
-        for change in ({"failure": "failure"}, {"failure": "error"}, {"failure": "skipped"},
-                       {"output": "", "raw": True},
-                       {"output": "Totals: 0 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n", "raw": True},
-                       {"output": "[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]\n"
-                                  "Totals: 3 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n"},
-                       {"output": "SKIP   : EvidenceTests::extraCase() Missing model\n"
-                                  "Totals: 3 passed, 0 failed, 1 skipped, 0 blacklisted, 1ms\n"}):
-            with self.subTest(change=change):
-                result = self.inspect(test_profile="fast", **change)
-                self.assertFalse(result["testsComplete"])
-                self.assertFalse(result["releaseComplete"])
-                self.assertTrue(result["errors"])
-
-    def test_fast_python_failure_and_unapproved_skip_remain_failures(self):
+    def test_python_failure_and_unapproved_skip_remain_failures(self):
         for status, footer in (("FAIL", "FAILED (failures=1)"),
                                ("skipped 'Missing required fixture'", "OK (skipped=1)")):
             with self.subTest(status=status):
                 result = self.inspect(signing_verbose([("test_required_case", status)], footer=footer),
-                                      name=SIGNING_PROGRAM, raw=True, test_profile="fast")
+                                      name=SIGNING_PROGRAM, raw=True)
                 self.assertFalse(result["testsComplete"])
                 self.assertFalse(result["releaseComplete"])
                 self.assertTrue(result["errors"])
 
-    def test_fast_retains_not_applicable_classification_without_counting_as_pass(self):
-        result = self.inspect(
-            "SKIP   : IndexRepositoryRegressionTest::rootFilterRespectsCaseSensitivePlatformKeys() "
-            "Non-Windows path keys are case-sensitive. Windows intentionally folds path keys.\n"
-            "Totals: 3 passed, 0 failed, 1 skipped, 0 blacklisted, 1ms\n",
-            name="qcs-tests-index_repository_regression", test_profile="fast")
-        self.assertTrue(result["testsComplete"])
-        self.assertFalse(result["releaseComplete"])
-        self.assertEqual(result["qtTestTotals"]["passed"], 3)
-        self.assertEqual(result["qtTestTotals"]["notApplicable"], 1)
-
-    def test_unknown_profile_is_rejected_before_reading_files(self):
-        for profile in ("quick", "", "FAST", None):
-            with self.subTest(profile=profile), self.assertRaisesRegex(ValueError, "Unknown test profile"):
-                evidence.inspect_junit(Path("not-opened.xml"), "Windows", test_profile=profile)
-
     def invoke(self, *options, failure=False):
-        with tempfile.TemporaryDirectory(prefix="qcs-ci-profile-",
+        with tempfile.TemporaryDirectory(prefix="qcs-ci-complete-",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
             directory = Path(temporary)
             junit, inventory, output = (directory / name for name in ("ctest.xml", "inventory.json", "result.json"))
@@ -386,35 +340,23 @@ class TestProfileEvidenceTests(unittest.TestCase):
                 code = evidence.main()
             return code, json.loads(output.read_text(encoding="utf-8"))
 
-    def test_cli_default_full_retains_release_gate(self):
+    def test_cli_complete_gate_passes_complete_inventory(self):
         code, report = self.invoke("--require-complete")
         self.assertEqual(code, 0)
-        self.assertEqual(report["testProfile"], "full")
         self.assertTrue(report["releaseComplete"])
         self.assertTrue(report["testsComplete"])
 
-    def test_cli_fast_selected_gate_passes_but_release_gate_fails(self):
-        for gates, expected_code in ((("--require-selected-tests",), 0),
-                                     (("--require-complete",), 1),
-                                     (("--require-selected-tests", "--require-complete"), 1)):
-            with self.subTest(gates=gates):
-                code, report = self.invoke("--test-profile", "fast", *gates)
-                self.assertEqual(code, expected_code)
-                self.assertTrue(report["testsComplete"])
-                self.assertFalse(report["releaseComplete"])
+    def test_cli_complete_gate_fails_for_incomplete_tests(self):
+        code, report = self.invoke("--require-complete", failure=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(report["testsComplete"])
+        self.assertFalse(report["releaseComplete"])
 
-    def test_cli_selected_gate_fails_for_incomplete_tests_in_both_profiles(self):
-        for profile in ("fast", "full"):
-            with self.subTest(profile=profile):
-                code, report = self.invoke("--test-profile", profile, "--require-selected-tests", failure=True)
-                self.assertEqual(code, 1)
-                self.assertFalse(report["testsComplete"])
-                self.assertFalse(report["releaseComplete"])
-
-    def test_cli_unknown_profile_is_rejected(self):
-        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as rejected:
-            self.invoke("--test-profile", "quick")
-        self.assertEqual(rejected.exception.code, 2)
+    def test_diagnostic_mode_records_failure_without_changing_process_status(self):
+        code, report = self.invoke(failure=True)
+        self.assertEqual(code, 0)
+        self.assertFalse(report["testsComplete"])
+        self.assertTrue(report["errors"])
 
 
 class PythonSigningEvidenceTests(unittest.TestCase):
@@ -761,20 +703,107 @@ class PythonCleanupPlatformEvidenceTests(unittest.TestCase):
         self.assertTrue(any("Required native cleanup case" in error for error in result["errors"]))
 
 
+class PythonWindowsNativeEvidenceTests(unittest.TestCase):
+    CASES = {
+        "qcs-tests-gpu-configuration": ("AbiTests", ["test_real_windows_system_image"],
+            "Uses an actual host PE library", "tests/runtime/gpu_configuration_test.py"),
+        "qcs-tests-windows-package": ("NativeInstallerTests", [
+            "test_install_uninstall_preserves_unowned_file", "test_missing_payload_fails_before_installing",
+            "test_overlapping_payload_destination_is_rejected", "test_same_length_corruption_fails_before_installing"],
+            "The native NSIS installer runs on Windows", "tools/qcs-package-windows-tests.py"),
+    }
+
+    def inspect(self, program, *, system="Linux", omitted=False, status=None, reason=None, changed_case=False,
+                reported_program=None):
+        class_name, methods, expected_reason, _ = self.CASES[program]
+        rows = [("test_portable_contract", "__main__.PortableTests.test_portable_contract", "ok")]
+        for index, method in enumerate(methods):
+            if omitted and index == 0:
+                continue
+            identifier = f"__main__.{class_name}.{method}"
+            if changed_case and index == 0:
+                identifier = f"__main__.WrongClass.{method}"
+            result = status or ("ok" if system == "Windows" else "skipped " + repr(reason or expected_reason))
+            rows.append((method, identifier, result))
+        skipped = sum(result.startswith("skipped ") for _, _, result in rows)
+        output = "\n".join(f"{method} ({identifier}) ... {result}" for method, identifier, result in rows)
+        output += f"\nRan {len(rows)} tests in 0.01s\n\nOK" + (f" (skipped={skipped})" if skipped else "") + "\n"
+        return EvidenceTests.inspect(self, output, name=reported_program or program, system=system, raw=True)
+
+    def test_exact_non_windows_skips_record_required_native_platform_without_passes(self):
+        for program, (_, methods, reason, _) in self.CASES.items():
+            for system in ("Linux", "Darwin"):
+                with self.subTest(program=program, system=system):
+                    result = self.inspect(program, system=system)
+                    self.assertTrue(result["testsComplete"], result["errors"])
+                    self.assertEqual(result["pythonTestTotals"]["passed"], 1)
+                    self.assertEqual(result["pythonTestTotals"]["notApplicable"], len(methods))
+                    for skipped in result["pythonTestSkips"]:
+                        self.assertEqual(skipped["classification"], "notApplicable")
+                        self.assertEqual(skipped["reason"], reason)
+                        self.assertEqual(skipped["requiredNativePlatforms"], ["Windows"])
+
+    def test_windows_must_execute_all_native_cases(self):
+        for program, (_, methods, reason, _) in self.CASES.items():
+            with self.subTest(program=program):
+                result = self.inspect(program, system="Windows")
+                self.assertTrue(result["testsComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"]["passed"], 1 + len(methods))
+                self.assertEqual(result["pythonTestTotals"]["notApplicable"], 0)
+                result = self.inspect(program, system="Windows", status="skipped " + repr(reason))
+                self.assertFalse(result["testsComplete"])
+                self.assertTrue(all(item["classification"] == "requiredNotRun" for item in result["pythonTestSkips"]))
+
+    def test_missing_native_records_cannot_hide_behind_matching_totals(self):
+        for program in self.CASES:
+            for system in ("Windows", "Linux", "Darwin"):
+                with self.subTest(program=program, system=system):
+                    result = self.inspect(program, system=system, omitted=True)
+                    self.assertFalse(result["testsComplete"])
+                    self.assertTrue(any("Required Windows case is missing" in error for error in result["errors"]))
+
+    def test_skip_requires_exact_case_reason_and_program(self):
+        for program in self.CASES:
+            for changes in ({"reason": "Required runtime is missing"}, {"changed_case": True},
+                            {"reported_program": "qcs-tests-license-materials"}):
+                with self.subTest(program=program, changes=changes):
+                    result = self.inspect(program, **changes)
+                    self.assertFalse(result["testsComplete"])
+                    self.assertTrue(any(item["classification"] == "requiredNotRun" for item in result["pythonTestSkips"]))
+
+    def test_registered_native_cases_and_reasons_match_real_source_declarations(self):
+        import ast
+        for program, (class_name, methods, reason, relative) in self.CASES.items():
+            with self.subTest(program=program):
+                tree = ast.parse((native.SOURCE / relative).read_text(encoding="utf-8"))
+                test_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+                declared = {node.name: node for node in test_class.body if isinstance(node, ast.FunctionDef)}
+                self.assertTrue(set(methods) <= set(declared))
+                self.assertEqual(evidence.WINDOWS_NATIVE_PROGRAM_CASES[program],
+                    {f"__main__.{class_name}.{method}": reason for method in methods})
+                for method in methods:
+                    decorators = test_class.decorator_list + declared[method].decorator_list
+                    reasons = [node.args[1].value for node in decorators
+                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "skipUnless" and len(node.args) == 2
+                        and isinstance(node.args[1], ast.Constant)]
+                    self.assertEqual(reasons, [reason])
+
+
 class NativeTestFlowTests(unittest.TestCase):
     def run_test_action(self, failure=None, *, collection_complete=True):
         with tempfile.TemporaryDirectory(prefix="qcs-ci-test-flow-",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
-            root = Path(temporary)
-            reports = root / "reports"
+            parent = Path(temporary)
+            root = parent / "windows-x64-cpu"
+            reports = root / "reports/Release"
             inventory = json.dumps({"kind": "ctestInfo", "tests": [{"name": "qcs-tests-core"}]})
             with mock.patch.object(native.sys, "argv", ["synthetic-native-ci", "test"]), \
                     mock.patch.object(native, "ROOT", root, create=True), \
                     mock.patch.object(native, "REPORTS", reports, create=True), \
                     mock.patch.object(native.platform, "machine", return_value="x86_64"), \
-                    mock.patch.dict(native.os.environ, {"QCOPILOTS_SEARCH_CI_ARCH": "x86_64",
-                        "QCOPILOTS_SEARCH_TEST_PROFILE": "full",
-                        "QCOPILOTS_SEARCH_BUILD_ROOT": str(root), "QCOPILOTS_SEARCH_QT_ROOT": str(root / "sdk"),
+                    mock.patch.dict(native.os.environ, {"QCOPILOTS_SEARCH_CI_ID": "windows-x64-cpu",
+                        "QCOPILOTS_SEARCH_BUILD_ROOT": str(parent), "QCOPILOTS_SEARCH_QT_ROOT": str(root / "sdk"),
                         "QCOPILOTS_SEARCH_MODEL_DIR": str(root / "models")}), \
                     mock.patch.object(native, "run", return_value=native.subprocess.CompletedProcess([], 0, stdout=inventory)), \
                     mock.patch.object(native, "dev", side_effect=failure) as dev, \
@@ -786,7 +815,7 @@ class NativeTestFlowTests(unittest.TestCase):
                 if failure is None:
                     if collection_complete:
                         native.main()
-                        acceptance.assert_called_once_with(require_complete=True, profile="full")
+                        acceptance.assert_called_once_with(require_complete=True)
                     else:
                         with self.assertRaisesRegex(RuntimeError, "diagnostic collection is incomplete"):
                             native.main()
@@ -824,6 +853,27 @@ class NativeTestFlowTests(unittest.TestCase):
     def test_successful_test_cannot_hide_incomplete_wrapper_collection(self):
         self.run_test_action(collection_complete=False)
 
+    def test_evidence_parser_receives_complete_gate_and_inventory(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-evidence-command-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            reports = Path(temporary)
+            (reports / "tests").mkdir()
+            (reports / "tests/qt-test-cases.json").write_text('{"testsComplete": true}', encoding="utf-8")
+            with mock.patch.object(native, "REPORTS", reports, create=True), \
+                    mock.patch.object(native, "run") as run:
+                self.assertTrue(native.test_evidence(require_complete=True)["testsComplete"])
+            command = run.call_args.args[0]
+            self.assertIn("--require-complete", command)
+            self.assertEqual(command[command.index("--inventory") + 1], reports / "tests/ctest-inventory.json")
+
+    def test_evidence_parser_failure_propagates_to_native_job(self):
+        failure = native.subprocess.CalledProcessError(1, ["synthetic-case-parser"])
+        with mock.patch.object(native, "REPORTS", Path("synthetic reports"), create=True), \
+                mock.patch.object(native, "run", side_effect=failure):
+            with self.assertRaises(native.subprocess.CalledProcessError) as raised:
+                native.test_evidence(require_complete=True)
+            self.assertIs(raised.exception, failure)
+
 
 class WrapperDiagnosticsTests(unittest.TestCase):
     def setUp(self):
@@ -831,17 +881,17 @@ class WrapperDiagnosticsTests(unittest.TestCase):
             dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.reports = self.root / "reports"
-        self.selected = self.root / "runs/qcs-t-fixture"
+        self.reports = self.root / "reports/Release"
+        self.selected = self.root / "runs/Release/qcs-t-fixture"
         self.inputs = self.selected / "reports"
         self.inputs.mkdir(parents=True)
-        self.reports.mkdir()
+        self.reports.mkdir(parents=True)
         for name, value in (("ROOT", self.root), ("REPORTS", self.reports)):
             patcher = mock.patch.object(native, name, value, create=True)
             patcher.start()
             self.addCleanup(patcher.stop)
         self.latest = self.reports / "latest-test-run.json"
-        self.latest.write_text(json.dumps({"runId": "fixture-full-run-identity",
+        self.latest.write_text(json.dumps({"runId": "fixture-run-identity",
             "testRoot": str(self.selected)}), encoding="utf-8")
 
     def wrapper(self, label="qcs-tests-core", *, suffix="fixture", cleanup_error=None):
@@ -890,7 +940,7 @@ class WrapperDiagnosticsTests(unittest.TestCase):
     def test_only_direct_current_run_reports_are_copied(self):
         self.wrapper()
         for directory in (self.inputs / "nested", self.selected / "models", self.selected / "retained",
-                          self.root / "runs/qcs-t-other/reports"):
+                          self.root / "runs/Release/qcs-t-other/reports"):
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "qcs-t-unrelated.json").write_text("unrelated content", encoding="utf-8")
         (self.inputs / "index.sqlite3").write_bytes(b"not diagnostic JSON")
@@ -1002,30 +1052,24 @@ class WrapperDiagnosticsTests(unittest.TestCase):
         self.assertTrue(collected["collectionComplete"])
         self.assertEqual(collected["files"][0]["cleanup"], {"attempted": True, "succeeded": True, "error": None})
 
-    def test_report_archives_wrappers_before_missing_acceptance_evidence_raises(self):
-        self.wrapper()
-        failure = RuntimeError("Missing acceptance fixture")
-        with mock.patch.object(native, "test_evidence", side_effect=failure):
-            with self.assertRaises(RuntimeError) as caught:
-                native.report()
-        self.assertIs(caught.exception, failure)
-        self.assertTrue((self.reports / "wrappers/index.json").is_file())
-
 
 class PackageModelFlowTests(unittest.TestCase):
     def test_native_installers_share_the_local_runner_and_its_model_arguments(self):
         root = Path("synthetic build 中文 空格")
         models = root / "shared models 中文"
-        with mock.patch.object(native, "ROOT", root, create=True), \
+        with mock.patch.object(native, "BUILD_PARENT", root, create=True), \
                 mock.patch.object(native, "REPORTS", root / "reports", create=True), \
                 mock.patch.object(native, "MODELS", models, create=True), \
                 mock.patch.object(native, "QT", root / "sdk", create=True), \
                 mock.patch.object(native.os, "name", "posix"), \
                 mock.patch.object(native.platform, "system", return_value="Linux"), \
+                mock.patch.dict(native.os.environ, {"QCOPILOTS_SEARCH_CI_ID": "linux-x64-cpu"}), \
                 mock.patch.object(native, "run") as run:
             native.installers()
         command = run.call_args.args[0]
         self.assertIn("installers", command)
+        self.assertEqual(command[command.index("--build-root") + 1], root)
+        self.assertEqual(command[command.index("--variant") + 1], "linux-x64-cpu")
         self.assertEqual(command.count("--model-dir"), 1)
         self.assertEqual(command[command.index("--model-dir") + 1], models)
         self.assertTrue(run.call_args.kwargs["display"])
@@ -1035,9 +1079,10 @@ class PackageModelFlowTests(unittest.TestCase):
         models = root / "shared models 中文"
         for extra in ((), ("--package-file", str(root / "pkg/installer with spaces.exe"))):
             with self.subTest(extra=extra), \
-                    mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "BUILD_PARENT", root, create=True), \
                     mock.patch.object(native, "QT", root / "Qt SDK", create=True), \
                     mock.patch.object(native, "MODELS", models, create=True), \
+                    mock.patch.dict(native.os.environ, {"QCOPILOTS_SEARCH_CI_ID": "linux-x64-cpu"}), \
                     mock.patch.object(native, "run") as run:
                 native.dev("verify-package", *extra, display=True)
                 command = run.call_args.args[0]
@@ -1055,6 +1100,8 @@ class PackageModelFlowTests(unittest.TestCase):
         if model_argument is not None:
             argv += ["--model-dir", str(model_argument)]
         with mock.patch.object(deb.sys, "argv", argv), \
+                mock.patch.dict(deb.os.environ, {"QCOPILOTS_SEARCH_VARIANT": "linux-x64-cpu",
+                    "QCOPILOTS_SEARCH_CI_ID": "linux-x64-cpu"}, clear=True), \
                 mock.patch.object(deb.platform, "system", return_value="Linux"), \
                 mock.patch.object(deb.os, "geteuid", return_value=1000, create=True), \
                 mock.patch.object(deb.os, "getegid", return_value=1000, create=True), \
@@ -1144,7 +1191,8 @@ class PackageModelFlowTests(unittest.TestCase):
                     mock.patch.object(deb.platform, "system", return_value="Linux"), \
                     mock.patch.object(deb.os, "geteuid", return_value=0, create=True), \
                     mock.patch.dict(deb.os.environ, {"QCOPILOTS_SEARCH_DEB_CONTAINER": "1",
-                        "QCOPILOTS_SEARCH_HOST_UID": "1000", "QCOPILOTS_SEARCH_HOST_GID": "1000"}), \
+                        "QCOPILOTS_SEARCH_VARIANT": "linux-x64-cpu", "QCOPILOTS_SEARCH_CI_ID": "linux-x64-cpu",
+                        "QCOPILOTS_SEARCH_HOST_UID": "1000", "QCOPILOTS_SEARCH_HOST_GID": "1000"}, clear=True), \
                     mock.patch.dict(sys.modules, {"grp": mock.Mock()}), \
                     mock.patch.object(deb, "run", side_effect=fake_run), \
                     mock.patch.object(deb.subprocess, "Popen") as spawn, \
@@ -1158,7 +1206,7 @@ class PackageModelFlowTests(unittest.TestCase):
             report = json.loads((root / "reports/report.json").read_text(encoding="utf-8"))
             verifier = [command for command in commands if command[0] == "runuser"]
             self.assertEqual(len(verifier), 1)
-            self.assertEqual(verifier[0][verifier[0].index("--model-dir") + 1], "/models")
+            self.assertEqual(verifier[0][verifier[0].index("--model-dir") + 1], str(root / "models"))
             self.assertEqual(verifier[0].count("--model-dir"), 1)
             return report
 
@@ -1178,12 +1226,29 @@ class PackageModelFlowTests(unittest.TestCase):
                 self.assertFalse(report["passed"])
                 self.assertFalse(report["releaseComplete"])
 
+    def test_deb_simulations_isolate_the_enclosing_build_variant_and_container(self):
+        for enclosing_variant in ("windows-x64-cpu", "linux-x64-cuda-13.4"):
+            with self.subTest(variant=enclosing_variant), mock.patch.dict(os.environ, {
+                    "QCOPILOTS_SEARCH_VARIANT": enclosing_variant,
+                    "QCOPILOTS_SEARCH_CI_ID": enclosing_variant,
+                    "QCOPILOTS_SEARCH_CI_CONTAINER": "1"}), tempfile.TemporaryDirectory(
+                    prefix="qcs-ci-deb-env-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+                root = Path(temporary)
+                models = root / "models"
+                models.mkdir()
+                command = self.invoke_deb_outer(root, models)
+                self.assertEqual(command[:3], ["docker", "run", "--rm"])
+                self.assertIn("QCOPILOTS_SEARCH_VARIANT=linux-x64-cpu", command)
+                report = self.inspect_container_smoke({"passed": True, "releaseComplete": True,
+                                                       "modelSmoke": {"passed": True}})
+                self.assertTrue(report["releaseComplete"])
+
 
 class RunnerIsolationTests(unittest.TestCase):
     def environment(self, temporary):
         return {"RUNNER_TEMP": str(temporary), "GITHUB_ENV": str(temporary / "environment"),
                 "GITHUB_RUN_ID": "12345678901234567890", "GITHUB_RUN_ATTEMPT": "123",
-                "QCOPILOTS_SEARCH_CI_ID": "windows-x64", "GITHUB_EVENT_PATH": "",
+                "QCOPILOTS_SEARCH_CI_ID": "windows-x64-cpu", "GITHUB_EVENT_PATH": "",
                 "GITHUB_SHA": "a" * 40, "QCOPILOTS_SEARCH_CANDIDATE_HEAD": "a" * 40}
 
     def test_short_roots_are_unique_and_keep_full_runner_identity(self):
@@ -1194,18 +1259,19 @@ class RunnerIsolationTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 roots = [native.initialize_runner(), native.initialize_runner()]
             self.assertNotEqual(*roots)
-            for root in roots:
-                self.assertEqual(root.parent, temporary.resolve())
-                self.assertLessEqual(len(root.name), 20)
-                identity = json.loads((root / "reports/runner-identity.json").read_text(encoding="utf-8"))
+            for parent in roots:
+                self.assertEqual(parent.parent, temporary.resolve())
+                self.assertLessEqual(len(parent.name), 20)
+                root = parent / "windows-x64-cpu"
+                identity = json.loads((root / "reports/Release/runner-identity.json").read_text(encoding="utf-8"))
                 self.assertEqual(identity["candidateHead"], "a" * 40)
                 self.assertEqual(identity["runId"], environment["GITHUB_RUN_ID"])
                 self.assertEqual(identity["runAttempt"], environment["GITHUB_RUN_ATTEMPT"])
-                self.assertEqual(identity["platformId"], "windows-x64")
-                for name in ("sdk", "models", "runs"):
-                    self.assertTrue((root / name).is_dir())
+                self.assertEqual(identity["configuration"], "windows-x64-cpu")
+                for path in (parent / "sdk", parent / "models", root / "runs/Release"):
+                    self.assertTrue(path.is_dir())
             exported = (temporary / "environment").read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(exported), 8)
+            self.assertEqual(len(exported), 10)
             self.assertEqual(sum(line.startswith("QCOPILOTS_SEARCH_TEST_ROOT=") for line in exported), 2)
 
     def test_initialized_ci_root_is_accepted_by_real_developer_bootstrap_guard(self):
@@ -1213,7 +1279,7 @@ class RunnerIsolationTests(unittest.TestCase):
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as directory:
             temporary = Path(directory)
             with mock.patch.dict(os.environ, self.environment(temporary), clear=True):
-                root = native.initialize_runner()
+                root = native.initialize_runner() / "windows-x64-cpu"
             developer = native.developer_workflow()
             self.assertEqual(developer.SOURCE, native.SOURCE)
             marker = root / developer.MARKER
@@ -1225,14 +1291,14 @@ class RunnerIsolationTests(unittest.TestCase):
             developer.initialize_root(root)
             self.assertEqual(marker.read_bytes(), before)
             self.assertEqual({path.name for path in root.iterdir()},
-                             {developer.MARKER, "sdk", "models", "runs", "reports"})
+                             {developer.MARKER, "runs", "reports"})
 
     def test_real_developer_guard_rejects_ci_root_with_replaced_owner(self):
         with tempfile.TemporaryDirectory(prefix="qcs-owner-",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as directory:
             temporary = Path(directory)
             with mock.patch.dict(os.environ, self.environment(temporary), clear=True):
-                root = native.initialize_runner()
+                root = native.initialize_runner() / "windows-x64-cpu"
             developer = native.developer_workflow()
             marker = root / developer.MARKER
             marker.write_text(json.dumps({"source": str(temporary / "another checkout"), "schemaVersion": 1}),
@@ -1257,7 +1323,9 @@ class RunnerIsolationTests(unittest.TestCase):
             exports = dict(line.split("=", 1) for line in (temporary / "environment").read_text(encoding="utf-8").splitlines())
             created = Path(exports["QCOPILOTS_SEARCH_BUILD_ROOT"])
             self.assertEqual(created.parent, temporary.resolve())
-            self.assertTrue((created / "reports/runner-identity.json").is_file())
+            variant_root = Path(exports["QCOPILOTS_SEARCH_VARIANT_ROOT"])
+            self.assertEqual(variant_root, created / "windows-x64-cpu")
+            self.assertTrue((variant_root / "reports/Release/runner-identity.json").is_file())
 
     def test_missing_required_environment_does_not_create_directories(self):
         with tempfile.TemporaryDirectory(prefix="qcs-ci-",
@@ -1286,6 +1354,18 @@ class RunnerIsolationTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         native.initialize_runner()
                     create.assert_not_called()
+
+    def test_unknown_variant_fails_before_creating_output(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-ci-variant-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as directory:
+            temporary = Path(directory)
+            environment = {**self.environment(temporary), "QCOPILOTS_SEARCH_CI_ID": "unknown-variant"}
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(native.tempfile, "mkdtemp") as create:
+                with self.assertRaisesRegex(RuntimeError, "Unknown CI build variant"):
+                    native.initialize_runner()
+                create.assert_not_called()
+            self.assertEqual(list(temporary.iterdir()), [])
 
     def test_source_tree_cannot_be_used_as_runner_temporary_root(self):
         environment = self.environment(native.SOURCE)
@@ -1331,28 +1411,7 @@ class NativeIdentityTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": "", "GITHUB_SHA": "b" * 40}):
             self.assertEqual(native.candidate_head(), "b" * 40)
 
-    def test_crash_collection_excludes_other_apps_old_files_and_large_dumps(self):
-        with tempfile.TemporaryDirectory(prefix="qcs-crash-",
-                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
-            root = Path(temporary)
-            source = root / "diagnostics"
-            source.mkdir()
-            for name in ("qcs-tests-gui.ips", "qcs-old.crash", "other-application.ips", "qcs.core"):
-                (source / name).write_text("synthetic diagnostic fixture", encoding="utf-8")
-            os.utime(source / "qcs-old.crash", (1, 1))
-            with (source / "qcs-large.ips").open("wb") as stream:
-                stream.truncate(4 * 1024**2 + 1)
-            result = native.collect_crash_reports([source], root / "collected", 2)
-            self.assertEqual([item["name"] for item in result["files"]], ["0-qcs-tests-gui.ips"])
-            self.assertEqual(len(result["unavailable"]), 1)
-            self.assertEqual(len(list((root / "collected").iterdir())), 1)
 
-    def test_absent_crash_report_is_not_a_success_claim(self):
-        with tempfile.TemporaryDirectory(prefix="qcs-crash-",
-                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
-            result = native.collect_crash_reports([Path(temporary) / "missing"], Path(temporary) / "collected", 0)
-            self.assertEqual(result["files"], [])
-            self.assertIn("does not prove", result["note"])
 
 
 class GuiDiagnosticsTests(unittest.TestCase):
@@ -1486,7 +1545,7 @@ class LinuxDiagnosticsTests(unittest.TestCase):
     def test_loader_environment_is_preserved_with_an_isolated_xvfb_probe(self):
         result, commands, root, prefix, targets = self.diagnose()
         expected_path = os.pathsep.join(str(path) for path in (
-            root / "release/bin", root / "release/lib", prefix / "bin", root / "bootstrap/nsis"))
+            root / "Release/bin", root / "Release/lib", prefix / "bin", root / "bootstrap/nsis"))
         expected_path += os.pathsep + "original-tool-path"
         for command in commands:
             environment = command["environment"]
@@ -1641,64 +1700,6 @@ class LinuxDiagnosticsTests(unittest.TestCase):
         self.doctor_with_diagnostic_error(native.subprocess.CalledProcessError(23, ["fixture-dev", "doctor"]))
 
 
-class SignatureEvidenceTests(unittest.TestCase):
-    def inspect(self, *, verify_code=0, display_code=0, details="Signature=adhoc\n",
-                verify_error="", exists=True, system="Darwin", error=None):
-        with tempfile.TemporaryDirectory(prefix="qcs-signature-",
-                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
-            stage = Path(temporary)
-            if exists:
-                (stage / "qcs-gui.app").mkdir()
-            outcomes = [native.subprocess.CompletedProcess([], verify_code, "", verify_error),
-                        native.subprocess.CompletedProcess([], display_code, "", details)]
-            with mock.patch.object(native.subprocess, "run", side_effect=error or outcomes) as run:
-                result = native.signature_evidence(stage, system=system)
-                if exists and system == "Darwin" and not error:
-                    self.assertEqual(run.call_count, 2)
-                    self.assertIn("--strict", run.call_args_list[0].args[0])
-                    self.assertIn("--deep", run.call_args_list[0].args[0])
-                return result
-
-    def test_verified_ad_hoc_is_not_developer_id_or_notarization(self):
-        result = self.inspect()
-        self.assertEqual(result["status"], "ad-hoc")
-        self.assertTrue(result["verified"])
-        self.assertFalse(result["developerIdSignatureVerified"])
-        self.assertEqual(result["notarization"], "not-assessed")
-
-    def test_developer_id_requires_successful_verification(self):
-        details = "Authority=Developer ID Application: Example (TEAM)\nAuthority=Apple Root CA\n"
-        self.assertEqual(self.inspect(details=details)["status"], "developer-id")
-        result = self.inspect(details=details, verify_code=1, verify_error="a sealed resource is missing")
-        self.assertEqual(result["status"], "invalid")
-        self.assertFalse(result["developerIdSignatureVerified"])
-
-    def test_explicit_unsigned_diagnostic(self):
-        result = self.inspect(verify_code=1, display_code=1,
-                              details="app: code object is not signed at all")
-        self.assertEqual(result["status"], "unsigned")
-        self.assertFalse(result["verified"])
-
-    def test_missing_bundle_does_not_claim_unsigned_or_signed(self):
-        self.assertEqual(self.inspect(exists=False)["status"], "unknown")
-
-    def test_unavailable_or_timed_out_codesign_remains_unknown(self):
-        for error in (FileNotFoundError("codesign"), native.subprocess.TimeoutExpired("codesign", 60)):
-            self.assertEqual(self.inspect(error=error)["status"], "unknown")
-
-    def test_unavailable_identity_remains_unknown(self):
-        self.assertEqual(self.inspect(display_code=1)["status"], "unknown")
-        self.assertEqual(self.inspect(details="Identifier=org.example.app")["status"], "unknown")
-
-    def test_other_certificate_is_distinct(self):
-        result = self.inspect(details="Authority=Apple Development: Example (TEAM)\n")
-        self.assertEqual(result["status"], "signed-other")
-        self.assertFalse(result["developerIdSignatureVerified"])
-
-    def test_non_macos_is_uninspected(self):
-        result = self.inspect(system="Windows")
-        self.assertEqual(result["status"], "unknown")
-        self.assertFalse(result["commands"])
 
 
 class PythonLicenseEvidenceTests(unittest.TestCase):
@@ -2024,497 +2025,232 @@ class PythonTempPathsEvidenceTests(PythonLicenseEvidenceTests):
     program = "qcs-tests-temp-paths"
 
 
-class FastNativeTests(unittest.TestCase):
-    FAST_FIXTURES = {"qcs-tests-core", "qcs-tests-gui"}
-
-    def temporary(self):
-        return tempfile.TemporaryDirectory(prefix="qcs-fast-中文 ",
-            dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
-
-    def selection(self, root, architecture="x86_64"):
-        directory = root / "reports/tests"
-        directory.mkdir(parents=True)
-        slow = {"qcs-tests-semantic", "qcs-tests-reference-vectors"}
-        if architecture == "x86_64":
-            slow.add("qcs-tests-reference-vectors-baseline")
-        full = {"kind": "ctestInfo", "tests": [fixture_test(name, ["slow"] if name in slow else ["unit"])
-            for name in sorted(self.FAST_FIXTURES | slow)]}
-        chosen = {"kind": "ctestInfo", "tests": [entry for entry in full["tests"]
-                                               if entry["name"] in self.FAST_FIXTURES]}
-        selection = {"profile": "fast", "kind": "ctest-selection", "status": "passed", "passed": True,
-                     "fullSuitePassed": False, "releaseComplete": False, "exitCode": 0,
-                     "filters": ["-LE", "^slow$"], "labelFilter": None,
-                     "registeredTests": [entry["name"] for entry in full["tests"]],
-                     "selectedTests": [entry["name"] for entry in chosen["tests"]],
-                     "excludedTests": sorted(slow), "counts": {
-                         "registered": len(full["tests"]), "selected": len(chosen["tests"]), "excluded": len(slow)}}
-        for filename, document in (("ctest-inventory.json", full), ("test-inventory.json", full),
-                                   ("test-selected-inventory.json", chosen), ("test-selection.json", selection)):
-            (directory / filename).write_text(json.dumps(document), encoding="utf-8")
-        return directory
-
-    def fixture(self, root, platform_id="windows-x64"):
-        release = native.release_evidence()
-        architecture = release.PLATFORMS[platform_id][1]
-        directory = self.selection(root, architecture)
-        identity = {"candidateHead": "a" * 40, "checkoutCommit": "a" * 40, "sourceTree": "b" * 40,
-                    "workingTreeModified": False, "lockHashes": {name: "c" * 64 for name in release.LOCKS}}
-        docs = {"runner-identity.json": {"testProfile": "fast", "candidateHead": "a" * 40,
-                    "platformId": platform_id, "runId": "123", "runAttempt": "1"},
-                "build-provenance.json": {"identity": identity, "completed": True,
-                    "programs": {name: {"sha256": "d" * 64} for name in release.APPLICATIONS}},
-                "fast-acceptance.json": {"kind": "native-fast-acceptance", "testProfile": "fast",
-                    "sourceIdentity": identity, "releaseComplete": False, "testCasesComplete": True,
-                    "testEvidenceErrors": [], "wrapperCollectionComplete": True}}
-        for name, document in docs.items():
-            release.write_json(root / "reports" / name, document)
-        suite = ET.Element("testsuite")
-        files = []
-        for name in sorted(self.FAST_FIXTURES):
-            case = ET.SubElement(suite, "testcase", name=name)
-            ET.SubElement(case, "system-out").text = (
-                "********* Start testing of SyntheticTests *********\n"
-                "PASS   : SyntheticTests::sample()\n"
-                "Totals: 1 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n"
-                "********* Finished testing of SyntheticTests *********\n")
-            path = root / "reports/wrappers" / (name + ".json")
-            release.write_json(path, {"kind": "synthetic-wrapper", "label": name, "exitCode": 0, "childExitCode": 0})
-            files.append({"label": name, "path": "wrappers/" + path.name, "sha256": release.digest(path),
-                          "exitCode": 0, "childExitCode": 0})
-        ET.ElementTree(suite).write(directory / "ctest.xml", encoding="utf-8")
-        release.write_json(root / "reports/wrappers/index.json", {
-            "collectionComplete": True, "errors": [], "missingLabels": [], "files": files})
-        self.seal(root, identity, platform_id)
-        return identity
-
-    def seal(self, root, identity, platform_id="windows-x64"):
-        release = native.release_evidence()
-        release.write_json(root / "reports/fast-evidence.json", {"schemaVersion": 1,
-            "kind": "native-fast", "identity": identity, "platformId": platform_id,
-            "files": [release.file_record(root, path) for path in sorted((root / "reports").rglob("*"))
-                      if path.is_file() and path.name != "fast-evidence.json"]})
-
-    def inspect(self, root, **kwargs):
-        return native.inspect_fast(root, expected_head=kwargs.get("head", "a" * 40),
-            expected_run=kwargs.get("run", "123"), expected_attempt=kwargs.get("attempt", "1"))
-
-    def artifact_selection(self, attempt=1, retried_platform=None):
-        # The standalone selector tests exercise actual API snapshots. These
-        # fixtures isolate the aggregate's consumption of an already verified
-        # selection and its strict raw-report identity comparisons.
-        return {"schemaVersion": 1, "kind": "ci-artifact-selection", "passed": True,
-            "runId": "123", "aggregateAttempt": attempt, "candidateHead": "a" * 40,
-            "testProfile": "fast", "selected": {name: {"artifactName": name,
-                "artifactId": number, "artifactDigest": "sha256:" + "d" * 64,
-                "sourceAttempt": attempt if name == retried_platform else 1,
-                "sourceJobId": number, "observedJobId": number + 10}
-                for number, name in enumerate(native.release_evidence().PLATFORMS, 1)}}
-
-    def test_daily_profile_defaults_fast_and_accepts_explicit_full(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(native.test_profile(), "fast")
-        for value in ("fast", "full"):
-            with mock.patch.dict(os.environ, {"QCOPILOTS_SEARCH_TEST_PROFILE": value}):
-                self.assertEqual(native.test_profile(), value)
-
-    def test_invalid_profiles_fail_before_creating_runner_root(self):
-        for value in ("", "FULL", " fast", "quick", "full\n"):
-            with self.subTest(value=value), mock.patch.dict(os.environ, {"QCOPILOTS_SEARCH_TEST_PROFILE": value}), \
-                    mock.patch.object(native.tempfile, "mkdtemp") as create:
-                with self.assertRaises(ValueError):
-                    native.initialize_runner()
-                create.assert_not_called()
-
-    def test_expensive_actions_require_explicit_full_before_environment_or_outputs(self):
-        for action in ("install", "models", "capacity", "package", "installers", "sources"):
-            with self.subTest(action=action), mock.patch.dict(os.environ, {}, clear=True), \
-                    mock.patch.object(sys, "argv", [native.__file__, action]), \
-                    mock.patch.object(native, "environment_path") as paths, mock.patch.object(native, "dev") as dev:
-                with self.assertRaisesRegex(RuntimeError, "requires.*full"):
-                    native.main()
-                paths.assert_not_called()
-                dev.assert_not_called()
-
-    def test_full_test_profile_is_explicitly_forwarded_to_developer_runner(self):
-        with self.temporary() as temporary:
-            root = Path(temporary)
-            environment = {"QCOPILOTS_SEARCH_TEST_PROFILE": "full", "QCOPILOTS_SEARCH_BUILD_ROOT": str(root),
-                "QCOPILOTS_SEARCH_QT_ROOT": str(root / "sdk"), "QCOPILOTS_SEARCH_MODEL_DIR": str(root / "models")}
-            with mock.patch.dict(os.environ, environment, clear=True), \
-                    mock.patch.object(sys, "argv", [native.__file__, "test"]), \
-                    mock.patch.object(native, "run", return_value=mock.Mock(stdout='{"kind":"ctestInfo","tests":[]}')) as inventory, \
-                    mock.patch.object(native, "dev") as dev, \
-                    mock.patch.object(native, "collect_test_wrappers", return_value={"collectionComplete": True}), \
-                    mock.patch.object(native, "test_evidence") as cases:
-                native.main()
-            self.assertEqual(dev.call_args.args[:3], ("test", "--test-profile", "full"))
-            cases.assert_called_once_with(require_complete=True, profile="full")
-            self.assertEqual(inventory.call_args.args[0][-3:], ["-C", "Release", "--show-only=json-v1"])
-
-    def test_case_parser_profile_and_required_gate_are_explicit(self):
-        with self.temporary() as temporary:
-            reports = Path(temporary)
-            (reports / "tests").mkdir()
-            (reports / "tests/qt-test-cases.json").write_text("{}", encoding="utf-8")
-            for profile in ("fast", "full"):
-                with self.subTest(profile=profile), mock.patch.object(native, "REPORTS", reports, create=True), \
-                        mock.patch.object(native, "run") as run:
-                    native.test_evidence(require_complete=True, profile=profile)
-                    command = [str(value) for value in run.call_args.args[0]]
-                    self.assertEqual(command[command.index("--test-profile") + 1], profile)
-                    self.assertIn("--require-selected-tests" if profile == "fast" else "--require-complete", command)
-                    expected = "ctest-inventory.json"
-                    self.assertEqual(Path(command[command.index("--inventory") + 1]).name, expected)
-
-    def test_test_evidence_parser_failure_propagates_to_job(self):
-        with self.temporary() as temporary, mock.patch.object(native, "REPORTS", Path(temporary), create=True), \
-                mock.patch.object(native, "run", side_effect=native.subprocess.CalledProcessError(1, ["parser"])):
-            with self.assertRaises(native.subprocess.CalledProcessError):
-                native.test_evidence(require_complete=True, profile="fast")
-
-    def test_selection_has_exact_fast_and_slow_sets_on_both_architectures(self):
-        for architecture in ("x86_64", "arm64"):
-            with self.subTest(architecture=architecture), self.temporary() as temporary:
-                root = Path(temporary)
-                self.selection(root, architecture)
-                selection = native.fast_selection(root, architecture)
-                self.assertEqual(selection["counts"]["selected"], len(self.FAST_FIXTURES))
-                self.assertEqual(selection["counts"]["excluded"], 3 if architecture == "x86_64" else 2)
-
-    def test_selection_rejects_missing_registration_extra_slow_or_missing_fast(self):
-        mutations = ("registration", "extra slow", "missing slow", "missing selected", "duplicate selected")
-        for mutation in mutations:
-            with self.subTest(mutation=mutation), self.temporary() as temporary:
-                root = Path(temporary)
-                directory = self.selection(root)
-                target = directory / ("test-selected-inventory.json" if "selected" in mutation else "ctest-inventory.json")
-                data = json.loads(target.read_text(encoding="utf-8"))
-                if mutation in ("registration", "missing selected"):
-                    data["tests"].pop()
-                elif mutation == "duplicate selected":
-                    data["tests"].append(data["tests"][0])
-                else:
-                    name = "qcs-tests-core" if mutation == "extra slow" else "qcs-tests-semantic"
-                    entry = next(item for item in data["tests"] if item["name"] == name)
-                    entry["properties"][0]["value"] = ["slow"] if mutation == "extra slow" else []
-                target.write_text(json.dumps(data), encoding="utf-8")
-                with self.assertRaises(ValueError):
-                    native.fast_selection(root, "x86_64")
-
-    def test_selection_rejects_partial_failed_or_false_release_claim(self):
-        for key, value in (("profile", "full"), ("passed", False), ("exitCode", 1),
-                           ("filters", []), ("labelFilter", "unit"), ("releaseComplete", True),
-                           ("fullSuitePassed", True), ("status", "running"), ("selectedTests", []),
-                           ("exitCode", False), ("passed", 1)):
-            with self.subTest(key=key), self.temporary() as temporary:
-                root = Path(temporary)
-                target = self.selection(root) / "test-selection.json"
-                data = json.loads(target.read_text(encoding="utf-8"))
-                data[key] = value
-                target.write_text(json.dumps(data), encoding="utf-8")
-                with self.assertRaises(ValueError):
-                    native.fast_selection(root, "x86_64")
-
-    def test_fast_manifest_can_pass_selected_scope_but_never_full_native_gate(self):
-        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core", "qcs-tests-gui"}):
-            root = Path(temporary)
-            self.fixture(root)
-            result = self.inspect(root)
-            self.assertTrue(result["passed"], result["errors"])
-            self.assertFalse(result["releaseComplete"])
-            full = native.release_evidence().inspect_native(root, expected_head="a" * 40)
-            self.assertFalse(full["passed"])
-            # Renaming a partial manifest cannot make the complete native gate pass.
-            (root / "reports/native-evidence.json").write_bytes((root / "reports/fast-evidence.json").read_bytes())
-            self.assertFalse(native.release_evidence().inspect_native(root, expected_head="a" * 40)["passed"])
-
-    def test_fast_gate_rejects_mixed_candidate_run_attempt_and_changed_raw_output(self):
-        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
-            root = Path(temporary)
-            self.fixture(root)
-            for mismatch in ({"head": "b" * 40}, {"run": "124"}, {"attempt": "2"}):
-                with self.subTest(mismatch=mismatch):
-                    self.assertFalse(self.inspect(root, **mismatch)["passed"])
-            with (root / "reports/tests/ctest.xml").open("a", encoding="utf-8") as output:
-                output.write("\n")
-            self.assertFalse(self.inspect(root)["passed"])
-
-    def test_fast_gate_rechecks_actual_case_failures_instead_of_summary_flags(self):
-        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
-            root = Path(temporary)
-            identity = self.fixture(root)
-            junit = root / "reports/tests/ctest.xml"
-            document = ET.parse(junit)
-            ET.SubElement(document.getroot().find("testcase"), "failure")
-            document.write(junit, encoding="utf-8")
-            self.seal(root, identity)
-            self.assertFalse(self.inspect(root)["passed"])
-
-    def test_fast_gate_rejects_false_summary_even_when_raw_cases_pass(self):
-        for key, value in (("testCasesComplete", False), ("testEvidenceErrors", ["required case absent"]),
-                           ("wrapperCollectionComplete", False)):
-            with self.subTest(key=key), self.temporary() as temporary, \
-                    mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
-                root = Path(temporary)
-                identity = self.fixture(root)
-                target = root / "reports/fast-acceptance.json"
-                data = json.loads(target.read_text(encoding="utf-8"))
-                data[key] = value
-                target.write_text(json.dumps(data), encoding="utf-8")
-                self.seal(root, identity)
-                self.assertFalse(self.inspect(root)["passed"])
-
-    def test_fast_gate_rejects_duplicate_wrapper_and_false_or_changed_exit(self):
-        for mutate in ("duplicate", "bool", "exit", "raw"):
-            with self.subTest(mutate=mutate), self.temporary() as temporary, \
-                    mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
-                root = Path(temporary)
-                identity = self.fixture(root)
-                index = root / "reports/wrappers/index.json"
-                data = json.loads(index.read_text(encoding="utf-8"))
-                if mutate == "duplicate":
-                    data["files"].append(data["files"][0])
-                elif mutate in ("bool", "exit"):
-                    data["files"][0]["exitCode"] = False if mutate == "bool" else 1
-                else:
-                    raw = root / "reports" / data["files"][0]["path"]
-                    raw.write_text(json.dumps({"label": "different", "exitCode": 0, "childExitCode": 0}), encoding="utf-8")
-                    data["files"][0]["sha256"] = native.release_evidence().digest(raw)
-                index.write_text(json.dumps(data), encoding="utf-8")
-                self.seal(root, identity)
-                self.assertFalse(self.inspect(root)["passed"])
-
-    def test_fast_gate_rejects_missing_bound_reports_and_incomplete_wrappers(self):
-        for mutate in ("unbound", "wrappers", "build", "release"):
-            with self.subTest(mutate=mutate), self.temporary() as temporary, \
-                    mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
-                root = Path(temporary)
-                identity = self.fixture(root)
-                if mutate == "unbound":
-                    target = root / "reports/fast-evidence.json"
-                    data = json.loads(target.read_text(encoding="utf-8"))
-                    data["files"] = [item for item in data["files"] if not item["path"].endswith("ctest.xml")]
-                    target.write_text(json.dumps(data), encoding="utf-8")
-                else:
-                    name = {"wrappers": "wrappers/index.json", "build": "build-provenance.json", "release": "fast-acceptance.json"}[mutate]
-                    target = root / "reports" / name
-                    data = json.loads(target.read_text(encoding="utf-8"))
-                    key = {"wrappers": "collectionComplete", "build": "completed", "release": "releaseComplete"}[mutate]
-                    data[key] = mutate == "release"
-                    target.write_text(json.dumps(data), encoding="utf-8")
-                    self.seal(root, identity)
-                self.assertFalse(self.inspect(root)["passed"])
-
-    def test_fast_aggregate_requires_four_platforms_and_one_source_run_identity(self):
-        for mutate in (None, "missing", "duplicate", "tree", "attempt"):
-            with self.subTest(mutate=mutate), self.temporary() as temporary, \
-                    mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}), \
-                    mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
-                        "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
-                    mock.patch.object(native, "artifact_selection") as selector:
-                selector.return_value.load_selection.return_value = self.artifact_selection()
-                root = Path(temporary)
-                platforms = list(native.release_evidence().PLATFORMS)
-                for platform_id in platforms[:-1] if mutate == "missing" else platforms:
-                    self.fixture(root / platform_id, platform_id)
-                if mutate == "duplicate":
-                    self.fixture(root / "duplicate", platforms[0])
-                elif mutate in ("tree", "attempt"):
-                    target = root / platforms[0]
-                    identity = json.loads((target / "reports/fast-evidence.json").read_text(encoding="utf-8"))["identity"]
-                    if mutate == "tree":
-                        identity["sourceTree"] = "e" * 40
-                    else:
-                        path = target / "reports/runner-identity.json"
-                        data = json.loads(path.read_text(encoding="utf-8"))
-                        data["runAttempt"] = "2"
-                        path.write_text(json.dumps(data), encoding="utf-8")
-                    self.seal(target, identity, platforms[0])
-                output = root / "aggregate.json"
-                if mutate:
-                    with self.assertRaises(RuntimeError):
-                        native.aggregate_fast(root, output)
-                else:
-                    native.aggregate_fast(root, output)
-                result = json.loads(output.read_text(encoding="utf-8"))
-                self.assertEqual(result["passed"], mutate is None)
-                self.assertFalse(result["releaseComplete"])
-
-    def test_fast_aggregate_binds_each_platform_source_attempt_after_one_job_retry(self):
-        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}), \
-                mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
-                    "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}), \
-                mock.patch.object(native, "artifact_selection") as selector:
-            root = Path(temporary)
-            for name in native.release_evidence().PLATFORMS:
-                identity = self.fixture(root / name, name)
-                if name == "windows-x64":
-                    runner = root / name / "reports/runner-identity.json"
-                    document = json.loads(runner.read_text(encoding="utf-8"))
-                    document["runAttempt"] = "2"
-                    runner.write_text(json.dumps(document), encoding="utf-8")
-                    self.seal(root / name, identity, name)
-            selection = self.artifact_selection(2, "windows-x64")
-            selector.return_value.load_selection.return_value = selection
-            native.aggregate_fast(root, root / "aggregate.json")
-            result = json.loads((root / "aggregate.json").read_text(encoding="utf-8"))
-            self.assertTrue(result["passed"], result["errors"])
-            self.assertEqual(result["artifactSelection"], selection)
-            self.assertEqual({name: gate["selection"]["sourceAttempt"]
-                for name, gate in result["gates"].items()},
-                {name: 2 if name == "windows-x64" else 1 for name in native.release_evidence().PLATFORMS})
-            selector.return_value.load_selection.assert_called_once_with(root / "selection.json",
-                expected_head="a" * 40, expected_profile="fast", expected_run="123")
-
-    def test_fast_aggregate_never_uses_old_success_when_latest_selection_fails(self):
-        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}), \
-                mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
-                    "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}), \
-                mock.patch.object(native, "artifact_selection") as selector, \
-                mock.patch.object(native, "inspect_fast") as inspect:
-            root = Path(temporary)
-            for name in native.release_evidence().PLATFORMS:
-                self.fixture(root / name, name)
-            selector.return_value.load_selection.side_effect = ValueError("Latest Windows job failed or its artifact is missing")
-            with self.assertRaises(RuntimeError):
-                native.aggregate_fast(root, root / "aggregate.json")
-            result = json.loads((root / "aggregate.json").read_text(encoding="utf-8"))
-            self.assertFalse(result["passed"])
-            self.assertIn("Latest Windows job failed", " ".join(result["errors"]))
-            inspect.assert_not_called()
-
-    def test_fast_aggregate_rejects_a_selection_from_another_aggregate_attempt(self):
-        with self.temporary() as temporary, \
-                mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
-                    "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}), \
-                mock.patch.object(native, "artifact_selection") as selector:
-            root = Path(temporary)
-            selector.return_value.load_selection.return_value = self.artifact_selection(1)
-            with self.assertRaisesRegex(RuntimeError, "another aggregate attempt"):
-                native.aggregate_fast(root, root / "aggregate.json")
-
-    def test_workflow_has_fast_daily_and_explicit_full_with_isolated_artifacts(self):
-        workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
-        self.assertIn("default: fast", workflow)
-        self.assertIn("options: [fast, full]", workflow)
-        self.assertIn("types: [opened, synchronize, reopened, labeled, unlabeled]", workflow)
-        profile_expression = "(github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full'))) && 'full' || inputs.test_profile || 'fast'"
-        self.assertEqual(workflow.count(profile_expression), 2,
-                         "Both profile selection and concurrency must distinguish full PR runs")
-        self.assertLess(workflow.index("qcs-native-ci.py models\n"), workflow.index("qcs-native-ci.py test\n"))
-        self.assertLess(workflow.index("qcs-native-ci.py test\n"), workflow.index("qcs-native-ci.py install\n"))
-        self.assertIn("name: qcs-fast-${{ matrix.id }}", workflow)
-        self.assertIn("name: qcs-native-${{ matrix.id }}", workflow)
-        self.assertEqual(workflow.count("-attempt${{ github.run_attempt }}"), 4)
-        self.assertEqual(workflow.count("overwrite: false"), 4)
-        self.assertNotIn("overwrite: true", workflow)
-        self.assertIn("artifact-ids: ${{ steps.selection.outputs.artifact_ids }}", workflow)
-        self.assertIn('--run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"', workflow)
-        self.assertIn("actions: read", workflow)
-        self.assertNotIn("pattern: qcs-", workflow)
-        for action in ("install", "models", "capacity", "package", "installers", "sources"):
-            step = next(item for item in workflow.split("      - name: ") if f"qcs-native-ci.py {action}\n" in item)
-            self.assertIn("env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'", step)
-        fast_upload = next(item for item in workflow.split("      - name: ") if item.startswith("Upload daily fast reports"))
-        self.assertNotIn("/pkg/", fast_upload)
-        self.assertNotIn("/runs/", fast_upload)
-        self.assertIn("/reports", fast_upload)
-
-
 class NativeStageDependencyTests(unittest.TestCase):
-    """Exercise the actual workflow predicates without a GitHub runner."""
+    """Verify workflow ordering and default failure propagation before upload."""
 
-    ACTIONS = ("capacity", "install", "package", "installers", "sources")
+    ACTIONS = ("initialize", "bootstrap", "doctor", "configure", "build", "models",
+               "test", "install", "package", "installers", "products")
+
+    def setUp(self):
+        self.workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
+        self.native_job = self.workflow.split("  native:\n", 1)[1].split("  required:\n", 1)[0]
+        self.steps = self.native_job.split("      - name: ")[1:]
 
     def step(self, action):
-        workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
-        return next(item for item in workflow.split("      - name: ")
-                    if f"qcs-native-ci.py {action}\n" in item)
+        return next(item for item in self.steps if f"qcs-native-ci.py {action}\n" in item)
 
-    def eligible(self, action, outcomes, *, profile="full", system="Windows", cancelled=False):
-        match = re.search(r"^        if: (.+)$", self.step(action), re.MULTILINE)
-        self.assertIsNotNone(match, f"{action} needs an explicit dependency condition")
-        expression = match.group(1).strip()
-        self.assertTrue(expression.startswith("${{ ") and expression.endswith(" }}"))
-        self.assertIn("!cancelled()", expression, "The default success() must not suppress independent work")
-        expression = expression[3:-2].strip().replace("!cancelled()", repr(not cancelled))
-        expression = expression.replace("env.QCOPILOTS_SEARCH_TEST_PROFILE", repr(profile))
-        expression = expression.replace("runner.os", repr(system))
-        expression = re.sub(r"steps\.([a-z_]+)\.outcome", lambda match: repr(outcomes.get(match.group(1), "skipped")), expression)
-        expression = expression.replace("&&", "and").replace("||", "or")
-        tree = ast.parse(expression, mode="eval")
-        allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.Constant)
-        self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)),
-                        "Unexpected workflow predicate syntax must be reviewed explicitly")
-        return eval(compile(tree, "<workflow-condition>", "eval"), {"__builtins__": {}}, {})
-
-    def scheduled(self, failures=(), *, profile="full", system="Windows", cancelled=False):
-        failures = set(failures)
-        outcomes = {"build": "failure" if "build" in failures else "success"}
-        outcomes["models"] = ("skipped" if outcomes["build"] != "success" or profile != "full"
-                              else "failure" if "models" in failures else "success")
-        outcomes["tests"] = ("failure" if "tests" in failures else "success")
-        started = set()
+    def test_native_steps_run_in_order_and_inherit_failure_propagation(self):
+        observed = re.findall(r"run: python \.github/scripts/qcs-native-ci\.py (\w+)", self.native_job)
+        self.assertEqual(observed, list(self.ACTIONS))
+        self.assertNotIn("continue-on-error:", self.native_job)
+        always_steps = [step.splitlines()[0] for step in self.steps if "always()" in step]
+        self.assertEqual(always_steps, ["Record Windows ROCm disk space after SDK setup"])
+        self.assertNotIn("!cancelled()", self.native_job)
         for action in self.ACTIONS:
-            if self.eligible(action, outcomes, profile=profile, system=system, cancelled=cancelled):
-                started.add(action)
-                outcomes[action] = "failure" if action in failures else "success"
-            else:
-                outcomes[action] = "skipped"
-        return started, outcomes
-
-    def test_full_tests_failure_keeps_independent_acceptance_and_preserves_failure(self):
-        # Quality failure, timeout and incomplete raw reports all retain the
-        # same nonzero test-step outcome. None becomes a passing full result.
-        started, outcomes = self.scheduled({"tests"})
-        self.assertEqual(started, set(self.ACTIONS))
-        self.assertEqual(outcomes["tests"], "failure")
-        self.assertTrue(self.eligible("preflight", {**outcomes, "report": "success"}))
-        workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
-        self.assertNotIn("continue-on-error:", workflow)
-        self.assertNotIn("if:", self.step("test"))
-        self.assertIn("if: always()", self.step("report"))
-        self.assertIn('run: test "$NATIVE_RESULT" = success', workflow)
-
-    def test_outcome_references_have_the_expected_native_step_ids(self):
-        for action in ("build", "models", "test", *self.ACTIONS, "report"):
             with self.subTest(action=action):
-                expected = "tests" if action == "test" else action
-                match = re.search(r"^        id: ([a-z_]+)$", self.step(action), re.MULTILINE)
-                self.assertIsNotNone(match)
-                self.assertEqual(match.group(1), expected)
+                conditions = re.findall(r"^        if: (.+)$", self.step(action), re.MULTILINE)
+                self.assertEqual(conditions, ["runner.os == 'Windows' || runner.os == 'Linux'"]
+                                 if action == "installers" else [])
 
-    def test_failed_or_missing_build_blocks_all_dependent_actions(self):
-        self.assertEqual(self.scheduled({"build"})[0], set())
-        for status in ("failure", "skipped", "cancelled", ""):
-            for action in ("capacity", "install", "sources"):
-                with self.subTest(status=status, action=action):
-                    self.assertFalse(self.eligible(action, {"build": status}))
+    def test_upload_is_only_after_all_real_model_and_package_checks(self):
+        uploads = [step for step in self.steps if "uses: actions/upload-artifact@" in step]
+        self.assertEqual(len(uploads), 1)
+        upload = uploads[0]
+        self.assertGreater(self.steps.index(upload), self.steps.index(self.step("products")))
+        self.assertIsNone(re.search(r"^        if:", upload, re.MULTILINE), "Upload must inherit success()")
+        self.assertIn("path: ${{ steps.packages.outputs.paths }}", upload)
+        self.assertIn("id: packages", self.step("products"))
+        self.assertIn("overwrite: false", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        self.assertIn("qcs-packages-${{ matrix.id }}-${{ env.QCOPILOTS_SEARCH_CANDIDATE_HEAD }}-attempt${{ github.run_attempt }}", upload)
+        self.assertNotIn("/reports", upload)
+        self.assertNotIn("/pkg/", upload)
 
-    def test_model_failure_still_allows_model_independent_actions(self):
-        self.assertEqual(self.scheduled({"models"})[0], {"capacity", "install", "sources"})
+    def test_matrix_comes_from_shared_manifest_and_keeps_independent_variants(self):
+        self.assertIn("run: python3 .github/scripts/qcs-native-ci.py matrix", self.workflow)
+        self.assertIn("matrix: ${{ fromJSON(needs.matrix.outputs.configurations) }}", self.native_job)
+        self.assertIn("container: ${{ matrix.container }}", self.native_job)
+        self.assertIn("fail-fast: false", self.native_job)
+        self.assertIn("QCOPILOTS_SEARCH_CI_ID: ${{ matrix.id }}", self.native_job)
+        with mock.patch.object(native.sys, "argv", ["synthetic-native-ci", "matrix"]), \
+                mock.patch.dict(native.os.environ, {"GITHUB_OUTPUT": ""}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            native.main()
+        rows = json.loads(output.getvalue())["include"]
+        self.assertEqual({row["id"] for row in rows}, set(native.variants()))
+        self.assertTrue(all("container" in row for row in rows))
 
-    def test_stage_failure_stops_only_its_actual_dependents(self):
-        cases = (("capacity", set(self.ACTIONS)),
-                 ("install", {"capacity", "install", "sources"}),
-                 ("package", {"capacity", "install", "package", "sources"}),
-                 ("installers", set(self.ACTIONS)))
-        for failed, expected in cases:
-            with self.subTest(failed=failed):
-                self.assertEqual(self.scheduled({failed})[0], expected)
+    def test_required_job_checks_native_result_and_immutable_artifacts(self):
+        required = self.workflow.split("  required:\n", 1)[1]
+        self.assertIn("if: always()", required)
+        self.assertIn("needs: [matrix, native]", required)
+        self.assertIn('test "$MATRIX_RESULT" = success && test "$NATIVE_RESULT" = success', required)
+        self.assertIn("qcs-artifact-selection.py collect", required)
+        self.assertIn(' --attempt "$GITHUB_RUN_ATTEMPT"', required)
+        self.assertNotIn("actions/upload-artifact@", required)
+        self.assertNotIn("continue-on-error:", required)
 
-    def test_fast_cancellation_and_platform_scope_remain_bounded(self):
-        self.assertEqual(self.scheduled(profile="fast")[0], set())
-        self.assertEqual(self.scheduled(cancelled=True)[0], set())
-        self.assertEqual(self.scheduled(system="macOS")[0], set(self.ACTIONS) - {"installers"})
-        self.assertEqual(self.scheduled(system="Linux")[0], set(self.ACTIONS))
 
-    def test_gate_requires_report_and_never_runs_after_cancellation(self):
-        self.assertTrue(self.eligible("preflight", {"report": "success", "tests": "failure"}))
-        for status in ("failure", "skipped", "cancelled", ""):
-            with self.subTest(status=status):
-                self.assertFalse(self.eligible("preflight", {"report": status}))
-        self.assertFalse(self.eligible("preflight", {"report": "success"}, cancelled=True))
+class NativePackageProductsTests(unittest.TestCase):
+    def package_set(self, root, identifier="windows-x64-cpu", head="a" * 40, attempt="2"):
+        selected = native.variants()[identifier]
+        suffixes = {"NSIS": ".exe", "ZIP": ".zip", "DEB": ".deb", "TGZ": ".tar.gz", "DragNDrop": ".dmg"}
+        files = []
+        for generator in selected["generators"]:
+            path = root / f"qcs-0.1.0-{identifier}-{head[:12]}-attempt{attempt}{suffixes[generator]}"
+            path.write_bytes(b"synthetic package bytes for output contract only")
+            files.append(path)
+        return selected, files
+
+    def test_every_variant_requires_its_installer_and_portable_formats(self):
+        for identifier in native.variants():
+            with self.subTest(identifier=identifier), tempfile.TemporaryDirectory(prefix="qcs-package-set-",
+                    dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+                root = Path(temporary)
+                selected, files = self.package_set(root, identifier)
+                self.assertEqual(set(native.package_files(root, selected, "a" * 40, "2")), set(files))
+                files[0].unlink()
+                with self.assertRaisesRegex(RuntimeError, "Package formats differ"):
+                    native.package_files(root, selected, "a" * 40, "2")
+
+    def test_wrong_candidate_attempt_backend_or_extra_format_is_rejected(self):
+        for mutation in ("candidate", "attempt", "backend", "extra", "sources", "symbols", "checksums", "duplicate", "empty"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(prefix="qcs-package-invalid-",
+                    dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+                root = Path(temporary)
+                selected, files = self.package_set(root)
+                if mutation == "candidate":
+                    files[0].rename(files[0].with_name(files[0].name.replace("a" * 12, "b" * 12)))
+                elif mutation == "attempt":
+                    files[0].rename(files[0].with_name(files[0].name.replace("attempt2", "attempt1")))
+                elif mutation == "backend":
+                    files[0].rename(files[0].with_name(files[0].name.replace("-cpu-", "-vulkan-")))
+                elif mutation == "extra":
+                    (root / "qcs-report.json").write_text("{}", encoding="utf-8")
+                elif mutation in ("sources", "symbols", "checksums"):
+                    name = {"sources": "qcs-sources.tar.gz", "symbols": "qcs-symbols.zip",
+                            "checksums": "qcs-SHA256SUMS"}[mutation]
+                    (root / name).write_bytes(b"not a user package")
+                elif mutation == "duplicate":
+                    files[0].with_name(files[0].name.replace("0.1.0", "0.2.0")).write_bytes(b"duplicate")
+                else:
+                    files[0].write_bytes(b"")
+                with self.assertRaises(RuntimeError):
+                    native.package_files(root, selected, "a" * 40, "2")
+
+    def test_rocm_setup_archive_replaces_only_the_installer(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-rocm-setup-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            root = Path(temporary)
+            selected, files = self.package_set(root, "windows-x64-rocm")
+            installer = next(path for path in files if path.suffix == ".exe")
+            portable = next(path for path in files if path.suffix == ".zip")
+            setup = installer.with_name(installer.stem + "-setup.zip")
+            installer.rename(setup)
+            self.assertEqual(set(native.package_files(root, selected, "a" * 40, "2")), {setup, portable})
+            installer.write_bytes(b"a second installer must not be uploaded")
+            with self.assertRaisesRegex(RuntimeError, "Package formats differ"):
+                native.package_files(root, selected, "a" * 40, "2")
+            installer.unlink()
+            portable.unlink()
+            with self.assertRaisesRegex(RuntimeError, "Package formats differ"):
+                native.package_files(root, selected, "a" * 40, "2")
+
+    def test_setup_archive_is_rejected_for_every_other_variant(self):
+        for identifier in set(native.variants()) - {"windows-x64-rocm"}:
+            with self.subTest(identifier=identifier), tempfile.TemporaryDirectory(prefix="qcs-setup-scope-",
+                    dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+                root = Path(temporary)
+                selected, files = self.package_set(root, identifier)
+                if any(path.suffix == ".exe" for path in files):
+                    next(path for path in files if path.suffix == ".exe").unlink()
+                setup = root / f"qcs-0.1.0-{identifier}-{'a' * 12}-attempt2-setup.zip"
+                setup.write_bytes(b"unsupported installer fallback")
+                with self.assertRaisesRegex(RuntimeError, "Unexpected package output"):
+                    native.package_files(root, selected, "a" * 40, "2")
+
+    def test_installer_and_portable_versions_cannot_be_mixed(self):
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback), tempfile.TemporaryDirectory(prefix="qcs-version-pair-",
+                    dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+                root = Path(temporary)
+                selected, files = self.package_set(root, "windows-x64-rocm")
+                installer = next(path for path in files if path.suffix == ".exe")
+                name = installer.name.replace("0.1.0", "0.2.0")
+                if fallback:
+                    name = name.removesuffix(".exe") + "-setup.zip"
+                installer.rename(installer.with_name(name))
+                with self.assertRaisesRegex(RuntimeError, "same version and candidate identity"):
+                    native.package_files(root, selected, "a" * 40, "2")
+
+    def test_two_gib_limit_is_strict_without_allocating_large_files(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-package-size-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            root = Path(temporary)
+            selected, files = self.package_set(root)
+            real_stat = Path.stat
+            for size in (2 * 1024**3 - 1, 2 * 1024**3, 2 * 1024**3 + 1):
+                def sized_stat(path, *args, **kwargs):
+                    actual = real_stat(path, *args, **kwargs)
+                    if path == files[0]:
+                        values = list(actual)
+                        values[6] = size
+                        return os.stat_result(values)
+                    return actual
+                with self.subTest(size=size), mock.patch.object(Path, "stat", sized_stat):
+                    if size < 2 * 1024**3:
+                        self.assertEqual(set(native.package_files(root, selected, "a" * 40, "2")), set(files))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "below 2 GiB"):
+                            native.package_files(root, selected, "a" * 40, "2")
+
+    def test_symbolic_package_cannot_enter_upload_list(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-package-link-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            root = Path(temporary)
+            selected, files = self.package_set(root)
+            real_is_symlink = Path.is_symlink
+            with mock.patch.object(Path, "is_symlink", lambda path: path == files[0] or real_is_symlink(path)):
+                with self.assertRaisesRegex(RuntimeError, "Not an ordinary package file"):
+                    native.package_files(root, selected, "a" * 40, "2")
+
+    def test_cpack_working_tree_and_unrelated_side_files_never_enter_upload_list(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-package-whitelist-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            root = Path(temporary)
+            selected, files = self.package_set(root)
+            working_tree = root / "_CPack_Packages"
+            working_tree.mkdir()
+            (working_tree / "transient-output").write_bytes(b"CPack working data")
+            (root / "SHA256SUMS").write_bytes(b"diagnostic checksums")
+            self.assertEqual(set(native.package_files(root, selected, "a" * 40, "2")), set(files))
+
+    def test_products_emits_only_verified_paths_and_hashes_to_native_logs(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-products-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            root = Path(temporary)
+            packages = root / "pkg/Release"
+            packages.mkdir(parents=True)
+            selected, files = self.package_set(packages)
+            output_path, summary_path = root / "github-output", root / "summary"
+            with mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "variant", return_value=selected), \
+                    mock.patch.object(native, "candidate_head", return_value="a" * 40), \
+                    mock.patch.dict(native.os.environ, {"GITHUB_RUN_ATTEMPT": "2",
+                        "GITHUB_OUTPUT": str(output_path), "GITHUB_STEP_SUMMARY": str(summary_path)}), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                emitted = native.products()
+            self.assertEqual(set(emitted), set(files))
+            document = json.loads(output.getvalue())
+            self.assertEqual(document["configuration"], selected["id"])
+            self.assertEqual({record["name"] for record in document["packages"]}, {path.name for path in files})
+            for record in document["packages"]:
+                raw = (packages / record["name"]).read_bytes()
+                self.assertEqual(record["bytes"], len(raw))
+                self.assertEqual(record["sha256"], native.hashlib.sha256(raw).hexdigest())
+                self.assertIn(record["sha256"], summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines(),
+                             ["paths<<QCS_PACKAGE_PATHS", *[str(path) for path in emitted], "QCS_PACKAGE_PATHS"])
 
 
 if __name__ == "__main__":

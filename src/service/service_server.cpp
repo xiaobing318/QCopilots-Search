@@ -21,6 +21,7 @@
 #include <QLockFile>
 #include <QPointer>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QQueue>
 #include <QRandomGenerator>
 #include <QSaveFile>
@@ -179,6 +180,10 @@ public:
     QSet<QString> catalogFiles;
     QString currentWorkerId;
     QJsonObject failures;
+    QJsonObject indexRuntime, queryRuntime;
+    bool latestRuntimeIsQuery = false;
+    bool indexGpuOperation = false, queryGpuOperation = false;
+    QString indexCpuFallback, queryCpuFallback;
     IndexProgress progress;
     QThreadPool scanPool, writePool, searchPool;
     std::mutex publicationConfigurationMutex;
@@ -396,6 +401,94 @@ public:
     }
     void publishProgress() { event(QStringLiteral("progress"), progress.toJson()); }
 
+    QJsonObject runtimeStatus() const {
+        return {{"runtime", latestRuntimeIsQuery ? queryRuntime : indexRuntime},
+                {"runtimeWorkers", QJsonObject{{"index", indexRuntime}, {"query", queryRuntime}}}};
+    }
+
+    void recordRuntime(bool query, const QJsonObject &message) {
+        const auto payload = message.value(message.value("ok").toBool() ? "result" : "error").toObject();
+        auto diagnostics = payload.value("runtime").toObject();
+        if (diagnostics.isEmpty()) return;
+        const auto &cpuFallback = query ? queryCpuFallback : indexCpuFallback;
+        if (!cpuFallback.isEmpty()) {
+            diagnostics.insert("requestedBackend", "auto");
+            diagnostics.insert("effectiveBackendRequest", "cpu");
+            const auto reason = diagnostics.value("fallbackReason").toString();
+            diagnostics.insert("fallbackReason", reason.isEmpty() ? cpuFallback : cpuFallback + '\n' + reason);
+        }
+        diagnostics.insert("workerRole", query ? "query" : "index");
+        auto &previous = query ? queryRuntime : indexRuntime;
+        if (previous == diagnostics && latestRuntimeIsQuery == query) return;
+        previous = diagnostics;
+        latestRuntimeIsQuery = query;
+        log(QStringLiteral("Inference runtime: %1").arg(QString::fromUtf8(QJsonDocument(diagnostics).toJson(QJsonDocument::Compact))));
+        event(QStringLiteral("runtime"), runtimeStatus());
+    }
+
+    void runtimeStopped(bool query) {
+        auto &diagnostics = query ? queryRuntime : indexRuntime;
+        if (diagnostics.isEmpty() || !diagnostics.value("loaded").toBool()) return;
+        diagnostics.insert("loaded", false);
+        event(QStringLiteral("runtime"), runtimeStatus());
+    }
+
+    bool strictGpu() const {
+        return qEnvironmentVariable("QCOPILOTS_SEARCH_BACKEND").trimmed().compare("gpu", Qt::CaseInsensitive) == 0;
+    }
+
+    bool runtimeEvent(bool query, const QJsonObject &message) {
+        if (message.value("event").toString() != "runtime") return false;
+        const auto id = message.value("id").toString();
+        if (id.isEmpty() || id != (query ? activeQuery : currentWorkerId)) return true;
+        const auto data = message.value("data").toObject();
+        const auto diagnostics = data.value("runtime").toObject();
+        auto &gpuOperation = query ? queryGpuOperation : indexGpuOperation;
+        const auto phase = data.value("phase").toString();
+        if (phase == "inference-start") {
+            const QString packaged = diagnostics.value("packagedBackend").toString();
+            gpuOperation = diagnostics.value("requestedBackend").toString().trimmed().compare("auto", Qt::CaseInsensitive) == 0
+                && !packaged.isEmpty() && packaged != "cpu"
+                && (data.value("activity").toString() == "model-load"
+                    || !diagnostics.value("loaded").toBool() || diagnostics.value("gpuSelected").toBool());
+        } else if (phase == "inference-end") gpuOperation = false;
+        else return true;
+        recordRuntime(query, {{"ok", true}, {"result", QJsonObject{{"runtime", diagnostics}}}});
+        return true;
+    }
+
+    bool retryGpuCrashOnCpu(bool query, int code, QProcess::ExitStatus status) {
+        auto &fallback = query ? queryCpuFallback : indexCpuFallback;
+        const bool gpuOperation = std::exchange(query ? queryGpuOperation : indexGpuOperation, false);
+        if (!gpuOperation || strictGpu() || !fallback.isEmpty()
+            || (status == QProcess::NormalExit && code == 0)) return false;
+        if (query ? activeQuery.isEmpty() || !requests.contains(activeQuery)
+                  : !current || currentWorkerId.isEmpty() || publishing) return false;
+        fallback = QStringLiteral("The GPU worker exited during inference (exit %1, status %2). Retrying once on CPU.")
+            .arg(code).arg(int(status));
+        log(fallback);
+        auto &diagnostics = query ? queryRuntime : indexRuntime;
+        diagnostics.insert("loaded", false);
+        diagnostics.insert("gpuSelected", false);
+        diagnostics.insert("gpuSelfTestPassed", false);
+        diagnostics.insert("textWarmupCompleted", false);
+        diagnostics.insert("selectedBackend", "");
+        diagnostics.insert("deviceName", "");
+        diagnostics.insert("deviceDescription", "");
+        diagnostics.insert("fallbackReason", fallback);
+        diagnostics.insert("error", "");
+        event(QStringLiteral("runtime"), runtimeStatus());
+        if (query) {
+            queryTimeout.stop();
+            queryQueue.prepend(activeQuery);
+            activeQuery.clear();
+        } else {
+            indexTimeout.stop();
+            currentWorkerId.clear();
+        }
+        return true;
+    }
+
     void dispatch(QLocalSocket *socket, const QJsonObject &message) {
         const QString id = message.value("id").toString();
         if (id.isEmpty() || id.size() > 128 || !message.value("method").isString()
@@ -427,7 +520,9 @@ public:
                 {"failures", failures}, {"warning", error},
                 {"watcherMode", watcherMode}, {"watcherWarning", watcherWarning}, {"reconcileIntervalMs", reconcile.interval()},
                 {"activeSearches", activeSearches.size()}, {"queuedQueries", queryQueue.size()},
-                {"queuedFiles", jobs.size() + (current ? 1 : 0)}, {"catalogReady", catalogReady}});
+                {"queuedFiles", jobs.size() + (current ? 1 : 0)}, {"catalogReady", catalogReady},
+                {"runtime", latestRuntimeIsQuery ? queryRuntime : indexRuntime},
+                {"runtimeWorkers", QJsonObject{{"index", indexRuntime}, {"query", queryRuntime}}}});
         } else if (method == "settings.get") sendResult(socket, id, settings.toJson());
         else if (method == "settings.set") {
             auto json = settings.toJson();
@@ -455,11 +550,15 @@ public:
                 sendError(socket, id, QStringLiteral("code_search_disabled"), QStringLiteral("Enable code search in folder settings before querying the code index")); return;
             }
             if (!params.value("query").isString() || params.value("query").toString().size() > 8192
-                || params.value("limit").toInt(100) < 1 || params.value("limit").toInt(100) > 500) {
-                sendError(socket, id, QStringLiteral("invalid_request"), QStringLiteral("Search requires a query up to 8192 characters and limit 1–500")); return;
+                || params.value("limit").toInt(100) < 1 || params.value("limit").toInt(100) > maximumSearchResults) {
+                sendError(socket, id, QStringLiteral("invalid_request"), QStringLiteral("Search requires a query up to 8192 characters and limit 1–%1").arg(maximumSearchResults)); return;
             }
             if (!catalogReady) {
                 sendError(socket, id, QStringLiteral("metadata_pending"), QStringLiteral("Folder metadata reconciliation has not completed successfully")); return;
+            }
+            if (strictGpu() && params.value("semantic").toBool(true)
+                && !params.value("query").toString().trimmed().isEmpty() && !modelAvailable) {
+                sendError(socket, id, QStringLiteral("gpu_unavailable"), QStringLiteral("Strict GPU search requires an available inference model")); return;
             }
             const QString internal = QUuid::createUuid().toString(QUuid::WithoutBraces);
             requests.insert(internal, {socket, id, params, generation});
@@ -536,6 +635,10 @@ public:
     }
 
     bool refreshModels(QString *error = nullptr) {
+        indexRuntime = {}; queryRuntime = {}; latestRuntimeIsQuery = false;
+        indexGpuOperation = queryGpuOperation = false;
+        indexCpuFallback.clear(); queryCpuFallback.clear();
+        if (started) event(QStringLiteral("runtime"), runtimeStatus());
         QString verificationError;
         ModelFiles models(paths.modelDir);
         const bool available = modelVerifier ? modelVerifier(&verificationError) : models.verify(&verificationError);
@@ -871,6 +974,7 @@ public:
                     workerFailure(query, QStringLiteral("Malformed worker response"));
                     stopWorkerForRestart(query, ExitReason::Fault); return;
                 }
+                if (runtimeEvent(query, document.object())) continue;
                 if (query) receiveQuery(document.object()); else receiveIndex(document.object());
             }
         });
@@ -888,6 +992,7 @@ public:
         });
         QObject::connect(&worker, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), q,
             [this, query](int code, QProcess::ExitStatus status) {
+                runtimeStopped(query);
                 if (stopping) return;
                 (query ? queryIdle : indexIdle).stop();
                 (query ? queryShutdownGrace : indexShutdownGrace).stop();
@@ -895,7 +1000,7 @@ public:
                 const auto previousReason = std::exchange(reason, ExitReason::None);
                 if (query) queryRestartPending = false; else indexRestartPending = false;
                 if (query) queryBuffer.clear(); else indexBuffer.clear();
-                if (previousReason == ExitReason::None)
+                if (previousReason == ExitReason::None && !retryGpuCrashOnCpu(query, code, status))
                     workerFailure(query, QStringLiteral("Worker exited (%1, %2)").arg(code).arg(int(status)));
                 QTimer::singleShot(0, q, [this, query] {
                     if (query) nextQuery();
@@ -912,7 +1017,15 @@ public:
         worker.setProgram(executablePath(QStringLiteral("qcs-worker")));
         worker.setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir,
                              "--mode", query ? "query" : (modelAvailable ? "full" : "extract"), "--threads", query ? "4" : "2"});
+        worker.setProcessEnvironment(QProcessEnvironment::systemEnvironment());
         if (configureWorker) configureWorker(worker, query);
+        if (!(query ? queryCpuFallback : indexCpuFallback).isEmpty()) {
+            auto environment = worker.processEnvironment();
+            if (environment.inheritsFromParent()) environment = QProcessEnvironment::systemEnvironment();
+            environment.insert("QCOPILOTS_SEARCH_BACKEND", "cpu");
+            worker.setProcessEnvironment(environment);
+        }
+        (query ? queryGpuOperation : indexGpuOperation) = false;
         worker.start();
         // Process startup is bounded. File decoding and inference are always asynchronous.
         return worker.waitForStarted(3000);
@@ -981,13 +1094,15 @@ public:
         currentWorkerId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         const QJsonObject request{{"id", currentWorkerId}, {"operation", "extract"}, {"path", current->file.path},
             {"expectedVersion", current->workerVersion}, {"code", current->file.kind == "code"}, {"embed", modelAvailable},
-            {"offset", current->offset}, {"maxSegments", 40}, {"pipelineFingerprint", pipeline}};
+            {"offset", current->offset}, {"maxSegments", 40}, {"pipelineFingerprint", pipeline}, {"runtimeEvents", true}};
         indexWorker.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
         indexTimeout.start(10 * 60 * 1000);
     }
 
     void receiveIndex(const QJsonObject &message) {
         if (!current || message.value("id").toString() != currentWorkerId) return;
+        indexGpuOperation = false;
+        recordRuntime(false, message);
         indexTimeout.stop(); currentWorkerId.clear();
         if (!message.value("ok").toBool()) {
             const auto error = message.value("error").toObject();
@@ -997,6 +1112,11 @@ public:
             publishFailedCurrent(error.value("message").toString("Worker failed")); return;
         }
         const auto result = message.value("result").toObject();
+        if (modelAvailable && strictGpu() && (!indexRuntime.value("gpuSelected").toBool()
+            || !indexRuntime.value("loaded").toBool() || !indexRuntime.value("gpuSelfTestPassed").toBool()
+            || !indexRuntime.value("textWarmupCompleted").toBool())) {
+            publishFailedCurrent(QStringLiteral("Strict GPU inference did not confirm a loaded GPU backend")); return;
+        }
         if (result.value("extractionFingerprint").toString() != extractionPipelineFingerprint()
             || (modelAvailable && result.value("modelFingerprint").toString() != embeddingPipelineFingerprint())) {
             failCurrent(QStringLiteral("Worker pipeline fingerprint differs from the service build")); return;
@@ -1165,7 +1285,7 @@ public:
         if (query) {
             queryTimeout.stop();
             const auto id = activeQuery; activeQuery.clear();
-            if (!id.isEmpty()) runSearch(id, {}, error);
+            if (!id.isEmpty()) completeQuery(id, {}, error);
         } else if (current && !publishing && !currentWorkerId.isEmpty()) publishFailedCurrent(error);
     }
 
@@ -1176,18 +1296,21 @@ public:
         if (queryQueue.isEmpty()) { updateIdleWorkers(); return; }
         activeQuery = queryQueue.dequeue();
         if (!ensureWorker(queryWorker, true)) {
-            const QString id = activeQuery; activeQuery.clear(); runSearch(id, {}, QStringLiteral("Query encoder unavailable"));
+            const QString id = activeQuery; activeQuery.clear(); completeQuery(id, {}, QStringLiteral("Query encoder unavailable"));
             QTimer::singleShot(0, q, [this] { nextQuery(); }); return;
         }
         const auto params = requests.value(activeQuery).params;
         queryIdle.stop();
-        const QJsonObject request{{"id", activeQuery}, {"operation", "query"}, {"query", params.value("query")}, {"code", params.value("code").toBool()}};
+        const QJsonObject request{{"id", activeQuery}, {"operation", "query"}, {"query", params.value("query")},
+            {"code", params.value("code").toBool()}, {"runtimeEvents", true}};
         queryWorker.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
         queryTimeout.start(90000);
     }
 
     void receiveQuery(const QJsonObject &message) {
         if (activeQuery.isEmpty() || message.value("id").toString() != activeQuery) return;
+        queryGpuOperation = false;
+        recordRuntime(true, message);
         queryTimeout.stop(); const auto id = activeQuery; activeQuery.clear();
         QVector<float> embedding;
         QString warning;
@@ -1197,8 +1320,21 @@ public:
                 warning = QStringLiteral("Query encoder pipeline fingerprint differs from the service build");
             else for (const auto &value : result.value("embedding").toArray()) embedding.append(float(value.toDouble()));
             if (embedding.size() != embeddingDimensions) { embedding.clear(); warning = QStringLiteral("Query encoder returned an invalid vector"); }
+            if (strictGpu() && (!queryRuntime.value("gpuSelected").toBool() || !queryRuntime.value("loaded").toBool()
+                || !queryRuntime.value("gpuSelfTestPassed").toBool() || !queryRuntime.value("textWarmupCompleted").toBool())) {
+                embedding.clear(); warning = QStringLiteral("Strict GPU inference did not confirm a loaded GPU backend");
+            }
         } else warning = message.value("error").toObject().value("message").toString();
-        runSearch(id, embedding, warning); nextQuery();
+        completeQuery(id, embedding, warning); nextQuery();
+    }
+
+    void completeQuery(const QString &id, const QVector<float> &embedding, const QString &warning) {
+        if (strictGpu() && embedding.isEmpty()) {
+            finishError(id, QStringLiteral("gpu_unavailable"), warning.isEmpty()
+                ? QStringLiteral("Strict GPU inference did not return an embedding") : warning);
+            return;
+        }
+        runSearch(id, embedding, warning);
     }
 
     bool pathAllowed(const QString &path, bool code = false) const {

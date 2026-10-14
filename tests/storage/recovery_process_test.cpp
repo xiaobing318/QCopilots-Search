@@ -210,7 +210,6 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         for (const bool semantic : {false, true}) {
             SearchOptions query;
-            query.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
             if (semantic)
                 query.queryEmbedding = segment({}, 700).embedding;
             else
@@ -229,7 +228,6 @@ private slots:
                                       {nextSegment}, false, &error), qPrintable(error));
         for (const bool semantic : {false, true}) {
             SearchOptions query;
-            query.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
             if (semantic)
                 query.queryEmbedding = nextSegment.embedding;
             else

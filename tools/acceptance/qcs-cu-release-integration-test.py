@@ -6,7 +6,7 @@ TemporaryDirectory and deleted before this test returns. The recorder's real
 begin/observe/finish/summarize flow produces the raw report. The requested release
 tool's real verify_manifest and validate_cu functions consume it without patching
 or manufacturing report fields, both before and after collect_local copies it
-into its new Computer Use unit root. Other units are minimal import placeholders.
+into its new Computer Use unit root. The candidate unit is a minimal import placeholder.
 This checks only CU import and its preflight sub-gate, not full release preflight.
 No UI, real candidate, git or subprocess runs.
 """
@@ -176,10 +176,10 @@ def integration(recorder_path, release_path):
             require(manifest_errors == [], f"release.verify_manifest rejected recorder raw: {manifest_errors}")
             require(cu_errors == [], f"release.validate_cu rejected recorder raw: {cu_errors}")
 
-            # collect_local requires four units. The other three deliberately
-            # contain only importable manifests, with no claim to pass any gate.
+            # collect_local binds the candidate and Computer Use units. The
+            # candidate placeholder only tests import, never a release gate.
             records = {"computerUse": report_path}
-            for name in ("candidate", "million", "physical"):
+            for name in ("candidate",):
                 placeholder_root = root / "SYNTHETIC-import-placeholders" / name
                 placeholder_root.mkdir(parents=True)
                 payload = placeholder_root / "SYNTHETIC-NOT-RELEASE-EVIDENCE.txt"
@@ -234,7 +234,7 @@ def integration(recorder_path, release_path):
                 "copiedVerifyManifestErrors": copied_manifest_errors,
                 "copiedValidateCuErrors": copied_cu_errors,
                 "fullReleasePreflightPerformed": False,
-                "scope": "SYNTHETIC CU import and CU preflight sub-gate only. Other units are import placeholders.",
+                "scope": "SYNTHETIC CU import and CU preflight sub-gate only. The candidate unit is an import placeholder.",
             }
         require(not root.exists(), "Synthetic passed raw report was not deleted with its temporary directory")
         summary["temporaryEvidenceDeleted"] = True

@@ -1,169 +1,126 @@
 # 脚本审查与维护清单
 
-本清单覆盖应用仓库自有的 Python、PowerShell、Shell 和 CMake 脚本，核对开发入口、CMake、CI、测试注册、动态导入与文档化专项入口。第三方源码、下载缓存、生成脚本和外置历史副本不计入。静态引用证明脚本有调用方，实际测试结果仍以对应候选的报告为准。
+本清单覆盖仓库自有 Python、PowerShell、Shell、CMake 模块及其注册入口。第三方源码、下载缓存、生成脚本和外置历史副本不计入。审查同时核对静态调用、动态导入、CMake、CI、测试聚合器和文档入口，存在调用方不等于实际执行通过。
 
-本轮审查基线为 **66 个 Python / PowerShell / Shell 脚本和 19 个 `.cmake` 脚本**。删除两个仅转发参数的安装包 PowerShell 包装，保留其 Python 实现。新增外置输出根、配置幂等、流程编排、测试策略、语义校准与证据校验、CI 产物选择及发布工具共 15 个已接入脚本，以及 2 个 CMake 模块。当前实际源树为 **79 个 Python / PowerShell / Shell 脚本和 21 个 `.cmake` 脚本**。第二版 quarter 语义校准的完整语料首次独立留出评估已执行，因代码召回和无答案误返回未达门槛而失败，状态为 `holdout-failed`、`accepted: false`，候选发行验收未通过。具体结果见[校准审核快照](../tests/semantic/calibration/README.md)。所有 `CMakeLists.txt`、`CMakePresets.json`、原生 Actions 工作流、桌面资源和 NSIS 模板也参与调用关系审查，但不重复计入这些数量。
+## 清理结论
 
-| 脚本分组 | 审查基线 | 当前文件数 |
-| --- | --- | --- |
-| 根目录入口 | 2 | 2 |
-| `tools/` 根目录 | 19 | 26 |
-| `.github/scripts/` | 5 | 7 |
-| `tests/` | 6 | 12 |
-| `tools/acceptance/` | 34 | 32 |
-| 合计，不含 `.cmake` | 66 | 79 |
+审查基线为 79 个 Python / PowerShell / Shell 脚本、21 个 `.cmake` 模块及全部 CMake 注册。本轮删除 18 个独立研究和专项验收脚本，再将候选身份、文件稳定性和材料完整性迁入统一 check 与发行准备，删除 3 个重复阶段脚本。保留的功能媒体迁入 `tests/acceptance/fixtures`，继续保留来源、许可和哈希。
 
-## 审查结论
+被删除的范围包括独立的大规模向量与物理文件验收、专项延迟测试、相关性校准及策略证据，以及重复的阶段式打包。必要的小规模增删改、过滤、事务、快照、取消和恢复继续由普通功能测试覆盖。源码树之外的历史构建、模型、SDK 和用户配置不随脚本删除清理。
 
-- 开发主入口为根目录的 `qcs-dev.ps1` 和 `qcs-dev.sh`，公共行为由 `tools/qcs-dev.py` 实现。Windows 包装负责 MSVC 环境与 Python 发现，POSIX 包装负责保留参数边界，两者有明确职责。
-- 删除 `tools/acceptance/qcs-package-phase1.ps1` 和 `qcs-package-phase2.ps1`。它们没有独立业务逻辑，原调用方改用同目录 Python 实现。阶段一负责二进制包，阶段二负责对应源码材料，两阶段不能合并为一次未经核验的成功声明。
-- `qcs-two-checkout-portability.py` 与 `qcs-service-latency.py` 共用 `qcs_owned_processes.py` 的 `WindowsProcesses`，消除前者内嵌的重复类。运行器继续保存 helper 原始文件、大小、SHA-256 和执行结束后的稳定性校验。
-- 其余基线脚本都有实际入口、共享调用或动态测试注册，予以保留。脚本数量本身不是删减目标，不能仅凭找不到完整文件名的静态字符串就删除动态导入的测试。
-- 所有开发、测试、依赖、安装暂存和打包产物继续位于源码树外。直接 CMake 使用同一输出边界检查，避免绕过开发脚本时在源码目录生成文件。
+Qt / NSIS bootstrap、许可证、源码材料、部署、路径预算、临时根、进程管理和测试运行器保留实际职责。GPU SDK 与 ABI、变体配置、包身份和 Windows 安装器兜底只增加必要适配。普通打包只生成用户包，symbols 和 sources 为独立动作。
 
-## 开发与发行工具
+下表按当前源树逐文件登记，新增或删除脚本时应同步更新。数量由下面列出的实际文件计算，不把原定精简数量当作包含新增 GPU 工具后的最终数字。
 
-下表路径相对于仓库根。引用列使用调用文件和关键行为，避免后续编辑使行号失效。发布材料冻结与草稿上传的参数说明见 [发布命令](release-command.md)。
+当前登记 **67 个 Python / PowerShell / Shell 脚本**和 **24 个 `.cmake` 模块**。
 
-| 脚本 | 决定与职责 | 实际引用证据 |
-| --- | --- | --- |
-| `qcs-dev.ps1` | 保留，Windows 工具链初始化及参数入口 | `README.md`、`docs/development.md`，内部执行 `tools/qcs-dev.py` |
-| `qcs-dev.sh` | 保留，POSIX 参数入口 | `README.md`、`docs/development.md`，内部执行 `tools/qcs-dev.py` |
-| `tools/qcs-dev.py` | 保留，统一开发工作流、生成目录归属与配置绑定的开发 OCR 数据定位 | 两个根包装入口，`.github/scripts/qcs-native-ci.py` 的 `developer_workflow()` |
-| `tools/qcs-bootstrap-qt.py` | 保留，锁定 Qt SDK 下载、校验与安装 | `tools/qcs-dev.py` 的 `bootstrap` 动作 |
-| `tools/qcs-bootstrap-nsis.py` | 保留，按需准备 Windows 安装器工具链 | `tools/qcs-dev.py` 的 `package` 动作，仅默认生成器或显式包含 NSIS 时执行 |
-| `tools/qcs-license-materials.py` | 保留，许可与 SBOM 材料生成和校验 | `cmake/qcs-licenses.cmake`，`tools/qcs-verify-package.py` |
-| `tools/qcs-msvc-response.py` | 保留，MSVC response file 与路径适配 | `cmake/qcs-msvc-rsp.cmake` 的 linker launcher 与静态库命令模板 |
-| `tools/qcs-package-symbols.py` | 保留，符号包与 manifest | `tools/qcs-dev.py` 的 `package` 动作，`tools/acceptance/qcs-package-phase1.py` |
-| `tools/qcs-path-budget.py` | 保留，生成路径长度诊断 | `tools/qcs-dev.py` 的配置、doctor 与打包路径检查 |
-| `tools/qcs-release-evidence.py` | 保留，候选来源与必需证据验证 | `.github/workflows/qcs-native.yml`、原生 CI 和候选验收运行器 |
-| `tools/qcs-semantic-policy-evidence.py` | 新增，校验冻结的 quarter 策略身份、完整查询集、分组隔离及重算质量统计，不重新拟合或运行模型 | `tools/qcs-release-evidence.py` 的 `relevance_calibration_errors()` 动态加载并调用 `validate_calibration_snapshot()` |
-| `tools/qcs-semantic-policy-evidence-tests.py` | 新增，语义策略证据的合成合约与失败拒绝回归 | `tests/CMakeLists.txt` 注册 fast 范围的 `qcs-tests-semantic-policy-evidence`，动态加载校验器与 `calibrate_relevance_v2.py` |
-| `tools/qcs-release.py` | 新增，校验并冻结完整候选材料，显式上传未公开的 GitHub 草稿 | `tools/qcs-dev.py` 的 `release-prepare`、`release-upload-draft` 动作分别调用 `prepare`、`upload-draft` |
-| `tools/qcs-test-release.py` | 新增，发布材料、草稿上传与拒绝边界的合成回归 | 顶层 `CMakeLists.txt` 注册 `qcs-tests-release-tool`，测试动态加载 `qcs-release.py` |
-| `tools/qcs-source-bundle.py` | 保留，对应源码材料生成与内容校验 | `tools/qcs-dev.py` 的 `sources` 动作，原生 CI 通过 `dev("sources")` 复用，另有 `tools/acceptance/qcs-package-phase2.py` |
-| `tools/qcs-sign-macos.py` | 保留，最终 APP 内 Mach-O 与 bundle 签名 | `cmake/qcs-package.cmake` 的安装部署脚本 |
-| `tools/qcs-verify-macos-links.py` | 保留，最终 APP 链接布局及来源验证 | `cmake/qcs-package.cmake` 的安装部署脚本 |
-| `tools/qcs-verify-package.py` | 保留，重定位后的程序、模型与安装验证 | `tools/qcs-dev.py` 的 `verify-package` 动作和原生 CI |
-| `tools/qcs-test-runner.py` | 保留，CTest 独立工作目录与清理 | `tests/CMakeLists.txt` 的 `qcopilots_search_add_test()` |
-| `tools/qcs-test-runner-tests.py` | 保留，测试运行器回归 | `tests/CMakeLists.txt` 注册 `qcs-tests-runner` |
-| `tools/qcs-test-path-budget.py` | 保留，路径预算回归 | `tests/CMakeLists.txt` 注册 `qcs-tests-path-budget` |
-| `tools/qcs-test-policy.py` | 新增，从实际 CTest 清单选择 fast/full 范围并验证证据类型 | `.github/scripts/qcs-ctest-evidence.py` 与 `qcs-native-ci.py` 动态加载，调用 `select_inventory()` 或 `describe_inventory()` |
-| `tools/qcs-test-policy-tests.py` | 新增，测试选择、标签和清单完整性回归 | `tests/CMakeLists.txt` 注册 `qcs-tests-test-policy` |
-| `tools/qcs-test-license-materials.py` | 保留，许可材料与拒绝边界回归 | `cmake/qcs-licenses.cmake` 注册 `qcs-tests-license-materials` |
-| `tools/qcs-test-macos-signing.py` | 保留，签名流程回归 | 顶层 `CMakeLists.txt` 注册 `qcs-tests-macos-signing` |
-| `tools/qcs-test-macos-links.py` | 保留，链接部署回归 | `tools/qcs-test-macos-signing.py` 的 `load_tests()` 动态加载 |
-| `tools/qcs-test-workflow.py` | 保留，开发、打包和安全清理回归 | 顶层 `CMakeLists.txt` 注册 `qcs-tests-workflow` |
-| `tools/qcs-test-check.py` | 新增，fast/full `check` 编排、证据绑定和失败输出回归 | `tests/CMakeLists.txt` 注册 `qcs-tests-check`，动态加载 `qcs-dev.py` 与 `qcs-release-evidence.py` |
+## 开发、CI 与运行器脚本
 
-## CI 与运行时测试工具
+| 文件 | 保留职责与接入方式 |
+| --- | --- |
+| `.github/scripts/qcs-artifact-selection.py` | 按 run、原始 job、attempt 和 artifact 身份选择成品 |
+| `.github/scripts/qcs-ctest-evidence.py` | 核验 CTest、QtTest 与 Python unittest 逐用例记录 |
+| `.github/scripts/qcs-deb-ci.py` | Linux DEB 的容器安装、包内运行及卸载验证 |
+| `.github/scripts/qcs-native-ci.py` | 原生 runner 适配、完整构建验包及最终产物白名单 |
+| `.github/scripts/qcs-tests-artifact-selection.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `.github/scripts/qcs-tests-ci-evidence.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `.github/scripts/qcs-tests-deb-ci.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `.github/scripts/qcs-tests-release-evidence.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `qcs-dev.ps1` | Windows MSVC 环境与根开发入口，调用公共 Python 驱动 |
+| `qcs-dev.sh` | POSIX 根开发入口，调用公共 Python 驱动 |
+| `tests/runtime/configure_idempotency_test.py` | 重复配置、补丁及生成内容的稳定性回归 |
+| `tests/runtime/gpu_configuration_test.py` | GPU 变体配置、后端选择和构建参数回归 |
+| `tests/runtime/install_layout_test.py` | 跨平台最终推理安装布局回归入口 |
+| `tests/runtime/linux_deploy_test.py` | Linux 部署依赖与布局回归，由安装布局测试调用 |
+| `tests/runtime/macos_deploy_test.py` | macOS bundle 依赖与布局回归，由安装布局测试调用 |
+| `tests/runtime/output_paths_test.py` | 直接 CMake 生成位置必须在源码树外的边界回归 |
+| `tests/runtime/source_integrity_test.py` | 锁定源码归档、补丁、版本和完整性回归 |
+| `tests/support/temp_paths.py` | Python 测试共用临时根、归属及清理实现 |
+| `tests/support/temp_paths_test.py` | 临时根创建、空值、路径与清理失败回归 |
+| `tools/acceptance/qcs-candidate-ctest-run.py` | 冻结候选的完整 CTest、程序字节及输入稳定性 |
+| `tools/acceptance/qcs-copy-cu-fixtures.py` | 生成、计划和复制独立 CU 夹具，核对来源与哈希 |
+| `tools/acceptance/qcs-cu-recorder-tests.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/acceptance/qcs-cu-recorder.py` | 记录实际 Windows 操作、截图、时间与候选包身份 |
+| `tools/acceptance/qcs-cu-release-integration-test.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/acceptance/qcs-launch-portability-sentinel.py` | 启动受控普通应用哨兵并记录实例身份 |
+| `tools/acceptance/qcs-portability-sentinel.py` | 验证并行测试没有修改或终止受控普通实例 |
+| `tools/acceptance/qcs-test-candidate-runner.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/acceptance/qcs-test-copy-cu-fixtures.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/acceptance/qcs-test-diagnostics.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/acceptance/qcs-test-portability-runners.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/acceptance/qcs-test-runners.py` | 聚合保留验收运行器用例，完整 CTest 执行全部能力分组 |
+| `tools/acceptance/qcs-test-source-checksums.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/acceptance/qcs-test-token-context.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/acceptance/qcs-token-context.py` | 受控 Windows 权限测试子进程上下文 |
+| `tools/acceptance/qcs-two-checkout-portability.py` | 真实只读源码、双 checkout 并行及隔离验证 |
+| `tools/acceptance/qcs_owned_processes.py` | 限定本次创建的 Windows 子进程生命周期与清理 |
+| `tools/qcs-bootstrap-nsis.py` | 准备 Windows 安装器工具链，供打包与安装验证使用 |
+| `tools/qcs-bootstrap-qt.py` | 下载并校验锁定 Qt SDK，供 bootstrap 使用 |
+| `tools/qcs-dev.py` | 统一变体、外置目录、完整 check、独立构建测试及发行命令 |
+| `tools/qcs-gpu-abi.py` | 核验独立 GPU 模块与主构建的 ABI、导入导出及依赖 |
+| `tools/qcs-gpu-runtime.py` | 从 SDK 构造 GPU 运行依赖闭包与 RDNA4 数据布局，缺依赖、许可或资源明确失败 |
+| `tools/qcs-gpu-sdk.py` | 按锁定上游配方准备 GPU SDK、后端构建和运行资源 |
+| `tools/qcs-gpu-tests.py` | 无 GPU、网络、模型或真实 SDK 的部署契约回归，验证依赖闭包、资源和 ABI 失败边界 |
+| `tools/qcs-license-materials.py` | 收集并校验实际部署依赖许可和 notices |
+| `tools/qcs-msvc-response.py` | MSVC response file 编码与长路径适配 |
+| `tools/qcs-package-symbols.py` | 独立生成符号材料，不由普通 package 自动调用 |
+| `tools/qcs-package-windows-tests.py` | 安装器兜底选择、载荷归属、归档身份及真实离线安装卸载回归 |
+| `tools/qcs-package-windows.py` | Windows 安装包编排及 ROCm 超限载荷兜底 |
+| `tools/qcs-path-budget.py` | 生成路径、对象和打包位置的长度预算诊断 |
+| `tools/qcs-release-evidence.py` | 真实构建、最终 Windows 包与 Computer Use 的候选身份和附件验证 |
+| `tools/qcs-release.py` | 按 CI run/attempt 下载、验证与冻结成品，显式上传草稿 |
+| `tools/qcs-sign-macos.py` | 最终 Mach-O 与 bundle 从内到外签名和验证 |
+| `tools/qcs-source-bundle.py` | 从同一干净提交和依赖锁生成平台无关对应源码材料 |
+| `tools/qcs-test-check.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-test-license-materials.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-test-macos-links.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-test-macos-signing.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-test-package-variants.py` | 11 变体的包身份、包类型及后端契约回归，不加载 GPU SDK |
+| `tools/qcs-test-path-budget.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-test-policy-tests.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-test-policy.py` | 核验注册清单、证据类型、完整执行和局部标签筛选 |
+| `tools/qcs-test-release.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-test-runner-tests.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-test-runner.py` | 为每次 CTest 调用分配独立 cwd，收集结果并严格清理 |
+| `tools/qcs-test-workflow.py` | 保留对应工具的契约、失败边界与回归，通过 CTest 或验收测试聚合器接入 |
+| `tools/qcs-verify-macos-links.py` | 核验最终 APP 动态库引用和部署来源 |
+| `tools/qcs-verify-package.py` | 最终包重定位、真实模型、服务、依赖与许可证验证 |
 
-| 脚本 | 决定与职责 | 实际引用证据 |
-| --- | --- | --- |
-| `.github/scripts/qcs-native-ci.py` | 保留，原生 runner 适配与阶段编排 | `.github/workflows/qcs-native.yml` 的平台 job |
-| `.github/scripts/qcs-ctest-evidence.py` | 保留，CTest 及逐用例证据完整性 | `qcs-native-ci.py`、`tools/qcs-release-evidence.py`、候选 CTest 运行器 |
-| `.github/scripts/qcs-artifact-selection.py` | 新增，保留 GitHub 原始分页快照，按实际 job 执行身份选择不可变产物，重算快照及选择绑定 | `qcs-native.yml` 的 required job 执行 `collect`，fast 聚合由 `qcs-native-ci.py` 的 `artifact_selection()` 加载并调用 `load_selection()`，full 聚合与发布通过 `qcs-release-evidence.py` 的 `load_native_selection()` 复核 |
-| `.github/scripts/qcs-tests-artifact-selection.py` | 新增，实际执行来源、重试、分页、产物摘要及快照绑定的合成回归 | `tests/CMakeLists.txt` 注册 `qcs-tests-artifact-selection`，标签为 `unit`、`tooling`、`evidence` 并自动补 `python-unittest`，超时 240 秒，属于 fast 范围 |
-| `.github/scripts/qcs-deb-ci.py` | 保留，Ubuntu 容器安装与卸载验证 | `tools/qcs-dev.py` 的 Linux `installers` 动作，原生 CI 通过 `dev("installers")` 复用 |
-| `.github/scripts/qcs-tests-ci-evidence.py` | 保留，CI 范围与日志验证回归 | `tests/CMakeLists.txt` 注册 `qcs-tests-ci-evidence`，由本地和 CI 的 CTest 流程执行 |
-| `.github/scripts/qcs-tests-release-evidence.py` | 保留，发行证据验证回归 | `tests/CMakeLists.txt` 注册 `qcs-tests-release-evidence`，由本地和 CI 的 CTest 流程执行 |
-| `tests/runtime/install_layout_test.py` | 保留，安装布局与平台部署测试入口 | `tests/runtime/CMakeLists.txt` 注册 `qcs-tests-inference-install-layout` |
-| `tests/runtime/linux_deploy_test.py` | 保留，Linux 部署布局回归 | `install_layout_test.py` 按平台 `import linux_deploy_test` |
-| `tests/runtime/macos_deploy_test.py` | 保留，macOS 部署布局回归 | `install_layout_test.py` 按平台 `import macos_deploy_test` |
-| `tests/runtime/source_integrity_test.py` | 保留，锁定源码、归档及补丁完整性 | `tools/qcs-dev.py` 的 `sources` 动作，原生 CI 通过 `dev("sources")` 复用 |
-| `tests/support/temp_paths.py` | 保留，测试临时根共享实现 | Python 工具与运行时测试导入 `temp_paths` |
-| `tests/support/temp_paths_test.py` | 保留，临时根生命周期回归 | `tests/CMakeLists.txt` 注册 `qcs-tests-temp-paths` |
-| `tests/runtime/output_paths_test.py` | 新增，直接 CMake 外置输出边界回归 | `tests/runtime/CMakeLists.txt` 注册 `qcs-tests-output-paths` |
-| `tests/runtime/configure_idempotency_test.py` | 新增，重复配置与 libgit2 补丁准备的内容、时间戳稳定性 | `tests/runtime/CMakeLists.txt` 注册 `qcs-tests-configure-idempotency`，传入实际 CMake 和 libgit2 源码目录 |
-| `tests/semantic/calibrate_relevance.py` | 新增，从冻结的真实语义报告校准模态阈值，独立校验留出集 | `test_calibrate_relevance.py` 动态导入，`calibrate_relevance_v2.py` 加载并复用 v1 helper |
-| `tests/semantic/test_calibrate_relevance.py` | 新增，校准输入、分组隔离、搜索及策略输出回归 | `tests/semantic/CMakeLists.txt` 注册 `qcs-tests-relevance-calibration` |
-| `tests/semantic/calibrate_relevance_v2.py` | 新增，分组交叉验证与独立留出校准，quarter 首次完整评估已执行且未通过质量门槛 | `tests/semantic/README.md` 的显式校准命令，独立 `main()` 入口复用 v1 helper，由同目录 v2 工具回归及语义策略证据回归动态加载 |
-| `tests/semantic/test_calibrate_relevance_v2.py` | 新增，第二版校准协议、数据隔离及搜索回归 | `tests/semantic/CMakeLists.txt` 注册 `qcs-tests-relevance-calibration-v2`，动态导入同目录 `calibrate_relevance_v2.py` |
+## CMake 模块
 
-## 专项验收运行器
+| 文件 | 保留职责与接入方式 |
+| --- | --- |
+| `cmake/qcs-checked-deploy.cmake` | 部署前置条件及失败传播 |
+| `cmake/qcs-cpack.cmake` | 生成器专属打包配置 |
+| `cmake/qcs-dev-deploy.cmake` | 开发构建的运行依赖部署 |
+| `cmake/qcs-ffmpeg.cmake` | 锁定 Qt 配套 FFmpeg 的导入与 ABI 校验 |
+| `cmake/qcs-gpu-backend.cmake` | 独立 GPU backend 子构建与主程序集成 |
+| `cmake/qcs-gpu-variants.cmake` | 读取共同变体配置并绑定 CMake 后端参数 |
+| `cmake/qcs-licenses.cmake` | 许可生成、安装和对应测试注册 |
+| `cmake/qcs-linux-deploy.cmake` | Linux 运行库部署与依赖来源 |
+| `cmake/qcs-macos-deploy.cmake` | macOS 推理与 Qt 依赖布局 |
+| `cmake/qcs-msvc-rsp.cmake` | 接入 MSVC response file 适配器 |
+| `cmake/qcs-native-data.cmake` | OCR 数据下载、校验与安装 |
+| `cmake/qcs-native-deps.cmake` | 锁定原生依赖与外置源码构建 |
+| `cmake/qcs-native-doc.cmake` | 旧 DOC 提取依赖适配 |
+| `cmake/qcs-native-git-patch.cmake` | 确定性上游补丁与重复配置稳定性 |
+| `cmake/qcs-native-images.cmake` | 图像解码依赖与选项 |
+| `cmake/qcs-native-ocr.cmake` | OCR 编译依赖与选项 |
+| `cmake/qcs-output-paths.cmake` | 配置、安装与打包的外置边界检查 |
+| `cmake/qcs-package-identity.cmake` | 生成变体、版本和候选包身份 |
+| `cmake/qcs-package.cmake` | 各平台 install、部署与 CPack 注册 |
+| `cmake/qcs-symbols.cmake` | 程序符号与 manifest 生成注册 |
+| `cmake/qcs-write-if-different.cmake` | 仅内容变化时写生成文件，避免无修改重编译 |
+| `src/runtime/install_inference_runtime.cmake` | 安装规范推理库与 CPU/GPU 模块 |
+| `src/runtime/verify_llama_source.cmake` | 校验 llama.cpp 提交、归档和项目补丁 |
+| `tests/service/client-tests.cmake` | 服务客户端测试注册 |
 
-这些脚本位于 `tools/acceptance/`。下表中的专项入口通过 [验收运行器说明](../tools/acceptance/README.md) 接入最终候选流程。运行器自身的合约测试不能代替真实模型、容量、双 checkout 或 Computer Use 验收。
+## 注册与后续维护
 
-| 脚本 | 决定与职责 | 实际引用证据 |
-| --- | --- | --- |
-| `qcs-candidate-ctest-run.py` | 保留，完整候选 CTest 与身份验证 | 验收 README 的“完整本机 CTest”，`qcs-test-candidate-runner.py` |
-| `qcs-package-phase1.py` | 保留，核验已有构建和 CTest 证明，生成并验证 Windows ZIP、NSIS 与符号包，延后对应源码材料 | 验收 README 的“安装包阶段一”，`qcs-package-phase2.py` 导入共享验证 |
-| `qcs-package-phase1.ps1` | 删除，仅转发 Python 参数 | 原唯一生产引用为验收 README，已改为 `.py` 入口 |
-| `qcs-package-phase2.py` | 保留，重新核验阶段一材料，生成并验证对应源码包，闭合包交付材料 | 验收 README 的“安装包阶段二”，`qcs-test-package-runners.py` |
-| `qcs-package-phase2.ps1` | 删除，仅转发 Python 参数 | 原唯一生产引用为验收 README，已改为 `.py` 入口 |
-| `qcs-run-million.ps1` | 保留，百万向量监视、预算及收尾 | `docs/releasing.md` 的 `run-local`，验收 README 与容量回归 |
-| `qcs-run-physical.ps1` | 保留，十万物理文件的候选验证与执行 | 验收 README 的“十万物理文件”，`qcs-test-capacity-runners.py` |
-| `qcs-physical-preflight.py` | 保留，容量候选与构建材料共享验证 | `qcs-run-million.ps1`、`qcs-run-physical.ps1` |
-| `qcs-service-latency.py` | 保留，服务延迟专项 | 验收 README 的“服务端延迟”，`qcs-test-latency-preparation.py` |
-| `qcs-launch-portability-sentinel.py` | 保留，启动受控普通窗口哨兵 | 验收 README 的“普通窗口哨兵”，`qcs-test-portability-runners.py` |
-| `qcs-portability-sentinel.py` | 保留，应用实例与隔离观察 | `qcs-launch-portability-sentinel.py`，双 checkout 运行器 |
-| `qcs-two-checkout-portability.py` | 保留，合并重复进程管理实现 | 验收 README 的“双 checkout 与只读源码”，导入 `qcs_owned_processes.WindowsProcesses` |
-| `qcs_owned_processes.py` | 保留，供 Python 验收运行器共用的 Windows 进程管理 helper | 服务延迟、双 checkout 与 `qcs-token-context.py` |
-| `qcs-token-context.py` | 保留，受控 Windows 令牌上下文 | 聚合测试、可移植性测试与双 checkout 的 `reexec_if_needed()` |
-| `qcs-cu-recorder.py` | 保留，Computer Use 原始操作与材料记录 | 验收 README 的 `init/begin/observe/finish/summarize` 流程，CU 回归 |
-| `qcs-copy-cu-fixtures.py` | 保留，按哈希计划复制独立 CU 样本 | 验收 README 的 `--create-plan` 和 `--execute` 流程，fixture 回归 |
+所有 `CMakeLists.txt`、`CMakePresets.json`、工作流、NSIS 模板和共同变体清单参与审查，不重复计入脚本数量。CTest 默认执行全部保留程序，纯协议与原生能力分组均纳入完整流程。局部标签筛选、工具合成数据与未执行的设备测试分别记录，不能冒充完整验收。
 
-`qcs-service-latency.py` 的输入校验可跨平台执行，当前真实运行依赖 Windows 原生进程管理。不能因脚本可在其他平台导入，就把实际延迟验收记为已支持或已完成。
+增加脚本前先检查现有统一入口是否可复用。删除时同步核对动态 import、CMake include、CPack、CI、聚合测试和文档，不能留下失效注册。共享 helper 变更必须更新来源与哈希验证，不让候选报告绑定已删除的副本。
 
-## 专项验收测试
+CI artifact 仅上传已验证用户包，汇总检查 11 个变体和 21 个文件。发行工具保留原始 API 来源与选择结果，重新核验 run、attempt、job、artifact ID 和 digest。最新失败不能借用旧成功产物，冻结后字节变化必须失败。
 
-下列 18 个脚本同样位于 `tools/acceptance/`。`qcs-test-runners.py` 使用同一 `SCRIPTS` 注册表和 `RecorderIntegration`，通过 `build_suite()` 将用例分为 `pure` 与 `native`。CTest 的 `qcs-tests-acceptance-runners` 传入 `--suite pure`，带 `slow` 标签的 `qcs-tests-acceptance-native` 传入 `--suite native`。后者包含跨平台超时回归及按实际平台能力执行的原生用例。独立执行默认 `--suite all`。实际 fast/full 范围以 [测试指南](testing.md) 和 CTest 注册为准。
-
-| 脚本 | 决定与职责 | 实际引用证据 |
-| --- | --- | --- |
-| `qcs-test-runners.py` | 保留，聚合注册、pure/native 分组与逐例输出 | `tests/CMakeLists.txt` 的 `qcs-tests-acceptance-runners` 与 `qcs-tests-acceptance-native` |
-| `qcs-test-candidate-runner.py` | 保留，候选身份及完整范围拒绝回归 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-source-checksums.py` | 保留，源码材料与 FFmpeg 元数据回归 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-capacity-runners.py` | 保留，容量前置验证与原生守卫回归 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-million-evidence.py` | 保留，百万向量证据完整性 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-package-runners.py` | 保留，两个包阶段的候选与材料契约 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-portability-runners.py` | 保留，路径、ACL、恢复与隔离回归 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-diagnostics.py` | 保留，聚合日志、失败与中断传播 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-token-context.py` | 保留，令牌隔离及共享进程 helper 回归 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-latency-preparation.py` | 保留，延迟运行器输入与输出边界 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-cu-recorder-tests.py` | 保留，CU 记录与附件绑定回归 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-test-copy-cu-fixtures.py` | 保留，样本计划、哈希与目标边界 | `qcs-test-runners.py` 的 `SCRIPTS` 注册 |
-| `qcs-cu-release-integration-test.py` | 保留，合成 CU 记录导入的集成回归 | `qcs-test-runners.py` 的 `RecorderIntegration` 动态加载 |
-| `qcs-test-million-guard-array.ps1` | 保留，PowerShell 参数数组回归 | `qcs-test-capacity-runners.py` 动态生成 `guard-array` 文件名 |
-| `qcs-test-million-guard-contract.ps1` | 保留，监视器契约回归 | `qcs-test-capacity-runners.py` 动态生成 `guard-contract` 文件名 |
-| `qcs-test-million-guard-evidence.ps1` | 保留，监视证据回归 | `qcs-test-capacity-runners.py` 动态生成 `guard-evidence` 文件名 |
-| `qcs-test-million-guard-process.ps1` | 保留，自有进程清理回归 | `qcs-test-capacity-runners.py` 动态生成 `guard-process` 文件名 |
-| `qcs-test-million-report-root.ps1` | 保留，报告根归属与边界回归 | `qcs-test-capacity-runners.py` 的 `report-root` 分支 |
-
-## CMake 脚本
-
-| 脚本 | 决定与职责 | 实际引用证据 |
-| --- | --- | --- |
-| `cmake/qcs-msvc-rsp.cmake` | 保留，MSVC 链接与静态库 response file 适配 | 顶层 `CMakeLists.txt` 的 `include(qcs-msvc-rsp)` |
-| `cmake/qcs-native-deps.cmake` | 保留，锁定依赖与外置源码构建 | 顶层 `CMakeLists.txt` 的 `include(qcs-native-deps)` |
-| `cmake/qcs-native-git-patch.cmake` | 保留，确定性上游补丁 | `qcs-native-deps.cmake` 的补丁函数 |
-| `cmake/qcs-native-ocr.cmake` | 保留，OCR 依赖适配 | `qcs-native-deps.cmake` 的 `include` |
-| `cmake/qcs-native-images.cmake` | 保留，图像依赖适配 | `qcs-native-deps.cmake` 的 `include` |
-| `cmake/qcs-native-data.cmake` | 保留，OCR 数据锁定与安装 | `qcs-native-deps.cmake` 的 `include` |
-| `cmake/qcs-native-doc.cmake` | 保留，旧 DOC 依赖适配 | `qcs-native-deps.cmake` 的 `include` |
-| `cmake/qcs-ffmpeg.cmake` | 保留，Qt 配套 FFmpeg 验证与导入 | 顶层 `CMakeLists.txt` 的 `include(qcs-ffmpeg)` |
-| `cmake/qcs-symbols.cmake` | 保留，程序与符号 manifest | 顶层 `CMakeLists.txt` 的 `include(qcs-symbols)` |
-| `cmake/qcs-dev-deploy.cmake` | 保留，开发运行库布局 | 顶层 `CMakeLists.txt` 的 `include(qcs-dev-deploy)` |
-| `cmake/qcs-package.cmake` | 保留，安装布局与各平台包 | 顶层 `CMakeLists.txt` 的 `include(qcs-package)` |
-| `cmake/qcs-licenses.cmake` | 保留，许可材料与安装规则 | `qcs-package.cmake` 的 `include(qcs-licenses)` |
-| `cmake/qcs-macos-deploy.cmake` | 保留，macOS 推理运行库布局 | `qcs-package.cmake` 的平台 `include` |
-| `cmake/qcs-linux-deploy.cmake` | 保留，Linux 运行库布局 | `qcs-package.cmake` 的平台 `include` |
-| `cmake/qcs-checked-deploy.cmake` | 保留，部署失败检测及前置校验 | `qcs-package.cmake` 写入安装期脚本的 `include` |
-| `cmake/qcs-cpack.cmake` | 保留，生成器相关包配置 | `qcs-package.cmake` 的 `CPACK_PROJECT_CONFIG_FILE` |
-| `src/runtime/verify_llama_source.cmake` | 保留，llama.cpp 锁定源码验证 | `src/runtime/CMakeLists.txt` 的 `include` |
-| `src/runtime/install_inference_runtime.cmake` | 保留，推理库及 CPU 模块安装 | `src/runtime/CMakeLists.txt` 与 `qcs-macos-deploy.cmake` 的 `include` |
-| `tests/service/client-tests.cmake` | 保留，服务客户端用例注册 | `tests/service/CMakeLists.txt` 的 `include` |
-| `cmake/qcs-output-paths.cmake` | 新增，直接 CMake 的外置输出边界 | 顶层、原生依赖、llama 和许可配置复用边界函数，安装期和 `qcs-cpack.cmake` 运行期再次 `include` 并校验有效输出路径 |
-| `cmake/qcs-write-if-different.cmake` | 新增，仅内容变化时写入配置生成文件，避免无改动重编译 | `qcs-native-deps.cmake`、`qcs-native-git-patch.cmake`、`qcs-native-ocr.cmake`、`qcs-native-doc.cmake` 与 `qcs-ffmpeg.cmake` 的 `include` 及 `qcopilots_search_write_if_different()` 调用 |
-
-## 后续维护规则
-
-第二版 quarter 首次完整评估的失败快照已保留，未生成可发布的已校准生产头文件。`calibrate_relevance_v2.py` 和配套 `test_calibrate_relevance_v2.py` 已计入当前数量，工具回归注册到 fast 范围，其通过不能覆盖真实相关性失败。已观察的 V2 数据只能继续用于开发回归，不能把相同数据的重跑称为新的独立验证。相关语料 JSON、资产和许可清单是数据材料，不计作脚本。新增或接入脚本后须同步调用关系和计数，候选验收前不能标记为已完成。
-
-`qcs-semantic-policy-evidence.py` 对真实失败或不完整的交叉验证、留出覆盖和质量统计返回拒绝。配套回归通过只能证明校验器执行了这些拒绝规则，真实相关性仍须由冻结候选的实际模型报告达到既定质量门槛，并通过完整证据验证。
-
-CI 产物选择同时保留 `selection.json` 和 `selection-inputs` 中的原始 API 分页。聚合及发布消费时重新计算原始执行与产物的绑定，`qcs-release.py` 复制相对快照并再次核验。重试中的已完成 job 复制记录只有在详细执行身份唯一对应原执行时才能复用其产物，不能用较早成功产物覆盖最新失败结果。helper 合成回归不等于四个平台的实际 CI 或完整发行验收通过。
-
-增加脚本前先确认已有入口是否可以复用。删除时核对动态 `import`、CMake `include`、CPack 配置、工作流、专项验收和文档入口。共享 helper 变更后同步来源捕获与哈希验证，不能让报告继续绑定已经移除的重复实现。
-
-GUI target、程序清单和包内发现逻辑使用 `qcs-gui`。包名前缀、其他程序、profile、测试名称和配置变量继续保留 `qcs`，禁止全仓替换产品常量来完成 GUI 改名。任何入口收敛都必须保留完整候选、实际执行范围、失败状态和原始证据验证。
+此清单属于代码审查记录，实际构建、测试、GPU 设备与最终包状态另见同一候选的执行报告。

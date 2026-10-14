@@ -75,6 +75,36 @@ private slots:
         QVERIFY(!runtime.isLoaded());
     }
 
+    void backendModeAndDiagnosticsBeforeLoad()
+    {
+        const test::ScopedEnvironment mode("QCOPILOTS_SEARCH_BACKEND", QByteArrayLiteral("gpu"));
+        EmbeddingRuntime runtime;
+        auto diagnostic = runtime.diagnostics();
+        QCOMPARE(diagnostic.value(QStringLiteral("requestedBackend")).toString(), QStringLiteral("gpu"));
+        QVERIFY(!diagnostic.value(QStringLiteral("loaded")).toBool());
+        QVERIFY(!diagnostic.value(QStringLiteral("gpuSelected")).toBool());
+        QVERIFY(!diagnostic.value(QStringLiteral("gpuSelfTestPassed")).toBool());
+        QVERIFY(!diagnostic.value(QStringLiteral("textWarmupCompleted")).toBool());
+        QVERIFY(!diagnostic.value(QStringLiteral("packagedBackend")).toString().isEmpty());
+        QString error;
+        QVERIFY(runtime.setBackendMode(QStringLiteral(" CPU "), &error));
+        QCOMPARE(runtime.diagnostics().value(QStringLiteral("requestedBackend")).toString(), QStringLiteral("cpu"));
+        QVERIFY(!runtime.setBackendMode(QStringLiteral("guess"), &error));
+        QVERIFY(!error.isEmpty());
+        QCOMPARE(runtime.diagnostics().value(QStringLiteral("requestedBackend")).toString(), QStringLiteral("cpu"));
+    }
+
+    void invalidBackendEnvironmentFailsExplicitly()
+    {
+        const test::ScopedEnvironment mode("QCOPILOTS_SEARCH_BACKEND", QByteArrayLiteral("cuad"));
+        EmbeddingRuntime runtime;
+        QString error;
+        QVERIFY(!runtime.load(QString{}, true, &error));
+        QVERIFY(error.contains(QStringLiteral("backend mode")));
+        QCOMPARE(runtime.diagnostics().value(QStringLiteral("error")).toString(), error);
+        QVERIFY(!runtime.diagnostics().value(QStringLiteral("loaded")).toBool());
+    }
+
     void missingAndCorruptModelsAreRejected()
     {
         QString error;

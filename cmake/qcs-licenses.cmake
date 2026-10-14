@@ -34,6 +34,24 @@ message(STATUS "Runtime license materials: ${_qcopilots_license_stdout}")
 
 # Check the generated inputs again at install time. Both cmake --install and
 # CPack stop before deploying incomplete or modified license material.
+# The GPU runtime is staged by src/runtime before this hook. Its dependency
+# manifest records the actual redistributable SDK license and notice files.
+# Collect these only after deployment, so licenses describe the bytes shipped
+# rather than every component that happens to be installed in the build SDK.
+if(QCOPILOTS_SEARCH_VARIANT MATCHES "-(cuda-[0-9.]+|rocm|vulkan)$")
+  install(CODE "set(_qcs_gpu_license_manifest \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/qcs-gpu-runtime.json\")
+if(NOT EXISTS \"\${_qcs_gpu_license_manifest}\")
+  message(FATAL_ERROR \"Deployed GPU runtime license manifest is missing: \${_qcs_gpu_license_manifest}\")
+endif()
+execute_process(COMMAND \"${Python3_EXECUTABLE}\" -X utf8 -B \"${_qcopilots_license_tool}\"
+  --qt-prefix \"${_qcopilots_license_qt_prefix}\" --llama-source \"${_qcopilots_license_llama_source}\"
+  --cache-dir \"${QCOPILOTS_SEARCH_LICENSE_SOURCE_CACHE}\" --output-dir \"${_qcopilots_license_output}\"
+  --source-lock \"${_qcopilots_license_lock}\" --runtime-license-manifest \"\${_qcs_gpu_license_manifest}\"
+  RESULT_VARIABLE _qcs_gpu_license_result OUTPUT_VARIABLE _qcs_gpu_license_output ERROR_VARIABLE _qcs_gpu_license_error)
+if(NOT _qcs_gpu_license_result EQUAL 0)
+  message(FATAL_ERROR \"Cannot collect deployed GPU license materials: \${_qcs_gpu_license_output}\${_qcs_gpu_license_error}\")
+endif()")
+endif()
 install(CODE "execute_process(COMMAND \"${Python3_EXECUTABLE}\" -X utf8 -B \"${_qcopilots_license_tool}\" --verify \"${_qcopilots_license_output}\" RESULT_VARIABLE _license_result OUTPUT_VARIABLE _license_output ERROR_VARIABLE _license_error)\nif(NOT _license_result EQUAL 0)\n  message(FATAL_ERROR \"Runtime license validation failed: \${_license_output}\${_license_error}\")\nendif()")
 install(DIRECTORY "${_qcopilots_license_output}/"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs/licenses/qcs-runtime")

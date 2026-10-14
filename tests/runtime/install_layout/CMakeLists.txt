@@ -9,11 +9,13 @@ else()
   add_library(qcs-base-fixture SHARED fixture.c)
 endif()
 add_library(qcs-cpu-fixture MODULE fixture.c)
+add_library(qcs-gpu-fixture MODULE fixture.c)
 if(QCOPILOTS_SEARCH_TEST_APPLE_LAYOUT)
   set(CMAKE_INSTALL_BINDIR "qcs-gui.app/Contents/MacOS")
   set(CMAKE_INSTALL_LIBDIR "qcs-gui.app/Contents/Frameworks")
   set_target_properties(qcs-base-fixture PROPERTIES PREFIX "lib" SUFFIX ".dylib")
   set_target_properties(qcs-cpu-fixture PROPERTIES PREFIX "lib" SUFFIX ".so")
+  set_target_properties(qcs-gpu-fixture PROPERTIES PREFIX "lib" SUFFIX ".so")
 else()
   set(CMAKE_INSTALL_BINDIR "bin")
   set(CMAKE_INSTALL_LIBDIR "lib")
@@ -21,7 +23,7 @@ endif()
 set(APPLE "${QCOPILOTS_SEARCH_TEST_APPLE_LAYOUT}")
 include("${QCOPILOTS_SEARCH_RUNTIME_CMAKE}")
 qcopilots_search_install_inference_runtime(
-  LIBRARIES qcs-base-fixture CPU_BACKENDS qcs-cpu-fixture)
+  LIBRARIES qcs-base-fixture CPU_BACKENDS qcs-cpu-fixture GPU_BACKENDS qcs-gpu-fixture)
 if(QCOPILOTS_SEARCH_TEST_APPLE_LAYOUT)
   cmake_path(GET QCOPILOTS_SEARCH_RUNTIME_CMAKE PARENT_PATH runtime_cmake_directory)
   include("${runtime_cmake_directory}/../../cmake/qcs-macos-deploy.cmake")
@@ -29,10 +31,12 @@ if(QCOPILOTS_SEARCH_TEST_APPLE_LAYOUT)
   # Mach-O relocation and macdeployqt are covered by the native macOS fixture.
   qcopilots_search_install_macos_runtime_after_bundle(
     NATIVE_TARGETS qcs-base-fixture
-    INFERENCE_TARGETS qcs-base-fixture qcs-cpu-fixture
-    CPU_TARGETS qcs-cpu-fixture)
+    INFERENCE_TARGETS qcs-base-fixture qcs-cpu-fixture qcs-gpu-fixture
+    CPU_TARGETS qcs-cpu-fixture GPU_TARGETS qcs-gpu-fixture)
 endif()
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/files.txt" CONTENT
-  "$<TARGET_FILE_NAME:qcs-base-fixture>\n$<TARGET_FILE_NAME:qcs-cpu-fixture>\n")
+  "$<TARGET_FILE_NAME:qcs-base-fixture>\n$<TARGET_FILE_NAME:qcs-cpu-fixture>\n$<TARGET_FILE_NAME:qcs-gpu-fixture>\n")
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu-rpath.txt" CONTENT
   "$<TARGET_PROPERTY:qcs-cpu-fixture,INSTALL_RPATH>")
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gpu-rpath.txt" CONTENT
+  "$<TARGET_PROPERTY:qcs-gpu-fixture,INSTALL_RPATH>")

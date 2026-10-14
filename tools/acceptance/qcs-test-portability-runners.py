@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast contract tests for the opt-in Windows portability acceptance runners."""
+"""Contract tests for the opt-in Windows portability acceptance runners."""
 from __future__ import annotations
 
 import importlib.util
@@ -190,10 +190,13 @@ class PortabilityContracts(unittest.TestCase):
         # and CMake. A language-free project needs no product/dependency build.
         for filename in ("qcs-dev.py", "qcs-path-budget.py"):
             shutil.copyfile(DIRECTORY.parent / filename, checkout / "tools" / filename)
+        (checkout / "config").mkdir()
+        shutil.copyfile(DIRECTORY.parents[1] / "config/build-variants.json", checkout / "config/build-variants.json")
         (checkout / "CMakeLists.txt").write_text(
             "cmake_minimum_required(VERSION 3.28)\nproject(qcs-argument-fixture NONE)\n", encoding="utf-8")
         build, supplied = self.root / "外置 构建", self.root / "中文 values"
         actual_arguments = ["configure", "--build-root", str(build), "--qt-root", str(self.root / "SDK 空格"),
+                            "--variant", "windows-x64-cpu", "--config", "Debug",
                             "--cmake-arg=-DQCS_TYPED:PATH=" + str(supplied),
                             "--cmake-arg=-DQCS_RAW:STRING=" + str(supplied),
                             "--cmake-arg=-DQCS_URL:STRING=https://example.test/a=b=c",
@@ -203,7 +206,8 @@ class PortabilityContracts(unittest.TestCase):
         result = subprocess.run(list(map(str, command)), cwd=self.root, env=environment, capture_output=True,
                                 encoding="utf-8", errors="replace", timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        cache = dict(line.split("=", 1) for line in (build / "release/CMakeCache.txt").read_text(encoding="utf-8").splitlines()
+        cache_path = build / "windows-x64-cpu/Debug/CMakeCache.txt"
+        cache = dict(line.split("=", 1) for line in cache_path.read_text(encoding="utf-8").splitlines()
                      if line.startswith("QCS_"))
         self.assertEqual(Path(cache["QCS_TYPED:PATH"]), supplied)
         self.assertEqual(cache["QCS_RAW:STRING"], str(supplied))
@@ -681,18 +685,66 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
                    "--root", str(tests), "--", *inner]
         return command, name, source, build, tests
 
+    def variant_manifest(self, variants):
+        (self.root / "config").mkdir(exist_ok=True)
+        (self.root / "config/build-variants.json").write_text(json.dumps({"variants": variants}), encoding="utf-8")
+
+    def test_variant_selection_uses_manifest_default_and_explicit_environment_override(self):
+        variants = [
+            {"id": "windows-x64-cpu", "os": "windows", "arch": "x64", "backend": "cpu"},
+            {"id": "windows-x64-vulkan", "os": "windows", "arch": "x64", "backend": "vulkan"},
+        ]
+        self.variant_manifest(variants)
+        before = runner.snapshot(self.root)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(runner.select_variant(self.root), "windows-x64-cpu")
+        with mock.patch.dict(os.environ, {"QCOPILOTS_SEARCH_VARIANT": "windows-x64-vulkan"}):
+            self.assertEqual(runner.select_variant(self.root), "windows-x64-vulkan")
+            self.assertEqual(runner.select_variant(self.root, "windows-x64-cpu"), "windows-x64-cpu")
+        self.assertEqual(runner.snapshot(self.root), before)
+
+    def test_variant_selection_rejects_unknown_non_windows_and_ambiguous_defaults(self):
+        windows = {"id": "windows-x64-cpu", "os": "windows", "arch": "x64", "backend": "cpu"}
+        linux = {"id": "linux-x64-cpu", "os": "linux", "arch": "x64", "backend": "cpu"}
+        self.variant_manifest([windows, linux])
+        before = runner.snapshot(self.root)
+        for selected in ("unknown", "linux-x64-cpu", "../windows-x64-cpu"):
+            with self.subTest(variant=selected), self.assertRaisesRegex(RuntimeError, "Windows x64 variant"):
+                runner.select_variant(self.root, selected)
+        self.assertEqual(runner.snapshot(self.root), before)
+        for variants in ([linux], [windows, {**windows, "id": "windows-x64-other"}]):
+            self.variant_manifest(variants)
+            with mock.patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(RuntimeError, "one default"):
+                runner.select_variant(self.root)
+
+    def test_build_layout_keeps_variant_and_configuration_outputs_isolated(self):
+        paths = set()
+        for variant in ("windows-x64-cpu", "windows-x64-vulkan"):
+            for config in runner.CONFIGURATIONS:
+                layout = runner.build_layout(self.root, variant, config)
+                self.assertEqual(layout["root"], self.root / variant)
+                self.assertEqual(layout["build"], self.root / variant / config)
+                for name in ("stage", "pkg", "reports", "runs", "deps"):
+                    self.assertEqual(layout[name], self.root / variant / name / config)
+                selected = {path for name, path in layout.items() if name != "root"}
+                self.assertTrue(paths.isdisjoint(selected))
+                paths.update(selected)
+        with self.assertRaisesRegex(RuntimeError, "Invalid build configuration"):
+            runner.build_layout(self.root, "windows-x64-cpu", "release")
+        self.assertEqual(list(self.root.iterdir()), [])
+
     def native_build_fixture(self):
-        clone = self.root / "克隆 构建/release"
-        main = self.root / "主构建"
+        clone = runner.build_layout(self.root / "克隆 构建", "windows-x64-cpu", "Debug")["build"]
+        main = runner.build_layout(self.root / "主构建", "windows-x64-cpu", "Debug")["build"]
         qt, nsis, global_dlls = (self.root / name for name in ("Qt SDK", "私有 NSIS", "全局 DLL"))
-        for directory in (clone / "bin", clone / "nd/libgit2", main / "release/bin",
-                          main / "release/lib", qt / "bin", qt / "plugins", nsis, global_dlls):
+        for directory in (clone / "bin", clone / "nd/libgit2", main / "bin",
+                          main / "lib", qt / "bin", qt / "plugins", nsis, global_dlls):
             directory.mkdir(parents=True, exist_ok=True)
         for name in runner.TARGETS:
             (clone / "bin" / (name + ".exe")).write_bytes(("independent " + name).encode())
         native = clone / "nd/libgit2/git2.dll"
         native.write_bytes(b"independently built native DLL")
-        for directory in (main / "release/bin", global_dlls):
+        for directory in (main / "bin", global_dlls):
             (directory / "git2.dll").write_bytes(("decoy " + str(directory)).encode("utf-8"))
         (nsis / "makensis.exe").write_bytes(b"locked NSIS lookup fixture, never executed")
         return clone, native, main, qt, nsis, global_dlls
@@ -715,7 +767,7 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
         clone, native, main, _, _, global_dlls = self.native_build_fixture()
         native.unlink()
         with mock.patch.dict(os.environ, {"PATH": os.pathsep.join(map(str, (
-                clone / "bin", main / "release/bin", global_dlls)))}):
+                clone / "bin", main / "bin", global_dlls)))}):
             for with_bin in (False, True):
                 with self.subTest(binDecoy=with_bin):
                     if with_bin:
@@ -755,7 +807,7 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
     def test_clone_command_environment_uses_selected_native_dll_directory(self):
         clone, native, main, qt, nsis, global_dlls = self.native_build_fixture()
         selected, _ = runner.clone_executable_snapshot(clone)
-        base = {"PATH": os.pathsep.join(map(str, (main / "release/bin", main / "release/lib", global_dlls))),
+        base = {"PATH": os.pathsep.join(map(str, (main / "bin", main / "lib", global_dlls))),
                 "UNCHANGED_VALUE": "preserve"}
         before = dict(base)
         # Only the unrelated Windows NSIS command lookup is stubbed. DLL
@@ -765,8 +817,8 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
         paths = actual["PATH"].split(os.pathsep)
         self.assertIn(str(native.parent), paths)
         self.assertLess(paths.index(str(native.parent)), paths.index(str(global_dlls)))
-        self.assertNotIn(str(main / "release/bin"), paths)
-        self.assertNotIn(str(main / "release/lib"), paths)
+        self.assertNotIn(str(main / "bin"), paths)
+        self.assertNotIn(str(main / "lib"), paths)
         self.assertIn(str(clone / "bin"), paths)
         self.assertEqual(actual["QT_PLUGIN_PATH"], str(qt / "plugins"))
         self.assertEqual(actual["NSISDIR"], str(nsis))
@@ -868,7 +920,9 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
                                     cwd=self.root, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
         command = [sys.executable, "-B", str(DIRECTORY / "qcs-two-checkout-portability.py"),
-                   "--head", "a" * 40, "--source-tree", "b" * 40]
+                   "--head", "a" * 40, "--source-tree", "b" * 40,
+                   "--variant", "windows-x64-cpu", "--config", "Debug",
+                   "--gpu-sdk-root", str(self.root / "共享 GPU SDK")]
         for flag in ("build-root", "build-record", "run-parent", "qt-root", "qt-prefix", "calligra-source"):
             command.extend(["--" + flag, str(self.root / flag)])
         result = subprocess.run(command, cwd=self.root, capture_output=True, timeout=20)
@@ -876,6 +930,11 @@ ConvertTo-Json -InputObject @{before=$before;prepared=@(Read-FixtureAcls)} -Dept
         plan = json.loads(result.stdout)
         self.assertFalse(plan["executeRequested"])
         self.assertEqual(Path(plan["source"]), DIRECTORY.parents[1])
+        self.assertEqual(plan["variant"], "windows-x64-cpu")
+        self.assertEqual(plan["configuration"], "Debug")
+        self.assertEqual(Path(plan["mainBuildDirectory"]), self.root / "build-root/windows-x64-cpu/Debug")
+        self.assertEqual(Path(plan["nsisRoot"]), self.root / "build-root/windows-x64-cpu/bootstrap/nsis")
+        self.assertEqual(Path(plan["gpuSdkRoot"]), self.root / "共享 GPU SDK")
         self.assertTrue(Path(plan["uniqueRunRoot"]).name.startswith("qcs-port-"))
         self.assertEqual(before, runner.snapshot(self.root))
 

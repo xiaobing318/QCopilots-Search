@@ -133,6 +133,14 @@ def entries():
     for module in ("qtbase", "qtsvg", "qt5compat", "qtimageformats", "qtmultimedia", "qttranslations", "qtwebengine"):
         if module not in locked_modules:
             raise RuntimeError(f"Corresponding Qt source module is missing: {module}")
+    gpu_license_lock = json.loads((SOURCE / "config/gpu-license-sources.lock.json").read_text(encoding="utf-8"))
+    for release in gpu_license_lock["rocm"].values():
+        for package in release["sourceArchives"]:
+            name = package["name"]
+            if (name in found or not re.fullmatch(r"[0-9a-f]{64}", package["sha256"])
+                    or Path(package["filename"]).name != package["filename"]):
+                raise RuntimeError(f"Invalid or duplicate GPU source package: {name}")
+            found[name] = package
     found["llama.cpp"] = LLAMA
     return [found[name] for name in sorted(found)]
 
@@ -184,6 +192,40 @@ def project_files():
         if path.is_symlink() or not path.is_file() or SOURCE not in path.resolve().parents:
             raise RuntimeError(f"Unexpected source file type: {relative}")
         yield relative, path
+
+
+def checkout_identity(candidate_commit: str | None = None):
+    """Bind release materials to one clean commit before and after copying bytes."""
+    if candidate_commit is not None and not re.fullmatch(r"[0-9a-f]{40}", candidate_commit):
+        raise RuntimeError("--candidate-commit must be a full lowercase commit SHA")
+    def git(*arguments):
+        return subprocess.check_output(["git", "-C", str(SOURCE), *arguments], text=True).strip()
+    identity = {"commit": git("rev-parse", "HEAD"), "sourceTree": git("rev-parse", "HEAD^{tree}"),
+                "workingTreeModified": bool(git("status", "--porcelain", "--untracked-files=all"))}
+    if candidate_commit is not None:
+        if identity["commit"] != candidate_commit:
+            raise RuntimeError("The source checkout does not match --candidate-commit")
+        if identity["workingTreeModified"]:
+            raise RuntimeError("Candidate source materials require a clean checkout")
+    return identity
+
+
+def verify_source_snapshot(identity, source_files, candidate_commit=None):
+    if checkout_identity(candidate_commit) != identity:
+        raise RuntimeError("The source checkout identity changed during bundle creation")
+    current = dict(project_files())
+    if set(current) != {entry["path"] for entry in source_files}:
+        raise RuntimeError("The source file inventory changed during bundle creation")
+    for entry in source_files:
+        path = current[entry["path"]]
+        if path.stat().st_size != entry["size"] or digest(path) != entry["sha256"]:
+            raise RuntimeError(f"Source changed during bundle creation: {entry['path']}")
+
+
+def dependency_locks(source_files):
+    return [entry for entry in source_files
+            if entry["path"] in {"dependencies.lock.json", "config/build-variants.json", "cmake/qcs-native-deps.cmake"}
+            or entry["path"].endswith((".lock.json", "llama-source-manifest.sha256"))]
 
 
 def add_file(archive: zipfile.ZipFile, relative: str, path: Path, expected_hash: str):
@@ -241,7 +283,7 @@ def ffmpeg_metadata(qt_root: Path):
             directory_handle.close()
 
 
-def verify_bundle(path: Path, expected_sha256: str | None = None):
+def verify_bundle(path: Path, expected_sha256: str | None = None, candidate_commit: str | None = None):
     checksum = digest(path)
     if expected_sha256 and checksum != expected_sha256.lower():
         raise RuntimeError("The source bundle SHA-256 does not match the expected value")
@@ -254,6 +296,19 @@ def verify_bundle(path: Path, expected_sha256: str | None = None):
         if archive.getinfo("source-manifest.json").file_size > 16 * 1024 * 1024:
             raise RuntimeError("The source manifest is unexpectedly large")
         manifest = json.loads(archive.read("source-manifest.json"))
+        if manifest.get("schemaVersion") != 2 or manifest.get("product") != PRODUCT:
+            raise RuntimeError("Unsupported source manifest schema or product")
+        if manifest.get("platform") != "source" or manifest.get("architecture") != "any":
+            raise RuntimeError("The source bundle must be platform neutral")
+        if candidate_commit is not None:
+            if not re.fullmatch(r"[0-9a-f]{40}", candidate_commit) or manifest.get("commit") != candidate_commit:
+                raise RuntimeError("The source bundle does not match --candidate-commit")
+            if manifest.get("workingTreeModified") is not False or manifest.get("qtSdkMetadata"):
+                raise RuntimeError("Candidate source materials must be clean and independent of a local SDK")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("sourceTree", ""))):
+            raise RuntimeError("Source tree identity is absent or invalid")
+        if manifest.get("dependencyLocks") != dependency_locks(manifest["projectFiles"]):
+            raise RuntimeError("Source dependency locks differ from the included project files")
         expected = {entry["archivePath"]: entry for entry in manifest["packages"]}
         expected.update({"project/" + entry["path"]: entry for entry in manifest["projectFiles"]})
         expected.update({"sdk-metadata/" + entry["path"]: entry for entry in manifest.get("qtSdkMetadata", [])})
@@ -271,7 +326,8 @@ def verify_bundle(path: Path, expected_sha256: str | None = None):
             checked += 1
     return {"passed": True, "bundle": str(path), "sha256": checksum,
             "verifiedEntries": checked, "sourcePackages": len(manifest["packages"]),
-            "workingTreeModified": manifest["workingTreeModified"], "commit": manifest["commit"]}
+            "workingTreeModified": manifest["workingTreeModified"], "commit": manifest["commit"],
+            "sourceTree": manifest["sourceTree"], "platform": manifest["platform"]}
 
 
 def main():
@@ -284,11 +340,15 @@ def main():
     parser.add_argument("--manifest-only", action="store_true")
     parser.add_argument("--verify-bundle", type=Path)
     parser.add_argument("--expected-sha256")
+    parser.add_argument("--candidate-commit", help="Require the exact clean release candidate SHA")
     parser.add_argument("--reserve-gib", type=float, default=3.0)
     args = parser.parse_args()
     if args.verify_bundle:
-        print(json.dumps(verify_bundle(args.verify_bundle.expanduser().resolve(), args.expected_sha256), ensure_ascii=False, indent=2))
+        print(json.dumps(verify_bundle(args.verify_bundle.expanduser().resolve(), args.expected_sha256,
+                                       args.candidate_commit), ensure_ascii=False, indent=2))
         return
+    if args.candidate_commit and args.qt_root:
+        parser.error("--qt-root is developer metadata and cannot be added to a platform-neutral release candidate")
     if not args.build_root:
         parser.error("--build-root is required when collecting sources")
     root = external(args.build_root)
@@ -299,22 +359,23 @@ def main():
     reserve = int(args.reserve_gib * 1024**3)
     cache.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
-    packages = entries()
     if args.manifest_only:
-        print(json.dumps({"schemaVersion": 1, "packages": packages}, ensure_ascii=False, indent=2))
+        print(json.dumps({"schemaVersion": 1, "packages": entries()}, ensure_ascii=False, indent=2))
         return
-    commit = subprocess.check_output(["git", "-C", str(SOURCE), "rev-parse", "HEAD"], text=True).strip()
-    dirty = bool(subprocess.check_output(["git", "-C", str(SOURCE), "status", "--porcelain"], text=True).strip())
+    identity = checkout_identity(args.candidate_commit)
+    commit = identity["commit"]
+    packages = entries()
     archives = []
     for entry in packages:
         path = get_archive(entry, root, cache, reserve, args.download)
         archives.append((entry, path))
     application = list(project_files())
     source_files = [{"path": relative, "sha256": digest(path), "size": path.stat().st_size} for relative, path in application]
-    manifest = {"schemaVersion": 1, "product": PRODUCT, "commit": commit, "workingTreeModified": dirty,
-                "platform": platform.system(), "architecture": platform.machine(),
+    manifest = {"schemaVersion": 2, "product": PRODUCT, **identity,
+                "platform": "source", "architecture": "any",
                 "packages": [{**entry, "size": path.stat().st_size, "archivePath": "upstream/" + entry["filename"]} for entry, path in archives],
                 "projectFiles": source_files,
+                "dependencyLocks": dependency_locks(source_files),
                 "archiveFormat": "ZIP_STORED with fixed timestamps, upstream source archives remain compressed",
                 "modelsIncluded": False,
                 "scope": "Sources for configured runtime dependencies, project recipes, patches, notices and SDK build metadata"}
@@ -331,7 +392,7 @@ def main():
         manifest["qtSdkMetadata"] = [{"path": name, "sha256": digest(path)} for name, path in sdk_metadata]
         manifest["ffmpegRuntime"] = ffmpeg_metadata(qt_root)
     content = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    bundle = output / f"{PRODUCT}-source-materials-{commit[:12]}-{platform.system().lower()}-{platform.machine().lower()}.zip"
+    bundle = output / f"{PRODUCT}-source-materials-{commit[:12]}.zip"
     if bundle.is_symlink():
         raise RuntimeError("Refusing a source output symlink")
     total = sum(path.stat().st_size for _, path in archives + application + sdk_metadata)
@@ -351,6 +412,7 @@ def main():
                 add_file(archive, "sdk-metadata/" + relative, path, entry["sha256"])
             for entry, path in archives:
                 add_file(archive, "upstream/" + entry["filename"], path, entry["sha256"])
+        verify_source_snapshot(identity, source_files, args.candidate_commit)
         os.replace(temporary, bundle)
     except Exception:
         temporary.unlink(missing_ok=True)

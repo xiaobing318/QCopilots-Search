@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Verify native and final release evidence. This command never publishes a release."""
+"""Capture and verify local candidate and Windows Computer Use evidence. Never publish."""
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -15,20 +14,15 @@ import re
 import shutil
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 import tempfile
 import zipfile
 from functools import wraps
 
 sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parents[1]
-PLATFORMS = {"windows-x64": ("Windows", "x86_64"), "linux-x64": ("Linux", "x86_64"),
-             "macos-arm64": ("Darwin", "arm64"), "macos-x64": ("Darwin", "x86_64")}
-GOLDENS = {"query", "query-bn", "query-ar", "document", "document-long", "screen-280", "photo-140", "frame-70", "speech"}
 LOCKS = ("dependencies.lock.json", "tools/qt-packages.lock.json", "tools/nsis-package.lock.json",
-         "tools/qcs-source-packages.lock.json", "cmake/qcs-native-deps.cmake")
-FAULTS = {"committed-before-ann", "uncommitted-sqlite", "ann-file-saved-before-manifest",
-          "ann-manifest-published-before-outbox-cleanup"}
+         "tools/qcs-source-packages.lock.json", "cmake/qcs-native-deps.cmake",
+         "config/build-variants.json", "config/gpu-sdk.lock.json", "config/gpu-license-sources.lock.json")
 GUI_EXECUTABLE = "qcs-gui"
 APPLICATIONS = {GUI_EXECUTABLE, "qcs-service", "qcs-worker", "qcs-cli"}
 PACKAGE_GOLDENS = {"query": "text", "screen-280": "image", "speech": "audio"}
@@ -58,10 +52,6 @@ def check(errors, condition, message):
         errors.append(message)
 
 
-def at_least(value, minimum):
-    return finite(value) and value >= minimum
-
-
 def within(value, minimum, maximum):
     return finite(value) and minimum <= value <= maximum
 
@@ -84,251 +74,6 @@ def malformed_as_error(function):
     return wrapped
 
 
-def validate_rebuild_intervals(concurrent):
-    errors = []
-    check(errors, concurrent.get("timingClock") == "steady-clock-relative-nanoseconds",
-          "capacity rebuild clock is missing or incompatible")
-    builds, queries = concurrent.get("buildIntervals", []), concurrent.get("queryIntervals", [])
-    check(errors, len(builds) == 1 and concurrent.get("observedBuilds") == len(builds)
-          and integer_at_least(concurrent.get("observedBuilds"), 1),
-          "capacity rebuild must observe exactly one actual graph build")
-    check(errors, 1 <= len(queries) <= 500 and concurrent.get("measuredQueries") == len(queries)
-          and integer_at_least(concurrent.get("measuredQueries"), 1),
-          "capacity rebuild query intervals are missing or inconsistent")
-    valid_builds = []
-    for build in builds:
-        start, end = build.get("startNanoseconds"), build.get("endNanoseconds")
-        valid = integer_at_least(start, 0) and integer_at_least(end, 0) and end > start
-        check(errors, valid, "capacity graph build interval is invalid")
-        if valid:
-            valid_builds.append((start, end))
-    overlapping = []
-    for query in queries:
-        start, end = query.get("startNanoseconds"), query.get("endNanoseconds")
-        valid = integer_at_least(start, 0) and integer_at_least(end, 0) and end > start
-        check(errors, valid, "capacity rebuild query interval is invalid")
-        if not valid:
-            continue
-        duration = (end - start) / 1000000.0
-        overlaps = any(start < build_end and end > build_start for build_start, build_end in valid_builds)
-        check(errors, query.get("overlapsBuild") is overlaps
-              and same_number(query.get("durationMilliseconds"), duration),
-              "capacity rebuild query duration or overlap disagrees with its raw interval")
-        if overlaps:
-            overlapping.append(duration)
-    check(errors, bool(overlapping) and concurrent.get("overlappingQueries") == len(overlapping),
-          "capacity rebuild has no measured overlap or its count disagrees")
-    if overlapping:
-        overlapping.sort()
-        for name, percentile in (("p50Milliseconds", .50), ("p95Milliseconds", .95), ("p99Milliseconds", .99)):
-            observed = overlapping[math.ceil(percentile * len(overlapping)) - 1]
-            check(errors, same_number(concurrent.get(name), observed),
-                  f"capacity rebuild {name} does not match genuinely overlapping queries")
-    return errors
-
-
-@malformed_as_error
-def validate_capacity(doc, *, minimum_segments, minimum_queries, minimum_timings):
-    errors = []
-    check(errors, doc.get("passed") is True and not doc.get("error"), "capacity did not finish successfully")
-    segments = doc.get("segments", 0)
-    check(errors, at_least(segments, minimum_segments), "capacity vector count is below the required scale")
-    check(errors, doc.get("dimensions") == 768, "capacity dimensions must be 768")
-    files, per_file = doc.get("files"), doc.get("segmentsPerFile")
-    check(errors, at_least(files, 1) and at_least(per_file, 1) and files * per_file == segments,
-          "capacity file/segment counts disagree")
-    check(errors, doc.get("oracleRows") == segments, "capacity exact oracle did not read the full corpus")
-    for name in ("builtStatus", "reopenedStatus"):
-        state = doc.get(name, {})
-        check(errors, state.get("vectors") == segments and state.get("segments") == segments and state.get("files") == files,
-              f"capacity {name} does not prove the full corpus was built and reopened")
-        check(errors, state.get("pipelineFingerprint") == "synthetic-capacity-768-v1", f"capacity {name} pipeline fingerprint is missing")
-    queries = doc.get("queries", [])
-    check(errors, isinstance(queries, list) and len(queries) >= minimum_queries, "capacity has too few exact query records")
-    if isinstance(queries, list) and queries:
-        query_ids = [row.get("query") for row in queries]
-        check(errors, all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in query_ids)
-              and len(set(query_ids)) == len(query_ids), "capacity exact query identities must be distinct nonnegative integers")
-        groups = defaultdict(list)
-        for row in queries:
-            value = row.get("recallAt20")
-            check(errors, within(value, 0, 1), "capacity query recall is invalid")
-            check(errors, within(row.get("returnedFiles"), 1, 20), "capacity query returned count is invalid")
-            if finite(value):
-                groups[row.get("distribution")].append(value)
-        values = [value for group in groups.values() for value in group]
-        mean = sum(values) / len(values) if values else -1
-        check(errors, same_number(doc.get("recallAt20"), mean) and mean >= .95, "capacity overall recall is inconsistent or below .95")
-        for group in ("clustered", "uniform"):
-            values = groups.get(group, [])
-            check(errors, bool(values) and same_number(doc.get(group + "RecallAt20"), sum(values)/len(values) if values else -1),
-                  f"capacity {group} query evidence is missing or inconsistent")
-    check(errors, at_least(doc.get("timedQueries"), minimum_timings) and at_least(doc.get("warmupQueries"), 10),
-          "capacity has too few warmed timing queries")
-    check(errors, within(doc.get("latencyMilliseconds", {}).get("p95"), 0, 500), "capacity P95 exceeds 500 ms or is invalid")
-    filters = doc.get("filters", [])
-    check(errors, len(filters) == 3 and {item.get("nominalPercent") for item in filters} == {10, 1, .1}, "capacity filter scenarios are incomplete")
-    for item in filters:
-        check(errors, item.get("passed") is True and at_least(item.get("checkedQueries"), minimum_queries)
-              and within(item.get("recallAt20"), .95, 1) and within(item.get("p95Milliseconds"), 0, 500),
-              "capacity filtered retrieval failed or lacks measurements")
-    concurrent = doc.get("concurrentRebuild", {})
-    check(errors, doc.get("concurrentRebuildEvaluated") is True and concurrent.get("passed") is True
-          and concurrent.get("singleShard") is True and at_least(concurrent.get("overlappingQueries"), 1)
-          and within(concurrent.get("p95Milliseconds"), 0, 1000), "capacity concurrent single-shard rebuild evidence is incomplete or slow")
-    errors.extend(validate_rebuild_intervals(concurrent))
-    mutations = doc.get("mutations", {})
-    check(errors, mutations.get("passed") is True and at_least(mutations.get("vectorsPerPhase"), min(10000, segments)),
-          "capacity mutation evidence is incomplete")
-    mutation_files, mutation_vectors = mutations.get("filesPerPhase"), mutations.get("vectorsPerPhase")
-    check(errors, integer_at_least(mutation_files, 1) and integer_at_least(mutation_vectors, 1)
-          and mutation_files * per_file == mutation_vectors,
-          "capacity mutation file/vector counts disagree")
-    phases = mutations.get("phases", [])
-    check(errors, mutations.get("queryScope") == "filtered-exact-file-plus-global-production-search-sample"
-          and [phase.get("phase") for phase in phases] == ["add", "update", "delete"],
-          "capacity mutation search phases are incomplete")
-    for phase in phases:
-        check(errors, phase.get("passed") is True and all(
-            integer_at_least(phase.get(name), 1) and phase.get(name) == mutation_files
-            for name in ("filesChecked", "keywordQueries", "vectorQueries")),
-            "capacity mutation did not check every changed file and its search results")
-        check(errors, all(integer_at_least(phase.get(name), 0) and phase.get(name) == 0
-            for name in ("staleHitCount", "retiredSegmentIdsRemaining", "globalSearchStaleHitCount")),
-            "capacity mutation returned stale versions or retained retired segments")
-        expected_retired = 0 if phase.get("phase") == "add" else mutation_vectors
-        check(errors, integer_at_least(phase.get("retiredSegmentIdsChecked"), 0)
-              and phase.get("retiredSegmentIdsChecked") == expected_retired,
-              "capacity mutation did not inspect every retired segment")
-        check(errors, integer_at_least(phase.get("globalSearchQueries"), 1)
-              and phase.get("globalSearchQueries") == min(16, mutation_files)
-              and integer_at_least(phase.get("globalSearchCheckedHits"), 1),
-              "capacity mutation global production search did not return checked hits")
-        global_vectors = segments + (0 if phase.get("phase") == "delete" else mutation_vectors)
-        expected_backend = "ann" if global_vectors > 20000 else "exact-subset"
-        check(errors, integer_at_least(phase.get("globalSearchVectorCount"), 1)
-              and phase.get("globalSearchVectorCount") == global_vectors
-              and phase.get("globalSearchBackend") == expected_backend,
-              "capacity mutation global search backend disagrees with the actual corpus scale")
-    faults = doc.get("recoveryFaults", [])
-    check(errors, doc.get("recoveryFaultInjectionEvaluated") is True and len(faults) == len(FAULTS)
-          and {item.get("faultPoint") for item in faults} == FAULTS, "capacity recovery fault points are incomplete")
-    ordered_faults = ["committed-before-ann", "uncommitted-sqlite", "ann-file-saved-before-manifest",
-                      "ann-manifest-published-before-outbox-cleanup"]
-    check(errors, [item.get("faultPoint") for item in faults] == ordered_faults,
-          "capacity recovery fault order is incomplete or inconsistent")
-    previous_id = 0
-    previous_version = previous_token = None
-    committed_versions, committed_tokens = set(), set()
-    for item in faults:
-        check(errors, item.get("passed") is True and item.get("childExitCode") == 73, "capacity recovery child did not exercise the required interruption")
-        version, token = item.get("expectedVersion"), item.get("expectedToken")
-        check(errors, isinstance(version, str) and bool(version.strip()) and version == item.get("observedVersion")
-              and isinstance(token, str) and bool(token.strip()) and token == item.get("observedToken"),
-              "capacity recovery did not recover the intended committed version and keyword")
-        observed_id = item.get("observedSegmentId")
-        check(errors, integer_at_least(item.get("previousSegmentId"), 0) and item.get("previousSegmentId") == previous_id
-              and integer_at_least(observed_id, 1), "capacity recovery segment lineage is incomplete")
-        rollback = item.get("faultPoint") == "uncommitted-sqlite"
-        if rollback:
-            check(errors, observed_id == previous_id and version == previous_version and token == previous_token,
-                  "capacity rollback did not preserve the previous committed identity")
-        else:
-            check(errors, integer_at_least(observed_id, 1) and observed_id > previous_id
-                  and version not in committed_versions and token not in committed_tokens,
-                  "capacity recovery reused an earlier committed identity")
-            committed_versions.add(version)
-            committed_tokens.add(token)
-        expected_dimension = {"committed-before-ann": 700, "uncommitted-sqlite": 700,
-                              "ann-file-saved-before-manifest": 702,
-                              "ann-manifest-published-before-outbox-cleanup": 703}.get(item.get("faultPoint"))
-        check(errors, integer_at_least(item.get("expectedVectorDimension"), 0)
-              and item.get("expectedVectorDimension") == expected_dimension
-              and integer_at_least(item.get("observedVectorDimension"), 0)
-              and item.get("observedVectorDimension") == expected_dimension
-              and within(item.get("observedVectorCosine"), .999, 1.000000001)
-              and item.get("vectorMatched") is True,
-              "capacity recovery did not recover the intended committed vector")
-        check(errors, all(integer_at_least(item.get(name), 0) and item.get(name) == 0
-              for name in ("staleVersionHits", "oldKeywordHits", "uncommittedCorruptionRows")),
-              "capacity recovery retained stale search results or uncommitted table changes")
-        previous_id, previous_version, previous_token = observed_id, version, token
-        if item.get("faultPoint") == "ann-manifest-published-before-outbox-cleanup":
-            check(errors, item.get("stalePublishedOutboxEvents") == 0 and item.get("postRecoveryWritePassed") is True,
-                  "capacity recovery retained stale events or could not accept a subsequent write")
-    check(errors, finite(doc.get("sampledDirectoryPeakBytes")) and finite(doc.get("directoryBudgetBytes"))
-          and doc["sampledDirectoryPeakBytes"] <= doc["directoryBudgetBytes"], "capacity disk usage exceeded the configured budget or is missing")
-    check(errors, finite(doc.get("minimumObservedFreeBytes")) and finite(doc.get("minimumFreeBytes"))
-          and doc["minimumObservedFreeBytes"] >= doc["minimumFreeBytes"], "capacity free-space reserve was violated or not measured")
-    return errors
-
-
-def compiled_relevance_policy():
-    """Read the policy compiled from this candidate, without executing supplied code."""
-    source = (SOURCE / "src/core/relevance_policy_data.h").read_text(encoding="utf-8")
-    def constant(name, declaration):
-        values = re.findall(r"inline constexpr " + declaration + r"\s*" + re.escape(name) +
-                            r"\s*=\s*(.+?);", source)
-        if len(values) != 1:
-            raise ValueError(f"Compiled relevance policy constant is missing or duplicated: {name}")
-        return values[0]
-    result = {name: json.loads(constant(name, r"const char \*")) for name in
-              ("version", "modelFingerprint", "corpusSha256", "rawExportSha256", "calibrationReportSha256")}
-    result["calibrated"] = json.loads(constant("calibrated", "bool"))
-    result["thresholds"] = {name: float(constant(name + "Minimum", "double"))
-                            for name in ("text", "image", "audio", "code")}
-    return result
-
-
-SEMANTIC_PROTOCOL = "grouped-cv-v2-quarter"
-SEMANTIC_CORPUS_FILES = {
-    "fixtureManifestSha256": "assets.json", "topicManifestSha256": "topics.tsv",
-    "generatorSha256": "semantic_acceptance.cpp", "relevanceManifestSha256": "relevance_queries.json",
-    "groupPlanSha256": "relevance_development_groups.json",
-    "v2TextCodeManifestSha256": "relevance_v2_text_code.json",
-    "v2MediaManifestSha256": "relevance_v2_media.json",
-}
-SEMANTIC_MODALITIES = {"text", "ocr", "image", "pdf", "speech", "environment", "video", "code",
-                      "image-natural", "video-natural"}
-
-
-def semantic_corpus_contract():
-    root = SOURCE / "tests/semantic"
-    identity = {field: digest(root / name) for field, name in SEMANTIC_CORPUS_FILES.items()}
-    plan = read_json(root / SEMANTIC_CORPUS_FILES["groupPlanSha256"])
-    groups = {}
-    families = set()
-    for group in plan["groups"]:
-        family, fold = group["family"], group["fold"]
-        if not isinstance(family, str) or not family or family in families or type(fold) is not int or fold not in (0, 1, 2):
-            raise ValueError("Invalid frozen semantic development family or fold")
-        families.add(family)
-        for topic in group["topics"]:
-            if not isinstance(topic, str) or not topic or topic in groups:
-                raise ValueError("Invalid or repeated frozen semantic development topic")
-            groups[topic] = {"family": family, "fold": fold}
-    text = read_json(root / SEMANTIC_CORPUS_FILES["v2TextCodeManifestSha256"])
-    media = read_json(root / SEMANTIC_CORPUS_FILES["v2MediaManifestSha256"])
-    holdout = [row["id"] for row in text["topics"]] + ["v2-media-" + row["id"] for row in media["topics"]]
-    if len(groups) != 143 or len(holdout) != 40 or len(set(holdout)) != 40 or set(groups) & set(holdout):
-        raise ValueError("Frozen semantic development and final holdout coverage is invalid")
-    return {"identity": identity, "development": groups, "holdout": set(holdout)}
-
-
-def relevance_calibration_errors(policy, report):
-    """Bind the reviewed calibration snapshot by bytes, then recompute its gates."""
-    wanted = policy.get("calibrationReportSha256", "")
-    root = SOURCE / "tests/semantic/calibration"
-    matches = [path for path in root.glob("*.json") if digest(path) == wanted]
-    if len(matches) != 1:
-        return ["The candidate needs exactly one frozen calibration snapshot matching its compiled SHA-256"]
-    snapshot = read_json(matches[0])
-    spec = importlib.util.spec_from_file_location("qcs_semantic_policy_evidence", SOURCE / "tools/qcs-semantic-policy-evidence.py")
-    validator = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(validator)
-    return validator.validate_calibration_snapshot(snapshot, policy, report)
-
-
 @malformed_as_error
 def validate_nsis_contract(doc, output):
     """Recompute the package-stage NSIS contract from its preserved raw output."""
@@ -344,188 +89,6 @@ def validate_nsis_contract(doc, output):
           and doc.get("log") == "nsis-contract.log", "NSIS contract summary or child exit is incomplete")
     check(errors, doc.get("counts") == counts and doc.get("cases") == records and doc.get("errors") == [],
           "NSIS contract summary disagrees with its original case records")
-    return errors
-
-
-@malformed_as_error
-def validate_semantic(doc):
-    errors = []
-    check(errors, doc.get("passed") is True and doc.get("mode") == "release", "semantic acceptance was not a successful full run")
-    check(errors, doc.get("calibrationProtocol") == SEMANTIC_PROTOCOL,
-          "semantic acceptance must use the frozen grouped-cv-v2-quarter protocol")
-    check(errors, doc.get("finalHoldoutEvaluated") is True and doc.get("metricsScope") == "all-production-queries",
-          "semantic final holdout has not been evaluated by a complete production run")
-    check(errors, doc.get("semanticCandidateMode") == "matches-only", "semantic acceptance used raw unfiltered candidates")
-    policy = doc.get("relevancePolicy", {})
-    check(errors, policy.get("calibrated") is True, "semantic relevance policy was not calibrated for the running model")
-    check(errors, isinstance(policy.get("version"), str) and re.fullmatch(r"qcs-relevance-v2-quarter-[0-9a-f]{12}", policy["version"]) is not None,
-          "semantic relevance policy is not the accepted v2 quarter policy")
-    check(errors, policy.get("modelFingerprint") == doc.get("modelFingerprint"), "semantic relevance policy uses another model")
-    for field in ("corpusSha256", "rawExportSha256", "calibrationReportSha256"):
-        check(errors, isinstance(policy.get(field), str) and re.fullmatch(r"[0-9a-f]{64}", policy[field]) is not None,
-              f"semantic relevance policy {field} is missing or invalid")
-    identity = doc.get("corpusIdentity", {})
-    identity_fields = set(SEMANTIC_CORPUS_FILES)
-    check(errors, set(identity) == identity_fields and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
-          for value in identity.values()), "semantic calibration corpus identity is incomplete")
-    for field in ("fixtureManifestSha256", "topicManifestSha256", "generatorSha256", "relevanceManifestSha256"):
-        check(errors, identity.get(field) == doc.get(field), "semantic corpus identity differs from its raw manifest hashes")
-    corpus_hash = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True,
-                                            separators=(",", ":")).encode("utf-8")).hexdigest()
-    check(errors, policy.get("corpusSha256") == corpus_hash, "semantic policy was calibrated against another corpus")
-    thresholds = policy.get("thresholds", {})
-    check(errors, set(thresholds) == {"text", "image", "audio", "code"}
-          and all(within(value, -1.000001, 1.000001) for value in thresholds.values()),
-          "semantic policy thresholds are incomplete or invalid")
-    try:
-        compiled = compiled_relevance_policy()
-        check(errors, compiled == policy, "semantic report policy differs from the immutable candidate's compiled policy")
-        contract = semantic_corpus_contract()
-        check(errors, contract["identity"] == identity, "semantic corpus hashes differ from the immutable candidate's frozen source")
-        errors.extend(relevance_calibration_errors(policy, doc))
-    except (OSError, ValueError) as error:
-        errors.append("Cannot verify the candidate's frozen relevance evidence: " + str(error))
-        contract = {"development": {}, "holdout": set()}
-    check(errors, at_least(doc.get("actualEmbeddedSegments"), 1000), "semantic corpus has fewer than 1000 embedded segments")
-    files = doc.get("files", [])
-    file_names = [row.get("file") for row in files]
-    check(errors, doc.get("fixtures") == 186 and doc.get("completedFiles") == 186 and len(files) == 186
-          and all(isinstance(name, str) and name for name in file_names) and len(set(file_names)) == 186,
-          "semantic corpus must preserve all 186 distinct completed fixtures, including background distractors")
-    queries = doc.get("queries", [])
-    check(errors, isinstance(queries, list) and len(queries) == 318 and doc.get("positiveQueries") == 318,
-          "semantic positive query records must retain all 318 frozen labels")
-    texts = [row.get("query") for row in queries]
-    check(errors, all(isinstance(value, str) and value.strip() for value in texts)
-          and len(set(texts)) == len(texts), "semantic query texts must be nonempty and distinct")
-    totals = defaultdict(lambda: [0, 0, 0])
-    partition_totals = {partition: defaultdict(lambda: [0, 0, 0]) for partition in ("development", "holdout")}
-    for row in queries:
-        expected = row.get("expectedFile")
-        production = [item.get("file") for item in row.get("productionTop10", [])]
-        exact = [item.get("file") for item in row.get("exactSemanticTop10", [])]
-        check(errors, len(exact) <= 10 and len(set(exact)) == len(exact)
-              and all(within(item.get("cosine"), -1.00001, 1.00001) for item in row.get("exactSemanticTop10", [])),
-              "semantic exact result list contains invalid cosines or duplicates")
-        rank = production.index(expected) + 1 if expected in production else 0
-        check(errors, expected in file_names and len(production) <= 10 and len(set(production)) == len(production)
-              and all(name in file_names for name in production + exact)
-              and type(row.get("rank")) is int and row["rank"] == rank,
-              "semantic query rank disagrees with its raw result list")
-        for key in ("overall", "language:" + str(row.get("language")), "modality:" + str(row.get("modality"))):
-            totals[key][0] += 1
-            totals[key][1] += int(rank > 0)
-            totals[key][2] += int(expected in exact)
-            if row.get("partition") in partition_totals:
-                group = partition_totals[row["partition"]][key]
-                group[0] += 1
-                group[1] += int(rank > 0)
-                group[2] += int(expected in exact)
-    required = {"overall", "language:en", "language:zh"} | {"modality:" + value for value in SEMANTIC_MODALITIES}
-    check(errors, set(totals) == required, "semantic language or modality groups differ from the frozen protocol")
-    for key, (count, hits, exact_hits) in totals.items():
-        metric = doc.get("metrics", {}).get(key, {})
-        recall = hits / count
-        check(errors, metric.get("queries") == count and metric.get("hits") == hits
-              and same_number(metric.get("recallAt10"), recall)
-              and same_number(metric.get("exactSemanticRecallAt10"), exact_hits / count)
-              and recall >= (.9 if key == "overall" else .8), f"semantic {key} counts or recall do not satisfy acceptance")
-    check(errors, set(doc.get("partitionMetrics", {})) == {"development", "holdout"},
-          "semantic production metrics must separate development from the independent final holdout")
-    for partition, groups in partition_totals.items():
-        summary = doc.get("partitionMetrics", {}).get(partition, {})
-        metrics = summary.get("metrics", {})
-        check(errors, summary.get("passed") is True and set(groups) == required and set(metrics) == required,
-              f"semantic {partition} metrics omit a language or modality group")
-        for key, (count, hits, _) in groups.items():
-            metric = metrics.get(key, {})
-            gate = .9 if key == "overall" else .8
-            check(errors, metric.get("queries") == count and metric.get("hits") == hits
-                  and same_number(metric.get("recallAt10"), hits / count)
-                  and same_number(metric.get("requiredRecallAt10"), gate)
-                  and metric.get("passed") is True and hits / count >= gate,
-                  f"semantic {partition} {key} counts or recall do not satisfy independent acceptance")
-    for key in ("modelFingerprint", "extractionFingerprint", "fixtureManifestSha256", "topicManifestSha256", "generatorSha256"):
-        check(errors, isinstance(doc.get(key), str) and bool(doc[key]), f"semantic {key} is missing")
-    negatives = doc.get("noAnswerQueries", [])
-    check(errors, len(negatives) == 176 and {row.get("partition") for row in negatives} == {"development", "holdout"},
-          "semantic independent absent-query evidence is missing")
-    negative_texts = [row.get("query") for row in negatives]
-    check(errors, all(isinstance(value, str) and value.strip() for value in negative_texts)
-          and len(set(negative_texts)) == len(negative_texts), "semantic absent-query texts must be nonempty and distinct")
-    groups, topic_groups, expected_files = {}, {}, {}
-    for field, expected_counts in (("queries", {"development": 238, "holdout": 80}),
-                                   ("noAnswerQueries", {"development": 96, "holdout": 80})):
-        rows = doc[field]
-        check(errors, {row.get("partition") for row in rows} == set(expected_counts)
-              and all(sum(row.get("partition") == partition for row in rows) == count for partition, count in expected_counts.items()),
-              f"semantic {field} development/holdout counts differ from the frozen protocol")
-        fold_counts = (74, 82, 82) if field == "queries" else (30, 26, 40)
-        check(errors, all(sum(row.get("partition") == "development" and row.get("fold") == fold for row in rows) == count
-                          for fold, count in enumerate(fold_counts)), "semantic development fold coverage differs from the frozen plan")
-        topic_languages = defaultdict(list)
-        for row in rows:
-            partition, topic, family = row.get("partition"), row.get("topic"), row.get("family")
-            location = (partition, row.get("fold"))
-            valid = isinstance(topic, str) and bool(topic) and isinstance(family, str) and bool(family)
-            if partition == "development":
-                assigned = contract["development"].get(topic, {})
-                valid = valid and type(row.get("fold")) is int and row["fold"] in (0, 1, 2)
-                valid = valid and assigned == {"family": family, "fold": row.get("fold")}
-            elif partition == "holdout":
-                valid = valid and "fold" not in row and family == "holdout:" + topic and topic in contract["holdout"]
-            else:
-                valid = False
-            check(errors, valid, "semantic row differs from its frozen family, fold or final-holdout assignment")
-            check(errors, groups.setdefault(family, location) == location and topic_groups.setdefault(topic, location) == location,
-                  "semantic topic or family leaks across development folds or final holdout")
-            check(errors, type(row.get("code")) is bool and row.get("code") == (row.get("modality") == "code"),
-                  "semantic query space differs from the frozen target modality")
-            topic_languages[(partition, topic)].append(row.get("language"))
-            if field == "queries":
-                modality = row.get("modality")
-                channel = "code" if modality == "code" else "audio" if modality in ("speech", "environment") else (
-                    "image" if modality in ("image", "image-natural", "video", "video-natural") else "text")
-                check(errors, row.get("policyModality") == channel and row.get("code") == (modality == "code"),
-                      "semantic policy modality differs from the frozen target modality or query space")
-                file_group = (family, location)
-                check(errors, expected_files.setdefault((row.get("code"), row.get("expectedFile")), file_group) == file_group,
-                      "semantic expected file leaks across families, folds or final holdout")
-        check(errors, all(sorted(languages) == ["en", "zh"] for languages in topic_languages.values()),
-              "semantic frozen topics require exactly one English and one Chinese label")
-        check(errors, {row.get("topic") for row in rows if row.get("partition") == "holdout"} == contract["holdout"],
-              "semantic final holdout must contain every one of the 40 frozen topics")
-    for partition in ("development", "holdout"):
-        rows = [row for row in negatives if row.get("partition") == partition]
-        summary = doc.get("noAnswerSummary", {}).get(partition, {})
-        check(errors, summary.get("queries") == len(rows) and len(rows) > 0
-              and summary.get("queriesReturningCandidates") == sum(row.get("returnedCount", 0) > 0 for row in rows),
-              "semantic absent-query counts disagree with raw records")
-        rate = sum(row.get("returnedCount", 0) > 0 for row in rows) / len(rows) if rows else 1
-        check(errors, same_number(summary.get("falseReturnRate"), rate)
-              and same_number(summary.get("maximumFalseReturnRate"), .1)
-              and summary.get("passed") is True and rate <= .1,
-              f"semantic {partition} absent-query false return rate exceeds .10 or its summary is inconsistent")
-        for row in rows:
-            returned = row.get("productionTop10", [])
-            names = [item.get("file") for item in returned]
-            check(errors, integer_at_least(row.get("returnedCount"), 0) and row["returnedCount"] <= 10
-                  and len(returned) == row["returnedCount"] and len(set(names)) == len(names)
-                  and all(isinstance(name, str) and name for name in names)
-                  and all(name in file_names for name in names)
-                  and all(within(item.get("cosine"), -1.00001, 1.00001) for item in row.get("exactSemanticTop10", [])),
-                  "semantic absent-query similarity evidence is invalid")
-    return errors
-
-
-@malformed_as_error
-def validate_physical(doc, *, minimum_files=100000):
-    errors = []
-    check(errors, doc.get("passed") is True and doc.get("scenario") == "physical-file-capacity", "physical file run did not pass")
-    check(errors, at_least(doc.get("createdPhysicalFiles"), minimum_files), "physical file count is below required scale")
-    for name in ("added", "modified", "deleted", "cancelledAfterDiscoveredFiles"):
-        check(errors, at_least(doc.get(name), 1), f"physical file scenario {name} did not execute")
-    check(errors, doc.get("staleResults") == 0 and doc.get("cleanupVerified") is True, "physical file run retained stale results or temporary files")
     return errors
 
 
@@ -577,21 +140,6 @@ def file_record(root: Path, path: Path):
     relative = path.relative_to(root).as_posix()
     checked = safe_file(root, relative)
     return {"path": relative, "bytes": checked.stat().st_size, "sha256": digest(checked), "sourcePath": str(path.resolve())}
-
-
-def capture_native(root: Path, identity: dict, platform_id: str):
-    files = []
-    for path in sorted((root / "reports").rglob("*")):
-        if path.is_file() and path.name not in ("native-evidence.json", "native-gate.json"):
-            files.append(file_record(root, path))
-    for path in sorted((root / "pkg").glob("qcs-*")):
-        if path.is_file():
-            files.append(file_record(root, path))
-    manifest = {"schemaVersion": 1, "kind": "native", "platformId": platform_id,
-                "identity": identity, "files": files,
-                "createdAtUtc": datetime.now(timezone.utc).isoformat()}
-    write_json(root / "reports/native-evidence.json", manifest)
-    return manifest
 
 
 def verified_build(root: Path, receipt):
@@ -660,6 +208,25 @@ def validate_package_release(doc, root: Path, *, model_fingerprint=None,
     check(errors, doc.get("passed") is True and doc.get("releaseComplete") is True
           and doc.get("verificationScope") == "release" and doc.get("realModelRequired") is True,
           "Package verification is not a complete release acceptance")
+    variants = {item["id"]: item for item in read_json(SOURCE / "config/build-variants.json")["variants"]}
+    variant_id = doc.get("variant")
+    variant = variants.get(variant_id, {})
+    check(errors, bool(variant) and (platform_id is None or variant_id == platform_id),
+          "Package build variant is missing or differs from the requested configuration")
+    build_identity = doc.get("buildIdentity", {})
+    check(errors, build_identity.get("schemaVersion") == 1
+          and build_identity.get("variant") == variant_id and build_identity.get("backend") == variant.get("backend")
+          and build_identity.get("configuration") in ("Debug", "Release", "RelWithDebInfo", "MinSizeRel")
+          and build_identity.get("workingTreeModified") is False
+          and re.fullmatch(r"[0-9a-f]{40}", build_identity.get("candidateCommit", "")) is not None,
+          "Package build identity is incomplete or differs from its variant")
+    if doc.get("commit") is not None:
+        check(errors, build_identity.get("candidateCommit") == doc["commit"],
+              "Package build identity differs from its verification candidate")
+    for field, relative in (("dependencyLockSha256", "dependencies.lock.json"),
+                            ("variantsSha256", "config/build-variants.json")):
+        check(errors, build_identity.get(field) == digest(SOURCE / relative),
+              f"Package build identity used different {relative}")
     check(errors, doc.get("licenseMaterials", {}).get("passed") is True,
           "Package license materials were not verified")
     try:
@@ -749,10 +316,43 @@ def validate_package_release(doc, root: Path, *, model_fingerprint=None,
           "Installed service did not complete semantic retrieval")
     runtime = smoke.get("runtime", {})
     linkage, architecture = runtime.get("linkage"), runtime.get("architecture")
-    expected_arch = PLATFORMS.get(platform_id, (None, None))[1]
+    expected_arch = variant.get("arch")
     check(errors, architecture in ("x86_64", "amd64", "arm64", "aarch64")
-          and (expected_arch is None or architecture in (("x86_64", "amd64") if expected_arch == "x86_64" else ("arm64", "aarch64"))),
+          and expected_arch in ("x64", "arm64")
+          and architecture in (("x86_64", "amd64") if expected_arch == "x64" else ("arm64", "aarch64")),
           "Package inference runtime architecture differs from the native platform")
+    diagnostics = runtime.get("diagnostics", {})
+    check(errors, diagnostics.get("buildVariant") == variant_id
+          and diagnostics.get("packagedBackend") == variant.get("backend")
+          and diagnostics.get("loaded") is True
+          and diagnostics.get("selectedBackend") in ("cpu", variant.get("backend"))
+          and diagnostics.get("gpuSelected") is (diagnostics.get("selectedBackend") != "cpu")
+          and bool(diagnostics.get("deviceName")), "Package runtime backend diagnostics are incomplete or inconsistent")
+    if variant.get("backend") != "cpu" and diagnostics.get("selectedBackend") == "cpu":
+        check(errors, isinstance(diagnostics.get("fallbackReason"), str) and bool(diagnostics["fallbackReason"].strip()),
+              "Package automatic CPU fallback has no explicit reason")
+    verification = doc.get("backendVerification", {})
+    cpu = verification.get("cpu", {})
+    cpu_diagnostics = cpu.get("diagnostics", {})
+    check(errors, cpu.get("passed") is True and cpu_diagnostics.get("loaded") is True
+          and cpu_diagnostics.get("buildVariant") == variant_id and cpu_diagnostics.get("requestedBackend") == "cpu"
+          and cpu_diagnostics.get("selectedBackend") == "cpu" and cpu_diagnostics.get("gpuSelected") is False,
+          "Package did not prove explicit CPU fallback")
+    strict = verification.get("strictGpu", {})
+    strict_diagnostics = strict.get("diagnostics", {})
+    check(errors, strict.get("passed") is True and isinstance(strict.get("hardwareTested"), bool),
+          "Package strict GPU outcome or hardware coverage is missing")
+    if strict.get("hardwareTested") is True:
+        check(errors, variant.get("backend") != "cpu" and strict_diagnostics.get("loaded") is True
+              and strict_diagnostics.get("gpuSelected") is True and strict_diagnostics.get("requestedBackend") == "gpu"
+              and strict_diagnostics.get("selectedBackend") == variant.get("backend")
+              and strict_diagnostics.get("buildVariant") == variant_id,
+              "Package strict GPU test did not use the packaged GPU backend")
+    else:
+        check(errors, strict_diagnostics.get("loaded") is False and strict_diagnostics.get("gpuSelected") is False
+              and strict_diagnostics.get("requestedBackend") == "gpu"
+              and isinstance(strict.get("reason"), str) and bool(strict["reason"].strip()),
+              "Package unavailable GPU must reject strict mode and record why hardware was not tested")
     check(errors, runtime.get("cpuBaselineForced") is False, "Package smoke CPU dispatch scope is missing or misreported")
     windows = PureWindowsPath(doc.get("applicationRoot", "")).is_absolute()
     path_type = PureWindowsPath if windows else PurePosixPath
@@ -767,217 +367,14 @@ def validate_package_release(doc, root: Path, *, model_fingerprint=None,
               "Package inference executable or library has no valid installed origin and content hash")
     check(errors, path_type(worker.get("path", "")).name in ("qcs-worker", "qcs-worker.exe")
           and (worker_sha256 is None or worker.get("sha256") == worker_sha256), "Package inference worker differs from the recorded executable")
-    if architecture in ("x86_64", "amd64"):
-        check(errors, linkage == "shared-cpu-dispatch" and {"llama", "mtmd", "ggml", "ggml-base", "cpu-backend"}
-              .issubset({item.get("role") for item in libraries}), "Package shared CPU runtime libraries are incomplete")
-        check(errors, len({path_type(item.get("path", "")) for item in libraries}) == len(libraries),
-              "Package shared CPU runtime repeats a loaded file")
-        if platform_id == "macos-x64":
-            for item in libraries:
-                if item.get("role") == "cpu-backend":
-                    check(errors, path_type(item["path"]).parent.parts[-3:] == ("Contents", "PlugIns", "ggml"),
-                          "macOS CPU backend did not load from the application plugin directory")
-    else:
-        check(errors, linkage == "static-cpu" and not libraries and platform_id in (None, "macos-arm64"),
-              "Only the Apple Silicon package may use the static CPU runtime contract")
+    check(errors, linkage == "shared-backend-dispatch"
+          and {"llama", "mtmd", "ggml", "ggml-base", "cpu-backend"}.issubset({item.get("role") for item in libraries}),
+          "Package shared backend runtime libraries are incomplete")
+    check(errors, runtime.get("cpuDispatch") is (expected_arch == "x64"),
+          "Package CPU dispatch selection differs from its architecture")
+    check(errors, len({path_type(item.get("path", "")) for item in libraries}) == len(libraries),
+          "Package inference runtime repeats a loaded file")
     return errors
-
-
-def native_runner_identity(root: Path, manifest):
-    name = "reports/runner-identity.json"
-    records = [entry for entry in manifest.get("files", []) if entry.get("path") == name]
-    if not records:
-        return None
-    if len(records) != 1:
-        raise ValueError("Native manifest repeats its runner identity")
-    path = safe_file(root, name)
-    if path.stat().st_size != records[0].get("bytes") or digest(path) != records[0].get("sha256"):
-        raise ValueError("Native runner identity bytes differ from the bound manifest")
-    identity = read_json(path)
-    if not isinstance(identity, dict):
-        raise ValueError("Native runner identity must be an object")
-    return identity
-
-
-def inspect_native(root: Path, *, expected_head: str | None = None):
-    errors = []
-    result = {"schemaVersion": 1, "kind": "native-gate", "passed": False, "errors": errors}
-    try:
-        manifest = read_json(root / "reports/native-evidence.json")
-        errors.extend(verify_manifest(root, manifest))
-        identity = manifest["identity"]
-        platform_id = manifest.get("platformId")
-        result.update(platformId=platform_id, identity=identity)
-        check(errors, platform_id in PLATFORMS, "Unknown native platform combination")
-        if expected_head:
-            check(errors, identity.get("candidateHead") == expected_head, "Native candidate head does not match the requested candidate")
-        paths = {entry["path"] for entry in manifest.get("files", [])}
-        def document(name):
-            check(errors, name in paths, f"Raw report is not bound to the native evidence manifest: {name}")
-            return read_json(safe_file(root, name))
-        # Old units remain inspectable, but new aggregate/release gates below
-        # require this manifest-bound runner identity for every selected unit.
-        runner = native_runner_identity(root, manifest)
-        if runner is not None:
-            result["runnerIdentity"] = runner
-        for name in ("reports/tests/ctest.xml", "reports/tests/ctest-inventory.json"):
-            check(errors, name in paths, f"Missing bound CTest raw evidence: {name}")
-        spec = importlib.util.spec_from_file_location("qcopilots_search_ctest_evidence", SOURCE / ".github/scripts/qcs-ctest-evidence.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        system, architecture = PLATFORMS.get(platform_id, ("unknown", "unknown"))
-        if system == "Windows":
-            nsis = document("reports/nsis-contract.json")
-            nsis_log = "reports/nsis-contract.log"
-            check(errors, nsis_log in paths, "NSIS compiler contract has no bound original output")
-            errors.extend(validate_nsis_contract(nsis, safe_file(root, nsis_log).read_text(encoding="utf-8")))
-        native = document("reports/native-acceptance.json")
-        check(errors, native.get("sourceIdentity") == identity and native.get("system") == system
-              and native.get("expectedArchitecture") == architecture, "Native runner source or platform identity differs from its evidence unit")
-        build = document("reports/build-provenance.json")
-        check(errors, build.get("identity") == identity and build.get("completed") is True
-              and APPLICATIONS.issubset(build.get("programs", {})), "Native executable build provenance is missing")
-        case_evidence = module.inspect_junit(root / "reports/tests/ctest.xml", system,
-                                             root / "reports/tests/ctest-inventory.json")
-        errors.extend(case_evidence["errors"])
-        check(errors, case_evidence["releaseComplete"], "Native CTest case evidence is incomplete")
-        required_tests = {"qcs-tests-" + name for name in
-                          ("reference-vectors", "semantic", "gui", "gui-service", "cli", "worker", "service",
-                           "extraction-document", "extraction-image", "extraction-media", "extraction-legacy_doc")}
-        if architecture == "x86_64":
-            required_tests.add("qcs-tests-reference-vectors-baseline")
-        check(errors, required_tests.issubset(case_evidence["expectedPrograms"]), "Native inventory omits required real-model or application tests")
-        junit = ET.parse(root / "reports/tests/ctest.xml").getroot()
-        for case in junit.iter("testcase"):
-            if "reference-vectors" not in case.attrib.get("name", ""):
-                continue
-            values = re.findall(r"(\S+) reference cosine ([0-9.]+)", case.findtext("system-out") or "")
-            check(errors, len(values) == 9 and {name for name, _ in values} == GOLDENS
-                  and all(within(float(value), .999, 1.00001) for _, value in values), "Nine raw golden-vector cosine measurements are missing or below .999")
-        models = document("reports/models.json")
-        model_manifest = document("reports/models-manifest.json")
-        expected_models = model_manifest.get("result", {}).get("artifacts", [])
-        actual_models = models.get("result", {}).get("artifacts", [])
-        check(errors, models.get("ok") is True and models.get("result", {}).get("valid") is True
-              and len(expected_models) == len(actual_models) == 2, "Verified model artifact evidence is incomplete")
-        for expected in expected_models:
-            actual = next((item for item in actual_models if item.get("name") == expected.get("name")), {})
-            check(errors, actual.get("present") is True and actual.get("sha256") == expected.get("sha256")
-                  and actual.get("bytes") == expected.get("size"), "Verified model content does not match its pinned manifest")
-        semantic = document("reports/semantic-quality.json")
-        errors.extend(validate_semantic(semantic))
-        result["modelFingerprint"] = semantic.get("modelFingerprint")
-        result["extractionFingerprint"] = semantic.get("extractionFingerprint")
-        errors.extend(validate_capacity(document("reports/capacity-ci.json"), minimum_segments=30000, minimum_queries=10, minimum_timings=20))
-        errors.extend(validate_physical(document("reports/physical-files-ci.json"), minimum_files=1000))
-        package_reports = ["reports/package/report.json"]
-        if system == "Windows":
-            package_reports.append("reports/package-nsis/report.json")
-        elif system == "Linux":
-            package_reports.append("reports/package-deb/report.json")
-        package_hashes = {item["sha256"] for item in manifest["files"] if item["path"].startswith("pkg/")}
-        for name in package_reports:
-            package = document(name)
-            check(errors, package.get("passed") is True and package.get("commit") == identity["checkoutCommit"]
-                  and package.get("workingTreeModified", False) is False and package.get("packageSha256") in package_hashes,
-                  f"Native package result is missing, stale or unbound: {name}")
-            check(errors, len(package.get("checks", [])) >= (3 if "package-deb" in name else 9), f"Native package scenarios are incomplete: {name}")
-            smoke_name = "reports/package-deb/smoke/report.json" if "package-deb" in name else name
-            smoke = document(smoke_name) if smoke_name != name else package
-            check(errors, package.get("releaseComplete") is True, f"Native package acceptance is partial: {name}")
-            for relative in package_evidence_paths(smoke, (root / smoke_name).parent):
-                check(errors, (PurePosixPath(smoke_name).parent / relative).as_posix() in paths,
-                      "Package inference or license raw evidence is not bound to the native manifest")
-            errors.extend(validate_package_release(smoke, (root / smoke_name).parent,
-                model_fingerprint=result["modelFingerprint"], extraction_fingerprint=result["extractionFingerprint"],
-                platform_id=platform_id))
-        integrity = document("reports/source-integrity.json")
-        check(errors, integrity.get("passed") is True and integrity.get("tests_run", 0) >= 10
-              and integrity.get("skipped") == 0 and len(integrity.get("cases", [])) == integrity.get("tests_run")
-              and all(item.get("status") == "passed" for item in integrity.get("cases", [])), "Source rebuild-integrity tests are incomplete")
-        sources = document("pkg/qcs-source-manifest.json")
-        check(errors, sources.get("commit") == identity["checkoutCommit"] and sources.get("workingTreeModified") is False,
-              "Corresponding source materials do not belong to the clean native checkout")
-        check(errors, any("-source-materials-" in name and name.endswith(".zip") for name in paths)
-              and any("-symbols-" in name and name.endswith(".zip") for name in paths), "Corresponding source archive or debug symbols are absent")
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, ET.ParseError) as error:
-        errors.append(f"Cannot inspect native evidence: {error}")
-    result["passed"] = not errors
-    return result
-
-
-def native_selection_path(parent: Path):
-    """Resolve a normalized bundle or one unambiguous downloaded aggregate."""
-    parent = Path(parent).resolve()
-    if (parent / "selection.json").exists():
-        return safe_file(parent, "selection.json")
-    candidates = sorted(parent.glob("qcs-native-aggregate-*/selection.json"))
-    if len(candidates) != 1:
-        raise ValueError("Native artifacts need selection.json or exactly one downloaded aggregate selection")
-    return safe_file(parent, candidates[0].relative_to(parent).as_posix())
-
-
-def load_native_selection(parent: Path, candidate_head: str, expected_run: str | None = None):
-    selection_path = native_selection_path(parent)
-    spec = importlib.util.spec_from_file_location("qcs_release_artifact_selection",
-        SOURCE / ".github/scripts/qcs-artifact-selection.py")
-    selector = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(selector)
-    selection = selector.load_selection(selection_path, expected_head=candidate_head,
-        expected_profile="full", expected_run=expected_run)
-    if set(selection.get("selected", {})) != set(PLATFORMS):
-        raise ValueError("Full native acceptance requires exactly four selected platforms")
-    if selection_path.parent != Path(parent).resolve():
-        expected_name = f"qcs-native-aggregate-{candidate_head}-attempt{selection['aggregateAttempt']}"
-        if selection_path.parent.name != expected_name:
-            raise ValueError("Downloaded aggregate directory differs from its candidate or attempt")
-    return selection
-
-
-def aggregate_native(roots: dict[str, Path], candidate_head: str, *,
-                     selection_path: Path | None = None, expected_run: str | None = None,
-                     expected_attempt: int | None = None):
-    errors = []
-    check(errors, set(roots) == set(PLATFORMS), "Exactly four distinct native platform combinations are required")
-    selection = None
-    try:
-        parents = {Path(path).resolve().parent for path in roots.values()}
-        if len(parents) != 1:
-            raise ValueError("Selected native artifacts must share one parent directory")
-        parent = next(iter(parents))
-        selected_path = native_selection_path(parent)
-        if selection_path is not None and Path(selection_path).resolve() != selected_path:
-            raise ValueError("Native selection must be the artifact bundle's unambiguous selection")
-        selection = load_native_selection(parent, candidate_head, expected_run)
-        if expected_attempt is not None:
-            check(errors, type(expected_attempt) is int and expected_attempt >= 1
-                  and selection.get("aggregateAttempt") == expected_attempt,
-                  "Native artifact selection aggregate attempt differs from the current CI attempt")
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        errors.append(f"Native artifact selection is missing, stale or unbound: {error}")
-    gates = {name: inspect_native(path, expected_head=candidate_head) for name, path in roots.items()}
-    identities = [gate.get("identity", {}) for gate in gates.values()]
-    for name, gate in gates.items():
-        errors.extend(f"{name}: {message}" for message in gate["errors"])
-        check(errors, gate.get("platformId") == name, f"Native artifact platform does not match its required slot: {name}")
-        if selection is not None:
-            chosen = selection["selected"].get(name, {})
-            check(errors, Path(roots[name]).name == chosen.get("artifactName"),
-                  f"Native artifact directory is not the selected artifact: {name}")
-            runner = gate.get("runnerIdentity", {})
-            check(errors, type(runner.get("schemaVersion")) is int and runner["schemaVersion"] == 1 and runner.get("platformId") == name
-                  and runner.get("candidateHead") == candidate_head and runner.get("testProfile") == "full"
-                  and runner.get("runId") == selection.get("runId")
-                  and runner.get("runAttempt") == str(chosen.get("sourceAttempt")),
-                  f"Manifest-bound runner identity differs from the selected run, profile or source attempt: {name}")
-    if identities:
-        for identity in identities[1:]:
-            for key in ("candidateHead", "checkoutCommit", "sourceTree", "lockHashes"):
-                check(errors, identity.get(key) == identities[0].get(key), f"Native executions disagree on {key}")
-        for key in ("modelFingerprint", "extractionFingerprint"):
-            check(errors, len({gate.get(key) for gate in gates.values()}) == 1, f"Native executions disagree on {key}")
-    return {"schemaVersion": 1, "kind": "native-aggregate", "candidateHead": candidate_head,
-            "passed": not errors, "errors": errors, "gates": gates, "selection": selection}
 
 
 def timestamp(value):
@@ -1120,63 +517,6 @@ def record_build(source: Path, parent: Path, programs: dict[str, Path], command:
     return root / "build-record.json", receipt
 
 
-def run_local(build_record: Path, parent: Path, kind: str, program_name: str, report_relative: str,
-              command: list[str], extra_environment: dict[str, str], inputs: list[Path] | None = None, *,
-              working_directory: Path | None = None):
-    build = read_json(build_record)
-    errors = verified_build(build_record.parent, build)
-    if errors or build.get("kind") != "build-execution" or build.get("passed") is not True:
-        raise ValueError("Local run requires a verified successful build execution record: " + "; ".join(errors))
-    program = build["programs"][program_name]
-    producer = Path(program["originalPath"])
-    source = Path(build["sourceDirectory"])
-    identity = source_identity(source)
-    if identity != build["identity"] or digest(producer) != program["sha256"]:
-        raise ValueError("The local producer or source changed after its recorded build")
-    root = fresh_directory(parent, kind + "-evidence")
-    # The command receives a fresh evidence directory. A report cannot be imported
-    # after the fact to impersonate an execution bound to this source and binary.
-    planned = PurePosixPath(report_relative)
-    if report_relative != planned.as_posix() or planned.is_absolute() or ".." in planned.parts or "\\" in report_relative or ":" in report_relative:
-        raise ValueError("The report must be a canonical relative POSIX path")
-    report = root.joinpath(*planned.parts)
-    if report.is_absolute() and not report.resolve().is_relative_to(root):
-        raise ValueError("The planned local report must remain in its new evidence directory")
-    environment = os.environ.copy()
-    environment.update({name: value.replace("{evidence}", str(root)).replace("{report}", str(report)) for name, value in extra_environment.items()})
-    expanded = [value.replace("{evidence}", str(root)).replace("{report}", str(report)).replace("{program}", str(producer)) for value in command]
-    begin = {"schemaVersion": 1, "kind": kind + "-execution", "identity": identity,
-             "buildRecordSha256": digest(build_record), "programName": program_name,
-             "producerSha256": program["sha256"], "plannedReport": report_relative,
-             "command": expanded, "startedAt": datetime.now(timezone.utc).isoformat()}
-    input_hashes = {}
-    for index, path in enumerate(inputs or []):
-        destination = root / "inputs" / f"{index}-{path.name}"
-        destination.parent.mkdir(exist_ok=True)
-        shutil.copyfile(path, destination)
-        input_hashes[str(path.resolve())] = digest(path)
-    begin["inputHashes"] = input_hashes
-    write_json(root / "begin.json", begin)
-    execution = execute_record(expanded, root, environment=environment, working_directory=working_directory)
-    unchanged = source_identity(source) == identity and digest(producer) == program["sha256"]
-    unchanged = unchanged and all(digest(Path(path)) == value for path, value in input_hashes.items())
-    matches = list(root.glob(report_relative))
-    if len(matches) == 1 and matches[0].is_file():
-        report = matches[0]
-        report_relative = report.relative_to(root).as_posix()
-    receipt = {**begin, "execution": execution, "report": report_relative,
-               "passed": execution["exitCode"] == 0 and unchanged and report.is_file()}
-    # Preserve the exact build provenance and program that existed before launch.
-    build_copy = root / "build"
-    shutil.copytree(build_record.parent, build_copy)
-    receipt["buildRecord"] = "build/" + build_record.name
-    receipt["files"] = [file_record(root, path) for path in root.rglob("*") if path.is_file()
-                        and (build_copy in path.parents or root / "inputs" in path.parents
-                             or path.suffix.lower() in (".json", ".jsonl", ".log", ".xml", ".txt"))]
-    write_json(root / "execution-record.json", receipt)
-    return root / "execution-record.json", receipt
-
-
 def record_package(build_record: Path, package: Path, verification: Path, parent: Path,
                    model_fingerprint: str, extraction_fingerprint: str):
     build = read_json(build_record)
@@ -1188,7 +528,7 @@ def record_package(build_record: Path, package: Path, verification: Path, parent
     if checked.get("passed") is not True or checked.get("commit") != build["identity"]["checkoutCommit"] or checked.get("workingTreeModified") is not False or checked.get("packageSha256") != package_hash:
         raise ValueError("Package verification is stale, modified or unsuccessful")
     errors.extend(validate_package_release(checked, verification.parent, model_fingerprint=model_fingerprint,
-        extraction_fingerprint=extraction_fingerprint, platform_id="windows-x64",
+        extraction_fingerprint=extraction_fingerprint, platform_id="windows-x64-cpu",
         worker_sha256=build.get("programs", {}).get("qcs-worker", {}).get("sha256")))
     if errors:
         raise ValueError("Package release evidence is incomplete: " + "; ".join(errors))
@@ -1247,7 +587,7 @@ def inspect_candidate(root: Path, candidate):
     for relative in package_evidence_paths(verification, root):
         check(errors, relative in bound, "Candidate inference or license raw evidence is not bound")
     errors.extend(validate_package_release(verification, root, model_fingerprint=candidate["modelFingerprint"],
-        extraction_fingerprint=candidate["extractionFingerprint"], platform_id="windows-x64",
+        extraction_fingerprint=candidate["extractionFingerprint"], platform_id="windows-x64-cpu",
         worker_sha256=candidate.get("executables", {}).get("qcs-worker", {}).get("sha256")))
     check(errors, set(candidate.get("executables", {})) == APPLICATIONS, "Candidate must contain all four application executable identities")
     with zipfile.ZipFile(package) as archive:
@@ -1268,8 +608,8 @@ def inspect_candidate(root: Path, candidate):
 
 
 def collect_local(records: dict[str, Path], parent: Path):
-    if set(records) != {"candidate", "million", "physical", "computerUse"}:
-        raise ValueError("Candidate, million, physical and Computer Use raw evidence units are all required")
+    if set(records) != {"candidate", "computerUse"}:
+        raise ValueError("Candidate and Computer Use raw evidence units are both required")
     root = fresh_directory(parent, "local-evidence")
     units = {}
     for name, path in records.items():
@@ -1293,137 +633,6 @@ def collect_local(records: dict[str, Path], parent: Path):
     return root / "manifest.json", manifest
 
 
-def inspect_local_run(root: Path, receipt, kind: str, identity: dict):
-    errors = verify_manifest(root, receipt)
-    check(errors, receipt.get("kind") == kind + "-execution" and receipt.get("passed") is True,
-          f"{kind} has no successful recorded execution")
-    check(errors, receipt.get("identity") == identity, f"{kind} was executed from a different source identity")
-    execution = receipt.get("execution", {})
-    check(errors, execution.get("exitCode") == 0, f"{kind} process did not exit successfully")
-    start, end = timestamp(execution.get("startedAt")), timestamp(execution.get("finishedAt"))
-    check(errors, end > start, f"{kind} process time range is invalid")
-    build_path = safe_file(root, receipt["buildRecord"])
-    build = read_json(build_path)
-    errors.extend(verified_build(build_path.parent, build))
-    check(errors, digest(build_path) == receipt.get("buildRecordSha256") and build.get("passed") is True
-          and build.get("identity") == identity and build.get("execution", {}).get("exitCode") == 0,
-          f"{kind} executable build provenance is missing or stale")
-    producer = build.get("programs", {}).get(receipt.get("programName"), {})
-    check(errors, producer.get("sha256") == receipt.get("producerSha256"), f"{kind} producer does not match its recorded build")
-    names = {item["path"] for item in receipt["files"]}
-    for name in (execution.get("stdout"), execution.get("stderr"), receipt.get("report"), receipt.get("buildRecord")):
-        check(errors, name in names, f"{kind} required raw execution evidence is not bound: {name}")
-    raw = read_json(safe_file(root, receipt["report"]))
-    if kind == "physical":
-        errors.extend(validate_physical(raw))
-        check(errors, start <= timestamp(raw.get("timestampUtc")) <= end, "Physical report is outside its recorded execution")
-    else:
-        check(errors, raw.get("kind") == "qcopilots-search-million-independent-monitor" and raw.get("passed") is True
-              and raw.get("processExitCode") == 0, "Million-vector independent monitor did not pass")
-        plan = raw.get("plan", {})
-        check(errors, plan.get("benchmarkSha256") == receipt.get("producerSha256"), "Million-vector monitor used a different executable")
-        lookup = {item.get("sourcePath", "").replace("\\", "/"): item["path"] for item in receipt["files"]}
-        def original(name):
-            path = lookup.get(str(plan.get(name, "")).replace("\\", "/"))
-            if not path:
-                raise ValueError(f"Million-vector original {name} is not included in the immutable evidence unit")
-            return safe_file(root, path)
-        benchmark_path = original("benchmarkReport")
-        check(errors, digest(benchmark_path) == raw.get("benchmarkReportSha256"), "Million-vector raw report hash differs from monitor")
-        benchmark = read_json(benchmark_path)
-        errors.extend(validate_capacity(benchmark, minimum_segments=1000000, minimum_queries=100, minimum_timings=500))
-        for key in ("sampleLog", "stdoutLog", "stderrLog"):
-            original(key)
-        samples = []
-        with original("sampleLog").open(encoding="utf-8-sig") as stream:
-            for line in stream:
-                if line.strip():
-                    samples.append(json.loads(line))
-        check(errors, len(samples) == raw.get("sampleCount") and len(samples) > 1,
-              "Million-vector independent samples are incomplete")
-        if samples:
-            sizes = [item.get("recursiveDirectoryBytes") for item in samples]
-            free = [item.get("volumeAvailableFreeBytes") for item in samples]
-            valid = all(finite(value) and value >= 0 for value in sizes + free)
-            check(errors, valid, "Million-vector independent disk samples are invalid")
-            if valid:
-                check(errors, max(sizes) == raw.get("maximumObservedDirectoryBytes") and min(free) == raw.get("minimumObservedFreeBytes")
-                      and max(sizes) <= plan.get("directoryBudgetBytes", -1) and min(free) >= plan.get("freeReserveBytes", math.inf),
-                      "Million-vector monitor summaries or budgets disagree with raw disk samples")
-            check(errors, all(start <= timestamp(item.get("utc")) <= end for item in samples),
-                  "Million-vector sample time is outside its execution")
-        check(errors, raw.get("stdoutComplete") is True and raw.get("stderrComplete") is True,
-              "Million-vector process output was not completely recorded")
-        gates = raw.get("gates", [])
-        check(errors, bool(gates) and all(item.get("passed") is True for item in gates), "Million-vector monitor has incomplete or failed gates")
-        unchanged = next((item for item in gates if item.get("name") == "executed-binary-unchanged"), {})
-        check(errors, unchanged.get("actual") == receipt.get("producerSha256"), "Million-vector producer changed during execution")
-        check(errors, start <= timestamp(raw.get("startedUtc")) <= timestamp(raw.get("completedUtc")) <= end,
-              "Million-vector monitor time is outside its execution receipt")
-    return errors
-
-
-def preflight(roots: dict[str, Path], local_root: Path, candidate_head: str, *,
-              selection_path: Path | None = None, expected_run: str | None = None):
-    native = aggregate_native(roots, candidate_head, selection_path=selection_path, expected_run=expected_run)
-    errors = list(native["errors"])
-    result = {"schemaVersion": 1, "kind": "release-preflight", "candidateHead": candidate_head,
-              "native": native, "localGates": {}, "passed": False, "errors": errors, "published": False}
-    try:
-        manifest = read_json(local_root / "manifest.json")
-        errors.extend(verify_manifest(local_root, manifest))
-        identity = manifest["identity"]
-        check(errors, identity.get("candidateHead") == candidate_head and identity.get("checkoutCommit") == candidate_head,
-              "Local evidence must execute the clean immutable candidate head")
-        for gate in native["gates"].values():
-            for key in ("candidateHead", "sourceTree", "lockHashes"):
-                check(errors, gate.get("identity", {}).get(key) == identity.get(key), f"Local and native {key} differ")
-        units = manifest["units"]
-        check(errors, set(units) == {"candidate", "million", "physical", "computerUse"}, "Required local evidence units are incomplete")
-        candidate_path = safe_file(local_root, units["candidate"])
-        candidate = read_json(candidate_path)
-        errors.extend(inspect_candidate(candidate_path.parent, candidate))
-        check(errors, candidate.get("identity") == identity and candidate.get("kind") == "package-candidate", "Local candidate package is unbound")
-        package = safe_file(candidate_path.parent, candidate["package"])
-        check(errors, digest(package) == candidate.get("packageSha256"), "Final Windows package content changed")
-        for key in ("modelFingerprint", "extractionFingerprint"):
-            check(errors, all(gate.get(key) == candidate.get(key) for gate in native["gates"].values()), f"Final candidate {key} differs from native acceptance")
-        for kind in ("million", "physical"):
-            try:
-                path = safe_file(local_root, units[kind])
-                failures = inspect_local_run(path.parent, read_json(path), kind, identity)
-            except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
-                failures = [f"{kind} source-bound execution is missing: {error}"]
-            result["localGates"][kind] = {"passed": not failures, "errors": failures}
-            errors.extend(failures)
-        cu_path = safe_file(local_root, units["computerUse"])
-        cu = read_json(cu_path)
-        failures = verify_manifest(cu_path.parent, cu)
-        failures.extend(validate_cu(cu, cu_path.parent, identity=identity, package_sha256=candidate["packageSha256"], model_fingerprint=candidate["modelFingerprint"]))
-        cu_bound = {item["path"] for item in cu.get("files", [])}
-        for scene in cu.get("scenarios", []):
-            check(failures, scene.get("operationLog") in cu_bound and all(name in cu_bound for name in scene.get("screenshots", [])),
-                  "Computer Use screenshot or operation log is not content-bound")
-        check(failures, cu.get("executables") == candidate.get("executables") and cu.get("extractionFingerprint") == candidate.get("extractionFingerprint"),
-              "Computer Use does not bind the same final packaged executables and extraction pipeline")
-        result["localGates"]["computerUse"] = {"passed": not failures, "errors": failures}
-        errors.extend(failures)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        errors.append(f"Local evidence is missing, stale or unbound: {error}")
-    result["passed"] = not errors
-    return result
-
-
-def discover_native(parent: Path):
-    roots = {}
-    for manifest in sorted(parent.glob("*/reports/native-evidence.json")):
-        platform_id = read_json(manifest).get("platformId")
-        if platform_id not in PLATFORMS or platform_id in roots:
-            raise ValueError(f"Unknown or duplicate native artifact combination: {platform_id}")
-        roots[platform_id] = manifest.parent.parent
-    return roots
-
-
 def pairs(values):
     result = {}
     for value in values:
@@ -1434,90 +643,162 @@ def pairs(values):
     return result
 
 
+SEMANTIC_FIXTURES = {"text", "pdf", "code", "illustration", "photo", "ocr-en", "ocr-zh",
+                     "speech", "environment", "tone", "video-generated", "video-natural"}
+
+
+@malformed_as_error
+def validate_semantic(doc):
+    """Validate extraction, real inference, persistence and retrieval, with no ranking gate."""
+    errors = []
+    check(errors, doc.get("schema") == 2 and doc.get("test") == "multimodal-functional"
+          and doc.get("mode") == "functional" and doc.get("passed") is True,
+          "Multimodal functional execution did not complete successfully")
+    for field in ("realModel", "persisted", "reloaded"):
+        check(errors, doc.get(field) is True, f"Multimodal functional execution did not prove {field}")
+    for field in ("modelFingerprint", "extractionFingerprint"):
+        check(errors, isinstance(doc.get(field), str) and bool(doc[field].strip()),
+              f"Multimodal functional execution lacks {field}")
+    for field, relative in (("fixtureManifestSha256", "tests/acceptance/fixtures/assets.json"),
+                            ("generatorSha256", "tests/semantic/semantic_acceptance.cpp")):
+        try:
+            check(errors, doc.get(field) == digest(SOURCE / relative),
+                  f"Multimodal functional execution used different {relative}")
+        except OSError as error:
+            errors.append(str(error))
+    files = doc.get("files", [])
+    check(errors, isinstance(files, list) and len(files) == len(SEMANTIC_FIXTURES)
+          and {row.get("id") for row in files} == SEMANTIC_FIXTURES
+          and doc.get("fixtures") == len(files) and doc.get("completedFiles") == len(files),
+          "Multimodal functional fixtures are incomplete or repeated")
+    by_id = {}
+    source_files = set()
+    segments = 0
+    for row in files:
+        name = row.get("file", "")
+        relative = PurePosixPath(name)
+        check(errors, isinstance(name, str) and name == relative.as_posix() and bool(relative.parts)
+              and relative.parts[0] == row.get("id") and name not in source_files
+              and not relative.is_absolute() and ".." not in relative.parts and "\\" not in name and ":" not in name,
+              "Multimodal functional file path is not a safe relative path")
+        source_files.add(name)
+        check(errors, integer_at_least(row.get("segments"), 1)
+              and isinstance(row.get("extractedModalities"), list) and bool(row["extractedModalities"])
+              and isinstance(row.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is not None,
+              "Multimodal functional file has no bound extraction and embedding output")
+        by_id[row.get("id")] = name
+        if integer_at_least(row.get("segments"), 1):
+            segments += row["segments"]
+    check(errors, doc.get("actualEmbeddedSegments") == segments and segments >= len(files),
+          "Multimodal embedded segment count differs from its files")
+    queries = doc.get("queries", [])
+    expected_queries = {(fixture, language) for fixture in SEMANTIC_FIXTURES for language in ("en", "zh")}
+    check(errors, isinstance(queries, list) and len(queries) == len(expected_queries)
+          and {(row.get("fixtureId"), row.get("language")) for row in queries} == expected_queries
+          and doc.get("queryCount") == len(queries) and doc.get("completedQueries") == len(queries),
+          "Multimodal functional query coverage is incomplete or repeated")
+    for row in queries:
+        check(errors, row.get("id") == f"{row.get('fixtureId')}-{row.get('language')}"
+              and isinstance(row.get("query"), str) and bool(row["query"].strip()),
+              "Multimodal functional query identity or text is invalid")
+        check(errors, row.get("source") == "semantic" and row.get("passed") is True
+              and row.get("locationPassed") is True and row.get("returnedFile") == by_id.get(row.get("fixtureId")),
+              "Multimodal production semantic retrieval did not return its source with valid location metadata")
+    return errors
+
+
+def local_preflight(local_root: Path, candidate_head: str):
+    """Verify only the local final package and observed Windows UI session.
+
+    CI artifact provenance is verified independently by qcs-release.py. This
+    result never represents remote jobs or GPU execution that was not observed.
+    """
+    errors = []
+    result = {"schemaVersion": 2, "kind": "local-release-preflight", "candidateHead": candidate_head,
+              "localGates": {}, "passed": False, "errors": errors, "published": False}
+    try:
+        manifest = read_json(local_root / "manifest.json")
+        errors.extend(verify_manifest(local_root, manifest))
+        identity = manifest["identity"]
+        check(errors, identity.get("candidateHead") == candidate_head and identity.get("checkoutCommit") == candidate_head,
+              "Local evidence must execute the clean immutable candidate head")
+        units = manifest["units"]
+        check(errors, set(units) == {"candidate", "computerUse"}, "Required local evidence units are incomplete")
+        candidate_path = safe_file(local_root, units["candidate"])
+        candidate = read_json(candidate_path)
+        failures = inspect_candidate(candidate_path.parent, candidate)
+        check(failures, candidate.get("identity") == identity, "Local candidate package is unbound")
+        result["localGates"]["candidate"] = {"passed": not failures, "errors": failures}
+        errors.extend(failures)
+        cu_path = safe_file(local_root, units["computerUse"])
+        cu = read_json(cu_path)
+        failures = verify_manifest(cu_path.parent, cu)
+        failures.extend(validate_cu(cu, cu_path.parent, identity=identity,
+            package_sha256=candidate["packageSha256"], model_fingerprint=candidate["modelFingerprint"]))
+        cu_bound = {item["path"] for item in cu.get("files", [])}
+        for scene in cu.get("scenarios", []):
+            check(failures, scene.get("operationLog") in cu_bound and all(name in cu_bound for name in scene.get("screenshots", [])),
+                  "Computer Use screenshot or operation log is not content-bound")
+        check(failures, cu.get("executables") == candidate.get("executables")
+              and cu.get("extractionFingerprint") == candidate.get("extractionFingerprint"),
+              "Computer Use does not bind the same final packaged executables and extraction pipeline")
+        result["localGates"]["computerUse"] = {"passed": not failures, "errors": failures}
+        errors.extend(failures)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        errors.append(f"Local evidence is missing, stale or unbound: {error}")
+    result["passed"] = not errors
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("validate-native", "aggregate-native", "preflight"):
-        command = commands.add_parser(action)
-        command.add_argument("--candidate-commit", required=True)
-        command.add_argument("--output", required=True, type=Path)
-        if action == "validate-native":
-            command.add_argument("--artifact-dir", required=True, type=Path)
-        else:
-            command.add_argument("--native-artifacts-dir", required=True, type=Path)
-            command.add_argument("--run-id", help="Require the selected GitHub Actions run ID")
-        if action == "aggregate-native":
-            command.add_argument("--run-attempt", type=int, help="Require the current GitHub Actions attempt")
-        if action == "preflight":
-            command.add_argument("--local-evidence-dir", required=True, type=Path)
+    validate = commands.add_parser("validate-local", help="Validate the final Windows package and observed UI evidence")
+    validate.add_argument("--candidate-commit", required=True)
+    validate.add_argument("--local-evidence-dir", required=True, type=Path)
+    validate.add_argument("--output", required=True, type=Path)
     build = commands.add_parser("record-build")
     build.add_argument("--source", type=Path, default=SOURCE)
     build.add_argument("--output-root", type=Path, required=True)
-    build.add_argument("--program", action="append", required=True, help="NAME=absolute executable path, repeat for every producer")
-    build.add_argument("--working-directory", type=Path,
-                       help="Explicit existing cwd for relative command paths, separate from the evidence directory")
+    build.add_argument("--program", action="append", required=True, help="NAME=absolute executable path")
+    build.add_argument("--working-directory", type=Path, help="Existing cwd for relative command paths")
     build.add_argument("command", nargs=argparse.REMAINDER)
-    local = commands.add_parser("run-local")
-    local.add_argument("--build-record", type=Path, required=True)
-    local.add_argument("--output-root", type=Path, required=True)
-    local.add_argument("--kind", choices=("million", "physical"), required=True)
-    local.add_argument("--program-name", required=True)
-    local.add_argument("--report", required=True, help="Fresh relative output path or a glob with exactly one report")
-    local.add_argument("--env", action="append", default=[])
-    local.add_argument("--input", type=Path, action="append", default=[], help="Capture an external runner script before execution")
-    local.add_argument("--working-directory", type=Path,
-                       help="Explicit existing cwd for relative command paths, separate from the evidence directory")
-    local.add_argument("command", nargs=argparse.REMAINDER)
     package = commands.add_parser("record-package")
     for name in ("build-record", "package", "verification", "output-root"):
         package.add_argument("--" + name, type=Path, required=True)
     package.add_argument("--model-fingerprint", required=True)
     package.add_argument("--extraction-fingerprint", required=True)
     collect = commands.add_parser("collect-local")
-    for name in ("candidate", "million", "physical", "computer-use", "output-root"):
+    for name in ("candidate", "computer-use", "output-root"):
         collect.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args(argv)
-    gate = args.action in ("validate-native", "aggregate-native", "preflight")
     try:
-        if gate:
+        if args.action == "validate-local":
             if not re.fullmatch(r"[0-9a-f]{40}", args.candidate_commit):
                 raise ValueError("The candidate must be a full immutable Git SHA")
-            if args.action == "validate-native":
-                result = inspect_native(args.artifact_dir.resolve(), expected_head=args.candidate_commit)
-            else:
-                roots = discover_native(args.native_artifacts_dir.resolve())
-                result = (aggregate_native(roots, args.candidate_commit, expected_run=args.run_id,
-                                           expected_attempt=args.run_attempt)
-                          if args.action == "aggregate-native" else
-                          preflight(roots, args.local_evidence_dir.resolve(), args.candidate_commit,
-                                    expected_run=args.run_id))
+            result = local_preflight(args.local_evidence_dir.resolve(), args.candidate_commit)
             write_json(args.output, result)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result["passed"] else 1
-        if args.action in ("record-build", "run-local"):
+        if args.action == "record-build":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not command:
                 raise ValueError("An actual command after -- is required")
-        if args.action == "record-build":
             path, result = record_build(args.source.resolve(), args.output_root,
-                                        {name: Path(value).resolve() for name, value in pairs(args.program).items()}, command,
-                                        working_directory=args.working_directory)
-        elif args.action == "run-local":
-            path, result = run_local(args.build_record.resolve(), args.output_root, args.kind, args.program_name,
-                                     args.report, command, pairs(args.env), [path.resolve() for path in args.input],
-                                     working_directory=args.working_directory)
+                {name: Path(value).resolve() for name, value in pairs(args.program).items()}, command,
+                working_directory=args.working_directory)
         elif args.action == "record-package":
             path, result = record_package(args.build_record.resolve(), args.package.resolve(), args.verification.resolve(),
-                                          args.output_root, args.model_fingerprint, args.extraction_fingerprint)
+                args.output_root, args.model_fingerprint, args.extraction_fingerprint)
         else:
-            path, result = collect_local({"candidate": args.candidate.resolve(), "million": args.million.resolve(),
-                                          "physical": args.physical.resolve(), "computerUse": args.computer_use.resolve()}, args.output_root)
+            path, result = collect_local({"candidate": args.candidate.resolve(),
+                "computerUse": args.computer_use.resolve()}, args.output_root)
         print(json.dumps({"record": str(path), "kind": result["kind"], "passed": result.get("passed"),
-                          "note": "Captured provenance is not a release acceptance result"}, ensure_ascii=False, indent=2))
+            "note": "Captured provenance is not a release acceptance result"}, ensure_ascii=False, indent=2))
         return 0 if result.get("passed", True) else 1
     except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
-        result = {"schemaVersion": 1, "kind": args.action, "passed": False, "errors": [str(error)], "published": False}
-        if gate:
+        result = {"schemaVersion": 2, "kind": args.action, "passed": False, "errors": [str(error)], "published": False}
+        if args.action == "validate-local":
             write_json(args.output, result)
         print(json.dumps(result, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1

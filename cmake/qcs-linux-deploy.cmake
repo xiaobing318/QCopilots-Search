@@ -13,6 +13,13 @@ function(qcopilots_search_linux_deploy_arguments output)
   set(_modules)
   set(_excluded)
   set(_targets ${ARGN})
+  # Dynamically loaded GPU modules have their own verified dependency closure.
+  # Qt must not traverse their SDK paths and flatten a second copy of ROCm's
+  # component directories into lib, where relative BLAS resources would break.
+  get_property(_gpu_targets GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_GPU_RUNTIME_TARGETS)
+  if(_gpu_targets)
+    list(REMOVE_ITEM _targets ${_gpu_targets})
+  endif()
   list(REMOVE_DUPLICATES _targets)
   foreach(_target IN LISTS _targets)
     if(NOT TARGET "${_target}")
