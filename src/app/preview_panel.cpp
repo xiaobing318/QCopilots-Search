@@ -1,19 +1,22 @@
 #include "preview_panel.h"
 #include "extraction/image_extractor.h"
 #include <QAudioOutput>
+#include <QEvent>
 #include <QFileInfo>
-#include <QImageReader>
+#include <QGraphicsPixmapItem>
+#include <QGraphicsScene>
+#include <QGraphicsView>
 #include <QJsonArray>
 #include <QFutureWatcher>
 #include <QHideEvent>
 #include <QLabel>
 #include <QMediaPlayer>
+#include <QPainter>
 #include <QPdfDocument>
 #include <QPdfPageNavigator>
 #include <QPdfView>
 #include <QPushButton>
-#include <QResizeEvent>
-#include <QScrollArea>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
@@ -61,11 +64,47 @@ PreviewPanel::PreviewPanel(QWidget *parent) : QWidget(parent) {
     pages_->addWidget(text_);
     imagePage_ = new QWidget(this);
     auto *imageLayout = new QVBoxLayout(imagePage_);
-    image_ = new QLabel(imagePage_);
+    auto *imageControls = new QHBoxLayout;
+    imageZoomOut_ = new QPushButton(imagePage_);
+    imageZoomOut_->setObjectName("imageZoomOutButton");
+    imageZoomIn_ = new QPushButton(imagePage_);
+    imageZoomIn_->setObjectName("imageZoomInButton");
+    imageActualSize_ = new QPushButton(QStringLiteral("100%"), imagePage_);
+    imageActualSize_->setObjectName("imageActualSizeButton");
+    imageFitButton_ = new QPushButton(imagePage_);
+    imageFitButton_->setObjectName("imageFitButton");
+    imageFitButton_->setCheckable(true);
+    imageZoom_ = new QLabel(imagePage_);
+    imageZoom_->setObjectName("imageZoomLabel");
+    imageControls->addWidget(imageZoomOut_);
+    imageControls->addWidget(imageZoomIn_);
+    imageControls->addWidget(imageActualSize_);
+    imageControls->addWidget(imageFitButton_);
+    imageControls->addWidget(imageZoom_);
+    imageControls->addStretch();
+    imageLayout->addLayout(imageControls);
+    imageState_ = new QLabel(imagePage_);
+    imageState_->setObjectName("imagePreviewState");
+    imageState_->setWordWrap(true);
+    imageLayout->addWidget(imageState_);
+    image_ = new QGraphicsView(imagePage_);
     image_->setObjectName("imagePreview");
     image_->setAlignment(Qt::AlignCenter);
     image_->setMinimumSize(1, 1);
-    imageLayout->addWidget(image_);
+    image_->setRenderHint(QPainter::SmoothPixmapTransform);
+    image_->setDragMode(QGraphicsView::ScrollHandDrag);
+    image_->setTransformationAnchor(QGraphicsView::NoAnchor);
+    image_->setResizeAnchor(QGraphicsView::AnchorViewCenter);
+    image_->setScene(new QGraphicsScene(image_));
+    imageItem_ = image_->scene()->addPixmap({});
+    imageItem_->setShapeMode(QGraphicsPixmapItem::BoundingRectShape);
+    imageItem_->setTransformationMode(Qt::SmoothTransformation);
+    image_->viewport()->installEventFilter(this);
+    imageLayout->addWidget(image_, 1);
+    connect(imageZoomOut_, &QPushButton::clicked, this, [this] { setImageZoom(image_->transform().m11() / 1.25); });
+    connect(imageZoomIn_, &QPushButton::clicked, this, [this] { setImageZoom(image_->transform().m11() * 1.25); });
+    connect(imageActualSize_, &QPushButton::clicked, this, [this] { setImageZoom(1.0); });
+    connect(imageFitButton_, &QPushButton::clicked, this, [this] { imageFit_ = true; updateImage(); });
     pages_->addWidget(imagePage_);
     pdfPage_ = new QWidget(this);
     auto *pdfLayout = new QVBoxLayout(pdfPage_);
@@ -157,6 +196,17 @@ void PreviewPanel::setLanguage(const QString &language) {
     empty_->setText(label("Select a result to preview its matching passage, page or moment.", "选择搜索结果，预览命中的文字、页面或时刻。"));
     open_->setText(label("Open file", "打开文件"));
     reveal_->setText(label("Show in folder", "在文件夹中显示"));
+    imageZoomOut_->setText(label("Zoom out", "缩小"));
+    imageZoomOut_->setToolTip(imageZoomOut_->text());
+    imageZoomOut_->setAccessibleName(imageZoomOut_->toolTip());
+    imageZoomIn_->setText(label("Zoom in", "放大"));
+    imageZoomIn_->setToolTip(imageZoomIn_->text());
+    imageZoomIn_->setAccessibleName(imageZoomIn_->toolTip());
+    imageActualSize_->setToolTip(label("Show current preview pixels at 1:1 (follows system display scaling)", "按当前预览像素 1:1 显示（跟随系统显示缩放）"));
+    imageActualSize_->setAccessibleName(imageActualSize_->toolTip());
+    imageFitButton_->setText(label("Fit", "适配"));
+    imageFitButton_->setToolTip(label("Fit image to preview", "适配预览区域"));
+    updateImageControls();
     updatePlaybackButton();
     const QString pagePrefix = label("Page ", "页码 ");
     if (page_->prefix() != pagePrefix) page_->setPrefix(pagePrefix);
@@ -197,8 +247,17 @@ void PreviewPanel::clear() {
     delete pdf_;
     pdf_ = new QPdfDocument(this);
     pdfView_->setDocument(pdf_);
-    originalImage_ = {};
-    image_->clear();
+    imageItem_->setPixmap({});
+    image_->scene()->setSceneRect(QRectF(0, 0, 1, 1));
+    image_->resetTransform();
+    imageFit_ = true;
+    image_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    image_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    image_->horizontalScrollBar()->setValue(0);
+    image_->verticalScrollBar()->setValue(0);
+    imageState_->clear();
+    imageState_->hide();
+    updateImageControls();
     hit_ = {};
     title_->clear();
     location_->clear();
@@ -235,7 +294,8 @@ void PreviewPanel::showHit(const SearchHit &hit) {
         pages_->setCurrentWidget(pdfPage_);
     } else if (hit.kind == "image" || QStringList{"png","jpg","jpeg","webp","bmp","gif","tiff","tif","heic","heif","avif"}.contains(suffix)) {
         pages_->setCurrentWidget(imagePage_);
-        image_->setText(label("Loading image…", "正在加载图片…"));
+        imageState_->setText(label("Loading image…", "正在加载图片…"));
+        imageState_->show();
         const quint64 generation = generation_;
         imageCancelled_ = std::make_shared<std::atomic_bool>(false);
         const auto cancelled = imageCancelled_;
@@ -245,9 +305,12 @@ void PreviewPanel::showHit(const SearchHit &hit) {
             const auto result = watcher->result();
             watcher->deleteLater();
             if (generation != generation_) return;
-            originalImage_ = result.first;
-            if (originalImage_.isNull()) { error_->setText(result.second); error_->show(); pages_->setCurrentWidget(text_); return; }
-            image_->clear();
+            if (result.first.isNull()) { error_->setText(result.second); error_->show(); pages_->setCurrentWidget(text_); return; }
+            auto pixels = QPixmap::fromImage(result.first);
+            pixels.setDevicePixelRatio(1.0);
+            imageItem_->setPixmap(pixels);
+            image_->scene()->setSceneRect(imageItem_->boundingRect());
+            imageState_->hide();
             updateImage();
         });
         const QString path = hit.path;
@@ -361,8 +424,51 @@ void PreviewPanel::updateDocumentButton() {
     default: document_->setText(label("Read document text", "读取文档正文")); break;
     }
 }
-void PreviewPanel::updateImage() { if (!originalImage_.isNull()) image_->setPixmap(QPixmap::fromImage(originalImage_).scaled(image_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation)); }
-void PreviewPanel::resizeEvent(QResizeEvent *event) { QWidget::resizeEvent(event); updateImage(); }
+void PreviewPanel::updateImage() {
+    if (!imageItem_->pixmap().isNull() && imageFit_) {
+        // Fit uses the viewport, never the scaled image's size hint. Keeping
+        // scrollbars off in this mode avoids a resize/scrollbar feedback loop.
+        image_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        image_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        const QSize available = image_->viewport()->size() - QSize(2, 2);
+        const QSize pixels = imageItem_->pixmap().size();
+        const qreal scale = qMin<qreal>(1.0, qMin(qMax(1, available.width()) / qreal(pixels.width()),
+                                                qMax(1, available.height()) / qreal(pixels.height())));
+        image_->setTransform(QTransform::fromScale(scale, scale));
+        image_->centerOn(imageItem_);
+    }
+    updateImageControls();
+}
+void PreviewPanel::setImageZoom(qreal scale) {
+    if (imageItem_->pixmap().isNull()) return;
+    const QPointF center = image_->mapToScene(image_->viewport()->rect().center());
+    imageFit_ = false;
+    image_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    image_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    // Transform the bounded decoded pixmap instead of allocating a whole
+    // enlarged raster. Only the visible part is painted at the chosen scale.
+    scale = qBound<qreal>(0.05, scale, 4.0);
+    image_->setTransform(QTransform::fromScale(scale, scale));
+    image_->centerOn(center);
+    updateImageControls();
+}
+void PreviewPanel::updateImageControls() {
+    const bool loaded = !imageItem_->pixmap().isNull();
+    const qreal scale = image_->transform().m11();
+    imageZoomOut_->setEnabled(loaded && scale > 0.050001);
+    imageZoomIn_->setEnabled(loaded && scale < 3.999999);
+    imageActualSize_->setEnabled(loaded);
+    imageFitButton_->setEnabled(loaded);
+    imageFitButton_->setChecked(imageFit_);
+    imageZoom_->setText(!loaded ? QString() : (imageFit_ ? label("Fit · %1%", "适配 · %1%") : QStringLiteral("%1%")).arg(qRound(scale * 100)));
+}
+bool PreviewPanel::eventFilter(QObject *watched, QEvent *event) {
+    if (watched == image_->viewport() && event->type() == QEvent::Resize && imageFit_) {
+        // The viewport's final geometry includes toolbar/font/layout changes.
+        QTimer::singleShot(0, this, [this] { updateImage(); });
+    }
+    return QWidget::eventFilter(watched, event);
+}
 void PreviewPanel::hideEvent(QHideEvent *event) {
     if (player_->playbackState() == QMediaPlayer::PlayingState) player_->pause();
     QWidget::hideEvent(event);

@@ -13,6 +13,9 @@
 #include <QDialogButtonBox>
 #include <QFile>
 #include <QFileInfo>
+#include <QGraphicsPixmapItem>
+#include <QGraphicsScene>
+#include <QGraphicsView>
 #include <QImage>
 #include <QInputMethodEvent>
 #include <QJsonArray>
@@ -42,6 +45,16 @@ using namespace qcopilots_search;
 using qcopilots_search::test::TestEnvironment;
 
 namespace {
+QPixmap imagePreviewPixmap(const QWidget &panel) {
+    const auto *view = panel.findChild<QGraphicsView *>("imagePreview");
+    if (view && view->scene()) {
+        for (auto *item : view->scene()->items()) {
+            if (auto *image = qgraphicsitem_cast<QGraphicsPixmapItem *>(item)) return image->pixmap();
+        }
+    }
+    return {};
+}
+
 class WidgetPopupStyle final : public QProxyStyle {
 public:
     int styleHint(StyleHint hint, const QStyleOption *option = nullptr,
@@ -294,6 +307,12 @@ private slots:
         auto *input = window.findChild<SearchEdit *>(quick ? "quickSearchInput" : "searchInput");
         auto *summary = window.findChild<QLabel *>(quick ? "quickSearchStatus" : "searchSummary");
         QCOMPARE(results->count(), 0); QCOMPARE(results->currentRow(), -1);
+        // Setting a child widget's focus does not activate its top-level window,
+        // particularly on X11 after another test window has been active.
+        auto *targetWindow = input->window();
+        targetWindow->raise();
+        targetWindow->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(targetWindow));
         input->setFocus();
         QTRY_VERIFY(input->hasFocus());
         auto *focus = QApplication::focusWidget();
@@ -787,8 +806,12 @@ private slots:
         const QString path = env.path("picture 中文.png"); QImage image(64, 64, QImage::Format_RGB32); image.fill(Qt::blue); QVERIFY(image.save(path));
         PreviewPanel preview; SearchHit hit; hit.path = path; hit.kind = "image";
         preview.showHit(hit); QVERIFY(preview.findChild<QPushButton *>("openResultButton")->isEnabled());
-        QTRY_VERIFY(!preview.findChild<QLabel *>("imagePreview")->pixmap().isNull());
-        preview.clear(); QVERIFY(QFile::remove(path));
+        QTRY_VERIFY(!imagePreviewPixmap(preview).isNull());
+        preview.clear();
+        QVERIFY(imagePreviewPixmap(preview).isNull());
+        for (const char *name : {"imageZoomOutButton", "imageZoomInButton", "imageActualSizeButton", "imageFitButton"})
+            QVERIFY(!preview.findChild<QPushButton *>(name)->isEnabled());
+        QVERIFY(QFile::remove(path));
         preview.showHit(hit); QVERIFY(!preview.findChild<QPushButton *>("openResultButton")->isEnabled());
         QVERIFY(!preview.findChild<QLabel *>("previewError")->text().isEmpty());
     }
@@ -803,7 +826,6 @@ private slots:
         SearchHit image; image.path = imagePath; image.kind = "image";
         SearchHit text; text.path = env.path("plain text.txt"); text.kind = "text"; text.text = "The currently selected document";
         PreviewPanel preview; preview.resize(640, 480); preview.show();
-        auto *imageLabel = preview.findChild<QLabel *>("imagePreview");
         auto *textPreview = preview.findChild<QTextBrowser *>("textPreview");
         for (int pass = 0; pass < 4; ++pass) {
             preview.showHit(pdf);
@@ -816,8 +838,8 @@ private slots:
             QCOMPARE(preview.currentHit().path, text.path);
             QCOMPARE(textPreview->toPlainText(), text.text);
             preview.showHit(image);
-            QTRY_VERIFY_WITH_TIMEOUT(!imageLabel->pixmap().isNull(), 10000);
-            QCOMPARE(imageLabel->pixmap().toImage().pixelColor(0, 0), QColor(Qt::green));
+            QTRY_VERIFY_WITH_TIMEOUT(!imagePreviewPixmap(preview).isNull(), 10000);
+            QCOMPARE(imagePreviewPixmap(preview).toImage().pixelColor(0, 0), QColor(Qt::green));
             QCOMPARE(preview.currentHit().path, imagePath);
             preview.clear();
         }
@@ -825,24 +847,165 @@ private slots:
         QVERIFY(QFile::remove(imagePath));
         QVERIFY(QFile::remove(text.path));
     }
+    void imagePreviewResizeRemainsBounded_data() {
+        QTest::addColumn<QSize>("imageSize");
+        QTest::newRow("landscape") << QSize(1200, 300);
+        QTest::newRow("portrait") << QSize(300, 1200);
+    }
     void imagePreviewResizeRemainsBounded() {
+        QFETCH(QSize, imageSize);
         TestEnvironment env("gui-image-resize"); QVERIFY(env.isValid());
         const QString path = env.path("wide image.png");
-        QImage pixels(1200, 300, QImage::Format_RGB32); pixels.fill(Qt::blue); QVERIFY(pixels.save(path));
+        QImage pixels(imageSize, QImage::Format_RGB32); pixels.fill(Qt::blue); QVERIFY(pixels.save(path));
         PreviewPanel preview; preview.resize(760, 560); preview.show();
         SearchHit hit; hit.path = path; hit.kind = "image"; preview.showHit(hit);
-        auto *image = preview.findChild<QLabel *>("imagePreview");
-        QTRY_VERIFY_WITH_TIMEOUT(!image->pixmap().isNull(), 10000);
+        auto *image = preview.findChild<QGraphicsView *>("imagePreview"); QVERIFY(image);
+        QTRY_VERIFY_WITH_TIMEOUT(!imagePreviewPixmap(preview).isNull(), 10000);
         for (const QSize size : {QSize(760, 560), QSize(600, 460), QSize(900, 620), QSize(620, 480)}) {
             preview.resize(size);
             QCoreApplication::processEvents();
             const QSize settled = preview.size();
             for (int pass = 0; pass < 3; ++pass) QCoreApplication::processEvents();
             QCOMPARE(preview.size(), settled);
-            QVERIFY(!image->pixmap().isNull());
-            QVERIFY(image->pixmap().width() <= image->width());
-            QVERIFY(image->pixmap().height() <= image->height());
+            QVERIFY(!imagePreviewPixmap(preview).isNull());
+            const QSizeF displayed = image->transform().mapRect(image->sceneRect()).size();
+            QVERIFY(displayed.width() <= image->viewport()->width());
+            QVERIFY(displayed.height() <= image->viewport()->height());
+            QCOMPARE(image->horizontalScrollBar()->maximum(), 0);
+            QCOMPARE(image->verticalScrollBar()->maximum(), 0);
         }
+    }
+    void imageZoomUsesScrollableViewportAndKeepsBoundedPixels() {
+        TestEnvironment env("gui-image-zoom"); QVERIFY(env.isValid());
+        const QString path = env.path("large image.png");
+        QImage pixels(1400, 1000, QImage::Format_RGB32); pixels.fill(Qt::blue); QVERIFY(pixels.save(path));
+        PreviewPanel preview; preview.resize(760, 560); preview.show();
+        SearchHit hit; hit.path = path; hit.kind = "image"; preview.showHit(hit);
+        auto *view = preview.findChild<QGraphicsView *>("imagePreview"); QVERIFY(view);
+        auto *zoomIn = preview.findChild<QPushButton *>("imageZoomInButton"); QVERIFY(zoomIn);
+        auto *zoomOut = preview.findChild<QPushButton *>("imageZoomOutButton"); QVERIFY(zoomOut);
+        auto *actual = preview.findChild<QPushButton *>("imageActualSizeButton"); QVERIFY(actual);
+        auto *fit = preview.findChild<QPushButton *>("imageFitButton"); QVERIFY(fit);
+        QTRY_VERIFY_WITH_TIMEOUT(actual->isEnabled(), 10000);
+        QVERIFY(fit->isChecked());
+        QTRY_VERIFY(view->transform().m11() < 1.0);
+        const qreal initialFit = view->transform().m11();
+        zoomOut->click();
+        QVERIFY(!fit->isChecked());
+        QVERIFY(view->transform().m11() < initialFit);
+        actual->click();
+        QCOMPARE(view->transform().m11(), 1.0);
+        QTRY_VERIFY(view->horizontalScrollBar()->maximum() > 0);
+        QTRY_VERIFY(view->verticalScrollBar()->maximum() > 0);
+        view->horizontalScrollBar()->setValue(100);
+        view->verticalScrollBar()->setValue(120);
+        QCOMPARE(view->horizontalScrollBar()->value(), 100);
+        QCOMPARE(view->verticalScrollBar()->value(), 120);
+        zoomIn->click();
+        QCOMPARE(view->transform().m11(), 1.25);
+        preview.resize(900, 620);
+        QCoreApplication::processEvents();
+        QCOMPARE(view->transform().m11(), 1.25);
+        for (int n = 0; n < 12; ++n) zoomIn->click();
+        QCOMPARE(view->transform().m11(), 4.0);
+        QVERIFY(!zoomIn->isEnabled());
+        QCOMPARE(imagePreviewPixmap(preview).size(), pixels.size());
+        for (int n = 0; n < 25; ++n) zoomOut->click();
+        QCOMPARE(view->transform().m11(), 0.05);
+        QVERIFY(!zoomOut->isEnabled());
+        fit->click();
+        QVERIFY(fit->isChecked());
+        QTRY_VERIFY(view->transform().mapRect(view->sceneRect()).width() <= view->viewport()->width());
+        QTRY_VERIFY(view->transform().mapRect(view->sceneRect()).height() <= view->viewport()->height());
+        QCOMPARE(view->horizontalScrollBar()->maximum(), 0);
+        QCOMPARE(view->verticalScrollBar()->maximum(), 0);
+    }
+    void switchingImagesResetsZoomAndScrollAndReleasesPixels() {
+        TestEnvironment env("gui-image-zoom-reset"); QVERIFY(env.isValid());
+        QImage large(1400, 1000, QImage::Format_RGB32); large.fill(Qt::blue);
+        QImage small(32, 16, QImage::Format_RGB32); small.fill(Qt::green);
+        const QString largePath = env.path("large.png"), smallPath = env.path("small@2x.png");
+        QVERIFY(large.save(largePath)); QVERIFY(small.save(smallPath));
+        QVERIFY(env.writeFile("text.txt", "after image"));
+        PreviewPanel preview; preview.resize(760, 560); preview.show();
+        SearchHit hit; hit.path = largePath; hit.kind = "image"; preview.showHit(hit);
+        auto *view = preview.findChild<QGraphicsView *>("imagePreview"); QVERIFY(view);
+        auto *actual = preview.findChild<QPushButton *>("imageActualSizeButton"); QVERIFY(actual);
+        auto *fit = preview.findChild<QPushButton *>("imageFitButton"); QVERIFY(fit);
+        QTRY_VERIFY_WITH_TIMEOUT(actual->isEnabled(), 10000);
+        actual->click();
+        view->horizontalScrollBar()->setValue(100);
+        view->verticalScrollBar()->setValue(120);
+        hit.path = smallPath; preview.showHit(hit);
+        QVERIFY(!actual->isEnabled());
+        QTRY_VERIFY_WITH_TIMEOUT(actual->isEnabled(), 10000);
+        QVERIFY(fit->isChecked());
+        QCOMPARE(imagePreviewPixmap(preview).size(), small.size());
+        QCOMPARE(imagePreviewPixmap(preview).devicePixelRatio(), 1.0);
+        QCOMPARE(view->sceneRect().size(), QSizeF(small.size()));
+        QCOMPARE(view->horizontalScrollBar()->value(), 0);
+        QCOMPARE(view->verticalScrollBar()->value(), 0);
+        QCOMPARE(view->horizontalScrollBar()->maximum(), 0);
+        QCOMPARE(view->verticalScrollBar()->maximum(), 0);
+        SearchHit text; text.path = env.path("text.txt"); text.kind = "text"; text.text = "after image";
+        preview.showHit(text);
+        QVERIFY(imagePreviewPixmap(preview).isNull());
+        QVERIFY(!actual->isEnabled());
+        QVERIFY(QFile::remove(largePath)); QVERIFY(QFile::remove(smallPath));
+    }
+    void imageZoomSurvivesStatusLanguageAndSameResultRefresh() {
+        TestEnvironment env("gui-image-refresh"); QVERIFY(env.isValid());
+        const QString path = env.path("image.png");
+        QImage pixels(1600, 1200, QImage::Format_RGB32); pixels.fill(Qt::blue); QVERIFY(pixels.save(path));
+        FakeBackend backend; backend.autoStatus = false; backend.settings.roots << env.root();
+        SearchHit hit; hit.path = path; hit.kind = "image"; hit.sourceVersion = "same-source";
+        backend.hits = {hit};
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("image");
+        auto *results = window.findChild<QListWidget *>("searchResults"); QVERIFY(results);
+        QTRY_COMPARE(results->count(), 1);
+        QTRY_VERIFY(backend.count("status") >= 1);
+        const QString heldStatus = backend.last("status").id;
+        auto *view = window.findChild<QGraphicsView *>("imagePreview"); QVERIFY(view);
+        auto *actual = window.findChild<QPushButton *>("imageActualSizeButton"); QVERIFY(actual);
+        auto *fit = window.findChild<QPushButton *>("imageFitButton"); QVERIFY(fit);
+        QTRY_VERIFY_WITH_TIMEOUT(actual->isEnabled(), 10000);
+        actual->click();
+        window.findChild<QPushButton *>("imageZoomInButton")->click();
+        QTRY_VERIFY(view->horizontalScrollBar()->maximum() >= 100);
+        QTRY_VERIFY(view->verticalScrollBar()->maximum() >= 120);
+        view->horizontalScrollBar()->setValue(100);
+        view->verticalScrollBar()->setValue(120);
+        emit backend.response(heldStatus, {{"modelAvailable", false}});
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(view->transform().m11(), 1.25);
+        QCOMPARE(view->horizontalScrollBar()->value(), 100);
+        QCOMPARE(view->verticalScrollBar()->value(), 120);
+        backend.settings.language = "zh_CN";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCoreApplication::processEvents();
+        QCOMPARE(view->transform().m11(), 1.25);
+        QVERIFY(!fit->isChecked());
+        QCOMPARE(fit->text(), QString::fromUtf8("适配"));
+        // Language can resize the toolbar. Preserve the resulting user viewport
+        // through the subsequent same-context search response as well.
+        const int horizontal = view->horizontalScrollBar()->value();
+        const int vertical = view->verticalScrollBar()->value();
+        backend.autoSearch = false;
+        const int searches = backend.count("search");
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "2"}, {"visibilityEpoch", "1"}});
+        QTRY_VERIFY(backend.count("search") > searches);
+        SearchHit refreshed = hit;
+        refreshed.title = "Refreshed image title";
+        emit backend.response(backend.last("search").id, {{"hits", QJsonArray{refreshed.toJson()}}, {"semantic", false}});
+        QCOMPARE(results->count(), 1);
+        QVERIFY(results->item(0)->text().contains(refreshed.title));
+        QCoreApplication::processEvents();
+        QCOMPARE(view->transform().m11(), 1.25);
+        QCOMPARE(view->horizontalScrollBar()->value(), horizontal);
+        QCOMPARE(view->verticalScrollBar()->value(), vertical);
+        QVERIFY(!fit->isChecked());
     }
     void playingMediaButtonSurvivesStatusAndLanguageRefresh() {
         TestEnvironment env("gui-media-label"); QVERIFY2(env.isValid(), qPrintable(env.error()));
@@ -1078,9 +1241,8 @@ private slots:
             preview.resize(600, 400);
             preview.show();
             for (const auto &path : paths) { SearchHit hit; hit.path = path; hit.kind = "image"; preview.showHit(hit); }
-            auto *image = preview.findChild<QLabel *>("imagePreview");
-            QTRY_VERIFY_WITH_TIMEOUT(!image->pixmap().isNull(), 10000);
-            QCOMPARE(image->pixmap().toImage().pixelColor(0, 0), QColor(Qt::green));
+            QTRY_VERIFY_WITH_TIMEOUT(!imagePreviewPixmap(preview).isNull(), 10000);
+            QCOMPARE(imagePreviewPixmap(preview).toImage().pixelColor(0, 0), QColor(Qt::green));
             QCOMPARE(preview.currentHit().path, paths.last());
         }
         for (const auto &path : paths) QVERIFY(QFile::remove(path));

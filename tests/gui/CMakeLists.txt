@@ -10,6 +10,11 @@ add_dependencies(qcs-tests-gui-service qcs-service qcs-worker)
 qcopilots_search_add_test(NAME qcs-tests-gui-service COMMAND $<TARGET_FILE:qcs-tests-gui-service> -o "-,txt")
 set_tests_properties(qcs-tests-gui-service PROPERTIES TIMEOUT 300 LABELS "gui;integration;portable")
 
+# Both suites show native windows. Keep their shared display exclusive so a
+# second test process cannot steal focus during keyboard/selection assertions.
+set_tests_properties(qcs-tests-gui qcs-tests-gui-service PROPERTIES
+    RESOURCE_LOCK qcs-native-display)
+
 add_executable(qcs-tests-login-startup login_startup_tests.cpp)
 target_link_libraries(qcs-tests-login-startup PRIVATE qcs-app-components Qt6::Test)
 qcopilots_search_add_test(NAME qcs-tests-login-startup COMMAND $<TARGET_FILE:qcs-tests-login-startup> -o "-,txt")

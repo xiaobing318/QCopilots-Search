@@ -1,11 +1,12 @@
 #pragma once
 #include "core/types.h"
-#include <QImage>
 #include <QThreadPool>
 #include <QWidget>
 #include <atomic>
 #include <memory>
 class QAudioOutput;
+class QGraphicsPixmapItem;
+class QGraphicsView;
 class QLabel;
 class QMediaPlayer;
 class QPdfDocument;
@@ -36,14 +37,18 @@ signals:
 private:
     QString label(const char *en, const char *zh) const;
     void updateImage();
+    void setImageZoom(qreal scale);
+    void updateImageControls();
     void updatePlaybackButton();
     void updateMediaTime(qint64 position, qint64 duration);
     void updateDocumentButton();
-    void resizeEvent(QResizeEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void hideEvent(QHideEvent *event) override;
     SearchHit hit_;
     QString language_;
-    QLabel *title_, *location_, *error_, *image_, *empty_, *time_;
+    QLabel *title_, *location_, *error_, *imageState_, *imageZoom_, *empty_, *time_;
+    QGraphicsView *image_;
+    QGraphicsPixmapItem *imageItem_;
     QStackedWidget *pages_;
     QTextBrowser *text_;
     QWidget *imagePage_, *pdfPage_, *mediaPage_;
@@ -54,8 +59,9 @@ private:
     QAudioOutput *audio_;
     QVideoWidget *video_;
     QPushButton *play_, *open_, *reveal_, *document_;
+    QPushButton *imageZoomOut_, *imageZoomIn_, *imageActualSize_, *imageFitButton_;
     QSlider *position_;
-    QImage originalImage_;
+    bool imageFit_ = true;
     qint64 pendingPosition_ = -1;
     quint64 generation_ = 0;
     int documentNext_ = 0;
