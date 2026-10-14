@@ -690,7 +690,13 @@ private slots:
         auto *editor = page->findChild<QLineEdit *>(); QVERIFY(editor);
         auto *view = window.findChild<QPdfView *>("pdfPreview"); QVERIFY(view);
         QSignalSpy changed(page, qOverload<int>(&QSpinBox::valueChanged));
-        editor->setFocus(); QTRY_VERIFY(editor->hasFocus()); page->selectAll();
+        // A widget focus request alone does not activate its top-level window.
+        window.raise();
+        window.activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(&window));
+        QTest::mouseClick(editor, Qt::LeftButton);
+        QTRY_VERIFY(editor->hasFocus());
+        page->selectAll();
         QTest::keyClick(editor, Qt::Key_Backspace);
         QVERIFY(page->cleanText().isEmpty());
         QVERIFY(!page->hasAcceptableInput());
