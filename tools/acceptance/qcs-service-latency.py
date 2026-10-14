@@ -16,6 +16,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -173,6 +174,59 @@ def verify_fingerprints(semantic, candidate):
             raise RuntimeError(f"The new candidate and semantic report disagree on {key}")
 
 
+def corpus_index_plan(semantic, corpus):
+    """Keep corpus membership separate from physical paths shared by both spaces."""
+    corpus = Path(corpus).resolve()
+    files = semantic.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("A nonempty semantic file manifest is required")
+    spaces = {False: set(), True: set()}
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("file"), str) or not item["file"]:
+            raise RuntimeError("Semantic files must identify a nonempty relative file path")
+        if not isinstance(item.get("modality"), str) or not item["modality"]:
+            raise RuntimeError("Semantic files must identify their modality")
+        path = contained_file(corpus, item["file"])
+        code = item["modality"] == "code"
+        if path in spaces[code]:
+            raise RuntimeError("Duplicate corpus membership in the same space")
+        spaces[code].add(path)
+    memberships = [{"file": path.relative_to(corpus).as_posix(), "code": code}
+                   for code in (False, True) for path in sorted(spaces[code])]
+    # The code scanner also accepts .txt/.md. Explicit opposite-space excludes
+    # prevent those ordinary documents from silently becoming code members.
+    settings = {"roots": [str(corpus)] if spaces[False] else [],
+                "excludes": [str(path) for path in sorted(spaces[True] - spaces[False])],
+                "codeRoots": [str(corpus)] if spaces[True] else [],
+                "codeExcludes": [str(path) for path in sorted(spaces[False] - spaces[True])],
+                "includeCode": bool(spaces[True])}
+    return {"settings": settings, "memberships": memberships,
+            "counts": {"normal": len(spaces[False]), "code": len(spaces[True]),
+                       "memberships": len(memberships),
+                       "physicalFiles": len(spaces[False] | spaces[True])}}
+
+
+def verify_indexed_memberships(database_path, profile, corpus, memberships):
+    """Inspect only this paused run's database, without changing index metadata."""
+    database = Path(database_path).resolve()
+    if not database.is_relative_to(Path(profile).resolve()) or not database.is_file():
+        raise RuntimeError("Indexed database must exist inside the isolated profile")
+    expected = {(contained_file(Path(corpus), item["file"]), item["code"]) for item in memberships}
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+    try:
+        rows = connection.execute("SELECT path,code FROM files").fetchall()
+    finally:
+        connection.close()
+    if any(code not in (0, 1) for _, code in rows):
+        raise RuntimeError("Indexed corpus contains an invalid space")
+    actual = {(Path(path).resolve(), bool(code)) for path, code in rows}
+    if actual != expected or len(rows) != len(expected):
+        missing, unexpected = expected - actual, actual - expected
+        raise RuntimeError(f"Indexed corpus membership mismatch: {len(missing)} missing, {len(unexpected)} unexpected")
+    return {"normal": sum(not code for _, code in actual), "code": sum(code for _, code in actual),
+            "memberships": len(actual), "physicalFiles": len({path for path, _ in actual})}
+
+
 def capture_inputs(run, candidate_path, candidate, semantic_path, semantic, corpus, evidence_path, reserve_gib=3.0):
     """Copy small provenance/raw inputs, never the ZIP, model cache or source bundle."""
     copies = [(Path(__file__), "inputs/runner.py"),
@@ -188,8 +242,9 @@ def capture_inputs(run, candidate_path, candidate, semantic_path, semantic, corp
         else:
             external.append({"path": item["path"], "bytes": item["bytes"], "sha256": item["sha256"],
                              "scope": "Retained in the final candidate archive, not duplicated in this latency bundle"})
-    for item in semantic["files"]:
-        copies.append((contained_file(corpus, item["file"]), "inputs/corpus/" + item["file"]))
+    physical_files = {contained_file(corpus, item["file"]) for item in semantic["files"]}
+    for path in sorted(physical_files):
+        copies.append((path, "inputs/corpus/" + path.relative_to(corpus.resolve()).as_posix()))
     budget = sum(path.stat().st_size for path, _ in copies) + 256 * 1024 * 1024
     if shutil.disk_usage(run).free <= reserve_gib * 1024**3 + budget:
         raise RuntimeError("Cannot preserve the configured free-space reserve while capturing latency inputs and an isolated index")
@@ -311,6 +366,7 @@ def main():
     layout = resolve_candidate(args.package_candidate.resolve(), candidate, args.app_dir, semantic)
     package_bin = layout["packageBin"]
     queries = choose_queries(semantic["queries"])
+    corpus_plan = corpus_index_plan(semantic, corpus)
     plan = {
         "kind": "packaged-cli-ipc-query-latency", "executeRequested": args.execute,
         "workingDirectoryParent": str(args.working_directory), "expectedCommit": args.expected_commit,
@@ -319,6 +375,7 @@ def main():
         "candidateIdentity": candidate["identity"], "packageArchive": str(layout["archive"]),
         "packageSha256": candidate["packageSha256"], "executables": candidate["executables"],
         "sourceSemanticVectors": semantic["actualEmbeddedSegments"],
+        "corpusIndexPlan": corpus_plan,
         "reuseExistingDatabase": False,
         "reasonForReindex": "Direct harness profile uses different pipeline/version metadata from the service. Rebuild through public production IPC, never rewrite validation metadata.",
         "warmupQueries": 10, "measuredQueries": len(queries),
@@ -473,20 +530,27 @@ def main():
         if initial is None or not initial["modelAvailable"] or initial["pipelineFingerprint"] != expected_pipeline:
             raise RuntimeError("Service model/contract fingerprint does not match the verified semantic model")
         report["initialStatus"] = initial
-        _, record = command(["index", str(corpus), "--code", "--wait"], 1800)
+        settings_path = run / "corpus-settings.json"
+        write_json(settings_path, corpus_plan["settings"])
+        _, record = command(["config", "set", "--file", str(settings_path)])
+        report["setup"].append(record)
+        # index.start scans both independently configured spaces in one run.
+        _, record = command(["index", "--wait"], 1800)
         report["setup"].append(record)
         _, record = command(["pause"])
         report["setup"].append(record)
         status, record = command(["status"])
         report["setup"].append(record)
         report["indexedStatus"] = status
-        if (status["repository"]["vectors"] < 1000 or status["repository"]["files"] != len(semantic["files"])
+        if (status["repository"]["vectors"] < 1000 or status["repository"]["files"] != corpus_plan["counts"]["memberships"]
                 or status["failures"] or status["queuedFiles"]):
             raise RuntimeError("Production corpus indexing was incomplete")
         if (status["progress"]["state"] != "paused" or status["settings"]["indexingPaused"] is not True
                 or status.get("warning") or status.get("pipelineTransitionError")
                 or status["repository"]["pipelineFingerprint"] != expected_pipeline):
             raise RuntimeError("Production corpus was not paused in the expected healthy model space")
+        report["indexedMemberships"] = verify_indexed_memberships(
+            status["repository"]["databasePath"], profile, corpus, corpus_plan["memberships"])
         report["actualProductionSegments"] = status["repository"]["segments"]
         report["actualProductionVectors"] = status["repository"]["vectors"]
         report["actualProductionFiles"] = status["repository"]["files"]
@@ -501,7 +565,7 @@ def main():
         report["queryWorkerThreads"] = 4
         report["warmupCount"] = len(report["warmup"])
         report["measuredCount"] = len(report["measurements"])
-        report["qualityNote"] = "Latencies include every selected query, including any relevance miss. Relevance remains governed by the separate 222-query quality report. Semantic fallback or worker warnings fail this measurement."
+        report["qualityNote"] = "Latencies include every selected query, including any relevance miss. Relevance remains governed by the separate full semantic quality report. Semantic fallback or worker warnings fail this measurement."
         verified_models_after, verify_record = command(["model", "verify"])
         report["setup"].append(verify_record)
         report["modelVerificationAfter"] = verified_models_after
