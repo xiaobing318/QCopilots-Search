@@ -2039,10 +2039,103 @@ class PythonTempPathsEvidenceTests(PythonLicenseEvidenceTests):
     program = "qcs-tests-temp-paths"
 
 
+class ContainerCmakeToolchainTests(unittest.TestCase):
+    def exercise(self, failure=None):
+        with tempfile.TemporaryDirectory(prefix="qcs-cmake-toolchain-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            root = Path(temporary)
+            github_path = root / "github-path"
+            selected = native.variants()["linux-x64-cuda-13.4"]
+            binary_directory = root / "bootstrap" / ("cmake-" + native.CONTAINER_CMAKE_VERSION) / "cmake/data/bin"
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append([str(part) for part in command])
+                if "pip" in command:
+                    self.assertIn("--isolated", command)
+                    for flag in ("--only-binary=:all:", "--require-hashes", "--no-deps", "--no-cache-dir"):
+                        self.assertIn(flag, command)
+                    self.assertEqual(command[command.index("--index-url") + 1], "https://pypi.org/simple")
+                    requirements = Path(command[command.index("--requirement") + 1]).read_text(encoding="utf-8")
+                    self.assertEqual(requirements, "cmake==3.31.10 --hash=sha256:"
+                                     "2f766bb46367e5e0559fa33184653754bce044583a06014dcaebf8e6dff8a1f1\n")
+                    if failure == "pip":
+                        raise native.subprocess.CalledProcessError(1, command)
+                    binary_directory.mkdir(parents=True)
+                    for name in ("cmake", "ctest", "cpack"):
+                        (binary_directory / name).write_text("synthetic wheel executable", encoding="utf-8")
+                    return mock.Mock(returncode=0)
+                self.assertEqual(Path(command[0]).parent, binary_directory)
+                self.assertFalse(github_path.exists(), "Do not publish a partially verified toolchain")
+                name = Path(command[0]).name
+                version = "3.28.3" if failure == "version" and name == "ctest" else "3.31.10"
+                return mock.Mock(stdout=f"{name} version {version}\n", returncode=0)
+
+            def which(name, *, path):
+                self.assertEqual(path.split(os.pathsep)[0], str(binary_directory))
+                return str(root / "unlocked/ctest") if failure == "path" and name == "ctest" else str(binary_directory / name)
+
+            environment = {"GITHUB_ACTIONS": "true", "GITHUB_PATH": str(github_path),
+                           "QCOPILOTS_SEARCH_CI_CONTAINER": "1",
+                           "QCOPILOTS_SEARCH_CI_CONTAINER_IMAGE": selected["container"]}
+            with mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "variant", return_value=selected), \
+                    mock.patch.object(native.platform, "system", return_value="Linux"), \
+                    mock.patch.dict(native.os.environ, environment), \
+                    mock.patch.object(native, "run", side_effect=fake_run), \
+                    mock.patch.object(native.shutil, "which", side_effect=which), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                if failure:
+                    error = native.subprocess.CalledProcessError if failure == "pip" else RuntimeError
+                    with self.assertRaises(error):
+                        native.container_toolchain()
+                    self.assertFalse(github_path.exists())
+                else:
+                    native.container_toolchain()
+                    self.assertEqual(github_path.read_text(encoding="utf-8").strip(), str(binary_directory))
+                    records = json.loads(output.getvalue())["containerCMake"]
+                    self.assertEqual([record["program"] for record in records], ["cmake", "ctest", "cpack"])
+                    self.assertTrue(all(record["version"] == "3.31.10" for record in records))
+                    self.assertEqual(len(commands), 4)
+
+    def test_hash_locked_wheel_publishes_one_verified_toolchain(self):
+        self.exercise()
+
+    def test_pip_failure_cannot_fall_back_to_distribution_tools(self):
+        self.exercise("pip")
+
+    def test_mixed_tool_versions_are_rejected_before_path_publication(self):
+        self.exercise("version")
+
+    def test_tools_outside_the_locked_wheel_are_rejected(self):
+        self.exercise("path")
+
+    def test_installation_rejects_non_cuda_non_container_and_local_invocations(self):
+        selected = native.variants()["linux-x64-cuda-13.4"]
+        for mutation in ("platform", "variant", "local", "container", "image"):
+            with self.subTest(mutation=mutation):
+                environment = {"GITHUB_ACTIONS": "true", "QCOPILOTS_SEARCH_CI_CONTAINER": "1",
+                               "QCOPILOTS_SEARCH_CI_CONTAINER_IMAGE": selected["container"]}
+                if mutation == "local":
+                    environment["GITHUB_ACTIONS"] = "false"
+                if mutation == "container":
+                    environment["QCOPILOTS_SEARCH_CI_CONTAINER"] = "0"
+                if mutation == "image":
+                    environment["QCOPILOTS_SEARCH_CI_CONTAINER_IMAGE"] = "different-image"
+                with mock.patch.object(native, "variant", return_value=native.variants()["linux-x64-cpu"]
+                        if mutation == "variant" else selected), \
+                        mock.patch.object(native.platform, "system", return_value="Windows" if mutation == "platform" else "Linux"), \
+                        mock.patch.dict(native.os.environ, environment), \
+                        mock.patch.object(native, "run") as run:
+                    with self.assertRaisesRegex(RuntimeError, "GitHub Linux CUDA container"):
+                        native.container_toolchain()
+                    run.assert_not_called()
+
+
 class NativeStageDependencyTests(unittest.TestCase):
     """Verify workflow ordering and default failure propagation before upload."""
 
-    ACTIONS = ("initialize", "bootstrap", "doctor", "configure", "build", "models",
+    ACTIONS = ("initialize", "toolchain", "bootstrap", "doctor", "configure", "build", "models",
                "test", "install", "package", "installers", "products")
 
     def setUp(self):
@@ -2065,8 +2158,17 @@ class NativeStageDependencyTests(unittest.TestCase):
         for action in self.ACTIONS:
             with self.subTest(action=action):
                 conditions = re.findall(r"^        if: (.+)$", self.step(action), re.MULTILINE)
-                self.assertEqual(conditions, ["runner.os == 'Windows' || runner.os == 'Linux'"]
-                                 if action == "installers" else [])
+                expected = {"installers": ["runner.os == 'Windows' || runner.os == 'Linux'"],
+                            "toolchain": ["matrix.container != ''"]}
+                self.assertEqual(conditions, expected.get(action, []))
+
+    def test_container_toolchain_is_selected_after_python_and_before_configure(self):
+        python = next(step for step in self.steps if "uses: actions/setup-python@" in step)
+        toolchain = self.step("toolchain")
+        self.assertLess(self.steps.index(python), self.steps.index(toolchain))
+        self.assertLess(self.steps.index(toolchain), self.steps.index(self.step("configure")))
+        prepare = next(step for step in self.steps if step.startswith("Prepare the pinned CUDA container"))
+        self.assertNotRegex(prepare, r"\bapt-get install[^\n]*\bcmake\b")
 
     def test_common_linux_dependencies_do_not_require_a_gpu_sdk(self):
         step = next(item for item in self.steps if item.startswith("Install Linux host libraries"))

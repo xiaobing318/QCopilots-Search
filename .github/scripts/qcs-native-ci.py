@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -26,6 +27,11 @@ for stream in (sys.stdout, sys.stderr):
 SOURCE = Path(__file__).resolve().parents[2]
 PRODUCT = "qcs"
 sys.dont_write_bytecode = True
+
+# CMake 3.28's Ninja depfile binding loses dependencies when external object
+# paths contain spaces. The official fix b11323f1e4 first ships in 3.31.
+CONTAINER_CMAKE_VERSION = "3.31.10"
+CONTAINER_CMAKE_WHEEL_SHA256 = "2f766bb46367e5e0559fa33184653754bce044583a06014dcaebf8e6dff8a1f1"
 
 
 def release_evidence():
@@ -82,6 +88,49 @@ def run(command: list[str | Path], *, environment=None, display=False, capture=F
     print("+ " + subprocess.list2cmdline(command), flush=True)
     return subprocess.run(command, cwd=ROOT, env=environment, check=True,
                           text=True, encoding="utf-8", capture_output=capture)
+
+def container_toolchain():
+    """Install one hash-locked CMake wheel only in the disposable CUDA job."""
+    selected = variant()
+    if (platform.system() != "Linux" or selected["arch"] != "x64"
+            or selected["backend"] != "cuda" or not selected.get("container")
+            or os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("QCOPILOTS_SEARCH_CI_CONTAINER") != "1"
+            or os.environ.get("QCOPILOTS_SEARCH_CI_CONTAINER_IMAGE") != selected["container"]):
+        raise RuntimeError("Pinned CMake installation requires the selected GitHub Linux CUDA container")
+    github_path = environment_path("GITHUB_PATH")
+    bootstrap = ROOT / "bootstrap"
+    bootstrap.mkdir(parents=True, exist_ok=True)
+    target = bootstrap / ("cmake-" + CONTAINER_CMAKE_VERSION)
+    if target.exists():
+        raise RuntimeError(f"CMake installation destination must be fresh: {target}")
+    requirements = bootstrap / "cmake-requirements.txt"
+    requirements.write_text(
+        f"cmake=={CONTAINER_CMAKE_VERSION} --hash=sha256:{CONTAINER_CMAKE_WHEEL_SHA256}\n",
+        encoding="utf-8")
+    run([sys.executable, "-m", "pip", "--isolated", "--disable-pip-version-check", "install",
+         "--index-url", "https://pypi.org/simple", "--only-binary=:all:", "--require-hashes",
+         "--no-deps", "--no-cache-dir", "--target", target, "--requirement", requirements])
+    binary_directory = target / "cmake/data/bin"
+    environment = os.environ.copy()
+    environment["PATH"] = str(binary_directory) + os.pathsep + environment.get("PATH", "")
+    records = []
+    for name in ("cmake", "ctest", "cpack"):
+        expected = binary_directory / name
+        resolved = shutil.which(name, path=environment["PATH"])
+        if (not expected.is_file() or expected.is_symlink() or not resolved
+                or Path(resolved).resolve() != expected.resolve()):
+            raise RuntimeError(f"{name} must resolve to the locked CMake wheel: {expected}")
+        result = run([expected, "--version"], environment=environment, capture=True)
+        first_line = result.stdout.splitlines()[0] if result.stdout else ""
+        if first_line != f"{name} version {CONTAINER_CMAKE_VERSION}":
+            raise RuntimeError(f"Unexpected {name} version: {first_line}")
+        records.append({"program": name, "path": str(expected), "version": CONTAINER_CMAKE_VERSION})
+    # Publish only after every tool resolves to this wheel and verifies its version.
+    with github_path.open("a", encoding="utf-8") as output:
+        print(binary_directory, file=output)
+    print(json.dumps({"containerCMake": records, "wheelSha256": CONTAINER_CMAKE_WHEEL_SHA256}, indent=2))
+
 
 def native_environment():
     result = os.environ.copy()
@@ -581,7 +630,7 @@ def products():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["matrix", "initialize", "bootstrap", "doctor", "configure", "build",
+    parser.add_argument("action", choices=["matrix", "initialize", "toolchain", "bootstrap", "doctor", "configure", "build",
                         "install", "models", "test", "package", "installers", "products"])
     args = parser.parse_args()
     if args.action == "matrix":
@@ -609,7 +658,9 @@ def main():
     if normalized != expected:
         raise RuntimeError(f"Expected native architecture {expected}, got {actual}")
     action = args.action
-    if action == "configure":
+    if action == "toolchain":
+        container_toolchain()
+    elif action == "configure":
         dev(action, "--cmake-arg=-DQCOPILOTS_SEARCH_REQUIRE_FULL_FEATURES=ON",
             "--cmake-arg=-DQCOPILOTS_SEARCH_CANDIDATE_COMMIT=" + candidate_head(),
             "--cmake-arg=-DQCOPILOTS_SEARCH_CANDIDATE_ATTEMPT=" + os.environ["GITHUB_RUN_ATTEMPT"])

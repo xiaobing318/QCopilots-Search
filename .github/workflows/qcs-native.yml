@@ -58,7 +58,7 @@ jobs:
         working-directory: /
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y ca-certificates git curl tar gzip unzip python3 python3-venv passwd cmake
+          apt-get install --no-install-recommends -y ca-certificates git curl tar gzip unzip python3 python3-venv passwd
       - name: Checkout candidate source
         timeout-minutes: 10
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -74,6 +74,10 @@ jobs:
       - name: Initialize isolated runner directories
         timeout-minutes: 5
         run: python "qcs-src/.github/scripts/qcs-native-ci.py" initialize
+      - name: Install the locked container CMake toolchain
+        if: matrix.container != ''
+        timeout-minutes: 10
+        run: python "qcs-src/.github/scripts/qcs-native-ci.py" toolchain
       - name: Install Linux host libraries and test display
         if: runner.os == 'Linux'
         timeout-minutes: 20

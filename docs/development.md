@@ -6,6 +6,8 @@ Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。两者�
 
 开发环境需要 Python 3.10+、CMake 3.28+、Ninja 和 C++20 编译器。Windows 主程序使用 MSVC 2022 与 Windows SDK，macOS 使用 Xcode Command Line Tools，Linux 使用 GCC 或 Clang。Qt 固定为 6.12.0，配套独立 Qt PDF 模块为 6.140.0。
 
+Linux CUDA 的 CI 容器单独固定 CMake 3.31.10，通过版本与 SHA-256 锁定的官方 wheel 安装，并验证 `cmake`、`ctest`、`cpack` 来自同一套工具。这避免旧版 CMake 在含空格的外置对象路径下丢失 Ninja 头文件依赖。本机 MSVC 的 CMake 3.28 基线保持不变。
+
 `config/build-variants.json` 是平台、后端、SDK 和包类型的共同清单。`--variant` 对应 CMake 的 `QCOPILOTS_SEARCH_VARIANT`，完整 11 项矩阵见 [发布指南](releasing.md)。默认变体为 Windows / Linux 的 CPU 或 macOS arm64 Metal。其他主机架构不能被默认值伪装成支持的平台。
 
 Windows CUDA 和 HIP 后端使用外置子构建，主程序及 Qt 仍由 MSVC 构建。最终部署使用主构建的唯一 `ggml-base`，后端 ABI、导入导出和运行库必须一致。SDK 和编译配方按锁定的 llama.cpp 提交引用，升级必须同时更新锁、配方及验证结果。
