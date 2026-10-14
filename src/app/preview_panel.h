@@ -35,6 +35,8 @@ signals:
 private:
     QString label(const char *en, const char *zh) const;
     void updateImage();
+    void updatePlaybackButton();
+    void updateMediaTime(qint64 position, qint64 duration);
     void updateDocumentButton();
     void resizeEvent(QResizeEvent *event) override;
     void hideEvent(QHideEvent *event) override;

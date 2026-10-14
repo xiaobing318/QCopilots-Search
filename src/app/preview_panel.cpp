@@ -98,6 +98,7 @@ PreviewPanel::PreviewPanel(QWidget *parent) : QWidget(parent) {
     position_ = new QSlider(Qt::Horizontal, mediaPage_);
     position_->setObjectName("mediaPosition");
     time_ = new QLabel(mediaPage_);
+    time_->setObjectName("mediaTimeLabel");
     controls->addWidget(play_);
     controls->addWidget(position_, 1);
     controls->addWidget(time_);
@@ -106,12 +107,9 @@ PreviewPanel::PreviewPanel(QWidget *parent) : QWidget(parent) {
     connect(play_, &QPushButton::clicked, this, [this] {
         if (player_->playbackState() == QMediaPlayer::PlayingState) player_->pause(); else player_->play();
     });
-    connect(player_, &QMediaPlayer::playbackStateChanged, this, [this](QMediaPlayer::PlaybackState state) { play_->setText(state == QMediaPlayer::PlayingState ? label("Pause", "暂停") : label("Play", "播放")); });
-    connect(player_, &QMediaPlayer::durationChanged, this, [this](qint64 duration) { position_->setRange(0, int(qMin<qint64>(duration, INT_MAX))); });
-    connect(player_, &QMediaPlayer::positionChanged, this, [this](qint64 ms) {
-        if (!position_->isSliderDown()) position_->setValue(int(qMin<qint64>(ms, INT_MAX)));
-        time_->setText(QStringLiteral("%1:%2 / %3:%4").arg(ms / 60000).arg(ms / 1000 % 60, 2, 10, QLatin1Char('0')).arg(player_->duration() / 60000).arg(player_->duration() / 1000 % 60, 2, 10, QLatin1Char('0')));
-    });
+    connect(player_, &QMediaPlayer::playbackStateChanged, this, &PreviewPanel::updatePlaybackButton);
+    connect(player_, &QMediaPlayer::durationChanged, this, [this](qint64 duration) { updateMediaTime(player_->position(), duration); });
+    connect(player_, &QMediaPlayer::positionChanged, this, [this](qint64 position) { updateMediaTime(position, player_->duration()); });
     connect(position_, &QSlider::sliderMoved, player_, &QMediaPlayer::setPosition);
     connect(player_, &QMediaPlayer::mediaStatusChanged, this, [this](QMediaPlayer::MediaStatus status) {
         if ((status == QMediaPlayer::LoadedMedia || status == QMediaPlayer::BufferedMedia) && pendingPosition_ >= 0) { player_->setPosition(pendingPosition_); pendingPosition_ = -1; }
@@ -157,9 +155,22 @@ void PreviewPanel::setLanguage(const QString &language) {
     empty_->setText(label("Select a result to preview its matching passage, page or moment.", "选择搜索结果，预览命中的文字、页面或时刻。"));
     open_->setText(label("Open file", "打开文件"));
     reveal_->setText(label("Show in folder", "在文件夹中显示"));
-    play_->setText(label("Play", "播放"));
-    page_->setPrefix(label("Page ", "页码 "));
+    updatePlaybackButton();
+    const QString pagePrefix = label("Page ", "页码 ");
+    if (page_->prefix() != pagePrefix) page_->setPrefix(pagePrefix);
     updateDocumentButton();
+}
+void PreviewPanel::updatePlaybackButton() {
+    play_->setText(player_->playbackState() == QMediaPlayer::PlayingState ? label("Pause", "暂停") : label("Play", "播放"));
+}
+void PreviewPanel::updateMediaTime(qint64 position, qint64 duration) {
+    position = qMax<qint64>(0, position);
+    duration = qMax<qint64>(0, duration);
+    position_->setRange(0, int(qMin<qint64>(duration, INT_MAX)));
+    if (!position_->isSliderDown()) position_->setValue(int(qMin<qint64>(position, INT_MAX)));
+    time_->setText(QStringLiteral("%1:%2 / %3:%4")
+        .arg(position / 60000).arg(position / 1000 % 60, 2, 10, QLatin1Char('0'))
+        .arg(duration / 60000).arg(duration / 1000 % 60, 2, 10, QLatin1Char('0')));
 }
 void PreviewPanel::clear() {
     if (imageCancelled_) imageCancelled_->store(true);
@@ -175,6 +186,7 @@ void PreviewPanel::clear() {
     updateDocumentButton();
     player_->stop();
     player_->setSource({});
+    updateMediaTime(0, 0);
     pendingPosition_ = -1;
     // QPdfDocument's filename overload retains its QFile until destruction.
     // Detach the view before releasing it so Windows can rename/remove the old

@@ -6,6 +6,7 @@
 #include "app/settings_dialog.h"
 #include "core/app_settings.h"
 #include "support/test_environment.h"
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -16,14 +17,20 @@
 #include <QInputMethodEvent>
 #include <QJsonArray>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QMediaPlayer>
 #include <QPainter>
+#include <QPdfPageNavigator>
+#include <QPdfView>
 #include <QPdfWriter>
+#include <QPersistentModelIndex>
 #include <QProcess>
+#include <QProxyStyle>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSignalSpy>
+#include <QSlider>
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QTextBrowser>
@@ -32,6 +39,29 @@
 
 using namespace qcopilots_search;
 using qcopilots_search::test::TestEnvironment;
+
+namespace {
+class WidgetPopupStyle final : public QProxyStyle {
+public:
+    int styleHint(StyleHint hint, const QStyleOption *option = nullptr,
+                  const QWidget *widget = nullptr, QStyleHintReturn *returnData = nullptr) const override {
+        if (hint == QStyle::SH_ComboBox_UseNativePopup) return 0;
+        return QProxyStyle::styleHint(hint, option, widget, returnData);
+    }
+};
+
+QByteArray silentPcmWave(int seconds) {
+    QByteArray wav("RIFF");
+    const auto append32 = [&wav](quint32 value) { const quint32 le = qToLittleEndian(value); wav.append(reinterpret_cast<const char *>(&le), sizeof(le)); };
+    const auto append16 = [&wav](quint16 value) { const quint16 le = qToLittleEndian(value); wav.append(reinterpret_cast<const char *>(&le), sizeof(le)); };
+    const int samples = 16000 * seconds;
+    append32(36 + samples * 2); wav.append("WAVEfmt ", 8); append32(16);
+    append16(1); append16(1); append32(16000); append32(32000);
+    append16(2); append16(16); wav.append("data", 4); append32(samples * 2);
+    wav.append(QByteArray(samples * 2, '\0'));
+    return wav;
+}
+}
 
 class FakeBackend final : public AppBackend {
     Q_OBJECT
@@ -42,6 +72,7 @@ public:
     AppSettings settings;
     QList<SearchHit> hits;
     bool autoSearch = true;
+    bool autoStatus = true;
     int next = 1;
     FakeBackend() { settings.language = "en"; settings.checkUpdates = false; settings.minimizeToTray = false; }
     void start() override { QTimer::singleShot(0, this, [this] { emit connected(); }); }
@@ -55,7 +86,7 @@ public:
                 for (auto it = params.begin(); it != params.end(); ++it) updated.insert(it.key(), it.value());
                 QString error; AppSettings::fromJson(updated, &settings, &error); emit response(id, settings.toJson());
             }
-            else if (method == "status") emit response(id, {{"modelAvailable", false}, {"progress", QJsonObject{{"state", "idle"}, {"total", 2}, {"completed", 2}}}});
+            else if (method == "status" && autoStatus) emit response(id, {{"modelAvailable", false}, {"progress", QJsonObject{{"state", "idle"}, {"total", 2}, {"completed", 2}}}});
             else if (method == "search" && autoSearch) {
                 QJsonArray values;
                 for (const auto &hit : hits) values.append(hit.toJson());
@@ -495,6 +526,192 @@ private slots:
             QVERIFY(image->pixmap().width() <= image->width());
             QVERIFY(image->pixmap().height() <= image->height());
         }
+    }
+    void playingMediaButtonSurvivesStatusAndLanguageRefresh() {
+        TestEnvironment env("gui-media-label"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        QVERIFY(env.writeFile("long audio 中文.wav", silentPcmWave(65)));
+        QVERIFY(env.writeFile("document.txt", "document preview"));
+        FakeBackend backend; backend.autoStatus = false; backend.settings.roots << env.root();
+        SearchHit audio; audio.path = env.path("long audio 中文.wav"); audio.kind = "audio"; audio.startMs = 1000;
+        SearchHit document; document.path = env.path("document.txt"); document.kind = "text"; document.text = "document preview";
+        backend.hits = {audio, document};
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        auto *results = window.findChild<QListWidget *>("searchResults"); QVERIFY(results);
+        QTRY_COMPARE(results->count(), 2);
+        QTRY_VERIFY(backend.count("status") >= 1);
+        const QString heldStatus = backend.last("status").id;
+        QVERIFY(!heldStatus.isEmpty());
+        auto *player = window.findChild<QMediaPlayer *>("previewMediaPlayer"); QVERIFY(player);
+        auto *button = window.findChild<QPushButton *>("mediaPlayButton"); QVERIFY(button);
+        QTRY_COMPARE_WITH_TIMEOUT(player->duration(), qint64(65000), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(player->position(), qint64(1000), 15000);
+        QCOMPARE(player->playbackState(), QMediaPlayer::StoppedState);
+        QCOMPARE(button->text(), QString("Play"));
+        QTest::mouseClick(button, Qt::LeftButton);
+        QTRY_COMPARE(player->playbackState(), QMediaPlayer::PlayingState);
+        QCOMPARE(button->text(), QString("Pause"));
+
+        // The real startup request remains pending until playback is active.
+        // This traverses the same response path as the periodic status refresh.
+        emit backend.response(heldStatus, {{"modelAvailable", false}});
+        QCOMPARE(player->playbackState(), QMediaPlayer::PlayingState);
+        QCOMPARE(button->text(), QString("Pause"));
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(player->playbackState(), QMediaPlayer::PlayingState);
+        QCOMPARE(button->text(), QString("Pause"));
+        backend.settings.language = "zh_CN";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(player->playbackState(), QMediaPlayer::PlayingState);
+        QCOMPARE(button->text(), QString::fromUtf8("暂停"));
+        QTest::mouseClick(button, Qt::LeftButton);
+        QTRY_COMPARE(player->playbackState(), QMediaPlayer::PausedState);
+        QCOMPARE(button->text(), QString::fromUtf8("播放"));
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(player->playbackState(), QMediaPlayer::PausedState);
+        QCOMPARE(button->text(), QString::fromUtf8("播放"));
+        backend.settings.language = "en";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(player->playbackState(), QMediaPlayer::PausedState);
+        QCOMPARE(button->text(), QString("Play"));
+        player->stop();
+        QCOMPARE(player->playbackState(), QMediaPlayer::StoppedState);
+        backend.settings.language = "zh_CN";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(button->text(), QString::fromUtf8("播放"));
+        backend.settings.language = "en";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(button->text(), QString("Play"));
+        QTest::mouseClick(button, Qt::LeftButton);
+        QTRY_COMPARE(player->playbackState(), QMediaPlayer::PlayingState);
+        results->setCurrentRow(1);
+        QCOMPARE(player->source(), QUrl());
+        QCOMPARE(player->playbackState(), QMediaPlayer::StoppedState);
+        QCOMPARE(button->text(), QString("Play"));
+        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), document.text);
+        QVERIFY(QFileInfo::exists(audio.path));
+        QTRY_VERIFY(!QFileInfo::exists(audio.path) || QFile::remove(audio.path));
+    }
+    void mediaClockTracksDurationBeforePlaybackAndClears() {
+        TestEnvironment env("gui-media-clock"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        QVERIFY(env.writeFile("long 中文.wav", silentPcmWave(65)));
+        QVERIFY(env.writeFile("short 中文.wav", silentPcmWave(2)));
+        PreviewPanel preview; preview.show();
+        auto *player = preview.findChild<QMediaPlayer *>("previewMediaPlayer"); QVERIFY(player);
+        auto *button = preview.findChild<QPushButton *>("mediaPlayButton"); QVERIFY(button);
+        auto *clock = preview.findChild<QLabel *>("mediaTimeLabel"); QVERIFY(clock);
+        auto *slider = preview.findChild<QSlider *>("mediaPosition"); QVERIFY(slider);
+        SearchHit longAudio; longAudio.path = env.path("long 中文.wav"); longAudio.kind = "audio"; longAudio.startMs = 1000;
+        preview.showHit(longAudio);
+        QTRY_COMPARE_WITH_TIMEOUT(player->duration(), qint64(65000), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(player->position(), qint64(1000), 15000);
+        QCOMPARE(clock->text(), QString("0:01 / 1:05"));
+        SearchHit shortAudio; shortAudio.path = env.path("short 中文.wav"); shortAudio.kind = "audio";
+        preview.showHit(shortAudio);
+        QTRY_COMPARE_WITH_TIMEOUT(player->duration(), qint64(2000), 15000);
+        QCOMPARE(player->playbackState(), QMediaPlayer::StoppedState);
+        QCOMPARE(player->position(), qint64(0));
+        QCOMPARE(button->text(), QString("Play"));
+        QCOMPARE(slider->minimum(), 0);
+        QCOMPARE(slider->maximum(), 2000);
+        QCOMPARE(slider->value(), 0);
+        // Duration must be correct before the first playback position signal.
+        QCOMPARE(clock->text(), QString("0:00 / 0:02"));
+        preview.clear();
+        QCOMPARE(player->source(), QUrl());
+        QCOMPARE(player->playbackState(), QMediaPlayer::StoppedState);
+        QCOMPARE(slider->minimum(), 0);
+        QCOMPARE(slider->maximum(), 0);
+        QCOMPARE(slider->value(), 0);
+        QCOMPARE(clock->text(), QString("0:00 / 0:00"));
+        QVERIFY(QFileInfo::exists(longAudio.path));
+        QVERIFY(QFileInfo::exists(shortAudio.path));
+        QTRY_VERIFY(!QFileInfo::exists(longAudio.path) || QFile::remove(longAudio.path));
+        QTRY_VERIFY(!QFileInfo::exists(shortAudio.path) || QFile::remove(shortAudio.path));
+    }
+    void statusRefreshPreservesUncommittedKindNavigation() {
+        TestEnvironment env("gui-kind-refresh"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        FakeBackend backend; backend.autoStatus = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_VERIFY(backend.count("search") > 0);
+        QTRY_VERIFY(backend.count("status") >= 1);
+        const QString heldStatus = backend.last("status").id;
+        QVERIFY(!heldStatus.isEmpty());
+        auto *kind = window.findChild<QComboBox *>("kindFilter"); QVERIFY(kind);
+        // Keep keyboard interaction observable on macOS too, without replacing
+        // the application's style or taking ownership of its shared instance.
+        auto *style = new WidgetPopupStyle;
+        style->setParent(kind);
+        kind->setStyle(style);
+        QCOMPARE(kind->currentData().toString(), QString());
+        QSignalSpy activated(kind, qOverload<int>(&QComboBox::activated));
+        kind->showPopup();
+        auto *view = kind->view(); QVERIFY(view);
+        QTRY_VERIFY(view->isVisible());
+        QTest::keyClick(view, Qt::Key_End);
+        QCOMPARE(view->currentIndex().data(Qt::UserRole).toString(), QString("video"));
+        const QPersistentModelIndex pendingIndex(view->currentIndex());
+        QVERIFY(pendingIndex.isValid());
+        QCOMPARE(kind->currentData().toString(), QString());
+        QCOMPARE(activated.count(), 0);
+        emit backend.response(heldStatus, {{"modelAvailable", false}});
+        QVERIFY(view->isVisible());
+        QVERIFY(pendingIndex.isValid());
+        QCOMPARE(view->currentIndex().data(Qt::UserRole).toString(), QString("video"));
+        QCOMPARE(kind->currentData().toString(), QString());
+        QCOMPARE(activated.count(), 0);
+        QTest::keyClick(view, Qt::Key_Return);
+        QTRY_COMPARE(kind->currentData().toString(), QString("video"));
+        QCOMPARE(activated.count(), 1);
+        QTRY_COMPARE(backend.last("search").params.value("kind").toString(), QString("video"));
+    }
+    void statusRefreshPreservesIntermediatePdfPageEdit() {
+        TestEnvironment env("gui-pdf-refresh"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        const QString path = env.path("two pages 中文.pdf");
+        {
+            QPdfWriter writer(path); QPainter painter(&writer);
+            QVERIFY(painter.isActive()); painter.drawText(100, 200, "first page");
+            QVERIFY(writer.newPage()); painter.drawText(100, 200, "second page");
+        }
+        FakeBackend backend; backend.autoStatus = false;
+        SearchHit pdf; pdf.path = path; pdf.kind = "pdf"; pdf.page = 2; pdf.text = "second page";
+        backend.hits = {pdf};
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        auto *results = window.findChild<QListWidget *>("searchResults"); QVERIFY(results);
+        QTRY_COMPARE(results->count(), 1);
+        QTRY_VERIFY(backend.count("status") >= 1);
+        const QString heldStatus = backend.last("status").id;
+        QVERIFY(!heldStatus.isEmpty());
+        auto *page = window.findChild<QSpinBox *>("pdfPageNumber"); QVERIFY(page);
+        QCOMPARE(page->maximum(), 2);
+        QCOMPARE(page->value(), 2);
+        auto *editor = page->findChild<QLineEdit *>(); QVERIFY(editor);
+        auto *view = window.findChild<QPdfView *>("pdfPreview"); QVERIFY(view);
+        QSignalSpy changed(page, qOverload<int>(&QSpinBox::valueChanged));
+        editor->setFocus(); QTRY_VERIFY(editor->hasFocus()); page->selectAll();
+        QTest::keyClick(editor, Qt::Key_Backspace);
+        QVERIFY(page->cleanText().isEmpty());
+        QVERIFY(!page->hasAcceptableInput());
+        QCOMPARE(page->value(), 2);
+        QCOMPARE(changed.count(), 0);
+        const QString intermediate = editor->text();
+        const int cursor = editor->cursorPosition();
+        QVERIFY(editor->hasFocus());
+        emit backend.response(heldStatus, {{"modelAvailable", false}});
+        QCOMPARE(editor->text(), intermediate);
+        QCOMPARE(editor->cursorPosition(), cursor);
+        QVERIFY(editor->hasFocus());
+        QVERIFY(page->cleanText().isEmpty());
+        QCOMPARE(page->value(), 2);
+        QCOMPARE(changed.count(), 0);
+        QTest::keyClicks(editor, "1");
+        QTest::keyClick(editor, Qt::Key_Return);
+        QCOMPARE(page->value(), 1);
+        QCOMPARE(view->pageNavigator()->currentPage(), 0);
+        window.findChild<PreviewPanel *>("previewPanel")->clear();
+        QVERIFY(QFile::remove(path));
     }
     void audioHitSeeksAndSwitchingReleasesFile() {
         TestEnvironment env("gui-audio"); QVERIFY(env.isValid());

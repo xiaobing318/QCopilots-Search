@@ -244,15 +244,18 @@ void MainWindow::applyLanguage() {
     query_->setPlaceholderText(label("Search documents, images, sounds and moments…", "搜索文档、图片、声音与视频片段…"));
     query_->setAccessibleName(label("Search files", "搜索文件"));
     const QSignalBlocker kindBlocker(kind_);
-    const QString currentKind = kind_->currentData().toString();
-    kind_->clear();
-    kind_->addItem(label("All file types", "所有类型"), "");
-    kind_->addItem(label("Documents", "文档"), "text");
-    kind_->addItem("PDF", "pdf");
-    kind_->addItem(label("Images", "图片"), "image");
-    kind_->addItem(label("Audio", "音频"), "audio");
-    kind_->addItem(label("Video", "视频"), "video");
-    kind_->setCurrentIndex(qMax(0, kind_->findData(currentKind)));
+    const QStringList kindValues{"", "text", "pdf", "image", "audio", "video"};
+    const QStringList kindLabels{label("All file types", "所有类型"), label("Documents", "文档"),
+        QStringLiteral("PDF"), label("Images", "图片"), label("Audio", "音频"), label("Video", "视频")};
+    const bool initializeKinds = kind_->count() == 0;
+    for (int row = 0; row < kindValues.size(); ++row) {
+        if (initializeKinds) kind_->addItem(kindLabels.at(row), kindValues.at(row));
+        else {
+            const int index = kind_->findData(kindValues.at(row));
+            if (index >= 0 && kind_->itemText(index) != kindLabels.at(row))
+                kind_->setItemText(index, kindLabels.at(row));
+        }
+    }
     code_->setText(label("Code search", "代码搜索"));
     code_->setToolTip(label("Enable code indexing in Settings before searching source code and notebook cells.", "请先在设置中启用代码索引，再搜索源代码与 Notebook 单元格。"));
     quickButton_->setText(label("Quick search", "快速搜索"));

@@ -47,6 +47,7 @@
 | Worker 崩溃及迟到结果 | 服务任务调度 | 进程故障注入与版本检查 | 待集成测试证据 |
 | 首次引导、设置与模型界面 | Qt Widgets app | GUI QtTest、CU-01 至 CU-03 | 待 GUI 与 Computer Use 结果 |
 | 搜索、过滤、导航和预览 | Qt Widgets app | GUI QtTest、CU-04 至 CU-08 | 待 GUI 与 Computer Use 结果 |
+| 状态与语言刷新保留正在操作的预览控件 | `app/main_window.*`、`app/preview_panel.*` | `qcs-tests-gui` 的 `playingMediaButtonSurvivesStatusAndLanguageRefresh`、`mediaClockTracksDurationBeforePlaybackAndClears`、`statusRefreshPreservesUncommittedKindNavigation`、`statusRefreshPreservesIntermediatePdfPageEdit`，验证实际播放状态、播放前时长、未提交分类导航与 PDF 页码输入 | 已建立独立回归，旧代码失败与修复后结果分别记录，最终包仍需 Computer Use 复验 |
 | 暂停、恢复与文件变化 | service、app | CU-09、服务变化对账测试 | 待集成与用户操作结果 |
 | 托盘、全局快捷键与重启 | 平台适配 | CU-10 和平台能力报告 | 待各平台执行结果 |
 | 十万个物理文件 | file_catalog 容量入口 | tests-file-capacity，独立全规模运行 | 已建立入口，规模结果待报告 |
