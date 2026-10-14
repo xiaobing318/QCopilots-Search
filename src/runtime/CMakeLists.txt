@@ -13,6 +13,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
   set(BUILD_SHARED_LIBS ON)
 endif()
 set(GGML_NATIVE OFF CACHE BOOL "Portable CPU instruction baseline" FORCE)
+if(WIN32)
+  # Upstream auto-detection sets a global launcher, including application
+  # targets. The hosted Windows ccache loses Unicode source paths with MSVC.
+  set(GGML_CCACHE OFF CACHE BOOL "Preserve Windows Unicode paths without an implicit compiler launcher" FORCE)
+endif()
 foreach(_instruction SSE42 AVX AVX2 AVX_VNNI AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 FMA F16C BMI2)
   set(GGML_${_instruction} OFF CACHE BOOL "Portable x64 baseline" FORCE)
 endforeach()

@@ -18,7 +18,6 @@ target_include_directories(qcs-app-components PUBLIC "${PROJECT_SOURCE_DIR}/src"
 if(WIN32)
     target_link_libraries(qcs-app-components PRIVATE user32)
 elseif(APPLE)
-    enable_language(OBJCXX)
     target_sources(qcs-app-components PRIVATE platform_login_mac.mm)
     set_target_properties(qcs-app-components PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON)
     find_library(QCOPILOTS_SEARCH_CARBON_FRAMEWORK Carbon REQUIRED)

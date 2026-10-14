@@ -657,7 +657,7 @@ class FixtureReceiptTests(TemporaryTest):
 
 
 class RedirectedCliTests(unittest.TestCase):
-    def test_init_and_summary_print_unicode_paths_through_ascii_redirected_streams(self):
+    def test_init_and_summary_use_ascii_run_roots_and_preserve_chinese_content(self):
         # Only a Python CLI child is launched. Four dummy ZIP members are never
         # executed, source identity is mocked, and no real candidate is claimed.
         with tempfile.TemporaryDirectory(prefix="qcs-recorder-CLI-SYNTHETIC-", dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
@@ -699,13 +699,30 @@ with mock.patch.object(m,"identity",return_value=c["identity"]), mock.patch.obje
             self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
             initialized = json.loads(result.stdout.decode("utf-8"))
             run = Path(initialized["runRoot"])
-            self.assertIn("验收", run.name)
+            self.assertTrue(run.name.startswith("qcs-cu-run-"))
+            self.assertTrue(run.name.isascii())
+            self.assertFalse(any(character.isspace() for character in run.name))
             self.assertTrue((run / "run.json").is_file())
+            state = recorder.read(run / "run.json")
+            for key in ("profileRoot", "modelDirectory", "samplesDirectory"):
+                directory = Path(state[key])
+                self.assertEqual(directory.parent, run)
+                self.assertTrue(directory.name.isascii())
+                self.assertFalse(any(character.isspace() for character in directory.name))
+            sample = Path(state["samplesDirectory"]) / "中文搜索样本.txt"
+            sample.write_text("中文搜索内容保留", encoding="utf-8")
+            started = subprocess.run([*prefix, "begin", "--run", str(run), "--scenario", "CU-01",
+                                      "--expected", "中文搜索内容保留"],
+                                     capture_output=True, env=environment, timeout=30)
+            self.assertEqual(started.returncode, 0, started.stderr.decode("utf-8"))
             summary = subprocess.run([*prefix, "summarize", "--run", str(run)], capture_output=True, env=environment, timeout=30)
             self.assertEqual(summary.returncode, 1, summary.stderr.decode("utf-8"))
             report = json.loads(summary.stdout.decode("utf-8"))
             self.assertFalse(report["passed"])
             self.assertTrue(Path(report["report"]).is_file())
+            retained = recorder.read(report["report"])
+            self.assertEqual(retained["scenarios"][0]["expected"], "中文搜索内容保留")
+            self.assertEqual(sample.read_text(encoding="utf-8"), "中文搜索内容保留")
 
 
 if __name__ == "__main__":

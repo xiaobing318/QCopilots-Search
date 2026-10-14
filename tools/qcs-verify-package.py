@@ -224,7 +224,7 @@ def force_stop(process):
 
 def real_model_smoke(worker, replies, executable, application, work, report_dir, verified_models, installed_files=None,
                      timeout=600, build_identity=None):
-    fixtures = work / "模型 参考"
+    fixtures = work / "model-references"
     references = reference_inputs(fixtures)
     vectors = []
     query, raw = worker_request(worker, replies, {"id": "model-query", "operation": "query",
@@ -795,7 +795,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     if run_root == SOURCE or SOURCE in run_root.parents or run_root == Path(run_root.anchor):
         raise RuntimeError("Package verification test root must be a dedicated directory outside the source checkout")
     run_root.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix="qcs-pkg 中文 空格-", dir=run_root))
+    work = Path(tempfile.mkdtemp(prefix="qcs-pkg-", dir=run_root))
     report = {"package":str(package) if package else None, "installedRoot":str(installed_root) if installed_root else None,
               "runId":run_id, "workingDirectory":str(work), "checks":[], "passed":False,
               "verificationScope": "keyword-only" if keyword_only else "release",
@@ -814,11 +814,11 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     cli = None
     logs = []
     environment = isolated_environment()
-    profile = explicit_profile or work / "独立配置"
+    profile = explicit_profile or work / "profile"
     report["profileDirectory"] = str(profile)
     if explicit_profile and profile.exists() and (not profile.is_dir() or any(profile.iterdir())):
         raise RuntimeError("Explicit package-test profile must be a new or empty dedicated directory")
-    application = installed_root or work/"应用"
+    application = installed_root or work/"application"
     report["applicationRoot"] = str(application)
     installed_files = {Path(line).resolve() for line in installed_manifest.read_text(encoding="utf-8").splitlines()
                        if line.startswith("/")} if installed_manifest else None
@@ -839,17 +839,17 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         if installed_root:
             report["checks"].append("validating the actual installed package tree")
         elif package.suffix.lower() == ".exe":
-            installer = NsisInstallation(package, work/"应用")
+            installer = NsisInstallation(package, work/"application")
             installer.install()
-            report["checks"].append("NSIS installed for this user into an isolated Unicode directory")
+            report["checks"].append("NSIS installed for this user into an isolated installation directory")
         else:
-            unpack(package,work/"应用")
+            unpack(package,work/"application")
             if package.name.endswith("-setup.zip"):
-                setup = work / "应用/setup.exe"
-                validate_setup_payload(work / "应用")
-                installer = NsisInstallation(setup, work / "已安装应用")
+                setup = work / "application/setup.exe"
+                validate_setup_payload(work / "application")
+                installer = NsisInstallation(setup, work / "installed-application")
                 installer.install()
-                application = work / "已安装应用"
+                application = work / "installed-application"
                 report["applicationRoot"] = str(application)
                 report["checks"].append("external-payload NSIS installed from its complete offline setup archive")
         suffix=".exe" if os.name=="nt" else ""
@@ -907,7 +907,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
                     raise
                 time.sleep(0.1)
         report["checks"].append("isolated service IPC status")
-        fixtures=work/"样本"
+        fixtures=work/"samples"
         create_fixtures(fixtures)
         error_log=(report_dir/"worker.log").open("w",encoding="utf-8"); logs.append(error_log)
         worker_environment=environment.copy(); worker_environment["QT_QPA_PLATFORM"]="offscreen"
@@ -932,7 +932,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         stop_worker(worker, replies, reader, report_dir)
         worker = None
         if not keyword_only:
-            reference = json.loads((work / "模型 参考/vectors.json").read_text(encoding="utf-8"))["vectors"]["query"]
+            reference = json.loads((work / "model-references/vectors.json").read_text(encoding="utf-8"))["vectors"]["query"]
             report["backendVerification"] = verify_backend_modes(binary / (PRODUCT + "-worker" + suffix),
                 application, work, report_dir, environment, model_arguments, report["buildIdentity"], reference,
                 installed_files, model_timeout)

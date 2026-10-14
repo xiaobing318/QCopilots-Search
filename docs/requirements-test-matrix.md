@@ -5,7 +5,7 @@
 | 需求 | 实现入口 | 验证入口或关键用例 | 证据状态 |
 | --- | --- | --- | --- |
 | 自有组件统一前缀 | 根 CMake、各模块、开发脚本 | CMake 测试名称检查、安装布局清单 | 已建立检查，待集成结果 |
-| 外置构建与任意源码路径 | 开发脚本、CMake presets | CI 中文空格 checkout、CMake 拒绝源码内构建 | 已建立流程，待原生 CI |
+| 外置构建与任意源码路径 | 开发脚本、CMake presets | CI 检出到 `qcs-src`、独立中文空格路径回归、CMake 拒绝源码内构建 | 已建立流程，待原生 CI |
 | 显式 profile 与 model 路径 | `core/runtime_paths.*` | `tests-core`: explicitRuntimePaths、environmentOverrides | 已建立用例 |
 | 中文、空格、长路径 | core、提取、runtime | longAndUnicodePaths、longUnicodePaths 的动态 258/259/260/300 长度数据行、unicodeAndSpacedImagePathMatchesReference | 已建立用例 |
 | 不依赖工作目录 | RuntimePaths、脚本自定位 | workingDirectoryIndependence、CI 独立工作目录 | 已建立用例 |
@@ -66,7 +66,7 @@
 | 指定外部 PDF 与媒体应用定位 | `app/platform_external_open.*`、外部应用设置 | `platformPdfPresetUsesPhysicalPage`、`mediaStartUsesExactMilliseconds`、`actualProcessReceivesLiteralFileAndLocationArguments`、`missingApplicationNeverSilentlyFallsBack` | 参数构造和进程传参已有回归，实际查看器/播放器定位需安装相应应用验证 |
 | 系统默认打开的定位边界 | `PlatformIntegration::openHit` 与 GUI 通知 | `ordinaryOpenExplicitlyReportsLocationLimit`、外部打开 Computer Use 场景 | 不保证默认应用页码或时间定位，指定应用失败不得伪装成默认打开成功 |
 | 磁盘不足、提交中断与失效版本零返回 | storage、service | 故障注入及恢复检查 | 部分存储用例已建立，全流程待报告 |
-| 安装布局与依赖部署 | install、CPack、verify-package | 原生 CI 与重定位包级启动 | 已建立流程，包级结果待报告 |
+| 安装布局与依赖部署 | install、CPack、verify-package | 英文无空格的解包、安装、搬移和 profile 路径，原生 CI、搬移后启动及依赖隔离 | 已建立流程，包级结果待报告 |
 | 包报告绑定实际源码 checkout | `tools/qcs-verify-package.py` | `qcs-tests-workflow`，真实 Git HEAD、linked worktree、候选声明失配、dirty 状态、无 Git 归档与错误提前失败 | 已建立回归，真实包级结果待新冻结候选报告 |
 | 验收运行器入库后契约 | `tools/acceptance` | qcs-tests-acceptance-runners，候选身份、fixture 拷贝、来源清单和可移植性运行器检查 | 已建立回归，实际专项验收仍单独执行 |
 | 用例结果与诊断输出完整性 | `tools/acceptance/qcs-test-diagnostics.py` | 独立和聚合入口的真实合流管道，大段 JSON、失败、中断、重复执行及输出错误，严格逐例解析不放宽 | 已建立回归，执行结果以同一候选的原始日志为准 |
@@ -74,7 +74,7 @@
 | Linux Qt FFmpeg 源码元数据加载 | `tools/qcs-source-bundle.py` | `qcs-tests-acceptance-runners` 中的 `qcs-test-source-checksums.py`，同目录 avformat 先加载、局部符号范围、句柄生命周期、错误传播及许可拒绝的模拟回归 | 已建立回归，真实 Linux SDK 与源码材料结果待原生 CI |
 | QtTest 内部跳过和平台不适用分类 | CI CTest 证据解析器 | qcs-tests-ci-evidence.py，注册程序集合、逐用例与汇总核对、精确平台分类及日志截断拦截 | 已建立回归，短名候选结果以本轮报告为准 |
 | 本地完整自动化门槛 | CTest、QtTest、工具与包验证 | 全量注册清单、逐用例明细、真实模型及安装报告，缺失不放行 | 同一冻结候选的独立门槛 |
-| Windows Computer Use 门槛 | 最终 Windows 包、@oai/sky | CU-01 至 CU-10，真实枚举与窗口操作，包及程序哈希、截图和结果 | 同一最终包的独立门槛 |
+| Windows Computer Use 门槛 | 最终 Windows 包、@oai/sky | CU-01 至 CU-10，英文无空格运行根、独立 profile、真实窗口操作，保留中文搜索样本、包及程序哈希和截图 | 同一最终包的独立门槛 |
 | 正式语义候选与多模态链 | storage、runtime、`tests/semantic` | 小型固定输入实际提取、编码、持久化、重载，隔离单文件范围关闭关键词兜底检索 | 检查实际来源与定位，不设置排名或相关度接受线 |
 | 扫描与提取格式一致 | core 共享格式定义、extraction 路由 | 音频、RAW、QML、Dockerfile 命名规则和扫描路由一致性 | 按本轮功能测试判定 |
 | 查询上限统一为 500 | core 共享约束、CLI、服务 | 500 接受、501 拒绝、帮助及协议一致 | 按本轮 CLI/服务测试判定 |

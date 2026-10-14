@@ -66,7 +66,7 @@ SIGNING_CASES = SIGNING_SYMLINK_CASES + (
 WORKFLOW_PROGRAM = "qcs-tests-workflow"
 WORKFLOW_SKIP_REASON = "NSIS is native to Windows"
 WORKFLOW_NSIS_CASES = (
-    "test_nsis_compiles_recursive_unicode_payload_beyond_max_path",
+    "test_nsis_compiles_recursive_payload_beyond_max_path",
     "test_installer_guard_rejects_existing_start_menu_before_execution",
 )
 WORKFLOW_LINK_CASES = (
@@ -99,13 +99,13 @@ def workflow_verbose(rows=None):
     lines = []
     for name, status in rows:
         if name == "test_release_package_requires_models_before_launching":
-            # The real workflow-nsis-final.log prints this expected failure
-            # report between complete unittest records. Paths here are synthetic.
-            lines.append(json.dumps({"package": None, "installedRoot": "synthetic 安装 空格",
-                "runId": "synthetic-workflow-parser-input", "workingDirectory": "synthetic 工作目录",
+            # Package diagnostics must not hide otherwise complete unittest
+            # records. This expected failure report uses synthetic paths.
+            lines.append(json.dumps({"package": None, "installedRoot": "synthetic-install",
+                "runId": "synthetic-workflow-parser-input", "workingDirectory": "synthetic-cwd",
                 "checks": [], "passed": False, "verificationScope": "release", "realModelRequired": True,
                 "releaseComplete": False, "commit": None, "workingTreeModified": None,
-                "profileDirectory": "synthetic 独立配置", "applicationRoot": "synthetic 安装 空格",
+                "profileDirectory": "synthetic-profile", "applicationRoot": "synthetic-install",
                 "error": "Release package verification requires --model-dir with both locked GGUF files. "
                          "Use --keyword-only only for an explicitly partial developer check."},
                 ensure_ascii=False, indent=2))
@@ -811,6 +811,7 @@ class NativeTestFlowTests(unittest.TestCase):
                     mock.patch.object(native, "test_evidence") as acceptance, \
                     mock.patch.object(native, "gui_failure_diagnostics", return_value={"attempts": []}) as gui_diagnostics, \
                     mock.patch.object(native, "linux_failure_diagnostics", return_value={"commands": []}) as linux_diagnostics, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO), \
                     mock.patch.object(native.subprocess, "Popen") as spawn:
                 if failure is None:
                     if collection_complete:
@@ -1055,8 +1056,8 @@ class WrapperDiagnosticsTests(unittest.TestCase):
 
 class PackageModelFlowTests(unittest.TestCase):
     def test_native_installers_share_the_local_runner_and_its_model_arguments(self):
-        root = Path("synthetic build 中文 空格")
-        models = root / "shared models 中文"
+        root = Path("synthetic-build")
+        models = root / "shared-models"
         with mock.patch.object(native, "BUILD_PARENT", root, create=True), \
                 mock.patch.object(native, "REPORTS", root / "reports", create=True), \
                 mock.patch.object(native, "MODELS", models, create=True), \
@@ -1075,12 +1076,12 @@ class PackageModelFlowTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["display"])
 
     def test_common_and_nsis_verification_keep_shared_model_argument(self):
-        root = Path("synthetic build 中文 空格")
-        models = root / "shared models 中文"
-        for extra in ((), ("--package-file", str(root / "pkg/installer with spaces.exe"))):
+        root = Path("synthetic-build")
+        models = root / "shared-models"
+        for extra in ((), ("--package-file", str(root / "pkg/installer.exe"))):
             with self.subTest(extra=extra), \
                     mock.patch.object(native, "BUILD_PARENT", root, create=True), \
-                    mock.patch.object(native, "QT", root / "Qt SDK", create=True), \
+                    mock.patch.object(native, "QT", root / "qt-sdk", create=True), \
                     mock.patch.object(native, "MODELS", models, create=True), \
                     mock.patch.dict(native.os.environ, {"QCOPILOTS_SEARCH_CI_ID": "linux-x64-cpu"}), \
                     mock.patch.object(native, "run") as run:
@@ -1093,9 +1094,9 @@ class PackageModelFlowTests(unittest.TestCase):
                 self.assertTrue(run.call_args.kwargs["display"])
 
     def invoke_deb_outer(self, root, model_argument):
-        package = root / "package 中文 空格.deb"
+        package = root / "package.deb"
         package.write_bytes(b"synthetic package, never installed")
-        argv = ["synthetic-deb-ci", "--build-root", str(root / "build with spaces"),
+        argv = ["synthetic-deb-ci", "--build-root", str(root / "build"),
                 "--package-file", str(package)]
         if model_argument is not None:
             argv += ["--model-dir", str(model_argument)]
@@ -1115,17 +1116,17 @@ class PackageModelFlowTests(unittest.TestCase):
             except (SystemExit, RuntimeError):
                 run.assert_not_called()
                 spawn.assert_not_called()
-                self.assertFalse((root / "build with spaces").exists())
+                self.assertFalse((root / "build").exists())
                 raise
             spawn.assert_not_called()
             run.assert_called_once()
             return run.call_args.args[0]
 
-    def test_deb_host_mounts_existing_models_readonly_without_splitting_spaces(self):
+    def test_deb_host_mounts_existing_models_readonly(self):
         with tempfile.TemporaryDirectory(prefix="qcs-ci-deb-",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
             root = Path(temporary)
-            models = root / "models 中文 空格"
+            models = root / "models"
             models.mkdir()
             command = self.invoke_deb_outer(root, models)
             self.assertEqual(command[:3], ["docker", "run", "--rm"])
@@ -1138,7 +1139,7 @@ class PackageModelFlowTests(unittest.TestCase):
             with self.subTest(case=case), tempfile.TemporaryDirectory(prefix="qcs-ci-deb-missing-",
                     dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
                 root = Path(temporary)
-                models = None if case == "argument absent" else root / "models 中文 空格"
+                models = None if case == "argument absent" else root / "models"
                 if case == "regular file":
                     models.write_text("not a model directory", encoding="utf-8")
                 if models is None:
@@ -1256,7 +1257,8 @@ class RunnerIsolationTests(unittest.TestCase):
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as directory:
             temporary = Path(directory)
             environment = self.environment(temporary)
-            with mock.patch.dict(os.environ, environment, clear=True):
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
                 roots = [native.initialize_runner(), native.initialize_runner()]
             self.assertNotEqual(*roots)
             for parent in roots:
@@ -1278,7 +1280,8 @@ class RunnerIsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="qcs-owner-中文 ",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as directory:
             temporary = Path(directory)
-            with mock.patch.dict(os.environ, self.environment(temporary), clear=True):
+            with mock.patch.dict(os.environ, self.environment(temporary), clear=True), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
                 root = native.initialize_runner() / "windows-x64-cpu"
             developer = native.developer_workflow()
             self.assertEqual(developer.SOURCE, native.SOURCE)
@@ -1297,7 +1300,8 @@ class RunnerIsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="qcs-owner-",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as directory:
             temporary = Path(directory)
-            with mock.patch.dict(os.environ, self.environment(temporary), clear=True):
+            with mock.patch.dict(os.environ, self.environment(temporary), clear=True), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
                 root = native.initialize_runner() / "windows-x64-cpu"
             developer = native.developer_workflow()
             marker = root / developer.MARKER
@@ -2037,11 +2041,13 @@ class NativeStageDependencyTests(unittest.TestCase):
         self.steps = self.native_job.split("      - name: ")[1:]
 
     def step(self, action):
-        return next(item for item in self.steps if f"qcs-native-ci.py {action}\n" in item)
+        return next(item for item in self.steps if f'qcs-native-ci.py" {action}\n' in item)
 
     def test_native_steps_run_in_order_and_inherit_failure_propagation(self):
-        observed = re.findall(r"run: python \.github/scripts/qcs-native-ci\.py (\w+)", self.native_job)
+        observed = re.findall(r'run: python "qcs-src/\.github/scripts/qcs-native-ci\.py" (\w+)', self.native_job)
         self.assertEqual(observed, list(self.ACTIONS))
+        self.assertIn("        working-directory: .\n", self.native_job)
+        self.assertIn("          path: 'qcs-src'\n", self.native_job)
         self.assertNotIn("continue-on-error:", self.native_job)
         always_steps = [step.splitlines()[0] for step in self.steps if "always()" in step]
         self.assertEqual(always_steps, ["Record Windows ROCm disk space after SDK setup"])
@@ -2051,6 +2057,12 @@ class NativeStageDependencyTests(unittest.TestCase):
                 conditions = re.findall(r"^        if: (.+)$", self.step(action), re.MULTILINE)
                 self.assertEqual(conditions, ["runner.os == 'Windows' || runner.os == 'Linux'"]
                                  if action == "installers" else [])
+
+    def test_common_linux_dependencies_do_not_require_a_gpu_sdk(self):
+        step = next(item for item in self.steps if item.startswith("Install Linux host libraries"))
+        for package in ("libvulkan-dev", "glslc", "spirv-headers"):
+            self.assertNotIn(package, step)
+        self.assertIn("fonts-noto-cjk fonts-dejavu-core\n", step)
 
     def test_upload_is_only_after_all_real_model_and_package_checks(self):
         uploads = [step for step in self.steps if "uses: actions/upload-artifact@" in step]

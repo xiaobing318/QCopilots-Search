@@ -468,7 +468,7 @@ class PackageReleaseEvidenceTests(unittest.TestCase):
 
 class NsisContractEvidenceTests(unittest.TestCase):
     def fixture(self):
-        identifier = "__main__.WorkflowTests.test_nsis_compiles_recursive_unicode_payload_beyond_max_path"
+        identifier = "__main__.WorkflowTests.test_nsis_compiles_recursive_payload_beyond_max_path"
         raw = f"{identifier.rsplit('.', 1)[-1]} ({identifier}) ... ok\n\nRan 1 test in 0.001s\n\nOK\n"
         summary = {"schemaVersion": 1, "passed": True, "exitCode": 0, "log": "nsis-contract.log",
                    "counts": {"run": 1, "passed": 1, "failed": 0, "skipped": 0, "notApplicable": 0},
@@ -481,7 +481,7 @@ class NsisContractEvidenceTests(unittest.TestCase):
     def test_skip_failure_wrong_case_or_missing_raw_output_cannot_pass(self):
         summary, raw = self.fixture()
         for output in ("", "Ran 1 test in 0.001s\n\nOK\n", raw.replace("... ok", "... skipped 'NSIS unavailable'"),
-                       raw.replace("... ok", "... FAIL"), raw.replace("test_nsis_compiles_recursive_unicode_payload_beyond_max_path", "test_other"),
+                       raw.replace("... ok", "... FAIL"), raw.replace("test_nsis_compiles_recursive_payload_beyond_max_path", "test_other"),
                        raw + "[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]\n"):
             with self.subTest(output=output):
                 self.assertTrue(evidence.validate_nsis_contract(summary, output))

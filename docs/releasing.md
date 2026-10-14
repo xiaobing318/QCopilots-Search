@@ -36,7 +36,7 @@ Windows 沿用开发包签名条件。macOS 使用 ad-hoc，部署修改、strip
 
 ## CI 产物协议
 
-每个变体顺序执行工具链准备、构建、全部保留测试、stage 安装、打包和最终包验证。GPU 开发运行也先生成完整 stage，避免裸构建目录依赖 SDK 环境补齐运行库。PR、主分支推送及手动运行使用同一流程。汇总 job 核对所有变体状态及用户文件，不下载大型测试报告重复聚合。
+CI 将源码检出到 `qcs-src`。每个变体顺序执行工具链准备、构建、全部保留测试、stage 安装、打包和最终包验证。受控解包、安装、搬移及验收 profile 路径使用英文且无空格的命名，仍需实际完成搬移后启动、安装卸载和隔离检查。GPU 开发运行也先生成完整 stage，避免裸构建目录依赖 SDK 环境补齐运行库。PR、主分支推送及手动运行使用同一流程。汇总 job 核对所有变体状态及用户文件，不下载大型测试报告重复聚合。
 
 仅上传通过验证的安装器和便携包。artifact 名为 `qcs-packages-<variant>-<候选SHA>-attempt<N>`，用户文件包含变体、版本及候选身份。artifact 不包含日志、报告、截图、源码、符号、测试数据或独立校验和。失败诊断保留在 GitHub 原生日志，需要时通过 API 读取。
 
@@ -58,6 +58,6 @@ Windows 沿用开发包签名条件。macOS 使用 ad-hoc，部署修改、strip
 
 候选记录工具保留 `record-build`、`record-package`、`collect-local` 等现有职责。构建记录绑定真实构建命令、执行前后源码身份及 `qcs-gui`、`qcs-service`、`qcs-worker`、`qcs-cli` 四个程序。包记录核对最终 ZIP 内程序字节，记录模型和提取指纹。
 
-Windows Computer Use 从这一最终 CPU 包启动独立 profile，完成 CU-01 至 CU-10 并保留实际操作、截图、时间和包哈希。`collect-local` 仅收集候选与 Computer Use 记录，按附件清单校验字节，不导入整个数据库目录。详细命令见 [候选验收运行器](../tools/acceptance/README.md)。
+Windows Computer Use 使用英文且无空格的独立运行根，从这一最终 CPU 包启动独立 profile，完成 CU-01 至 CU-10 并保留实际操作、截图、时间和包哈希。`collect-local` 仅收集候选与 Computer Use 记录，按附件清单校验字节，不导入整个数据库目录。详细命令见 [候选验收运行器](../tools/acceptance/README.md)。
 
 Windows 工作目录仍受 `CreateProcessW` 限制。记录器可使用明确指定的短工作目录，或在验证指向相同目录后使用已有 8.3 名称，不通过改写来源或手工补报告掩盖失败。

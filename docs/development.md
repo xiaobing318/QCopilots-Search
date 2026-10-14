@@ -14,7 +14,7 @@ Linux CPU / Vulkan 使用 Ubuntu 22.04 基线，CUDA / ROCm 使用 Ubuntu 24.04 
 
 ## 外置目录
 
-`--build-root` 指定父根，`--qt-root` 指定 Qt SDK 根。所有生成目录必须位于源码树之外，包含空格或中文的路径应作为单独参数正常引用。
+`--build-root` 指定父根，`--qt-root` 指定 Qt SDK 根。所有生成目录必须位于源码树之外，路径参数应作为单独参数正常引用。CI 检出目录使用 `qcs-src`，受控安装包解包、安装、搬移、验收 profile 和 Windows CU 运行目录统一采用英文且无空格的路径。中文内容及样本文件的路径回归继续保留。
 
 ```text
 <build-root>/

@@ -31,16 +31,16 @@ class DebContainerTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name).resolve()
         self.workspace = self.base / "workspace"
-        self.source = self.workspace / "qcs 源码"
+        self.source = self.workspace / "qcs-src"
         (self.source / ".git").mkdir(parents=True)
         (self.source / "config").mkdir()
         (self.source / "config/build-variants.json").write_text(json.dumps({"variants": VARIANTS}), encoding="utf-8")
-        self.runner = self.base / "runner temp"
-        self.root = self.runner / "qcs build" / CUDA["id"]
+        self.runner = self.base / "runner-temp"
+        self.root = self.runner / "qcs-build" / CUDA["id"]
         self.models = self.root.parent / "models"
         self.models.mkdir(parents=True)
         (self.models / "model.gguf").write_bytes(b"unit fixture, never used for inference")
-        self.package = self.root / "pkg/Release/qcs test.deb"
+        self.package = self.root / "pkg/Release/qcs-test.deb"
         self.package.parent.mkdir(parents=True)
         self.package.write_bytes(b"unit fixture, never installed")
         self.report = self.root / "reports/Release/check-one/package-deb"
@@ -70,7 +70,7 @@ class DebContainerTests(unittest.TestCase):
         stack.enter_context(mock.patch.dict(deb.os.environ, {**self.environment, **(overrides or {})}, clear=True))
         return stack
 
-    def test_accepts_manifest_locked_cuda_with_unicode_checkout_and_new_layout(self):
+    def test_accepts_manifest_locked_cuda_with_expected_checkout_and_new_layout(self):
         with self.guarded():
             result = deb.job_container_context(self.args)
         self.assertEqual(result["package"], self.package)

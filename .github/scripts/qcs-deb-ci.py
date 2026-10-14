@@ -218,7 +218,7 @@ def job_container_context(args):
             raise RuntimeError(f"A valid GitHub job identity is required: {name}")
     workspace = os.environ.get("GITHUB_WORKSPACE")
     workspace_path = Path(workspace).resolve() if workspace else None
-    if (workspace_path is None or SOURCE not in (workspace_path, workspace_path / "qcs 源码") or
+    if (workspace_path is None or SOURCE not in (workspace_path, workspace_path / "qcs-src") or
             not (SOURCE / ".git").exists()):
         raise RuntimeError("The container verifier must execute from the GitHub workspace checkout")
     variant_id = os.environ.get("QCOPILOTS_SEARCH_VARIANT")

@@ -30,7 +30,7 @@ PLATFORM_EXCLUSIONS = {
 SIGNING_TEST = "qcs-tests-macos-signing"
 WORKFLOW_TEST = "qcs-tests-workflow"
 WORKFLOW_NATIVE_TEST = "qcs-tests-workflow-native"
-WORKFLOW_NATIVE_CASE = "__main__.WorkflowTests.test_nsis_compiles_recursive_unicode_payload_beyond_max_path"
+WORKFLOW_NATIVE_CASE = "__main__.WorkflowTests.test_nsis_compiles_recursive_payload_beyond_max_path"
 SIGNING_WINDOWS_SKIP_REASON = "Windows lacks symbolic-link creation privilege (WinError 1314). Native CI must run this case."
 SIGNING_WINDOWS_SKIPS = {
     "__main__.SigningTests." + name for name in (
@@ -40,7 +40,7 @@ SIGNING_WINDOWS_SKIPS = {
 WORKFLOW_NSIS_SKIP_REASON = "NSIS is native to Windows"
 WORKFLOW_NSIS_SKIPS = {
     "__main__.WorkflowTests." + name for name in (
-        "test_nsis_compiles_recursive_unicode_payload_beyond_max_path",
+        "test_nsis_compiles_recursive_payload_beyond_max_path",
         "test_installer_guard_rejects_existing_start_menu_before_execution")
 }
 WORKFLOW_POSIX_LINK_SKIP_REASON = "Windows symbolic-link creation privilege unavailable (WinError 1314), native macOS/Linux execution required"

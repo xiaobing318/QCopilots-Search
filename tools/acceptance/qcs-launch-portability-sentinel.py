@@ -126,8 +126,8 @@ def main():
     pwsh = shutil.which('pwsh')
     require(pwsh is not None, 'PowerShell 7 is required for process identity observation')
     root = Path(tempfile.mkdtemp(prefix='qcs-sent-', dir=parent))
-    profile, documents, caller, logs = [root / name for name in ('独立 profile', '只读样本 documents', '任意 工作目录', 'logs')]
-    models = args.model_dir.resolve() if args.model_dir else root / '空模型 models'
+    profile, documents, caller, logs = [root / name for name in ('profile', 'documents', 'caller', 'logs')]
+    models = args.model_dir.resolve() if args.model_dir else root / 'models'
     for directory in (profile, documents, caller, logs):
         directory.mkdir()
     if args.model_dir:

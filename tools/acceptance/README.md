@@ -6,7 +6,7 @@
 
 ## 候选身份与完整测试
 
-先准备依赖与模型，将候选冻结为干净提交。构建根、Qt、模型、报告根和完整提交 SHA 均由调用者提供。程序路径按变体与配置选择，例如 Windows CPU 的 Release 程序位于 `<build-root>/windows-x64-cpu/Release/bin`。
+先准备依赖与模型，将候选冻结为干净提交。构建根、Qt、模型、报告根和完整提交 SHA 均由调用者提供。程序路径按变体与配置选择，例如 Windows CPU 的 Release 程序位于 `<build-root>/windows-x64-cpu/Release/bin`。包解压、安装、搬移、验收 profile 和 Windows CU 运行根使用英文且无空格的路径，保留独立实例及实际搬移验证。样本内部的中文及空格文件名与中文查询继续用于功能检查。
 
 `tools/qcs-release-evidence.py record-build` 执行并记录真实构建命令，绑定执行前后源码身份及四个应用程序。示例中的路径均替换为本次实际目录：
 

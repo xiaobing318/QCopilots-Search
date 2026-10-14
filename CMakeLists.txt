@@ -33,6 +33,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
 if(APPLE)
   set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum supported macOS version")
+  # Metal uses Objective-C, while application integration uses Objective-C++.
+  # Enable both in their common scope before any targets choose source languages.
+  enable_language(OBJC OBJCXX)
   set(CMAKE_INSTALL_RPATH "@executable_path/../Frameworks")
 endif()
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)

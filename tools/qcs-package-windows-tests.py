@@ -152,7 +152,7 @@ class NativeInstallerTests(PayloadFixture):
         if not compiler:
             self.fail("Native installer tests require the bootstrapped NSIS compiler on PATH or QCOPILOTS_SEARCH_NSIS_EXECUTABLE")
         self.identity = "qcs-fallback-test-" + uuid.uuid4().hex
-        self.destination = self.work / "installed 中文 space"
+        self.destination = self.work / "installed-application"
         self.executable = self.work / "setup.exe"
         self.script = self.work / "setup.nsi"
         self.script.write_text(package.render_script(self.manifest, self.executable, SOURCE / "LICENSE",

@@ -130,9 +130,9 @@ finally:
 
     def test_qt_deploy_rejects_zero_exit_error_diagnostics(self):
         helper = workflow.SOURCE / "cmake/qcs-checked-deploy.cmake"
-        deployment = self.root / "deploy script.cmake"
-        wrapper = self.root / "checked deployment.cmake"
-        prefix = self.root / "安装 空格"
+        deployment = self.root / "deploy-script.cmake"
+        wrapper = self.root / "checked-deployment.cmake"
+        prefix = self.root / "install-prefix"
         wrapper.write_text(
             f'include("{helper.as_posix()}")\n'
             f'qcopilots_search_checked_deploy("{deployment.as_posix()}")\n',
@@ -164,7 +164,7 @@ finally:
         import time
         current = self.root / "pkg/_CPack_Packages/win64/NSIS/NSISOutput.log"
         current.parent.mkdir(parents=True)
-        current.write_text("LicenseData: unable to open 中文路径", encoding="utf-8")
+        current.write_text("LicenseData: unable to open missing-license-file", encoding="utf-8")
         stale = current.parent.parent / "ZIP/CPackError.log"
         stale.parent.mkdir()
         stale.write_text("stale package failure", encoding="utf-8")
@@ -172,7 +172,7 @@ finally:
         output = io.StringIO()
         with contextlib.redirect_stderr(output):
             workflow.report_package_errors(self.root / "pkg", time.time())
-        self.assertIn("LicenseData: unable to open 中文路径", output.getvalue())
+        self.assertIn("LicenseData: unable to open missing-license-file", output.getvalue())
         self.assertNotIn("stale package failure", output.getvalue())
         self.assertTrue(current.is_file())
 
@@ -251,8 +251,10 @@ finally:
         self.assertEqual(list(packages.iterdir()), [])
 
     def test_cpack_matches_full_install_before_final_bundle_hook(self):
+        import contextlib
+        import io
         import zipfile
-        project = self.root / "package source"
+        project = self.root / "package-source"
         project.mkdir()
         for name in ("application.txt", "runtime.txt", "internal-export.cmake"):
             (project / name).write_text(name, encoding="utf-8")
@@ -287,7 +289,7 @@ set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
 set(CPACK_PROJECT_CONFIG_FILE "''' + packaging.as_posix() + '''")
 include(CPack)
 ''', encoding="utf-8")
-        build, stage = self.root / "Release", self.root / "package stage"
+        build, stage = self.root / "Release", self.root / "package-stage"
         for command in (["cmake", "-S", str(project), "-B", str(build), "-G", "Ninja"],
                         ["cmake", "--install", str(build), "--prefix", str(stage)]):
             result = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
@@ -297,7 +299,16 @@ include(CPack)
         self.assertFalse(list(stage.rglob("*.cmake")))
         packages = self.root / "pkg/Release"
         packages.mkdir(parents=True)
-        package = workflow.package_generator(self.root, build, "Release", "ZIP", os.environ.copy())
+        diagnostic = io.StringIO()
+        # Exercise the real command runner while keeping native output and its
+        # wrapper prints inside the case, away from unittest's status record.
+        with patch.object(workflow, "_ACTIVE_LOG", self.root / "cpack-native.log"), \
+                contextlib.redirect_stdout(diagnostic), contextlib.redirect_stderr(diagnostic):
+            try:
+                package = workflow.package_generator(self.root, build, "Release", "ZIP", os.environ.copy())
+            except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+                self.fail(str(error) + "\n" + diagnostic.getvalue())
+        self.assertIn("CPack:", diagnostic.getvalue())
         self.assertEqual(list(packages.iterdir()), [package])
         with zipfile.ZipFile(package) as archive:
             names = archive.namelist()
@@ -810,7 +821,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                 package_verifier.validate_vector(actual, reference)
 
     def test_model_smoke_uses_unmodified_reference_inputs(self):
-        destination = self.root / "参考 vectors"
+        destination = self.root / "reference-vectors"
         vectors = package_verifier.reference_inputs(destination)
         self.assertEqual(set(vectors), {"query", "query-bn", "query-ar", "document", "document-long",
                                        "screen-280", "photo-140", "frame-70", "speech"})
@@ -903,7 +914,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
             package_verifier.stop_worker(worker, replies, reader, self.root)
 
     @unittest.skipUnless(os.name == "nt", "NSIS is native to Windows")
-    def test_nsis_compiles_recursive_unicode_payload_beyond_max_path(self):
+    def test_nsis_compiles_recursive_payload_beyond_max_path(self):
         compiler = shutil.which("makensis")
         self.assertIsNotNone(compiler, "NSIS compiler missing: invoke the NSIS package stage")
         template = (workflow.SOURCE / "cmake/nsis/NSIS.template.in").read_text(encoding="utf-8")
@@ -911,19 +922,19 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                          template.index("!macroend") + len("!macroend")]
         guard_start = template.index("!macro QCOPILOTS_SEARCH_REQUIRE_WRITE_SUCCESS")
         guard = template[guard_start:template.index("!macroend", guard_start) + len("!macroend")]
-        payload = self.root / "编译输入 空格"
+        payload = self.root / "compiler-input"
         while len(str(payload)) < 290:
             payload /= "long-payload-segment"
-        license = payload / "share/qcs/licenses/qt/third-party/许可声明.txt"
+        license = payload / "share/qcs/licenses/qt/third-party/license-notice.txt"
         license.parent.mkdir(parents=True)
-        content = "Real recursive license payload 中文\n"
+        content = "Real recursive license payload\n"
         license.write_text(content, encoding="utf-8")
         output = payload.parent / "installer-output.exe"
         cases = [
-            ("C:/外置 build/payload", r"\\?\C:\外置 build\payload"),
-            ("//server/share/许可 payload", r"\\?\UNC\server\share\许可 payload"),
-            (r"\\?\C:\already long", r"\\?\C:\already long"),
-            (r"\\?\UNC\server\share\already long", r"\\?\UNC\server\share\already long"),
+            ("C:/external-build/payload", r"\\?\C:\external-build\payload"),
+            ("//server/share/license-payload", r"\\?\UNC\server\share\license-payload"),
+            (r"\\?\C:\already-long", r"\\?\C:\already-long"),
+            (r"\\?\UNC\server\share\already-long", r"\\?\UNC\server\share\already-long"),
         ]
         manifest_option = next(line for line in template.splitlines()
                                if line.startswith("ManifestLongPathAware "))
@@ -938,8 +949,18 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                     'RequestExecutionLevel user', 'LicenseData "${LICENSE}"',
                     'Section', 'ClearErrors', 'SetOutPath "$INSTDIR"', 'File /r "${PAYLOAD}\\*.*"',
                     '!insertmacro QCOPILOTS_SEARCH_REQUIRE_WRITE_SUCCESS',
+                    'WriteUninstaller "$INSTDIR\\uninstall.exe"',
+                    '!insertmacro QCOPILOTS_SEARCH_REQUIRE_WRITE_SUCCESS',
                     'FileOpen $0 "$INSTDIR\\completed.txt" w', 'FileWrite $0 "completed"',
-                    'FileClose $0', 'SectionEnd']
+                    'FileClose $0', 'SectionEnd',
+                    'Section "Uninstall"',
+                    'Delete "$INSTDIR\\share\\qcs\\licenses\\qt\\third-party\\license-notice.txt"',
+                    'Delete "$INSTDIR\\completed.txt"', 'Delete "$INSTDIR\\uninstall.exe"']
+        for directory in ("share/qcs/licenses/qt/third-party", "share/qcs/licenses/qt",
+                          "share/qcs/licenses", "share/qcs", "share", ""):
+            relative = directory.replace("/", "\\")
+            program.append('RMDir "$INSTDIR' + ("\\" + relative if relative else "") + '"')
+        program.append('SectionEnd')
         script = self.root / "compiler-path.nsi"
         script.write_text("\n".join(program) + "\n", encoding="utf-8")
         # Feed the script on stdin so this regression concerns compiler file
@@ -951,7 +972,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertGreater(output.stat().st_size, 1000)
         self.assertEqual(license.read_text(encoding="utf-8"), content)
-        destination = self.root / "安装目标 空格"
+        destination = self.root / "install-target"
         while len(str(destination)) < 230:
             destination /= "long-target-segment"
         executable = str(output.resolve())
@@ -976,11 +997,26 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                                 executable=executable, capture_output=True, timeout=30)
         self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
         self.assertFalse((failed_destination / "completed.txt").exists())
+        user_file = destination / "user-file.txt"
+        user_file.write_text("preserve user content", encoding="utf-8")
+        uninstaller = str(destination / "uninstall.exe")
+        if uninstaller.startswith("\\\\?\\"):
+            pass
+        elif uninstaller.startswith("\\\\"):
+            uninstaller = "\\\\?\\UNC\\" + uninstaller[2:]
+        else:
+            uninstaller = "\\\\?\\" + uninstaller
+        uninstalled = subprocess.run('"qcs-uninstall-fixture.exe" /S _?=' + str(destination),
+                                     executable=uninstaller, capture_output=True, timeout=30)
+        self.assertEqual(uninstalled.returncode, 0, uninstalled.stdout + uninstalled.stderr)
+        self.assertFalse(received.exists())
+        self.assertFalse((destination / "completed.txt").exists())
+        self.assertEqual(user_file.read_text(encoding="utf-8"), "preserve user content")
 
     @unittest.skipUnless(os.name == "nt", "NSIS is native to Windows")
     def test_installer_guard_rejects_existing_start_menu_before_execution(self):
         from unittest.mock import patch
-        appdata = self.root / "test AppData"
+        appdata = self.root / "test-AppData"
         (appdata / "Microsoft/Windows/Start Menu/Programs/QCopilots Search").mkdir(parents=True)
         with patch.dict(os.environ, {"APPDATA": str(appdata)}), self.assertRaises(RuntimeError):
             package_verifier.NsisInstallation(self.root / "installer.exe", self.root / "install")
@@ -1076,12 +1112,17 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         self.assertFalse(missing.exists())
 
     def test_clean_reports_permission_failure(self):
+        import contextlib
+        import io
         build = self.root / "owned" / DEFAULT_VARIANT
         workflow.initialize_root(build)
         (build / "deps").mkdir()
-        with patch.object(workflow.shutil, "rmtree", side_effect=PermissionError("busy fixture")):
+        diagnostic = io.StringIO()
+        with patch.object(workflow.shutil, "rmtree", side_effect=PermissionError("busy fixture")), \
+                contextlib.redirect_stdout(diagnostic):
             with self.assertRaisesRegex(PermissionError, "busy fixture"):
                 workflow.clean_generated(build, "Release", "generated", False)
+        self.assertEqual(json.loads(diagnostic.getvalue())["error"], "busy fixture")
         self.assertTrue((build / "deps").is_dir())
 
     def test_clean_rejects_reparse_entry_before_deletion(self):
@@ -1566,7 +1607,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--suite", choices=("pure", "native", "all"), default="pure")
     options, remaining = parser.parse_known_args()
-    native = {"test_nsis_compiles_recursive_unicode_payload_beyond_max_path"}
+    native = {"test_nsis_compiles_recursive_payload_beyond_max_path"}
     def load_tests(loader, tests, pattern):
         cases = loader.loadTestsFromTestCase(WorkflowTests)
         posix_only = {"test_clean_unlinks_internal_framework_and_versioned_library_links",

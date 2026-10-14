@@ -407,15 +407,78 @@ def rocm_sdk(variant: dict, root: Path, install: bool, lock: dict) -> dict:
             "sdkProvenance": "externally-installed-version-verified" if provided_python else "private-verified-wheels"}
 
 
+def linux_vulkan_sdk(variant: dict, root: Path, install: bool, specification: dict) -> dict:
+    """Install reviewed Jammy packages, then inspect the actual system SDK."""
+    if variant["toolkitVersion"] != specification["sdkVersion"]:
+        raise RuntimeError("Linux Vulkan variant and SDK lock versions differ")
+    apt = specification["apt"]
+    host = platform.freedesktop_os_release()
+    if host.get("ID") != "ubuntu" or host.get("VERSION_ID") != "22.04":
+        raise RuntimeError("The locked Linux Vulkan SDK requires Ubuntu 22.04 (Jammy)")
+    if platform.machine().lower() not in ("x86_64", "amd64"):
+        raise RuntimeError("The locked Linux Vulkan SDK requires an x86_64 host")
+    receipts = []
+    if install:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            privileged = []
+        else:
+            sudo = shutil.which("sudo")
+            if not sudo:
+                raise RuntimeError("Installing the locked Vulkan SDK requires root or non-interactive sudo")
+            privileged = [sudo, "-n", "--"]
+        key, receipt = download(apt["signingKey"], root / "downloads")
+        receipts.append(receipt)
+        keyring = "/usr/share/keyrings/qcs-lunarg.asc"
+        source = external(root / "vulkan-jammy.list")
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f"deb [arch=amd64 signed-by={keyring}] {apt['repository']} {apt['suite']} {apt['component']}\n",
+                          encoding="utf-8", newline="\n")
+        run(privileged + ["install", "-D", "-m", "0644", str(key), keyring])
+        run(privileged + ["install", "-D", "-m", "0644", str(source), "/etc/apt/sources.list.d/qcs-lunarg.list"])
+        run(privileged + ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"])
+        packages = []
+        for package in apt["packages"]:
+            archive, receipt = download(package, root / "downloads")
+            receipts.append(receipt)
+            packages.append(str(archive))
+        # All six explicit packages use the reviewed archive bytes. APT handles
+        # the SDK metapackage's other dependencies via its signed repositories.
+        run(privileged + ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "--yes",
+                          "--no-install-recommends", *packages])
+    installed = []
+    for package in apt["packages"]:
+        try:
+            status = run(["dpkg-query", "--show", "--showformat=${Status}\t${Version}\n", package["name"]], capture=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(f"Locked Vulkan package {package['name']} is missing. Run bootstrap with --install.") from error
+        expected = "install ok installed\t" + package["version"]
+        if status != expected:
+            raise RuntimeError(f"Vulkan package {package['name']} must be {package['version']}, found {status!r}. Run bootstrap with --install.")
+        installed.append({"name": package["name"], "version": package["version"], "archiveSha256": package["sha256"]})
+    header = Path("/usr/include/vulkan/vulkan_core.h")
+    if not header.is_file() or not re.search(r"#define\s+VK_HEADER_VERSION\s+" + re.escape(specification["sdkVersion"].split(".")[2]) + r"\b", header.read_text(encoding="utf-8")):
+        raise RuntimeError("Linux Vulkan headers do not match the locked SDK patch version")
+    glslc = Path("/usr/bin/glslc")
+    spirv_config = Path("/usr/share/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake")
+    loader = Path("/usr/lib/x86_64-linux-gnu/libvulkan.so")
+    if not glslc.is_file() or not spirv_config.is_file() or not loader.is_file():
+        raise RuntimeError("Locked Vulkan SDK is incomplete: glslc, the loader or SPIRV-Headers CMake config is missing")
+    if digest(glslc) != specification["glslcSha256"]:
+        raise RuntimeError("Installed glslc executable differs from the reviewed shaderc package")
+    version_output = run([str(glslc), "--version"], capture=True)
+    if not version_output.strip():
+        raise RuntimeError("The verified glslc executable returned empty version output")
+    return {"environment": {}, "cmakeCache": {"Vulkan_GLSLC_EXECUTABLE": str(glslc),
+                                              "Vulkan_INCLUDE_DIR": "/usr/include", "Vulkan_LIBRARY": str(loader),
+                                              "SPIRV-Headers_DIR": str(spirv_config.parent)},
+            "runtimeRoots": ["/usr/lib/x86_64-linux-gnu"], "licenseRoots": ["/usr/share/doc/libvulkan1"],
+            "systemPackages": installed, "toolVersions": {"glslc": version_output}, "downloads": receipts}
+
+
 def vulkan_sdk(variant: dict, root: Path, install: bool, lock: dict) -> dict:
     windows = variant["os"] == "windows"
     if not windows:
-        glslc = shutil.which("glslc")
-        if not glslc or not Path("/usr/include/vulkan/vulkan.h").is_file():
-            raise RuntimeError("Vulkan development files are missing. Install glslc, libvulkan-dev and spirv-headers using CI's system package manager.")
-        run([glslc, "--version"], capture=True)
-        return {"environment": {}, "cmakeCache": {}, "runtimeRoots": ["/usr/lib/x86_64-linux-gnu"],
-                "licenseRoots": ["/usr/share/doc/libvulkan1"], "downloads": []}
+        return linux_vulkan_sdk(variant, root, install, lock["vulkan"]["linux"])
     version = variant["toolkitVersion"]
     private = root / ("vulkan-" + version)
     sdk = Path(os.environ.get("VULKAN_SDK", str(private))).resolve()

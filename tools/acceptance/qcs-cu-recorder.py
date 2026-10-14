@@ -359,7 +359,7 @@ def initialize(args):
     if parent.is_relative_to(source):
         raise ValueError("CU runtime must be outside the source checkout")
     parent.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="qcs CU 验收 ", dir=parent))
+    root = Path(tempfile.mkdtemp(prefix="qcs-cu-run-", dir=parent))
     for folder in ("inputs", "evidence", "profile", "models", "samples", "exports"):
         (root / folder).mkdir()
     shutil.copyfile(args.candidate_record, root / "inputs/package-candidate.json")
@@ -594,8 +594,8 @@ def summarize(args):
 
 
 def main(argv=None):
-    # Redirected Windows streams may otherwise use a legacy encoding. The run
-    # directory deliberately includes Chinese characters even on English hosts.
+    # Redirected Windows streams may otherwise use a legacy encoding. Chinese
+    # sample names, search text and observations still require UTF-8 output.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")

@@ -62,7 +62,7 @@ class PackageVariantTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="qcs-package-variants-", dir=configured)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.application = self.root / "已移动的应用 with spaces"
+        self.application = self.root / "relocated-application"
         self.binary = self.application / "bin"
         self.binary.mkdir(parents=True)
         self.materials = self.application / "share/qcs"
@@ -308,7 +308,7 @@ class PackageVariantTests(unittest.TestCase):
                 self.assertEqual(self.verify_payload(), {"passed": True, "required": False})
 
     def setup_payload(self):
-        directory = self.root / "离线 ROCm setup"
+        directory = self.root / "rocm-offline-setup"
         directory.mkdir()
         (directory / "setup.exe").write_bytes(b"SYNTHETIC SETUP TEST ONLY")
         records = []

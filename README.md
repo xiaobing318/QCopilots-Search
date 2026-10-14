@@ -48,7 +48,7 @@ macOS 选择 `macos-arm64-metal`。`bootstrap` 用于未安装 SDK 的环境。�
 
 CI 使用一套流程构建 11 个变体，产生 21 个用户文件。Windows 每个变体提供 EXE 与便携 ZIP，Linux 每个变体提供 DEB 与便携 TGZ，macOS 提供 DMG。GPU 变体默认自动使用可用后端，不可用时回退 CPU 并报告原因。没有 GPU 的托管 runner 验证 CPU 回退及部署完整性，不能声称已经完成 GPU 实机验证。
 
-每个 CI artifact 仅包含对应变体已验证的用户安装包和便携包。构建、测试与失败诊断保留在 GitHub 原生日志中。发布准备可按 run ID、attempt 和候选提交自动下载 CI 成品，验证来源与字节后生成本地冻结清单。源码材料独立生成，符号保留独立生成能力，草稿上传必须显式执行。详细矩阵和协议见 [发布指南](docs/releasing.md) 与 [发布命令](docs/release-command.md)。
+CI 源码检出目录为 `qcs-src`。包验证的解包、安装、搬移、profile 及 Windows CU 运行根使用英文且无空格的路径，中文查询和样本文件继续验证搜索能力。每个 CI artifact 仅包含对应变体已验证的用户安装包和便携包。构建、测试与失败诊断保留在 GitHub 原生日志中。发布准备可按 run ID、attempt 和候选提交自动下载 CI 成品，验证来源与字节后生成本地冻结清单。源码材料独立生成，符号保留独立生成能力，草稿上传必须显式执行。详细矩阵和协议见 [发布指南](docs/releasing.md) 与 [发布命令](docs/release-command.md)。
 
 ## 文档
 
