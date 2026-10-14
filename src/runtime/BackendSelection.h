@@ -20,6 +20,8 @@ struct BackendDevice {
     QString description;
     bool cpu = false;
     bool gpu = false;
+    // An explicit capability rejection, never an initialization failure.
+    QString unavailableReason;
 };
 
 struct BackendSelection {

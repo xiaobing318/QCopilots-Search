@@ -9,6 +9,11 @@ BackendDevice cpu() { return {QStringLiteral("CPU"), QStringLiteral("CPU"), QStr
 BackendDevice gpu(const QString& backend, const QString& name = QStringLiteral("GPU0")) {
     return {backend, name, QStringLiteral("Policy fixture, not a real GPU"), false, true};
 }
+BackendDevice unsupportedMetal(const QString& name) {
+    auto device = gpu(QStringLiteral("MTL"), name);
+    device.unavailableReason = QStringLiteral("Policy fixture: metal %1 rejects required matrix multiplication.").arg(name);
+    return device;
+}
 }
 
 class BackendSelectionTest final : public QObject {
@@ -149,6 +154,81 @@ private slots:
             QCOMPARE(selected.backend, QStringLiteral("metal"));
             QVERIFY(selected.gpu);
             QVERIFY(selected.fallbackReason.isEmpty());
+        }
+    }
+
+    void unsupportedMetalFallsBackBeforeGpuSelection() {
+        const auto unsupported = unsupportedMetal(QStringLiteral("MTL0"));
+        const QVector<BackendDevice> devices{unsupported, cpu()};
+        const auto automatic = selectBackend(BackendMode::Auto, QStringLiteral("metal"), devices);
+        QVERIFY(automatic.error.isEmpty());
+        QCOMPARE(automatic.deviceIndex, 1);
+        QCOMPARE(automatic.backend, QStringLiteral("cpu"));
+        QVERIFY(!automatic.gpu);
+        QCOMPARE(automatic.fallbackReason, unsupported.unavailableReason);
+        const auto strict = selectBackend(BackendMode::Gpu, QStringLiteral("metal"), devices);
+        QCOMPARE(strict.deviceIndex, -1);
+        QVERIFY(strict.backend.isEmpty());
+        QVERIFY(!strict.gpu);
+        QVERIFY(strict.fallbackReason.isEmpty());
+        QVERIFY(strict.error.startsWith(QStringLiteral("Strict GPU mode cannot start:")));
+        QVERIFY(strict.error.contains(unsupported.unavailableReason));
+    }
+
+    void unsupportedMetalDoesNotHideLaterCompatibleDevice() {
+        const BackendDevice missing{QStringLiteral("MTL"), {}, {}, false, true};
+        const QVector<BackendDevice> devices{gpu(QStringLiteral("CUDA")), unsupportedMetal(QStringLiteral("MTL0")),
+            cpu(), missing, gpu(QStringLiteral("MTL"), QStringLiteral("MTL1")),
+            gpu(QStringLiteral("MTL"), QStringLiteral("MTL2"))};
+        for (const auto mode : {BackendMode::Auto, BackendMode::Gpu}) {
+            const auto selected = selectBackend(mode, QStringLiteral("metal"), devices);
+            QVERIFY(selected.error.isEmpty());
+            QCOMPARE(selected.deviceIndex, 4);
+            QCOMPARE(selected.backend, QStringLiteral("metal"));
+            QVERIFY(selected.gpu);
+            QVERIFY(selected.fallbackReason.isEmpty());
+        }
+    }
+
+    void allUnsupportedMetalReasonsAreRetained() {
+        const auto first = unsupportedMetal(QStringLiteral("MTL0"));
+        const auto second = unsupportedMetal(QStringLiteral("MTL1"));
+        auto foreign = gpu(QStringLiteral("CUDA"));
+        foreign.unavailableReason = QStringLiteral("An unrelated backend failure");
+        const QVector<BackendDevice> devices{first, cpu(), foreign, second};
+        for (const auto mode : {BackendMode::Auto, BackendMode::Gpu}) {
+            const auto selected = selectBackend(mode, QStringLiteral("metal"), devices);
+            const auto reason = mode == BackendMode::Auto ? selected.fallbackReason : selected.error;
+            QVERIFY(!selected.gpu);
+            QCOMPARE(selected.deviceIndex, mode == BackendMode::Auto ? 1 : -1);
+            QVERIFY(reason.contains(first.unavailableReason));
+            QVERIFY(reason.contains(second.unavailableReason));
+            QVERIFY(reason.indexOf(first.unavailableReason) < reason.indexOf(second.unavailableReason));
+            QVERIFY(!reason.contains(foreign.unavailableReason));
+        }
+    }
+
+    void capabilityRejectionsPreserveCpuAndLoaderPriority() {
+        const auto unsupported = unsupportedMetal(QStringLiteral("MTL0"));
+        const QVector<BackendDevice> devices{unsupported, cpu()};
+        const QString loadError = QStringLiteral("The packaged Metal module could not be loaded");
+        const auto cpuOnly = selectBackend(BackendMode::Cpu, QStringLiteral("metal"), devices, loadError);
+        QVERIFY(cpuOnly.error.isEmpty());
+        QCOMPARE(cpuOnly.deviceIndex, 1);
+        QCOMPARE(cpuOnly.backend, QStringLiteral("cpu"));
+        QVERIFY(cpuOnly.fallbackReason.isEmpty());
+        QVERIFY(!cpuOnly.gpu);
+        for (const auto mode : {BackendMode::Auto, BackendMode::Gpu}) {
+            const auto failedLoad = selectBackend(mode, QStringLiteral("metal"), devices, loadError);
+            const auto reason = mode == BackendMode::Auto ? failedLoad.fallbackReason : failedLoad.error;
+            QVERIFY(reason.contains(loadError));
+            QVERIFY(!reason.contains(unsupported.unavailableReason));
+            QVERIFY(!failedLoad.gpu);
+            const auto missingCpu = selectBackend(mode, QStringLiteral("metal"), {unsupported}, loadError);
+            QCOMPARE(missingCpu.deviceIndex, -1);
+            QVERIFY(missingCpu.error.contains(QStringLiteral("CPU")));
+            QVERIFY(!missingCpu.error.contains(loadError));
+            QVERIFY(!missingCpu.error.contains(unsupported.unavailableReason));
         }
     }
 

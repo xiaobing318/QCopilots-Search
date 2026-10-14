@@ -1,5 +1,7 @@
 #include "BackendSelection.h"
 
+#include <QStringList>
+
 namespace qcopilots_search::detail {
 
 std::optional<BackendMode> parseBackendMode(const QString& value, QString* error)
@@ -45,6 +47,7 @@ BackendSelection selectBackend(BackendMode mode, const QString& packagedBackend,
     }
     int cpuIndex = -1;
     int gpuIndex = -1;
+    QStringList unavailableReasons;
     for (qsizetype index = 0; index < devices.size(); ++index) {
         const auto& device = devices[index];
         const auto backend = canonicalBackendName(device.backend);
@@ -52,8 +55,10 @@ BackendSelection selectBackend(BackendMode mode, const QString& packagedBackend,
         // is available. Real devices receive MTL<n> before backend initialization.
         const bool missingMetalDevice = backend == QStringLiteral("metal") && device.name.isEmpty();
         if (device.cpu && cpuIndex < 0) cpuIndex = int(index);
-        if (device.gpu && !missingMetalDevice && gpuIndex < 0 && packaged != QStringLiteral("cpu")
-            && backend == packaged) gpuIndex = int(index);
+        if (device.gpu && !missingMetalDevice && packaged != QStringLiteral("cpu") && backend == packaged) {
+            if (!device.unavailableReason.isEmpty()) unavailableReasons.append(device.unavailableReason);
+            else if (gpuIndex < 0) gpuIndex = int(index);
+        }
     }
     // ggml still needs its CPU backend for unsupported operations even when all
     // model layers are offloaded. A broken CPU installation is not a GPU fallback.
@@ -72,9 +77,9 @@ BackendSelection selectBackend(BackendMode mode, const QString& packagedBackend,
         if (packaged == QStringLiteral("cpu")) {
             if (mode == BackendMode::Gpu) reason = QStringLiteral("This installation includes CPU inference only.");
         } else {
-            reason = gpuLoadError.isEmpty()
-                ? QStringLiteral("No compatible %1 GPU device was found. Check the installed GPU and driver.").arg(packaged)
-                : gpuLoadError;
+            if (!gpuLoadError.isEmpty()) reason = gpuLoadError;
+            else if (!unavailableReasons.isEmpty()) reason = unavailableReasons.join(QLatin1Char(' '));
+            else reason = QStringLiteral("No compatible %1 GPU device was found. Check the installed GPU and driver.").arg(packaged);
         }
     }
     if (mode == BackendMode::Gpu) {

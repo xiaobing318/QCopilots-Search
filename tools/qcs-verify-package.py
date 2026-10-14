@@ -651,8 +651,9 @@ def verify_gpu_payload(binary, application, identity, installed_files=None):
 
 
 def verify_backend_modes(executable, application, work, report_dir, environment, model_arguments,
-                         identity, reference, installed_files, timeout):
-    outcomes = {}
+                         identity, reference, installed_files, timeout, *, outcomes=None):
+    if outcomes is None:
+        outcomes = {}
     for mode in ("cpu", "gpu"):
         current_environment = dict(environment, QT_QPA_PLATFORM="offscreen", QCOPILOTS_SEARCH_BACKEND=mode)
         with (report_dir / ("backend-" + mode + ".log")).open("w", encoding="utf-8") as log:
@@ -665,6 +666,13 @@ def verify_backend_modes(executable, application, work, report_dir, environment,
             try:
                 reply, raw = worker_request(child, replies, {"id": "backend-" + mode, "operation": "query",
                     "query": "payment declined error"}, report_dir, timeout, accept_failure=True)
+                key = "strictGpu" if mode == "gpu" else "cpu"
+                payload = reply.get("result" if reply.get("ok") is True else "error", {})
+                # Preserve the actual response before validation can reject it.
+                # Failed initialization must remain a failed package check.
+                outcomes[key] = {"passed": False, "rawReply": raw,
+                    "diagnostics": payload.get("runtime") if isinstance(payload, dict) else None,
+                    "reason": payload.get("message", "") if isinstance(payload, dict) else ""}
                 if reply.get("ok") is True:
                     result = reply.get("result", {})
                     diagnostics = validate_backend_diagnostics(result.get("runtime"), identity, mode)
@@ -684,7 +692,7 @@ def verify_backend_modes(executable, application, work, report_dir, environment,
                                "reason": reason, "rawReply": raw}
                 else:
                     raise RuntimeError(f"Explicit CPU fallback failed: {reply}")
-                outcomes["strictGpu" if mode == "gpu" else "cpu"] = outcome
+                outcomes[key] = outcome
             finally:
                 try:
                     stop_worker(child, replies, reader, report_dir)
@@ -1021,9 +1029,10 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         worker = None
         if not keyword_only:
             reference = json.loads((work / "model-references/vectors.json").read_text(encoding="utf-8"))["vectors"]["query"]
-            report["backendVerification"] = verify_backend_modes(binary / (PRODUCT + "-worker" + suffix),
+            report["backendVerification"] = {}
+            verify_backend_modes(binary / (PRODUCT + "-worker" + suffix),
                 application, work, report_dir, environment, model_arguments, report["buildIdentity"], reference,
-                installed_files, model_timeout)
+                installed_files, model_timeout, outcomes=report["backendVerification"])
             report["checks"].append("explicit CPU inference and strict GPU acceptance or rejection verified")
         invoke("index",fixtures,"--wait","--timeout","120000")
         hits=invoke("search","qcopilots_package_4317","--keyword-only").get("hits",[])

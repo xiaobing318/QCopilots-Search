@@ -233,6 +233,56 @@ class PackageVariantTests(unittest.TestCase):
         self.assertEqual(report["workerStderrDiagnostics"][1]["requestedBackend"], "gpu")
         self.assertEqual(report["workerStderrDiagnostics"][1]["headText"], "gpu synthetic protocol worker stderr" + os.linesep)
 
+    def test_failed_gpu_initialization_keeps_response_and_remains_a_failure(self):
+        identity = dict(self.identity, variant="macos-arm64-metal", backend="metal")
+        failed = diagnostic(identity, "gpu", "metal", loaded=False)
+        failed.update(deviceName="MTL0", deviceDescription="Synthetic Metal fixture",
+                      gpuSelfTestPassed=False, textWarmupCompleted=False)
+        reason = "Selected GPU does not support the compute self-test operation"
+        children = []
+
+        def launch_child(*args, **kwargs):
+            mode = kwargs["env"]["QCOPILOTS_SEARCH_BACKEND"]
+            if mode == "cpu":
+                reply = {"id": "backend-cpu", "ok": True, "result": {
+                    "runtime": diagnostic(identity, "cpu", "cpu"), "embedding": [1.0] + [0.0] * 767}}
+            else:
+                reply = {"id": "backend-gpu", "ok": False, "error": {"runtime": failed, "message": reason}}
+            shutdown = {"id": "worker-shutdown", "ok": True, "result": {"stopping": True}}
+            child = Mock()
+            child.stdin = io.StringIO()
+            child.stdout = io.StringIO(json.dumps(reply) + "\n" + json.dumps(shutdown) + "\n")
+            child.poll.return_value = None
+            child.returncode = 0
+            children.append(child)
+            return child
+
+        report = {"passed": False, "releaseComplete": False, "backendVerification": {}}
+        with patch.object(package.subprocess, "Popen", side_effect=launch_child), \
+                patch.object(package, "inference_runtime_origins", return_value={}), \
+                patch.object(package, "force_stop", return_value=None), \
+                self.assertRaisesRegex(RuntimeError, "Failed strict GPU initialization reported an active"):
+            package.verify_backend_modes(self.binary / "qcs-worker", self.application,
+                self.root, self.root, {}, [], identity, [1.0] + [0.0] * 767, None, 5,
+                outcomes=report["backendVerification"])
+        self.assertTrue(report["backendVerification"]["cpu"]["passed"])
+        observed = report["backendVerification"]["strictGpu"]
+        self.assertFalse(observed["passed"])
+        self.assertEqual(observed["diagnostics"], failed)
+        self.assertEqual(observed["reason"], reason)
+        self.assertNotIn("hardwareTested", observed)
+        self.assertEqual(observed["rawReply"]["sha256"],
+                         package.file_digest(self.root / observed["rawReply"]["path"]))
+        self.assertEqual(len(children), 2)
+        self.assertTrue(all(child.stdin.closed and child.stdout.closed for child in children))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            package.write_verification_report(report, self.root)
+        printed = json.loads(output.getvalue())
+        self.assertFalse(printed["passed"])
+        self.assertFalse(printed["releaseComplete"])
+        self.assertEqual(printed["backendVerification"]["strictGpu"], observed)
+
     def validate_identity(self, **overrides):
         return package.validate_build_identity(
             self.binary, self.application, {"commit": CANDIDATE}, **overrides)

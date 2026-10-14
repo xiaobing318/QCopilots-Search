@@ -161,6 +161,42 @@ RuntimeDevices enumerateDevices() {
     return result;
 }
 
+struct GpuSelfTestGraph {
+    static constexpr size_t Side = 32;
+    static constexpr size_t GraphSize = 8;
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> context;
+    ggml_tensor* a = nullptr;
+    ggml_tensor* b = nullptr;
+    ggml_tensor* product = nullptr;
+    ggml_cgraph* graph = nullptr;
+
+    GpuSelfTestGraph() : context(ggml_init({3 * ggml_tensor_overhead()
+        + ggml_graph_overhead_custom(GraphSize, false), nullptr, true}), &ggml_free) {
+        if (!context) throw std::runtime_error("Cannot allocate GPU self-test metadata");
+        // Capability queries and actual computation use this identical graph.
+        // A full small tile avoids odd or tiny matrix support differences.
+        a = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, Side, Side);
+        b = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, Side, Side);
+        product = ggml_mul_mat(context.get(), a, b);
+        graph = ggml_new_graph_custom(context.get(), GraphSize, false);
+        ggml_build_forward_expand(graph, product);
+    }
+};
+
+void checkMetalCapabilities(RuntimeDevices& devices) {
+    std::unique_ptr<GpuSelfTestGraph> selfTest;
+    for (qsizetype index = 0; index < devices.descriptions.size(); ++index) {
+        auto& device = devices.descriptions[index];
+        if (!device.gpu || device.backend != QStringLiteral("metal") || device.name.isEmpty()) continue;
+        if (!selfTest) selfTest = std::make_unique<GpuSelfTestGraph>();
+        // Metal reads device properties and tensor metadata here. Only an
+        // explicit unsupported result excludes a candidate before selection.
+        if (!ggml_backend_dev_supports_op(devices.handles[index], selfTest->product))
+            device.unavailableReason = QStringLiteral("metal GPU device %1 does not support required %2x%2 F32 matrix multiplication.")
+                .arg(device.name).arg(GpuSelfTestGraph::Side);
+    }
+}
+
 void verifyGpuComputation(ggml_backend_dev_t device) {
     // This intentionally bypasses the scheduler. An unsupported or failing GPU
     // operation must not be silently dispatched to CPU during this self-test.
@@ -168,23 +204,14 @@ void verifyGpuComputation(ggml_backend_dev_t device) {
         ggml_backend_dev_init(device, nullptr), &ggml_backend_free);
     if (!backend || ggml_backend_get_device(backend.get()) != device)
         throw std::runtime_error("Cannot initialize the selected GPU for its compute self-test");
-    constexpr size_t graphSize = 8;
-    const ggml_init_params params{3 * ggml_tensor_overhead() + ggml_graph_overhead_custom(graphSize, false), nullptr, true};
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init(params), &ggml_free);
-    if (!context) throw std::runtime_error("Cannot allocate GPU self-test metadata");
-    // A full small tile avoids relying on every driver supporting odd or tiny
-    // matrix dimensions. Integer-valued operands have exact float references.
-    constexpr size_t side = 32;
-    auto* a = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, side, side);
-    auto* b = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, side, side);
-    auto* product = ggml_mul_mat(context.get(), a, b);
-    if (!ggml_backend_supports_op(backend.get(), product))
+    GpuSelfTestGraph selfTest;
+    if (!ggml_backend_supports_op(backend.get(), selfTest.product))
         throw std::runtime_error("Selected GPU does not support the compute self-test operation");
-    auto* graph = ggml_new_graph_custom(context.get(), graphSize, false);
-    ggml_build_forward_expand(graph, product);
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
-        ggml_backend_alloc_ctx_tensors(context.get(), backend.get()), &ggml_backend_buffer_free);
+        ggml_backend_alloc_ctx_tensors(selfTest.context.get(), backend.get()), &ggml_backend_buffer_free);
     if (!buffer) throw std::runtime_error("Cannot allocate GPU self-test tensors");
+    // Integer-valued operands have exact float references.
+    constexpr size_t side = GpuSelfTestGraph::Side;
     std::array<float, side * side> aValues{}, bValues{}, expected{}, actual{};
     for (size_t index = 0; index < aValues.size(); ++index) {
         aValues[index] = float(index % 7 + 1);
@@ -194,12 +221,12 @@ void verifyGpuComputation(ggml_backend_dev_t device) {
         for (size_t column = 0; column < side; ++column)
             for (size_t k = 0; k < side; ++k)
                 expected[row * side + column] += aValues[column * side + k] * bValues[row * side + k];
-    ggml_backend_tensor_set(a, aValues.data(), 0, sizeof(aValues));
-    ggml_backend_tensor_set(b, bValues.data(), 0, sizeof(bValues));
-    if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS)
+    ggml_backend_tensor_set(selfTest.a, aValues.data(), 0, sizeof(aValues));
+    ggml_backend_tensor_set(selfTest.b, bValues.data(), 0, sizeof(bValues));
+    if (ggml_backend_graph_compute(backend.get(), selfTest.graph) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("Selected GPU failed its compute self-test");
     ggml_backend_synchronize(backend.get());
-    ggml_backend_tensor_get(product, actual.data(), 0, sizeof(actual));
+    ggml_backend_tensor_get(selfTest.product, actual.data(), 0, sizeof(actual));
     for (size_t index = 0; index < actual.size(); ++index) {
         if (!std::isfinite(actual[index]) || std::abs(actual[index] - expected[index]) > 0.001f)
             throw std::runtime_error("Selected GPU returned an incorrect compute self-test result");
@@ -564,8 +591,14 @@ bool EmbeddingRuntime::load(const QString& modelDir, bool textOnly, QString* err
         static QString gpuLoadError;
         if (*mode != detail::BackendMode::Cpu)
             std::call_once(gpuBackend, [] { gpuLoadError = initializeGpuBackend(); });
-        const auto devices = enumerateDevices();
-        d->selection = detail::selectBackend(*mode, packagedBackend(), devices.descriptions, gpuLoadError);
+        auto devices = enumerateDevices();
+        auto selection = detail::selectBackend(*mode, packagedBackend(), devices.descriptions, gpuLoadError);
+        // Preserve CPU mode and CPU/loader errors without probing GPU devices.
+        if (selection.gpu && packagedBackend() == QStringLiteral("metal")) {
+            checkMetalCapabilities(devices);
+            selection = detail::selectBackend(*mode, packagedBackend(), devices.descriptions, gpuLoadError);
+        }
+        d->selection = std::move(selection);
         if (!d->selection.error.isEmpty()) throw std::runtime_error(d->selection.error.toStdString());
         d->selectedDevice = devices.descriptions[d->selection.deviceIndex];
         try {
