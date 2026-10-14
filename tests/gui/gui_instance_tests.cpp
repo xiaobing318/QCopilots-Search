@@ -353,15 +353,42 @@ private slots:
             "qcs-gui/1 shutdown " + token + '\n',
             "qcs-gui/1 show " + token + "\nextra\n",
             QByteArray(129, 'x'), QByteArrayLiteral("qcs-gui/1 show ")};
-        for (const auto &request : invalid) {
+        const QStringList names{"wrong-token", "wrong-command", "trailing-data", "oversized", "incomplete"};
+        for (qsizetype index = 0; index < invalid.size(); ++index) {
+            const auto &request = invalid.at(index);
+            bool unexpectedError = false;
             QLocalSocket socket;
+            QObject::connect(&socket, &QLocalSocket::errorOccurred, &socket,
+                             [&](QLocalSocket::LocalSocketError error) {
+                // Windows can report a broken named pipe as ConnectionError.
+                if (error != QLocalSocket::PeerClosedError
+#ifdef Q_OS_WIN
+                    && error != QLocalSocket::ConnectionError
+#endif
+                    ) unexpectedError = true;
+            });
+            const auto diagnostics = [&] {
+                return QStringLiteral("%1 (%2 bytes): state=%3, error=%4 (%5), pending=%6")
+                    .arg(names.at(index)).arg(request.size()).arg(int(socket.state()))
+                    .arg(int(socket.error())).arg(socket.errorString()).arg(socket.bytesToWrite());
+            };
             socket.connectToServer(probe.endpointName());
-            QVERIFY(socket.waitForConnected(1000));
+            QVERIFY2(socket.waitForConnected(1000), qPrintable(diagnostics()));
             QCOMPARE(socket.write(request), request.size());
-            if (socket.bytesToWrite()) QVERIFY(socket.waitForBytesWritten(1000));
+            if (socket.bytesToWrite() && !socket.waitForBytesWritten(1000)) {
+                // Rejecting malformed input may close the pipe before the
+                // client's write-completion notification. A timeout with
+                // queued bytes on a live connection still fails this test.
+                QVERIFY2(!unexpectedError && (socket.bytesToWrite() == 0
+                    || socket.state() == QLocalSocket::UnconnectedState
+                    || socket.error() == QLocalSocket::PeerClosedError), qPrintable(diagnostics()));
+            }
             if (socket.state() != QLocalSocket::UnconnectedState)
-                QVERIFY(socket.waitForDisconnected(3000));
+                QVERIFY2(socket.waitForDisconnected(3000)
+                    || socket.state() == QLocalSocket::UnconnectedState, qPrintable(diagnostics()));
+            QVERIFY2(!unexpectedError, qPrintable(diagnostics()));
             QVERIFY(socket.readAll().isEmpty());
+            QCOMPARE(owner.process.state(), QProcess::Running);
         }
         owner.readStandardOutput();
         QVERIFY(!owner.standardOutput.contains("shown\n"));

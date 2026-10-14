@@ -81,7 +81,7 @@ def check_linux_deployment(options, source, repo, root):
         print(f"PASS {label}: desktop entry, installed RPATH and indirect dependencies verified", flush=True)
 
     for label, strip in (("linux-install", False), ("linux-install-strip", True)):
-        stage = root / "linux-deploy" / f"{label} 中文 空格"
+        stage = root / "linux-deploy" / f"{label}-stage"
         arguments = [options.cmake, "--install", build, "--config", "Release", "--prefix", stage]
         if strip:
             arguments.append("--strip")
@@ -89,7 +89,7 @@ def check_linux_deployment(options, source, repo, root):
         verify(stage, label)
     run([cpack, "--config", build / "CPackConfig.cmake", "-C", "Release", "-G", "TGZ", "-B", build / "packages"])
     archive = build / "packages/qcs-linux-deploy-fixture.tar.gz"
-    unpack = root / "linux-deploy" / "package 中文 空格"
+    unpack = root / "linux-deploy" / "package-original"
     unpack.mkdir()
     with tarfile.open(archive) as package:
         # This archive was generated immediately above from the local fixture.

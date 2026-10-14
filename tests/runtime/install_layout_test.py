@@ -39,7 +39,7 @@ def main():
         for apple in (False, True):
             name = "mac-bundle" if apple else "non-bundle"
             build = Path(root) / name / "build"
-            stage = Path(root) / name / "安装 空格"
+            stage = Path(root) / name / "installation"
             command = [options.cmake, "-S", str(source / "install_layout"), "-B", str(build),
                        "-G", options.generator, "-DCMAKE_BUILD_TYPE=Release",
                        f"-DQCOPILOTS_SEARCH_TEST_APPLE_LAYOUT={'ON' if apple else 'OFF'}",

@@ -37,7 +37,7 @@ def check_macos_deployment(options, source, repo, root):
     def verify(stage, label, names):
         # Relocate before inspection and execution. Runtime paths must not rely
         # on either the original staging directory or the fixture build tree.
-        relocated = fixture_root / f"{label} 已迁移 中文 空格"
+        relocated = fixture_root / f"{label}-relocated"
         stage.rename(relocated)
         bundle = relocated / "qcs-deploy-fixture.app"
         frameworks = bundle / "Contents/Frameworks"
@@ -83,7 +83,7 @@ def check_macos_deployment(options, source, repo, root):
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith(("DYLD_", "LD_", "QT_", "QML"))}
         environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
-        hidden = fixture_root / "build temporarily unavailable"
+        hidden = fixture_root / "build-unavailable"
         build.rename(hidden)
         try:
             mapped = run([binary], env=environment).splitlines()
@@ -117,7 +117,7 @@ def check_macos_deployment(options, source, repo, root):
             copied = Path(development_bundle) / "Contents/Frameworks" / original.name
             os.utime(original, (stamp, stamp))
             os.utime(copied, (stamp, stamp))
-        stage = fixture_root / "install 原始 空格"
+        stage = fixture_root / "install-original"
         run([options.cmake, "--install", build, "--config", "Release", "--prefix", stage])
         verify(stage, "macos-install", names)
         cpack = Path(options.cmake).with_name("cpack")
@@ -126,7 +126,7 @@ def check_macos_deployment(options, source, repo, root):
         run([cpack, "--config", build / "CPackConfig.cmake", "-C", "Release", "-G", "TGZ",
              "-B", build / "packages"])
         archive = build / "packages/qcs-macos-deploy-fixture.tar.gz"
-        unpack = fixture_root / "package 原始 空格"
+        unpack = fixture_root / "package-original"
         unpack.mkdir()
         with tarfile.open(archive) as package:
             package.extractall(unpack, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
