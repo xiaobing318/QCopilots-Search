@@ -191,8 +191,58 @@ def package_contract():
     return module.MODEL_ARTIFACTS, module.REFERENCE_HASHES, read_json(path)["vectors"]
 
 
+def package_program_inventory(doc, root: Path):
+    """Validate the frozen pre-execution file inventory, without reading removed installs."""
+    reference = doc.get("programInventory", {})
+    if not isinstance(reference, dict) or reference.get("stable") is not True:
+        raise ValueError("Package final program inventory is missing or was not stable")
+    path = safe_file(root, reference.get("path", ""))
+    if digest(path) != reference.get("sha256"):
+        raise ValueError("Package final program inventory bytes changed")
+    inventory = read_json(path)
+    identity = doc.get("buildIdentity", {})
+    if (type(inventory.get("schemaVersion")) is not int or inventory["schemaVersion"] != 1
+            or inventory.get("kind") != "qcs-installed-programs"
+            or inventory.get("candidateCommit") != identity.get("candidateCommit")
+            or inventory.get("candidateCommit") != doc.get("commit")
+            or inventory.get("variant") != doc.get("variant")
+            or inventory.get("packageSha256") != doc.get("packageSha256")
+            or not isinstance(inventory.get("packageSha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", inventory["packageSha256"]) is None
+            or inventory.get("applicationRoot") != doc.get("applicationRoot")):
+        raise ValueError("Package final program inventory differs from its package or candidate identity")
+    application = doc.get("applicationRoot", "")
+    path_type = PureWindowsPath if PureWindowsPath(application).is_absolute() else PurePosixPath
+    application = path_type(application)
+    if not application.is_absolute() or ".." in application.parts:
+        raise ValueError("Package final program inventory has an invalid application root")
+    programs = inventory.get("programs")
+    if not isinstance(programs, dict) or set(programs) != APPLICATIONS:
+        raise ValueError("Package final program inventory must contain exactly four application programs")
+    seen = set()
+    for name, record in programs.items():
+        relative = record.get("path")
+        if not isinstance(relative, str):
+            raise ValueError("Package final program path is missing")
+        member = PurePosixPath(relative)
+        if (member.is_absolute() or ".." in member.parts or "\\" in relative or ":" in relative
+                or member.as_posix() != relative or member.name not in (name, name + ".exe")
+                or not integer_at_least(record.get("bytes"), 1)
+                or not isinstance(record.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None):
+            raise ValueError("Package final program inventory has an invalid file record")
+        absolute = application.joinpath(*member.parts)
+        if absolute in seen:
+            raise ValueError("Package final program inventory repeats an installed file")
+        seen.add(absolute)
+    return inventory
+
+
 def package_evidence_paths(doc, root: Path):
     paths = [item["rawReply"]["path"] for item in doc.get("modelSmoke", {}).get("vectors", [])]
+    inventory = doc.get("programInventory", {}).get("path")
+    if isinstance(inventory, str):
+        paths.append(inventory)
     manifest = doc.get("licenseMaterials", {}).get("manifest")
     if isinstance(manifest, str):
         paths.append(manifest)
@@ -203,7 +253,8 @@ def package_evidence_paths(doc, root: Path):
 
 @malformed_as_error
 def validate_package_release(doc, root: Path, *, model_fingerprint=None,
-                             extraction_fingerprint=None, platform_id=None, worker_sha256=None):
+                             extraction_fingerprint=None, platform_id=None, worker_sha256=None,
+                             package_sha256=None):
     errors = []
     check(errors, doc.get("passed") is True and doc.get("releaseComplete") is True
           and doc.get("verificationScope") == "release" and doc.get("realModelRequired") is True,
@@ -223,6 +274,14 @@ def validate_package_release(doc, root: Path, *, model_fingerprint=None,
     if doc.get("commit") is not None:
         check(errors, build_identity.get("candidateCommit") == doc["commit"],
               "Package build identity differs from its verification candidate")
+    if package_sha256 is not None:
+        check(errors, doc.get("packageSha256") == package_sha256,
+              "Package verification differs from its bound package bytes")
+    inventory = None
+    try:
+        inventory = package_program_inventory(doc, root)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        errors.append("Package final program inventory is invalid: " + str(error))
     for field, relative in (("dependencyLockSha256", "dependencies.lock.json"),
                             ("variantsSha256", "config/build-variants.json")):
         check(errors, build_identity.get(field) == digest(SOURCE / relative),
@@ -367,6 +426,12 @@ def validate_package_release(doc, root: Path, *, model_fingerprint=None,
               "Package inference executable or library has no valid installed origin and content hash")
     check(errors, path_type(worker.get("path", "")).name in ("qcs-worker", "qcs-worker.exe")
           and (worker_sha256 is None or worker.get("sha256") == worker_sha256), "Package inference worker differs from the recorded executable")
+    if inventory is not None:
+        expected_worker = inventory["programs"]["qcs-worker"]
+        expected_path = application.joinpath(*PurePosixPath(expected_worker["path"]).parts)
+        check(errors, path_type(worker.get("path", "")) == expected_path
+              and worker.get("bytes") == expected_worker["bytes"] and worker.get("sha256") == expected_worker["sha256"],
+              "Package inference worker differs from the independent final program inventory")
     check(errors, linkage == "shared-backend-dispatch"
           and {"llama", "mtmd", "ggml", "ggml-base", "cpu-backend"}.issubset({item.get("role") for item in libraries}),
           "Package shared backend runtime libraries are incomplete")
@@ -535,6 +600,7 @@ def record_package(build_record: Path, package: Path, verification: Path, parent
         worker_sha256=build.get("programs", {}).get("qcs-worker", {}).get("sha256")))
     if errors:
         raise ValueError("Package release evidence is incomplete: " + "; ".join(errors))
+    final_programs = package_program_inventory(checked, verification.parent)["programs"]
     executables = {}
     with zipfile.ZipFile(package) as archive:
         for name in sorted(APPLICATIONS):
@@ -547,6 +613,9 @@ def record_package(build_record: Path, package: Path, verification: Path, parent
                     value.update(block)
             if value.hexdigest() != build.get("programs", {}).get(name, {}).get("sha256"):
                 raise ValueError(f"Packaged executable differs from its recorded build: {name}")
+            if final_programs[name] != {"path": matches[0].filename, "bytes": matches[0].file_size,
+                                        "sha256": value.hexdigest()}:
+                raise ValueError(f"Packaged executable differs from its independent final inventory: {name}")
             executables[name] = {"sha256": value.hexdigest(), "packageMember": matches[0].filename}
     root = fresh_directory(parent, "candidate-evidence")
     shutil.copytree(build_record.parent, root / "build")
@@ -592,6 +661,11 @@ def inspect_candidate(root: Path, candidate):
     errors.extend(validate_package_release(verification, root, model_fingerprint=candidate["modelFingerprint"],
         extraction_fingerprint=candidate["extractionFingerprint"], platform_id="windows-x64-cpu",
         worker_sha256=candidate.get("executables", {}).get("qcs-worker", {}).get("sha256")))
+    try:
+        final_programs = package_program_inventory(verification, root)["programs"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        errors.append("Candidate final program inventory is invalid: " + str(error))
+        final_programs = {}
     check(errors, set(candidate.get("executables", {})) == APPLICATIONS, "Candidate must contain all four application executable identities")
     with zipfile.ZipFile(package) as archive:
         for name in APPLICATIONS:
@@ -607,6 +681,9 @@ def inspect_candidate(root: Path, candidate):
             check(errors, expected.get("packageMember") == entries[0].filename
                   and expected.get("sha256") == value.hexdigest() == build.get("programs", {}).get(name, {}).get("sha256"),
                   f"Candidate executable is not the recorded build output: {name}")
+            check(errors, final_programs.get(name) == {"path": entries[0].filename, "bytes": entries[0].file_size,
+                                                     "sha256": value.hexdigest()},
+                  f"Candidate executable differs from its independent final inventory: {name}")
     return errors
 
 

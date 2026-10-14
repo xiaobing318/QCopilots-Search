@@ -122,6 +122,98 @@ class PackageVariantTests(unittest.TestCase):
     def verify_payload(self, **kwargs):
         return package.verify_gpu_payload(self.binary, self.application, self.identity, **kwargs)
 
+    def final_programs(self, binary, variant):
+        binary.mkdir(parents=True, exist_ok=True)
+        suffix = ".exe" if variant.startswith("windows-") else ""
+        paths = {}
+        for name in package.APPLICATION_PROGRAMS:
+            path = binary / (name + suffix)
+            path.write_bytes(("SYNTHETIC FINAL INSTALLED PROGRAM " + name).encode())
+            paths[name] = path
+        return paths
+
+    def test_final_program_inventory_reads_each_platform_installed_files_before_execution(self):
+        for variant, layout in (("windows-x64-cpu", "bin"), ("linux-x64-cpu", "bin"),
+                                ("macos-arm64-metal", "qcs-gui.app/Contents/MacOS")):
+            with self.subTest(variant=variant):
+                application = self.root / variant
+                binary = application / layout
+                programs = self.final_programs(binary, variant)
+                identity = {**self.identity, "variant": variant}
+                with patch.object(package.subprocess, "Popen") as start, patch.object(package.subprocess, "run") as run:
+                    inventory = package.installed_program_inventory(binary, application, identity, "a" * 64)
+                start.assert_not_called()
+                run.assert_not_called()
+                self.assertEqual(inventory["candidateCommit"], CANDIDATE)
+                self.assertEqual(inventory["variant"], variant)
+                self.assertEqual(inventory["packageSha256"], "a" * 64)
+                self.assertEqual(set(inventory["programs"]), set(package.APPLICATION_PROGRAMS))
+                for name, path in programs.items():
+                    self.assertEqual(inventory["programs"][name], {
+                        "path": path.relative_to(application).as_posix(), "bytes": path.stat().st_size,
+                        "sha256": package.file_digest(path)})
+
+    def test_final_program_inventory_requires_all_four_package_manager_owned_programs(self):
+        programs = self.final_programs(self.binary, self.identity["variant"])
+        installed = {path.resolve() for path in programs.values()}
+        for name, path in programs.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError, "verified package files"):
+                    package.installed_program_inventory(self.binary, self.application, self.identity, "a" * 64,
+                                                        installed - {path.resolve()})
+        contents = programs["qcs-cli"].read_bytes()
+        programs["qcs-cli"].write_bytes(b"")
+        with self.assertRaisesRegex(RuntimeError, "empty"):
+            package.installed_program_inventory(self.binary, self.application, self.identity, "a" * 64)
+        programs["qcs-cli"].write_bytes(contents)
+        programs["qcs-worker"].unlink()
+        with self.assertRaisesRegex(RuntimeError, "verified package files"):
+            package.installed_program_inventory(self.binary, self.application, self.identity, "a" * 64)
+
+    def test_final_program_inventory_rejects_executables_outside_application(self):
+        binary = self.root / "outside-programs"
+        self.final_programs(binary, self.identity["variant"])
+        with self.assertRaisesRegex(RuntimeError, "verified package files"):
+            package.installed_program_inventory(binary, self.application, self.identity, "a" * 64)
+
+    def test_final_program_stability_rejects_each_changed_program_and_original_package(self):
+        programs = self.final_programs(self.binary, self.identity["variant"])
+        archive = self.root / "synthetic-package.zip"
+        archive.write_bytes(b"SYNTHETIC ORIGINAL PACKAGE BYTES")
+        inventory = package.installed_program_inventory(self.binary, self.application, self.identity,
+                                                        package.file_digest(archive))
+        package.verify_program_stability(inventory, self.binary, self.application, self.identity, archive)
+        for name, path in programs.items():
+            with self.subTest(name=name):
+                original = path.read_bytes()
+                path.write_bytes(original + b"changed during verification")
+                with self.assertRaisesRegex(RuntimeError, "program bytes changed"):
+                    package.verify_program_stability(inventory, self.binary, self.application, self.identity, archive)
+                path.write_bytes(original)
+        archive.write_bytes(b"CHANGED PACKAGE BYTES")
+        with self.assertRaisesRegex(RuntimeError, "Original package bytes changed"):
+            package.verify_program_stability(inventory, self.binary, self.application, self.identity, archive)
+
+    def test_installed_source_combination_only_allows_linux_deb_and_package_manager_manifest(self):
+        archive, manifest = self.root / "original.deb", self.root / "dpkg-files.txt"
+        archive.write_bytes(b"SYNTHETIC DEB SOURCE IDENTITY")
+        manifest.write_text("/usr/bin/qcs-worker\n", encoding="utf-8")
+        with patch.object(package.sys, "platform", "linux"):
+            package.validate_installed_package_source(archive, self.application, manifest)
+            for source, listing in ((None, manifest), (archive, None),
+                                    (self.root / "absent.deb", manifest),
+                                    (archive, self.root / "absent-manifest.txt")):
+                with self.subTest(source=source, listing=listing), self.assertRaisesRegex(RuntimeError, "original DEB"):
+                    package.validate_installed_package_source(source, self.application, listing)
+            for suffix in (".zip", ".exe", ".tar.gz", ".dmg"):
+                wrong = self.root / ("wrong" + suffix)
+                wrong.write_bytes(b"NOT A DEB")
+                with self.subTest(suffix=suffix), self.assertRaisesRegex(RuntimeError, "original DEB"):
+                    package.validate_installed_package_source(wrong, self.application, manifest)
+        for platform in ("win32", "darwin"):
+            with patch.object(package.sys, "platform", platform), self.assertRaisesRegex(RuntimeError, "requires Linux"):
+                package.validate_installed_package_source(archive, self.application, manifest)
+
     def test_relocated_identity_preserves_candidate_variant_and_manifest_hashes(self):
         result = self.validate_identity(expected_variant="windows-x64-cuda-12.4")
         self.assertEqual(result, self.identity)

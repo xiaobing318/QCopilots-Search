@@ -22,6 +22,7 @@ deb = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(deb)
 VARIANTS = json.loads((deb.SOURCE / "config/build-variants.json").read_text(encoding="utf-8"))["variants"]
 CUDA = next(variant for variant in VARIANTS if variant["os"] == "linux" and variant["backend"] == "cuda")
+HEAD = "a" * 40
 
 
 class DebContainerTests(unittest.TestCase):
@@ -50,7 +51,8 @@ class DebContainerTests(unittest.TestCase):
             "RUNNER_ENVIRONMENT": "github-hosted", "GITHUB_RUN_ID": "12", "GITHUB_RUN_ATTEMPT": "2",
             "GITHUB_WORKSPACE": str(self.workspace), "RUNNER_TEMP": str(self.runner),
             "QCOPILOTS_SEARCH_VARIANT": CUDA["id"], "QCOPILOTS_SEARCH_CI_ID": CUDA["id"],
-            "QCOPILOTS_SEARCH_CI_CONTAINER_IMAGE": CUDA["container"]}
+            "QCOPILOTS_SEARCH_CI_CONTAINER_IMAGE": CUDA["container"],
+            "QCOPILOTS_SEARCH_CANDIDATE_HEAD": HEAD}
         self.docker = self.base / ".dockerenv"
         self.docker.touch()
         self.os_release = self.base / "os-release"
@@ -133,10 +135,21 @@ class DebContainerTests(unittest.TestCase):
                 deb.job_container_context(self.args)
 
     def test_host_docker_uses_manifest_baseline_and_correct_ubuntu_runtime_packages(self):
+        verifier_spec = importlib.util.spec_from_file_location("qcs_deb_actual_verifier", deb.SOURCE / "tools/qcs-verify-package.py")
+        verifier = importlib.util.module_from_spec(verifier_spec)
+        verifier_spec.loader.exec_module(verifier)
+        for arguments in (("init",), ("add", "config/build-variants.json"),
+                          ("-c", "user.name=QCS fixture", "-c", "user.email=fixture@example.invalid",
+                           "-c", "commit.gpgsign=false", "commit", "-m", "Isolated candidate fixture")):
+            result = subprocess.run(["git", "-C", str(self.source), *arguments], capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        candidate = subprocess.check_output(["git", "-C", str(self.source), "rev-parse", "HEAD"], text=True).strip()
         for identifier, baseline in (("linux-x64-cpu", "ubuntu-22.04"), ("linux-x64-rocm", "ubuntu-24.04")):
             argv = ["qcs-deb-ci", "--build-root", str(self.root), "--package-file", str(self.package),
                     "--model-dir", str(self.models), "--variant", identifier]
-            with self.subTest(variant=identifier), self.guarded({"QCOPILOTS_SEARCH_CI_CONTAINER": ""}), \
+            with self.subTest(variant=identifier), self.guarded({"QCOPILOTS_SEARCH_CI_CONTAINER": "",
+                    "QCOPILOTS_SEARCH_CANDIDATE_HEAD": candidate, "QCOPILOTS_SEARCH_CANDIDATE_COMMIT": ""}), \
                     mock.patch.object(deb.sys, "argv", argv), \
                     mock.patch.object(deb.os, "geteuid", return_value=1000, create=True), \
                     mock.patch.object(deb.os, "getegid", return_value=1000, create=True), \
@@ -150,12 +163,21 @@ class DebContainerTests(unittest.TestCase):
                 self.assertIn(deb.IMAGES[baseline], command)
                 self.assertIn("QCOPILOTS_SEARCH_VARIANT=" + identifier, command)
                 self.assertIn("QCOPILOTS_SEARCH_CI_ID=" + identifier, command)
+                forwarded = dict(str(command[index + 1]).split("=", 1)
+                                 for index, argument in enumerate(command) if argument == "--env")
+                self.assertEqual(forwarded["QCOPILOTS_SEARCH_CANDIDATE_HEAD"], candidate)
+                self.assertEqual(forwarded["QCOPILOTS_SEARCH_CI_COMMIT"], candidate)
+                self.assertNotIn("QCOPILOTS_SEARCH_CANDIDATE_COMMIT", forwarded)
+                self.assertTrue(all(forwarded.values()), "Docker must not inject empty identity declarations")
                 if baseline == "ubuntu-24.04":
                     self.assertIn("libasound2t64", command[-1])
                     self.assertIn("libglib2.0-0t64", command[-1])
                 else:
                     self.assertIn("libasound2 ", command[-1])
                     self.assertNotIn("t64", command[-1])
+            identity = verifier.package_source_identity(self.source, forwarded)
+            self.assertEqual(identity["commit"], candidate)
+            self.assertFalse(identity["workingTreeModified"])
 
     def test_unsupported_linux_baseline_is_rejected(self):
         variants = [{**variant, "runner": "ubuntu-26.04"} for variant in VARIANTS]
@@ -194,7 +216,8 @@ class DebContainerTests(unittest.TestCase):
             self.assertTrue(Path(options["environment"]["QCOPILOTS_SEARCH_TEST_ROOT"]).is_relative_to(self.runner))
         self.assertEqual(stat.S_IMODE(self.root.parent.stat().st_mode), original)
 
-    def exercise_install(self, *, complete=True, apt_error=False, preserve=True, cleanup_error=False):
+    def exercise_install(self, *, complete=True, apt_error=False, preserve=True, cleanup_error=False,
+                         environment=None, smoke_identity=None):
         self.report.mkdir(parents=True)
         work = self.runner / "isolated-work"
         work.mkdir()
@@ -223,7 +246,9 @@ class DebContainerTests(unittest.TestCase):
                 (profile / "user-data").write_text("retain me", encoding="utf-8")
                 (self.report / "smoke").mkdir()
                 (self.report / "smoke/report.json").write_text(json.dumps({"passed": complete,
-                    "releaseComplete": complete, "modelSmoke": {"passed": complete}}), encoding="utf-8")
+                    "releaseComplete": complete, "modelSmoke": {"passed": complete},
+                    "commit": HEAD, "buildIdentity": {"candidateCommit": HEAD},
+                    "packageSha256": deb.digest(self.package), **(smoke_identity or {})}), encoding="utf-8")
             elif command[:2] == ["dpkg", "--remove"]:
                 self.payload.unlink(missing_ok=True)
                 if not preserve and (work / "user-profile/user-data").exists():
@@ -235,7 +260,7 @@ class DebContainerTests(unittest.TestCase):
         groups = mock.Mock()
         groups.getgrgid.side_effect = KeyError("unused group")
         groups.getgrnam.side_effect = KeyError("userdel already removed group")
-        with self.guarded(), mock.patch.dict(sys.modules, {"grp": groups}), \
+        with self.guarded(environment), mock.patch.dict(sys.modules, {"grp": groups}), \
                 mock.patch.object(deb, "run", side_effect=fake_run), mock.patch("builtins.print"):
             try:
                 deb.install_and_verify(self.package, self.report, work, self.source, self.models,
@@ -251,6 +276,8 @@ class DebContainerTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(report["passed"])
         self.assertTrue(report["releaseComplete"])
+        self.assertEqual(report["commit"], HEAD)
+        self.assertEqual(report["packageSha256"], deb.digest(self.package))
         self.assertFalse(self.payload.exists())
         self.assertEqual((work / "user-profile/user-data").read_text(encoding="utf-8"), "retain me")
         self.assertEqual(report["retainedProfileFiles"], 2)
@@ -258,11 +285,56 @@ class DebContainerTests(unittest.TestCase):
         self.assertEqual(command[1:4], ["--user", "qcs-deb-fixture", "--"])
         self.assertEqual(command[command.index("--model-dir") + 1], str(self.models))
         self.assertEqual(command[command.index("--installed-root") + 1], "/usr")
+        self.assertEqual(command[command.index("--package-file") + 1], str(self.package))
         self.assertEqual(command[command.index("--variant") + 1], CUDA["id"])
         useradd = next(command for command, _ in calls if command[0] == "useradd")
         self.assertEqual(useradd[useradd.index("--home-dir") + 1], str(work / "home"))
         self.assertTrue(any(command[0] == "userdel" for command, _ in calls))
         self.assertFalse(any(command[0] in ("docker", "groupdel") for command, _ in calls))
+
+    def test_verified_smoke_binds_candidate_without_environment_declaration(self):
+        report, _, error, _ = self.exercise_install(environment={"QCOPILOTS_SEARCH_CANDIDATE_HEAD": ""})
+        self.assertIsNone(error)
+        self.assertEqual(report["commit"], HEAD)
+        self.assertTrue(report["passed"])
+
+    def test_matching_candidate_aliases_bind_the_same_verified_commit(self):
+        report, _, error, _ = self.exercise_install(environment={
+            "QCOPILOTS_SEARCH_CANDIDATE_COMMIT": HEAD, "QCOPILOTS_SEARCH_CI_COMMIT": HEAD})
+        self.assertIsNone(error)
+        self.assertEqual(report["commit"], HEAD)
+
+    def test_conflicting_candidate_alias_cannot_pass_and_removes_installation(self):
+        report, calls, error, _ = self.exercise_install(environment={"QCOPILOTS_SEARCH_CANDIDATE_COMMIT": "b" * 40})
+        self.assertFalse(report["passed"])
+        self.assertIn("QCOPILOTS_SEARCH_CANDIDATE_COMMIT differs", error)
+        self.assertTrue(any(command[:2] == ["dpkg", "--remove"] for command, _ in calls))
+
+    def test_head_declaration_must_match_verified_smoke_commit(self):
+        report, _, error, _ = self.exercise_install(smoke_identity={
+            "commit": "b" * 40, "buildIdentity": {"candidateCommit": "b" * 40}})
+        self.assertFalse(report["passed"])
+        self.assertIn("QCOPILOTS_SEARCH_CANDIDATE_HEAD differs", error)
+
+    def test_ci_commit_alias_cannot_override_another_verified_candidate(self):
+        report, _, error, _ = self.exercise_install(environment={"QCOPILOTS_SEARCH_CI_COMMIT": "b" * 40})
+        self.assertFalse(report["passed"])
+        self.assertIn("QCOPILOTS_SEARCH_CI_COMMIT differs", error)
+
+    def test_smoke_requires_actual_verified_commit(self):
+        report, _, error, _ = self.exercise_install(smoke_identity={"commit": None})
+        self.assertFalse(report["passed"])
+        self.assertIn("no verified candidate commit", error)
+
+    def test_embedded_candidate_must_match_verified_smoke_commit(self):
+        report, _, error, _ = self.exercise_install(smoke_identity={"buildIdentity": {"candidateCommit": "b" * 40}})
+        self.assertFalse(report["passed"])
+        self.assertIn("embedded candidate differs", error)
+
+    def test_smoke_must_bind_the_original_deb_bytes(self):
+        report, _, error, _ = self.exercise_install(smoke_identity={"packageSha256": "0" * 64})
+        self.assertFalse(report["passed"])
+        self.assertIn("digest differs", error)
 
     def test_dependency_failure_removes_partial_installation(self):
         report, calls, error, _ = self.exercise_install(apt_error=True)

@@ -70,7 +70,38 @@ def package_license_fixture(root, application):
             "installedManifestPath": str(application / "share/qcs/licenses/qcs-runtime" / manifest.name)}
 
 
-def package_release_fixture(root, *, worker=None, model_fingerprint="synthetic-model-fingerprint",
+def write_program_inventory(root, report, programs=None):
+    """Explicitly capture synthetic installed files after a test changes identity."""
+    worker = Path(report["modelSmoke"]["runtime"]["workerExecutable"]["path"])
+    application = Path(report["applicationRoot"]).resolve()
+    if programs is None:
+        programs = {name: worker.parent / (name + worker.suffix) for name in (
+            "qcs-gui", "qcs-service", "qcs-worker", "qcs-cli")}
+    inventory = {"schemaVersion": 1, "kind": "qcs-installed-programs",
+        "candidateCommit": report["buildIdentity"]["candidateCommit"],
+        "variant": report["variant"], "packageSha256": report["packageSha256"],
+        "applicationRoot": report["applicationRoot"], "programs": {
+            name: {"path": path.resolve().relative_to(application).as_posix(),
+                "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for name, path in programs.items()}}
+    path = root / "installed-programs.json"
+    path.write_text(json.dumps(inventory), encoding="utf-8")
+    report["programInventory"] = {"path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                  "stable": True}
+    return inventory
+
+
+def use_posix_program_fixture(report):
+    """Give cross-platform validator fixtures their actual installed basenames."""
+    worker = report["modelSmoke"]["runtime"]["workerExecutable"]
+    directory = Path(worker["path"]).parent
+    for name in ("qcs-gui", "qcs-service", "qcs-worker", "qcs-cli"):
+        (directory / name).write_bytes((directory / (name + ".exe")).read_bytes())
+    worker["path"] = str(directory / "qcs-worker")
+
+
+def package_release_fixture(root, *, worker=None, application_root=None,
+                            model_fingerprint="synthetic-model-fingerprint",
                             extraction_fingerprint="synthetic-extraction-fingerprint"):
     """Synthetic verifier input using immutable vectors, never an inference run."""
     root.mkdir(parents=True, exist_ok=True)
@@ -78,7 +109,11 @@ def package_release_fixture(root, *, worker=None, model_fingerprint="synthetic-m
         worker = root / "synthetic application 中文" / "qcs-worker.exe"
         worker.parent.mkdir()
         worker.write_bytes(b"SYNTHETIC VALIDATOR WORKER, NOT AN EXECUTABLE")
-    application = worker.parent.resolve()
+    application = Path(application_root or worker.parent).resolve()
+    for name in ("qcs-gui", "qcs-service", "qcs-cli"):
+        path = worker.parent / (name + worker.suffix)
+        if not path.exists():
+            path.write_bytes(b"SYNTHETIC VALIDATOR PROGRAM, NOT AN EXECUTABLE " + name.encode())
     fixtures = Path(__file__).resolve().parents[2] / "tests/runtime/fixtures"
     references = json.loads((fixtures / "vectors.json").read_text(encoding="utf-8"))["vectors"]
     vectors = []
@@ -118,7 +153,8 @@ def package_release_fixture(root, *, worker=None, model_fingerprint="synthetic-m
         "packagedBackend": "cpu", "selectedBackend": "cpu", "deviceName": "CPU",
         "deviceDescription": "Synthetic CPU fixture", "gpuSelected": False,
         "fallbackReason": "", "loaded": True}
-    return {"syntheticValidatorFixture": True, "passed": True, "releaseComplete": True,
+    report = {"syntheticValidatorFixture": True, "passed": True, "releaseComplete": True,
+            "commit": "1" * 40, "packageSha256": hashlib.sha256(b"SYNTHETIC VALIDATOR PACKAGE").hexdigest(),
             "variant": "windows-x64-cpu", "buildIdentity": {
                 "schemaVersion": 1, "version": "0.1.0", "variant": "windows-x64-cpu", "backend": "cpu",
                 "configuration": "Release", "candidateCommit": "1" * 40, "workingTreeModified": False,
@@ -145,6 +181,8 @@ def package_release_fixture(root, *, worker=None, model_fingerprint="synthetic-m
                                          "sha256": hashlib.sha256(worker.read_bytes()).hexdigest()},
                     "libraries": libraries},
                 "serviceSemantic": {"semantic": True, "warning": "", "hits": [{"path": "synthetic-notes.txt"}]}}}
+    write_program_inventory(root, report)
+    return report
 
 
 class PackageReleaseEvidenceTests(unittest.TestCase):
@@ -176,8 +214,143 @@ class PackageReleaseEvidenceTests(unittest.TestCase):
                 raw["result"]["segments"][0]["embedding"] = vector["embedding"]
         self.change_raw(vector, update)
 
+    def inspect_inventory_change(self, change):
+        """Rehash only an explicitly altered synthetic inventory, then restore it."""
+        changed = deepcopy(self.doc)
+        path = self.root / changed["programInventory"]["path"]
+        original = path.read_bytes()
+        inventory = json.loads(original)
+        change(inventory)
+        try:
+            path.write_text(json.dumps(inventory), encoding="utf-8")
+            changed["programInventory"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            return self.inspect(changed)
+        finally:
+            path.write_bytes(original)
+
     def test_complete_synthetic_golden_reports_validate_without_running_models(self):
         self.assertEqual(self.inspect(), [])
+
+    def test_installed_program_inventory_is_required_and_independent(self):
+        self.assertIn("installed-programs.json", evidence.package_evidence_paths(self.doc, self.root))
+        changed = deepcopy(self.doc)
+        changed.pop("programInventory")
+        self.assertTrue(self.inspect(changed))
+        for value in (None, [], {}, True, {"stable": True}):
+            with self.subTest(value=value):
+                changed = deepcopy(self.doc)
+                changed["programInventory"] = value
+                self.assertTrue(self.inspect(changed))
+        (self.root / self.doc["programInventory"]["path"]).unlink()
+        self.assertTrue(self.inspect())
+
+    def test_installed_program_inventory_must_be_byte_bound(self):
+        changed = deepcopy(self.doc)
+        changed["programInventory"]["sha256"] = "0" * 64
+        self.assertTrue(self.inspect(changed))
+        inventory = self.root / self.doc["programInventory"]["path"]
+        inventory.write_bytes(inventory.read_bytes() + b"\n")
+        self.assertTrue(self.inspect())
+
+    def test_installed_program_inventory_requires_strict_stability(self):
+        for value in (None, False, 0, 1, "true", [], {}):
+            with self.subTest(value=value):
+                changed = deepcopy(self.doc)
+                changed["programInventory"]["stable"] = value
+                self.assertTrue(self.inspect(changed))
+        self.doc["programInventory"].pop("stable")
+        self.assertTrue(self.inspect())
+
+    def test_installed_program_inventory_paths_cannot_escape_or_alias_report_root(self):
+        for value in ("../installed-programs.json", str(self.root / "installed-programs.json"),
+                      "nested/../../installed-programs.json", "./installed-programs.json",
+                      "nested\\installed-programs.json", "installed-programs.json:stream"):
+            with self.subTest(value=value):
+                changed = deepcopy(self.doc)
+                changed["programInventory"]["path"] = value
+                self.assertTrue(self.inspect(changed))
+
+    def test_rehashed_inventory_must_match_candidate_variant_package_and_application(self):
+        for field, value in (("schemaVersion", 2), ("kind", "other-programs"),
+                             ("candidateCommit", "2" * 40), ("variant", "linux-x64-cpu"),
+                             ("packageSha256", "0" * 64),
+                             ("applicationRoot", str(self.root / "other application"))):
+            with self.subTest(field=field):
+                self.assertTrue(self.inspect_inventory_change(lambda inventory: inventory.__setitem__(field, value)))
+
+    def test_package_hash_is_required_and_checked_against_external_bytes(self):
+        self.assertEqual(evidence.validate_package_release(self.doc, self.root,
+            package_sha256=self.doc["packageSha256"]), [])
+        self.assertTrue(evidence.validate_package_release(self.doc, self.root, package_sha256="0" * 64))
+        for value in (None, "", "not-a-digest", "0" * 64):
+            with self.subTest(value=value):
+                changed = deepcopy(self.doc)
+                changed["packageSha256"] = value
+                self.assertTrue(self.inspect(changed))
+
+    def test_installed_program_inventory_requires_exactly_four_programs(self):
+        for name in ("qcs-gui", "qcs-service", "qcs-worker", "qcs-cli"):
+            with self.subTest(missing=name):
+                self.assertTrue(self.inspect_inventory_change(lambda inventory: inventory["programs"].pop(name)))
+        self.assertTrue(self.inspect_inventory_change(lambda inventory: inventory["programs"].__setitem__(
+            "unexpected-program", deepcopy(inventory["programs"]["qcs-cli"]))))
+        for value in (None, [], "four programs", {}):
+            with self.subTest(programs=value):
+                self.assertTrue(self.inspect_inventory_change(lambda inventory: inventory.__setitem__("programs", value)))
+
+    def test_installed_program_records_require_relative_paths_sizes_and_hashes(self):
+        invalid = (("path", "../qcs-cli.exe"), ("path", "/qcs-cli.exe"),
+                   ("path", "C:/qcs-cli.exe"), ("path", "bin\\qcs-cli.exe"),
+                   ("path", "./qcs-cli.exe"), ("path", "bin/../qcs-cli.exe"),
+                   ("path", "qcs-cli.exe:stream"), ("bytes", 0), ("bytes", True),
+                   ("bytes", 1.5), ("sha256", "not-a-digest"))
+        for field, value in invalid:
+            with self.subTest(field=field, value=value):
+                self.assertTrue(self.inspect_inventory_change(
+                    lambda inventory: inventory["programs"]["qcs-cli"].__setitem__(field, value)))
+        self.assertTrue(self.inspect_inventory_change(lambda inventory: inventory["programs"]["qcs-cli"].update(
+            inventory["programs"]["qcs-worker"])))
+
+    def test_runtime_worker_must_match_independent_inventory_path_size_and_hash(self):
+        worker = self.doc["modelSmoke"]["runtime"]["workerExecutable"]
+        for field, value in (("path", str(Path(self.doc["applicationRoot"]) / "other/qcs-worker.exe")),
+                             ("bytes", worker["bytes"] + 1), ("sha256", "0" * 64)):
+            with self.subTest(field=field):
+                changed = deepcopy(self.doc)
+                changed["modelSmoke"]["runtime"]["workerExecutable"][field] = value
+                self.assertTrue(self.inspect(changed))
+                self.assertTrue(self.inspect_inventory_change(lambda inventory: inventory["programs"]["qcs-worker"].__setitem__(
+                    field, "other/qcs-worker.exe" if field == "path" else value)))
+
+    def test_preserved_inventory_does_not_require_original_installation_to_exist(self):
+        inventory = json.loads((self.root / "installed-programs.json").read_text(encoding="utf-8"))
+        application = Path(self.doc["applicationRoot"])
+        for record in inventory["programs"].values():
+            (application / record["path"]).unlink()
+        self.assertEqual(self.inspect(), [])
+
+    def test_linux_and_macos_accept_deployed_bytes_distinct_from_raw_build(self):
+        build_worker = self.root / "synthetic-raw-build-worker"
+        build_worker.write_bytes(b"SYNTHETIC RAW BUILD BEFORE RPATH STRIP OR SIGNING")
+        build_hash = hashlib.sha256(build_worker.read_bytes()).hexdigest()
+        for variant, backend, architecture in (("linux-x64-cpu", "cpu", "x86_64"),
+                                                ("macos-arm64-metal", "metal", "arm64")):
+            with self.subTest(variant=variant):
+                changed = deepcopy(self.doc)
+                runtime = changed["modelSmoke"]["runtime"]
+                changed["variant"] = variant
+                changed["buildIdentity"].update({"variant": variant, "backend": backend})
+                runtime.update({"architecture": architecture,
+                    "cpuDispatch": {"x64": architecture == "x86_64", "arm64": False}})
+                for diagnostics in (runtime["diagnostics"], changed["backendVerification"]["cpu"]["diagnostics"],
+                                    changed["backendVerification"]["strictGpu"]["diagnostics"]):
+                    diagnostics.update({"buildVariant": variant, "packagedBackend": backend})
+                if backend != "cpu":
+                    runtime["diagnostics"]["fallbackReason"] = "No GPU in synthetic deployment fixture"
+                self.assertNotEqual(build_hash, runtime["workerExecutable"]["sha256"])
+                use_posix_program_fixture(changed)
+                write_program_inventory(self.root, changed)
+                self.assertEqual(self.inspect(changed, platform_id=variant), [])
 
     def test_apple_silicon_uses_shared_metal_libraries_without_x64_cpu_dispatch(self):
         runtime = self.doc["modelSmoke"]["runtime"]
@@ -189,6 +362,8 @@ class PackageReleaseEvidenceTests(unittest.TestCase):
             diagnostics.update({"buildVariant": "macos-arm64-metal", "packagedBackend": "metal"})
         runtime["diagnostics"]["fallbackReason"] = "No compatible Metal device in synthetic fixture"
         self.doc["backendVerification"]["strictGpu"]["reason"] = runtime["diagnostics"]["fallbackReason"]
+        use_posix_program_fixture(self.doc)
+        write_program_inventory(self.root, self.doc)
         self.assertEqual(self.inspect(platform_id="macos-arm64-metal"), [])
         for dispatch in ({"x64": True, "arm64": False}, {"x64": False, "arm64": True}):
             with self.subTest(dispatch=dispatch):
@@ -231,6 +406,8 @@ class PackageReleaseEvidenceTests(unittest.TestCase):
                     diagnostics.update({"buildVariant": variant, "packagedBackend": backend})
                 if backend != "cpu":
                     runtime["diagnostics"]["fallbackReason"] = "No GPU in synthetic producer contract test"
+                if host != "win32":
+                    use_posix_program_fixture(changed)
                 application = Path(changed["applicationRoot"])
                 libraries = [item["path"] for item in runtime["libraries"]]
                 with mock.patch.object(producer.platform, "machine", return_value=architecture), \
@@ -239,6 +416,7 @@ class PackageReleaseEvidenceTests(unittest.TestCase):
                     changed["modelSmoke"]["runtime"] = producer.inference_runtime_origins(
                         object(), Path(runtime["workerExecutable"]["path"]), application,
                         diagnostics=runtime["diagnostics"])
+                write_program_inventory(self.root, changed)
                 self.assertEqual(self.inspect(changed, platform_id=variant), [])
 
     def test_build_variant_and_backend_diagnostics_are_required(self):
@@ -1218,18 +1396,29 @@ class ExecutionProvenanceTests(unittest.TestCase):
                                      self.programs, self.build_command,
                                      working_directory=self.working_directory)
 
-    def candidate(self):
+    def candidate(self, *, changed_program=None):
         build_path, build = self.build()
+        if changed_program is not None:
+            program = self.programs[changed_program]
+            program.write_bytes(program.read_bytes() + b" SYNTHETIC CHANGE AFTER RECORDED BUILD")
         package = self.root / "qcs-synthetic-validator.zip"
         with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_STORED) as archive:
             for name, path in self.programs.items():
                 archive.write(path, "bin/" + name + ".exe")
+        application = self.root / "synthetic installed application"
+        with zipfile.ZipFile(package) as archive:
+            archive.extractall(application)
         verification = self.root / "synthetic-package-verification.json"
-        report = package_release_fixture(self.root, worker=self.programs["qcs-worker"])
+        report = package_release_fixture(self.root, worker=application / "bin/qcs-worker.exe",
+                                         application_root=application)
         report.update({"commit": build["identity"]["checkoutCommit"], "workingTreeModified": False,
             "packageSha256": hashlib.sha256(package.read_bytes()).hexdigest(),
             "checks": [{"name": f"synthetic-validator-{n}", "passed": True} for n in range(9)]})
         report["buildIdentity"]["candidateCommit"] = build["identity"]["checkoutCommit"]
+        write_program_inventory(self.root, report)
+        if changed_program is not None:
+            self.assertEqual(evidence.validate_package_release(report, self.root,
+                package_sha256=hashlib.sha256(package.read_bytes()).hexdigest()), [])
         verification.write_text(json.dumps(report), encoding="utf-8")
         return evidence.record_package(build_path, package, verification,
             self.root / "recorded candidates", "synthetic-model-fingerprint", "synthetic-extraction-fingerprint")
@@ -1268,6 +1457,92 @@ class ExecutionProvenanceTests(unittest.TestCase):
         self.assertEqual(evidence.inspect_candidate(path.parent, candidate), [])
         build_path = path.parent / candidate["buildProvenance"]["path"]
         self.assertEqual(evidence.verified_build(build_path.parent, evidence.read_json(build_path)), [])
+
+    def test_record_package_rejects_self_consistent_program_changes_after_build(self):
+        parent = self.root
+        for name in sorted(self.programs):
+            with self.subTest(program=name):
+                self.root = parent / name
+                self.root.mkdir()
+                expected = ("Package inference worker differs from the recorded executable"
+                    if name == "qcs-worker" else f"Packaged executable differs from its recorded build: {name}")
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.candidate(changed_program=name)
+
+    def test_inspect_candidate_keeps_original_build_binding_after_all_package_hashes_change(self):
+        parent = self.root
+        for name in sorted(self.programs):
+            with self.subTest(program=name):
+                self.root = parent / name
+                self.root.mkdir()
+                path, candidate = self.candidate()
+                root = path.parent
+                package = root / candidate["package"]
+                member = candidate["executables"][name]["packageMember"]
+                with zipfile.ZipFile(package) as archive:
+                    members = {entry.filename: archive.read(entry) for entry in archive.infolist()}
+                members[member] += b" SYNTHETIC REPLACEMENT AFTER CAPTURE"
+                with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_STORED) as archive:
+                    for relative, payload in members.items():
+                        archive.writestr(relative, payload)
+                program_hash = hashlib.sha256(members[member]).hexdigest()
+                package_hash = hashlib.sha256(package.read_bytes()).hexdigest()
+                candidate["packageSha256"] = package_hash
+                candidate["executables"][name]["sha256"] = program_hash
+                report_path = root / candidate["verification"]
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                report["packageSha256"] = package_hash
+                inventory_path = root / report["programInventory"]["path"]
+                inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+                inventory["packageSha256"] = package_hash
+                inventory["programs"][name].update({"bytes": len(members[member]), "sha256": program_hash})
+                inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+                report["programInventory"]["sha256"] = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
+                if name == "qcs-worker":
+                    report["modelSmoke"]["runtime"]["workerExecutable"].update(
+                        {"bytes": len(members[member]), "sha256": program_hash})
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+                candidate["files"] = [evidence.file_record(root, root / entry["path"])
+                                      for entry in candidate["files"]]
+                self.assertEqual(evidence.verify_manifest(root, candidate), [])
+                build_path = root / candidate["buildProvenance"]["path"]
+                self.assertEqual(evidence.verified_build(build_path.parent, evidence.read_json(build_path)), [])
+                self.assertEqual(evidence.validate_package_release(report, root,
+                    package_sha256=package_hash), [])
+                self.assertIn(f"Candidate executable is not the recorded build output: {name}",
+                              evidence.inspect_candidate(root, candidate))
+
+    def test_package_and_candidate_reject_rehashed_inventory_that_disagrees_with_unchanged_zip(self):
+        parent = self.root
+        for field in ("path", "bytes", "sha256"):
+            with self.subTest(field=field):
+                self.root = parent / field
+                self.root.mkdir()
+                path, candidate = self.candidate()
+                root = path.parent
+                build_path = root / candidate["buildProvenance"]["path"]
+                report_path = root / candidate["verification"]
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                inventory_path = root / report["programInventory"]["path"]
+                inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+                record = inventory["programs"]["qcs-gui"]
+                record[field] = {"path": "other/qcs-gui.exe", "bytes": record["bytes"] + 1,
+                                 "sha256": "0" * 64}[field]
+                inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+                report["programInventory"]["sha256"] = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+                candidate["files"] = [evidence.file_record(root, root / entry["path"])
+                                      for entry in candidate["files"]]
+                self.assertEqual(evidence.verify_manifest(root, candidate), [])
+                self.assertEqual(evidence.verified_build(build_path.parent, evidence.read_json(build_path)), [])
+                self.assertEqual(evidence.validate_package_release(report, root,
+                    package_sha256=candidate["packageSha256"]), [])
+                with self.assertRaisesRegex(ValueError,
+                        "Packaged executable differs from its independent final inventory: qcs-gui"):
+                    evidence.record_package(build_path, root / candidate["package"], report_path,
+                        self.root / "rejected candidates", "synthetic-model-fingerprint", "synthetic-extraction-fingerprint")
+                self.assertEqual(evidence.inspect_candidate(root, candidate),
+                    ["Candidate executable differs from its independent final inventory: qcs-gui"])
 
     def test_candidate_archive_tampering_is_detected(self):
         path, candidate = self.candidate()

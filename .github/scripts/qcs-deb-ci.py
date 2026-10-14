@@ -97,6 +97,7 @@ def install_and_verify(package, report_root, work, source, models, user_id, grou
               "containerImage": image, "packageSha256": digest(package),
               "variantId": variant,
               "commit": os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_COMMIT") or
+                        os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD") or
                         os.environ.get("QCOPILOTS_SEARCH_CI_COMMIT"), "checks": []}
     installed = False
     user_created = False
@@ -147,13 +148,25 @@ def install_and_verify(package, report_root, work, source, models, user_id, grou
         run(["runuser", "--user", user, "--", "xvfb-run", "--auto-servernum",
              "--server-args=-screen 0 1600x1000x24", "python3",
              source / "tools/qcs-verify-package.py",
-             "--build-root", work, "--installed-root", "/usr",
+             "--build-root", work, "--package-file", package, "--installed-root", "/usr",
              "--installed-manifest", manifest, "--profile-dir", profile,
              "--model-dir", models, "--report-dir", report_root / "smoke", *variant_arguments], env=environment)
         smoke = json.loads((report_root / "smoke/report.json").read_text(encoding="utf-8"))
         if (smoke.get("passed") is not True or smoke.get("releaseComplete") is not True
                 or smoke.get("modelSmoke", {}).get("passed") is not True):
             raise RuntimeError("The installed DEB failed the complete package and real-model smoke")
+        verified_commit = smoke.get("commit")
+        if not isinstance(verified_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", verified_commit):
+            raise RuntimeError("The installed DEB smoke has no verified candidate commit")
+        if smoke.get("buildIdentity", {}).get("candidateCommit") != verified_commit:
+            raise RuntimeError("The installed DEB embedded candidate differs from its verified smoke commit")
+        for name in ("QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD",
+                     "QCOPILOTS_SEARCH_CI_COMMIT"):
+            if os.environ.get(name) and os.environ[name] != verified_commit:
+                raise RuntimeError(f"{name} differs from the installed DEB verified smoke commit")
+        if smoke.get("packageSha256") != report["packageSha256"]:
+            raise RuntimeError("The installed DEB smoke package digest differs from the original installer")
+        report["commit"] = verified_commit
         report["checks"].append("non-root GUI, service, worker, OCR, PDF, media, real-model inference and search smoke passed")
         sentinel = profile / "qcs-uninstall-preservation.txt"
         sentinel.write_text(str(uuid.uuid4()), encoding="utf-8")
@@ -363,14 +376,21 @@ apt-get install --yes --no-install-recommends python3 git xvfb xauth ca-certific
   {audio_package} libpulse0 fonts-noto-cjk fonts-dejavu-core
 exec python3 /source/.github/scripts/qcs-deb-ci.py --inside-container
 """
+    candidate_environment = {name: os.environ[name] for name in
+        ("QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD", "QCOPILOTS_SEARCH_CI_COMMIT")
+        if os.environ.get(name)}
+    if "QCOPILOTS_SEARCH_CI_COMMIT" not in candidate_environment:
+        candidate = (candidate_environment.get("QCOPILOTS_SEARCH_CANDIDATE_COMMIT") or
+                     candidate_environment.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD"))
+        if candidate:
+            candidate_environment["QCOPILOTS_SEARCH_CI_COMMIT"] = candidate
     command = ["docker", "run", "--rm", "--platform", "linux/amd64",
                "--env", "QCOPILOTS_SEARCH_DEB_CONTAINER=1",
                "--env", "QCOPILOTS_SEARCH_VARIANT=" + variant["id"],
                "--env", "QCOPILOTS_SEARCH_CI_ID=" + variant["id"],
                "--env", "QCOPILOTS_SEARCH_HOST_UID=" + str(os.getuid()),
                "--env", "QCOPILOTS_SEARCH_HOST_GID=" + str(os.getgid()),
-               "--env", "QCOPILOTS_SEARCH_CI_COMMIT=" + (os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_COMMIT") or
-                                                        os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD", "")),
+               *(argument for name, value in candidate_environment.items() for argument in ("--env", name + "=" + value)),
                "--mount", f"type=bind,source={SOURCE},target=/source,readonly",
                "--mount", f"type=bind,source={package},target=/incoming/qcs.deb,readonly",
                "--mount", f"type=bind,source={models},target=/models,readonly",

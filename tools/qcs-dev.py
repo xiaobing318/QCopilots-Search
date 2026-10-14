@@ -1013,11 +1013,15 @@ def inspect_check(report_path: Path, expected_head: str):
             smoke = evidence.read_json(smoke_path)
             for name in evidence.package_evidence_paths(smoke, smoke_path.parent):
                 if (smoke_path.parent / name).relative_to(root).as_posix() not in bound:
-                    errors.append("Local package raw reply or license material is not bound")
+                    errors.append("Local package raw reply, program inventory or license material is not bound")
+            # RPATH, stripping and signing can rewrite deployed Linux/macOS workers.
+            # Their installed inventory remains bound to this exact package.
             errors.extend(evidence.validate_package_release(smoke, smoke_path.parent,
                 model_fingerprint=semantic.get("modelFingerprint"),
                 extraction_fingerprint=semantic.get("extractionFingerprint"), platform_id=document["variant"],
-                worker_sha256=document.get("executables", {}).get("qcs-worker", {}).get("sha256")))
+                package_sha256=package.get("packageSha256"),
+                worker_sha256=(document.get("executables", {}).get("qcs-worker", {}).get("sha256")
+                               if document["system"] == "Windows" else None)))
         if document["system"] == "Windows":
             native = evidence.read_json(report_path.parent / "nsis-contract.json")
             raw = (report_path.parent / "nsis-contract.log").read_text(encoding="utf-8")

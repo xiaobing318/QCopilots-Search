@@ -31,6 +31,7 @@ def load_helper(relative, name):
 
 workflow = load_helper("tools/qcs-dev.py", "qcs_check_workflow_tests")
 evidence = load_helper("tools/qcs-release-evidence.py", "qcs_check_evidence_tests")
+release_fixtures = load_helper(".github/scripts/qcs-tests-release-evidence.py", "qcs_check_release_fixtures")
 HEAD = "a" * 40
 IDENTITY = {"candidateHead": HEAD, "checkoutCommit": HEAD, "sourceTree": "b" * 40,
             "workingTreeModified": False,
@@ -208,6 +209,166 @@ class CheckTests(unittest.TestCase):
             self.assertGreater(records[name]["bytes"], 0)
             self.assertEqual(records[name]["sha256"], evidence.digest(self.root / name))
         self.assertEqual(evidence.verify_manifest(self.root, document), [])
+
+    def inspection_fixture(self, system):
+        """Isolated validator inputs, never reports of an application or model run."""
+        root = self.root / ("synthetic-inputs-" + system)
+        directory = root / "reports/check"
+        directory.mkdir(parents=True)
+        report_path = directory / "check-report.json"
+        variant = {"Windows": "windows-x64-cpu", "Linux": "linux-x64-cpu",
+                   "Darwin": "macos-arm64-metal"}[system]
+        backend = "metal" if system == "Darwin" else "cpu"
+        marker = {"syntheticValidatorFixture": True}
+        tests = directory / "tests"
+        tests.mkdir()
+        inventory = {**marker, "kind": "ctestInfo", "tests": [{
+            "name": "qcs-tests-synthetic-validator-fixture",
+            "properties": [{"name": "LABELS", "value": ["program"]}]}]}
+        for name, content in (("test-selection.json", {**marker, "fullSuitePassed": True, "excludedTests": []}),
+                              ("test-inventory.json", inventory), ("test-selected-inventory.json", inventory),
+                              ("qt-test-cases.json", marker)):
+            evidence.write_json(tests / name, content)
+        (tests / "ctest.xml").write_text(
+            '<testsuite><testcase name="qcs-tests-synthetic-validator-fixture" status="run">'
+            '<system-out>SYNTHETIC validator input only</system-out></testcase></testsuite>', encoding="utf-8")
+        pins = evidence.package_contract()[0]
+        evidence.write_json(directory / "models.json", {**marker, "ok": True, "result": {
+            "valid": True, "artifacts": [{"name": name, "bytes": size, "sha256": sha, "present": True}
+                                         for name, (size, sha) in pins.items()]}})
+        evidence.write_json(directory / "models-manifest.json", {**marker, "result": {
+            "artifacts": [{"name": name, "size": size, "sha256": sha} for name, (size, sha) in pins.items()]}})
+        evidence.write_json(directory / "semantic-functional.json", release_fixtures.semantic_fixture())
+        packages = [("package", {"Windows": ".zip", "Linux": ".tar.gz", "Darwin": ".dmg"}[system])]
+        if system == "Linux":
+            packages.append(("package-deb", ".deb"))
+        elif system == "Windows":
+            packages.append(("package-nsis", ".exe"))
+            native, raw = release_fixtures.NsisContractEvidenceTests().fixture()
+            evidence.write_json(directory / "nsis-contract.json", {**marker, **native})
+            (directory / "nsis-contract.log").write_text(raw, encoding="utf-8")
+        document = {**marker, "schemaVersion": 2, "kind": "developer-check", "passed": True,
+            "releaseComplete": False, "system": system, "variant": variant, "identity": deepcopy(IDENTITY),
+            "reportPath": report_path.relative_to(root).as_posix(), "sourceFiles": {"SYNTHETIC.cpp": {}},
+            "executables": {name: {"bytes": 1, "sha256": "e" * 64}
+                            for name in ("qcs-gui", "qcs-service", "qcs-worker", "qcs-cli")},
+            "runtimeFiles": {}, "packages": {}, "stages": [],
+            "stability": {"sourceUnchanged": True, "binariesUnchanged": True,
+                          "runtimeUnchanged": True, "packagesUnchanged": True}}
+        for index, (action, generator) in enumerate(workflow.check_plan(system)):
+            log = directory / f"{index:02d}-{action}.log"
+            log.write_text("SYNTHETIC validator stage input only\n", encoding="utf-8")
+            document["stages"].append({"action": action, "generator": generator, "status": "passed",
+                "exitCode": 0, "elapsedSeconds": 0, "log": log.relative_to(root).as_posix()})
+        for folder, suffix in packages:
+            package = root / "pkg" / ("synthetic-validator-input" + suffix)
+            package.parent.mkdir(exist_ok=True)
+            package.write_bytes(("SYNTHETIC PACKAGE INPUT " + folder).encode())
+            sha = evidence.digest(package)
+            document["packages"][package.relative_to(root).as_posix()] = {"bytes": package.stat().st_size, "sha256": sha}
+            package_directory = directory / folder
+            smoke_directory = package_directory / "smoke" if folder == "package-deb" else package_directory
+            worker = smoke_directory / "synthetic-installed" / ("qcs-worker.exe" if system == "Windows" else "qcs-worker")
+            worker.parent.mkdir(parents=True)
+            # DEB stripping and portable deployment can produce different bytes from the same build.
+            worker.write_bytes(("SYNTHETIC DEPLOYED WORKER " + (system if system == "Windows" else folder)).encode())
+            smoke = release_fixtures.package_release_fixture(smoke_directory, worker=worker)
+            smoke.update(commit=HEAD, workingTreeModified=False, packageSha256=sha, variant=variant,
+                         checks=["SYNTHETIC validator check"] * 9)
+            smoke["buildIdentity"].update(candidateCommit=HEAD, variant=variant, backend=backend)
+            runtime = smoke["modelSmoke"]["runtime"]
+            runtime.update(architecture="arm64" if system == "Darwin" else "amd64",
+                           cpuDispatch={"x64": system != "Darwin", "arm64": False})
+            for diagnostics in (runtime["diagnostics"], smoke["backendVerification"]["cpu"]["diagnostics"],
+                                smoke["backendVerification"]["strictGpu"]["diagnostics"]):
+                diagnostics.update(buildVariant=variant, packagedBackend=backend)
+            if backend != "cpu":
+                runtime["diagnostics"]["fallbackReason"] = "Synthetic fixture has no GPU device"
+                smoke["backendVerification"]["strictGpu"]["reason"] = "Synthetic fixture has no GPU device"
+            if system == "Windows":
+                document["executables"]["qcs-worker"] = {
+                    key: runtime["workerExecutable"][key] for key in ("bytes", "sha256")}
+            release_fixtures.write_program_inventory(smoke_directory, smoke)
+            evidence.write_json(smoke_directory / "report.json", smoke)
+            if folder == "package-deb":
+                evidence.write_json(package_directory / "report.json", {**marker, "passed": True,
+                    "releaseComplete": True, "commit": HEAD, "workingTreeModified": False,
+                    "packageSha256": sha, "checks": ["SYNTHETIC DEB validator check"] * 3})
+        self.bind_inspection_fixture(report_path, document)
+        return report_path
+
+    def bind_inspection_fixture(self, report_path, document=None):
+        document = document or evidence.read_json(report_path)
+        root = report_path.parents[2]
+        document["files"] = [evidence.file_record(root, path) for path in sorted(root.rglob("*"))
+                             if path.is_file() and path != report_path]
+        evidence.write_json(report_path, document)
+
+    def inspect_fixture(self, path):
+        with patch.object(workflow, "helper_module", side_effect=self.helper):
+            return self.real_inspect(path, HEAD)
+
+    def test_deployed_programs_can_differ_from_build_and_from_each_other(self):
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system=system):
+                path = self.inspection_fixture(system)
+                document = evidence.read_json(path)
+                portable = evidence.read_json(path.parent / "package/report.json")
+                build_sha = document["executables"]["qcs-worker"]["sha256"]
+                portable_sha = portable["modelSmoke"]["runtime"]["workerExecutable"]["sha256"]
+                self.assertNotEqual(build_sha, portable_sha)
+                if system == "Linux":
+                    deb = evidence.read_json(path.parent / "package-deb/smoke/report.json")
+                    deb_sha = deb["modelSmoke"]["runtime"]["workerExecutable"]["sha256"]
+                    self.assertEqual(len({build_sha, portable_sha, deb_sha}), 3)
+                    self.assertNotEqual(portable["programInventory"]["sha256"], deb["programInventory"]["sha256"])
+                result = self.inspect_fixture(path)
+                self.assertTrue(result["passed"], result["errors"])
+
+    def test_windows_still_requires_the_original_build_worker_hash(self):
+        path = self.inspection_fixture("Windows")
+        result = self.inspect_fixture(path)
+        self.assertTrue(result["passed"], result["errors"])
+        document = evidence.read_json(path)
+        document["executables"]["qcs-worker"]["sha256"] = "0" * 64
+        self.bind_inspection_fixture(path, document)
+        result = self.inspect_fixture(path)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("worker differs" in error for error in result["errors"]), result["errors"])
+
+    def test_runtime_worker_must_match_independent_installed_program_inventory(self):
+        path = self.inspection_fixture("Linux")
+        smoke_path = path.parent / "package-deb/smoke/report.json"
+        smoke = evidence.read_json(smoke_path)
+        smoke["modelSmoke"]["runtime"]["workerExecutable"]["sha256"] = "0" * 64
+        evidence.write_json(smoke_path, smoke)
+        self.bind_inspection_fixture(path)
+        result = self.inspect_fixture(path)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("worker" in error.lower() for error in result["errors"]), result["errors"])
+
+    def test_deb_smoke_cannot_use_another_bound_packages_inventory(self):
+        path = self.inspection_fixture("Linux")
+        portable = evidence.read_json(path.parent / "package/report.json")
+        smoke_path = path.parent / "package-deb/smoke/report.json"
+        smoke = evidence.read_json(smoke_path)
+        smoke["packageSha256"] = portable["packageSha256"]
+        release_fixtures.write_program_inventory(smoke_path.parent, smoke)
+        evidence.write_json(smoke_path, smoke)
+        self.bind_inspection_fixture(path)
+        result = self.inspect_fixture(path)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("package" in error.lower() and ("hash" in error.lower() or "sha" in error.lower()
+                            or "differ" in error.lower()) for error in result["errors"]), result["errors"])
+
+    def test_installed_program_inventory_must_be_bound_by_complete_check(self):
+        path = self.inspection_fixture("Linux")
+        document = evidence.read_json(path)
+        document["files"] = [item for item in document["files"] if not item["path"].endswith("installed-programs.json")]
+        evidence.write_json(path, document)
+        result = self.inspect_fixture(path)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("not bound" in error for error in result["errors"]), result["errors"])
 
     def test_complete_plan_includes_each_platform_package_and_installer(self):
         common = [(name, None) for name in ("doctor", "configure", "build", "models", "test", "install")]
@@ -437,6 +598,18 @@ class CheckTests(unittest.TestCase):
             self.invoke(self.args())
         _, document = self.latest()
         self.assertFalse(document["stability"]["runtimeUnchanged"])
+
+    def test_original_build_executable_changes_still_fail_after_deployment(self):
+        original = {name: {"bytes": 1, "sha256": "e" * 64}
+                    for name in ("qcs-gui", "qcs-service", "qcs-worker", "qcs-cli")}
+        changed = deepcopy(original)
+        changed["qcs-worker"]["sha256"] = "0" * 64
+        with self.runtime(), patch.object(workflow, "executable_snapshot", side_effect=[original, changed]), \
+                self.assertRaisesRegex(RuntimeError, "bytes changed"):
+            self.invoke(self.args())
+        _, document = self.latest()
+        self.assertFalse(document["passed"])
+        self.assertFalse(document["stability"]["binariesUnchanged"])
 
     def test_later_packaging_cannot_replace_an_earlier_package_baseline(self):
         package = self.root / "pkg/Release/qcs-example.exe"

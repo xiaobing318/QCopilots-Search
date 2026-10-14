@@ -1159,7 +1159,12 @@ class PackageModelFlowTests(unittest.TestCase):
             (root / ".dockerenv").touch()
             (root / "incoming/qcs.deb").write_bytes(b"synthetic DEB fixture")
             (root / "etc/os-release").write_text("synthetic container", encoding="utf-8")
-            (root / "reports/smoke/report.json").write_text(json.dumps(smoke), encoding="utf-8")
+            # Synthetic identity fields follow the real installed-root smoke
+            # contract. This fixture never installs or executes a native DEB.
+            bound_smoke = {"syntheticFixture": True, "commit": "a" * 40,
+                "buildIdentity": {"candidateCommit": "a" * 40},
+                "packageSha256": deb.digest(root / "incoming/qcs.deb"), **smoke}
+            (root / "reports/smoke/report.json").write_text(json.dumps(bound_smoke), encoding="utf-8")
             payload = root / "usr/bin/qcs-gui"
             payload.write_bytes(b"synthetic payload")
             commands = []
@@ -1193,6 +1198,7 @@ class PackageModelFlowTests(unittest.TestCase):
                     mock.patch.object(deb.os, "geteuid", return_value=0, create=True), \
                     mock.patch.dict(deb.os.environ, {"QCOPILOTS_SEARCH_DEB_CONTAINER": "1",
                         "QCOPILOTS_SEARCH_VARIANT": "linux-x64-cpu", "QCOPILOTS_SEARCH_CI_ID": "linux-x64-cpu",
+                        "QCOPILOTS_SEARCH_CANDIDATE_HEAD": "a" * 40,
                         "QCOPILOTS_SEARCH_HOST_UID": "1000", "QCOPILOTS_SEARCH_HOST_GID": "1000"}, clear=True), \
                     mock.patch.dict(sys.modules, {"grp": mock.Mock()}), \
                     mock.patch.object(deb, "run", side_effect=fake_run), \
@@ -1209,6 +1215,10 @@ class PackageModelFlowTests(unittest.TestCase):
             self.assertEqual(len(verifier), 1)
             self.assertEqual(verifier[0][verifier[0].index("--model-dir") + 1], str(root / "models"))
             self.assertEqual(verifier[0].count("--model-dir"), 1)
+            self.assertEqual(verifier[0][verifier[0].index("--package-file") + 1], str(root / "incoming/qcs.deb"))
+            self.assertEqual(verifier[0].count("--package-file"), 1)
+            self.assertEqual(report["commit"], "a" * 40)
+            self.assertEqual(report["packageSha256"], bound_smoke["packageSha256"])
             return report
 
     def test_deb_container_verifier_receives_models_and_complete_smoke_can_pass(self):

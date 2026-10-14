@@ -28,6 +28,7 @@ import zipfile
 sys.dont_write_bytecode = True
 PRODUCT = "qcs"
 GUI_EXECUTABLE = "qcs-gui"
+APPLICATION_PROGRAMS = (GUI_EXECUTABLE, "qcs-service", "qcs-worker", "qcs-cli")
 WINDOWS_PRODUCT_KEY = r"Software\QCopilots\qcopilots-search"
 WINDOWS_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\qcopilots-search"
 SOURCE = Path(__file__).resolve().parent.parent
@@ -48,6 +49,44 @@ def file_digest(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def installed_program_inventory(binary, application, identity, package_sha256, installed_files=None):
+    """Read final installed files independently of any application response."""
+    application = application.resolve()
+    suffix = ".exe" if identity["variant"].startswith("windows-") else ""
+    programs = {}
+    for name in APPLICATION_PROGRAMS:
+        path = binary / (name + suffix)
+        resolved = path.resolve()
+        if (not path.is_file() or path.is_symlink() or application not in resolved.parents
+                or (installed_files is not None and resolved not in installed_files)):
+            raise RuntimeError(f"Installed program is outside the verified package files: {path}")
+        size = resolved.stat().st_size
+        if size < 1:
+            raise RuntimeError(f"Installed program is empty: {path}")
+        programs[name] = {"path": resolved.relative_to(application).as_posix(),
+                          "bytes": size, "sha256": file_digest(resolved)}
+    return {"schemaVersion": 1, "kind": "qcs-installed-programs",
+            "candidateCommit": identity.get("candidateCommit"), "variant": identity["variant"],
+            "packageSha256": package_sha256, "applicationRoot": str(application), "programs": programs}
+
+
+def verify_program_stability(inventory, binary, application, identity, package, installed_files=None):
+    current = installed_program_inventory(binary, application, identity, inventory["packageSha256"], installed_files)
+    if current != inventory:
+        raise RuntimeError("Installed program bytes changed during package verification")
+    if package is not None and file_digest(package) != inventory["packageSha256"]:
+        raise RuntimeError("Original package bytes changed during package verification")
+
+
+def validate_installed_package_source(package, installed_root, installed_manifest):
+    if installed_root is None:
+        return
+    if (not sys.platform.startswith("linux") or package is None or package.suffix.lower() != ".deb"
+            or not package.is_file() or package.is_symlink()
+            or installed_manifest is None or not installed_manifest.is_file()):
+        raise RuntimeError("Installed-tree verification requires Linux, the original DEB and its package-manager file manifest")
 
 
 def model_verification(result, directory):
@@ -812,6 +851,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     installer = None
     service_started = False
     cli = None
+    program_inventory = None
     logs = []
     environment = isolated_environment()
     profile = explicit_profile or work / "profile"
@@ -835,6 +875,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     try:
         if not keyword_only and (model_dir is None or not model_dir.is_dir()):
             raise RuntimeError("Release package verification requires --model-dir with both locked GGUF files. Use --keyword-only only for an explicitly partial developer check.")
+        validate_installed_package_source(package, installed_root, installed_manifest)
         model_arguments = ["--model-dir", str(model_dir)] if model_dir and not keyword_only else []
         if installed_root:
             report["checks"].append("validating the actual installed package tree")
@@ -869,6 +910,11 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
                                  or report["buildIdentity"]["attempt"] != int(expected_attempt)):
             raise RuntimeError("Packaged build attempt differs from the requested candidate attempt")
         report["variant"] = report["buildIdentity"]["variant"]
+        program_inventory = installed_program_inventory(binary, application, report["buildIdentity"],
+                                                         report.get("packageSha256"), installed_files)
+        inventory_path = report_dir / "installed-programs.json"
+        inventory_path.write_text(json.dumps(program_inventory, indent=2, ensure_ascii=False), encoding="utf-8")
+        report["programInventory"] = {"path": inventory_path.name, "sha256": file_digest(inventory_path), "stable": False}
         report["gpuPayload"] = verify_gpu_payload(binary, application, report["buildIdentity"], installed_files)
         report["licenseMaterials"] = verify_license_materials(binary, application, report_dir, installed_files)
         if (report["gpuPayload"].get("required") and
@@ -885,7 +931,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
                 raise RuntimeError(f"OCR language is missing from distribution: {language}")
         if not list(data_root.rglob("jieba.dict.utf8")):
             raise RuntimeError("Chinese tokenizer dictionary is missing from distribution")
-        for name in (GUI_EXECUTABLE, PRODUCT+"-service", PRODUCT+"-worker", PRODUCT+"-cli"):
+        for name in APPLICATION_PROGRAMS:
             completed=subprocess.run([str(binary/(name+suffix)),"--version"],cwd=work,env=environment,capture_output=True,text=True,timeout=30)
             if completed.returncode:
                 raise RuntimeError(f"Packaged program failed to load: {name}: {completed.stderr}")
@@ -1014,6 +1060,14 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
                 if cleanup_error:
                     report.setdefault("cleanupErrors", []).append(cleanup_error)
         for log in logs: log.close()
+        if program_inventory is not None:
+            try:
+                verify_program_stability(program_inventory, binary, application, report["buildIdentity"],
+                                         package, installed_files)
+                report["programInventory"]["stable"] = True
+            except Exception as error:
+                report["cleanupError"] = str(error)
+                report["passed"] = False
         if installer is not None:
             try:
                 # User data lives outside the install tree and must survive
@@ -1039,6 +1093,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         report["releaseComplete"] = (report["passed"] and not keyword_only and
             report.get("licenseMaterials", {}).get("passed") is True and report.get("modelSmoke", {}).get("passed") is True
             and report.get("buildIdentity", {}).get("workingTreeModified") is False
+            and report.get("programInventory", {}).get("stable") is True
             and report.get("backendVerification", {}).get("cpu", {}).get("passed") is True
             and report.get("backendVerification", {}).get("strictGpu", {}).get("passed") is True)
         (report_dir/"report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding="utf-8")
@@ -1050,7 +1105,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-root",required=True,type=Path)
-    parser.add_argument("--package-file",type=Path)
+    parser.add_argument("--package-file",type=Path,help="Distribution to verify, or original DEB identity with --installed-root")
     parser.add_argument("--report-dir",type=Path)
     parser.add_argument("--installed-root",type=Path,help="Verify an already installed package in place, without deleting it")
     parser.add_argument("--installed-manifest",type=Path,help="Absolute file list from the OS package manager, such as dpkg -L")
@@ -1065,8 +1120,6 @@ def main():
     if root==source or source in root.parents or root==Path(root.anchor):
         raise RuntimeError("Package verification requires a dedicated external build root")
     package=args.package_file
-    if package is not None and args.installed_root:
-        raise RuntimeError("Choose either --package-file or --installed-root")
     if args.installed_root and not args.installed_manifest:
         raise RuntimeError("Installed-tree verification requires --installed-manifest from the package manager")
     if package is None and not args.installed_root:
