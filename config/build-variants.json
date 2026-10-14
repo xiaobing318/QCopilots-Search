@@ -6,8 +6,8 @@
     "commit": "4d756bc72bf00a4aacf410ae15a2d315f3db400d"
   },
   "variants": [
-    {"id":"windows-x64-cpu","os":"windows","arch":"x64","backend":"cpu","runner":"windows-2025","generators":["NSIS","ZIP"],"toolkitVersion":"","gpuTargets":[],"upstreamJob":"windows-cpu"},
-    {"id":"windows-x64-vulkan","os":"windows","arch":"x64","backend":"vulkan","runner":"windows-2025","generators":["NSIS","ZIP"],"toolkitVersion":"1.4.357.0","gpuTargets":[],"upstreamJob":"windows"},
+    {"id":"windows-x64-cpu","os":"windows","arch":"x64","backend":"cpu","runner":"windows-2022","generators":["NSIS","ZIP"],"toolkitVersion":"","gpuTargets":[],"upstreamJob":"windows-cpu"},
+    {"id":"windows-x64-vulkan","os":"windows","arch":"x64","backend":"vulkan","runner":"windows-2022","generators":["NSIS","ZIP"],"toolkitVersion":"1.4.357.0","gpuTargets":[],"upstreamJob":"windows"},
     {"id":"windows-x64-rocm","os":"windows","arch":"x64","backend":"hip","runner":"windows-2022","generators":["NSIS","ZIP"],"toolkitVersion":"10.0.0","gpuTargets":["gfx1200","gfx1201"],"upstreamJob":"windows-rocm"},
     {"id":"windows-x64-cuda-12.4","os":"windows","arch":"x64","backend":"cuda","runner":"windows-2022","generators":["NSIS","ZIP"],"toolkitVersion":"12.4","cudaLabel":"12.4","gpuTargets":[],"upstreamJob":"windows-cuda"},
     {"id":"windows-x64-cuda-13.4","os":"windows","arch":"x64","backend":"cuda","runner":"windows-2022","generators":["NSIS","ZIP"],"toolkitVersion":"13.4","cudaLabel":"13.4","gpuTargets":[],"upstreamJob":"windows-cuda"},
