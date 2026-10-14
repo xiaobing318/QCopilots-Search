@@ -88,6 +88,7 @@ public:
     bool autoSearch = true;
     bool autoFiles = true;
     bool autoStatus = true;
+    bool autoPreview = true;
     int next = 1;
     FakeBackend() { settings.language = "en"; settings.checkUpdates = false; settings.minimizeToTray = false; }
     void start() override { QTimer::singleShot(0, this, [this] { emit connected(); }); }
@@ -115,9 +116,9 @@ public:
                     files.append(file.toJson());
                 }
                 emit response(id, {{"files", files}, {"nextCursor", ""}, {"hasMore", false}, {"browseGeneration", "1"}, {"metadataPending", false}});
-            } else if (method == "document.preview") {
+            } else if (method == "document.preview" && autoPreview) {
                 for (const auto &hit : hits) if (hit.path == params.value("path").toString()) {
-                    emit response(id, {{"text", hit.text}, {"partial", false}, {"next", 0}});
+                    emit response(id, {{"sourceVersion", "preview-source-v1"}, {"text", hit.text}, {"partial", false}, {"next", 0}});
                     break;
                 }
             } else if (method == "index.pause") { settings.indexingPaused = true; emit response(id, {{"state", "paused"}}); }
@@ -237,7 +238,7 @@ private slots:
         QTRY_VERIFY(results->verticalScrollBar()->value() > 0);
         const int scroll = results->verticalScrollBar()->value();
         const QString selected = results->currentItem()->data(Qt::UserRole).toString();
-        preview->setDocumentPreview({{"text", "Already loaded body"}, {"partial", false}}, false);
+        preview->setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"text", "Already loaded body"}, {"partial", false}}, false);
         const int reads = backend.count("document.preview");
         more->click();
         QCOMPARE(backend.last("files.list").params.value("cursor").toString(), QString("cursor-1"));
@@ -603,7 +604,7 @@ private slots:
         auto *preview = window.findChild<PreviewPanel *>();
         const auto selected = backend.hits.at(20);
         const QString expanded = selected.text + "\nAlready loaded full document body";
-        preview->setDocumentPreview({{"text", expanded}, {"partial", false}, {"next", 0}}, false);
+        preview->setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"text", expanded}, {"partial", false}, {"next", 0}}, false);
         backend.hits.move(20, 25);
         const int before = backend.count("search");
         emit backend.eventReceived("indexChanged", {});
@@ -613,6 +614,169 @@ private slots:
         QCOMPARE(preview->currentHit().path, selected.path);
         QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), expanded);
         QVERIFY(results->verticalScrollBar()->value() > 0);
+    }
+    void indexPublicationPreservesDocumentContinuation_data() {
+        QTest::addColumn<QString>("initialVersion");
+        QTest::addColumn<QString>("publishedVersion");
+        QTest::addColumn<bool>("previewArrivesFirst");
+        const QString base = "source-fingerprint|pipeline-fingerprint";
+        QTest::newRow("same-partial-progress") << base + "|partial:40" << base + "|partial:40" << false;
+        QTest::newRow("advanced-partial-progress") << base + "|partial:40" << base + "|partial:80" << false;
+        QTest::newRow("completed-publication") << base + "|partial:40" << base << false;
+        QTest::newRow("unchanged-complete-version") << base << base << false;
+        QTest::newRow("preview-before-search-refresh") << base + "|partial:40" << base + "|partial:80" << true;
+    }
+    void indexPublicationPreservesDocumentContinuation() {
+        QFETCH(QString, initialVersion);
+        QFETCH(QString, publishedVersion);
+        QFETCH(bool, previewArrivesFirst);
+        TestEnvironment env("gui-publication-continuation"); QVERIFY(env.isValid());
+        QVERIFY(env.writeFile("document.txt", "matching passage"));
+        FakeBackend backend; backend.autoPreview = false;
+        SearchHit hit; hit.path = env.path("document.txt"); hit.title = "Initial title";
+        hit.kind = "text"; hit.text = "matching passage"; hit.segmentId = 10; hit.sourceVersion = initialVersion;
+        backend.hits.append(hit);
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("matching passage");
+        auto *preview = window.findChild<PreviewPanel *>();
+        auto *body = window.findChild<QTextBrowser *>("textPreview");
+        auto *button = window.findChild<QPushButton *>("loadDocumentPreviewButton");
+        QTRY_COMPARE(preview->currentHit().segmentId, hit.segmentId);
+        button->click();
+        const auto first = backend.last("document.preview");
+        QCOMPARE(first.params.value("start").toInt(), 0);
+        const QString firstBody = hit.text + "\nFirst document batch";
+        emit backend.response(first.id, {{"sourceVersion", "preview-source-v1"}, {"text", firstBody}, {"partial", true}, {"next", 100}});
+        QCOMPARE(body->toPlainText(), firstBody);
+        QCOMPARE(button->text(), QString("Continue reading"));
+        QVERIFY(button->isEnabled());
+        auto cursor = body->textCursor();
+        const int readingPosition = int(firstBody.indexOf("First document batch"));
+        cursor.setPosition(readingPosition);
+        body->setTextCursor(cursor);
+
+        auto &published = backend.hits.first();
+        published.segmentId = 20; published.sourceVersion = publishedVersion;
+        published.title = "Published title"; published.score = 0.75;
+        int searches = backend.count("search");
+        emit backend.eventReceived("indexChanged", {{"path", hit.path}});
+        QTRY_VERIFY(backend.count("search") > searches);
+        QTRY_COMPARE(preview->currentHit().toJson(), published.toJson());
+        QCOMPARE(body->toPlainText(), firstBody);
+        QCOMPARE(body->textCursor().position(), readingPosition);
+        QCOMPARE(button->text(), QString("Continue reading"));
+        QCOMPARE(backend.count("document.preview"), 1);
+
+        button->click();
+        const auto second = backend.last("document.preview");
+        QCOMPARE(second.params.value("start").toInt(), 100);
+        QCOMPARE(button->text(), QString("Loading text…"));
+        QVERIFY(!button->isEnabled());
+        published.segmentId = 30; published.sourceVersion = "source-fingerprint|pipeline-fingerprint";
+        published.title = "Completed title"; published.score = 0.9;
+        backend.autoSearch = false;
+        searches = backend.count("search");
+        emit backend.eventReceived("indexChanged", {{"path", hit.path}});
+        QTRY_VERIFY(backend.count("search") > searches);
+        const auto refresh = backend.last("search");
+        const QJsonObject continuation{{"sourceVersion", "preview-source-v1"}, {"text", "Second document batch"}, {"partial", true}, {"next", 200}};
+        const QString expanded = firstBody + "\nSecond document batch";
+        if (previewArrivesFirst) emit backend.response(second.id, continuation);
+        emit backend.response(refresh.id, {{"hits", QJsonArray{published.toJson()}}, {"semantic", false}});
+        QCOMPARE(preview->currentHit().toJson(), published.toJson());
+        QVERIFY(!backend.cancelled.contains(second.id));
+        QCOMPARE(backend.count("document.preview"), 2);
+        QCOMPARE(body->toPlainText(), previewArrivesFirst ? expanded : firstBody);
+        QCOMPARE(body->textCursor().position(), readingPosition);
+        QCOMPARE(button->text(), previewArrivesFirst ? QString("Continue reading") : QString("Loading text…"));
+
+        if (!previewArrivesFirst) emit backend.response(second.id, continuation);
+        QCOMPARE(body->toPlainText(), expanded);
+        QCOMPARE(body->textCursor().position(), readingPosition);
+        QCOMPARE(button->text(), QString("Continue reading"));
+        QVERIFY(button->isEnabled());
+        emit backend.response(second.id, continuation);
+        emit backend.response(first.id, {{"sourceVersion", "preview-source-v1"}, {"text", "Late initial response"}, {"partial", false}, {"next", 0}});
+        QCOMPARE(body->toPlainText(), expanded);
+        button->click();
+        QCOMPARE(backend.count("document.preview"), 3);
+        QCOMPARE(backend.last("document.preview").params.value("start").toInt(), 200);
+    }
+    void changedHitResetsDocumentContinuation_data() {
+        QTest::addColumn<QString>("change");
+        QTest::addColumn<QString>("initialVersion");
+        QTest::addColumn<QString>("publishedVersion");
+        const QString base = "source-fingerprint|pipeline-fingerprint";
+        const QString partial = base + "|partial:40";
+        for (const auto *change : {"path", "kind", "text", "page", "lineStart", "lineEnd", "cell", "startMs", "endMs"})
+            QTest::newRow(change) << QString::fromLatin1(change) << partial << partial;
+        QTest::newRow("source-fingerprint") << QString() << partial << QString("new-source|pipeline-fingerprint|partial:80");
+        QTest::newRow("pipeline-fingerprint") << QString() << partial << QString("source-fingerprint|new-pipeline|partial:80");
+        QTest::newRow("partial-regression") << QString() << partial << base + "|partial:20";
+        QTest::newRow("complete-to-partial") << QString() << base << partial;
+        QTest::newRow("failed") << QString() << partial << base + "|failed:80";
+        QTest::newRow("capped") << QString() << partial << base + "|capped:5000";
+        QTest::newRow("unknown-suffix") << QString() << partial << base + "|unknown:80";
+        QTest::newRow("zero-partial") << QString() << partial << base + "|partial:0";
+        QTest::newRow("negative-partial") << QString() << partial << base + "|partial:-1";
+        QTest::newRow("trailing-suffix") << QString() << partial << base + "|partial:80|unexpected";
+        QTest::newRow("unknown-to-complete") << QString() << base + "|unknown:40" << base;
+        QTest::newRow("failed-to-complete") << QString() << base + "|failed:40" << base;
+        QTest::newRow("capped-to-complete") << QString() << base + "|capped:5000" << base;
+        QTest::newRow("partial-with-newline-to-complete") << QString() << partial + "\n" << base;
+        QTest::newRow("nested-failed-partial") << QString() << base + "|failed:40|partial:80" << base + "|failed:40";
+    }
+    void changedHitResetsDocumentContinuation() {
+        QFETCH(QString, change);
+        QFETCH(QString, initialVersion);
+        QFETCH(QString, publishedVersion);
+        TestEnvironment env("gui-changed-document-continuation"); QVERIFY(env.isValid());
+        QVERIFY(env.writeFile("document.txt", "matching passage"));
+        QVERIFY(env.writeFile("other.txt", "matching passage"));
+        FakeBackend backend; backend.autoPreview = false;
+        SearchHit hit; hit.path = env.path("document.txt"); hit.kind = "text"; hit.text = "matching passage";
+        hit.segmentId = 10; hit.sourceVersion = initialVersion; backend.hits.append(hit);
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("matching passage");
+        auto *preview = window.findChild<PreviewPanel *>();
+        auto *body = window.findChild<QTextBrowser *>("textPreview");
+        auto *button = window.findChild<QPushButton *>("loadDocumentPreviewButton");
+        QTRY_COMPARE(preview->currentHit().segmentId, hit.segmentId);
+        button->click();
+        const auto first = backend.last("document.preview");
+        emit backend.response(first.id, {{"sourceVersion", "preview-source-v1"}, {"text", hit.text + "\nFirst document batch"}, {"partial", true}, {"next", 100}});
+        QCOMPARE(button->text(), QString("Continue reading"));
+        button->click();
+        const auto continuation = backend.last("document.preview");
+        QCOMPARE(continuation.params.value("start").toInt(), 100);
+
+        auto &published = backend.hits.first();
+        published.segmentId = 20; published.sourceVersion = publishedVersion;
+        if (change == "path") published.path = env.path("other.txt");
+        else if (change == "kind") published.kind = "code";
+        else if (change == "text") published.text = "different passage";
+        else if (change == "page") published.page = 2;
+        else if (change == "lineStart") published.lineStart = 12;
+        else if (change == "lineEnd") published.lineEnd = 15;
+        else if (change == "cell") published.cell = 3;
+        else if (change == "startMs") published.startMs = 1200;
+        else if (change == "endMs") published.endMs = 2400;
+        const int searches = backend.count("search");
+        emit backend.eventReceived("indexChanged", {{"path", published.path}});
+        QTRY_VERIFY(backend.count("search") > searches);
+        QTRY_COMPARE(preview->currentHit().toJson(), published.toJson());
+        QVERIFY(backend.cancelled.contains(continuation.id));
+        QCOMPARE(body->toPlainText(), published.text);
+        QCOMPARE(button->text(), QString("Read document text"));
+        QVERIFY(button->isEnabled());
+        emit backend.response(continuation.id, {{"sourceVersion", "preview-source-v1"}, {"text", "Late old document batch"}, {"partial", true}, {"next", 200}});
+        QCOMPARE(body->toPlainText(), published.text);
+        QCOMPARE(button->text(), QString("Read document text"));
+        button->click();
+        QCOMPARE(backend.last("document.preview").params.value("start").toInt(), 0);
+        QCOMPARE(backend.last("document.preview").params.value("path").toString(), published.path);
     }
     void chineseDialogButtonsUseApplicationLanguage() {
         TestEnvironment env("gui-chinese-buttons"); QVERIFY(env.isValid());
@@ -807,15 +971,77 @@ private slots:
         QCOMPARE(requests.count(), 1);
         QCOMPARE(requests.first().at(2).toInt(), 0);
         QVERIFY(!button->isEnabled());
-        preview.setDocumentPreview({{"text", "first body"}, {"partial", true}, {"next", 100}}, false);
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"text", "first body"}, {"partial", true}, {"next", 100}}, false);
         QVERIFY(button->isEnabled());
         button->click();
         QCOMPARE(requests.last().at(2).toInt(), 100);
-        preview.setDocumentPreview({{"text", "second body"}, {"partial", false}, {"next", 0}}, true);
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"text", "second body"}, {"partial", false}, {"next", 0}}, true);
         QCOMPARE(preview.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString("first body\nsecond body"));
         QVERIFY(!button->isEnabled());
         preview.setLanguage("zh_CN");
         QCOMPARE(button->text(), QString::fromUtf8("正文已读取"));
+    }
+    void documentContinuationRejectsChangedSource_data() {
+        QTest::addColumn<QString>("returnedVersion");
+        QTest::addColumn<bool>("emptyRestart");
+        QTest::newRow("changed-source") << QString("preview-source-v2") << false;
+        QTest::newRow("missing-source") << QString() << false;
+        QTest::newRow("empty-source-after-restart") << QString("preview-source-v2") << true;
+    }
+    void documentContinuationRejectsChangedSource() {
+        QFETCH(QString, returnedVersion);
+        QFETCH(bool, emptyRestart);
+        TestEnvironment env("gui-preview-source-version"); QVERIFY(env.isValid());
+        QVERIFY(env.writeFile("document.txt", "matching passage"));
+        PreviewPanel preview; SearchHit hit; hit.path = env.path("document.txt"); hit.kind = "text";
+        hit.text = emptyRestart ? QString() : QString("matching passage");
+        preview.showHit(hit);
+        QSignalSpy requests(&preview, &PreviewPanel::documentRequested);
+        auto *button = preview.findChild<QPushButton *>("loadDocumentPreviewButton");
+        auto *body = preview.findChild<QTextBrowser *>("textPreview");
+        auto *error = preview.findChild<QLabel *>("previewError");
+        button->click();
+        const QString firstBody = hit.text + "\nOriginal source body";
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"text", firstBody}, {"partial", true}, {"next", 100}}, false);
+        button->click();
+        QCOMPARE(requests.last().at(2).toInt(), 100);
+        QJsonObject changed{{"text", "Do not append this unverified batch"}, {"partial", true}, {"next", 200}};
+        if (!returnedVersion.isEmpty()) changed.insert("sourceVersion", returnedVersion);
+        preview.setDocumentPreview(changed, true);
+        QCOMPARE(body->toPlainText(), firstBody);
+        QCOMPARE(button->text(), QString("Retry reading"));
+        QVERIFY(button->isEnabled());
+        QVERIFY(!error->isHidden());
+        QVERIFY(error->text().contains("beginning"));
+
+        button->click();
+        QCOMPARE(requests.count(), 3);
+        QCOMPARE(requests.last().at(2).toInt(), 0);
+        const QString newBody = emptyRestart ? QString() : "New source prefix\n" + hit.text + "\nReplacement source body";
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v2"}, {"text", newBody}, {"partial", false}, {"next", 0}}, false);
+        QCOMPARE(body->toPlainText(), newBody);
+        QCOMPARE(body->textCursor().position(), int(newBody.indexOf(hit.text)));
+        QCOMPARE(button->text(), QString("Document loaded"));
+        QVERIFY(!button->isEnabled());
+        QVERIFY(error->isHidden());
+        QVERIFY(error->text().isEmpty());
+    }
+    void documentPreviewRejectsMissingInitialSourceVersion() {
+        TestEnvironment env("gui-preview-missing-source-version"); QVERIFY(env.isValid());
+        QVERIFY(env.writeFile("document.txt", "matching passage"));
+        PreviewPanel preview; SearchHit hit; hit.path = env.path("document.txt"); hit.kind = "text"; hit.text = "matching passage";
+        preview.showHit(hit);
+        QSignalSpy requests(&preview, &PreviewPanel::documentRequested);
+        auto *button = preview.findChild<QPushButton *>("loadDocumentPreviewButton");
+        button->click();
+        preview.setDocumentPreview({{"text", "Unverified initial body"}, {"partial", true}, {"next", 100}}, false);
+        QCOMPARE(preview.findChild<QTextBrowser *>("textPreview")->toPlainText(), hit.text);
+        QCOMPARE(button->text(), QString("Retry reading"));
+        QVERIFY(button->isEnabled());
+        QVERIFY(!preview.findChild<QLabel *>("previewError")->isHidden());
+        button->click();
+        QCOMPARE(requests.count(), 2);
+        QCOMPARE(requests.last().at(2).toInt(), 0);
     }
     void browsingDocumentLoadsOneBatchWithoutInventingSearchLocation() {
         TestEnvironment env("gui-browse-document-batch"); QVERIFY(env.isValid()); QVERIFY(env.writeFile("large.txt", "body"));
@@ -824,7 +1050,7 @@ private slots:
         QSignalSpy requests(&preview, &PreviewPanel::documentRequested);
         preview.loadDocumentText();
         QCOMPARE(requests.count(), 1);
-        preview.setDocumentPreview({{"segments", QJsonArray{QJsonObject{{"text", "first batch"}}}}, {"partial", true}, {"next", 100}}, false);
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"segments", QJsonArray{QJsonObject{{"text", "first batch"}}}}, {"partial", true}, {"next", 100}}, false);
         QCoreApplication::processEvents();
         QCOMPARE(requests.count(), 1);
         QVERIFY(preview.findChild<QPushButton *>("loadDocumentPreviewButton")->isEnabled());
@@ -842,7 +1068,7 @@ private slots:
             QJsonObject{{"text", "repeat();"}, {"cell", 3}, {"lineStart", 1}, {"lineEnd", 2}},
             QJsonObject{{"text", "repeat();"}, {"cell", 3}, {"lineStart", 90}, {"lineEnd", 91}}
         };
-        preview.setDocumentPreview({{"segments", segments}, {"partial", false}, {"next", 0}}, false);
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"segments", segments}, {"partial", false}, {"next", 0}}, false);
         auto *body = preview.findChild<QTextBrowser *>("textPreview");
         QCOMPARE(body->textCursor().position(), int(body->toPlainText().lastIndexOf("repeat();")));
         QVERIFY(body->textCursor().position() > 0);
@@ -854,15 +1080,40 @@ private slots:
         QSignalSpy requests(&preview, &PreviewPanel::documentRequested);
         auto *button = preview.findChild<QPushButton *>("loadDocumentPreviewButton");
         button->click();
-        preview.setDocumentPreview({{"segments", QJsonArray{QJsonObject{{"text", "first batch"}, {"lineStart", 1}, {"lineEnd", 3}}}}, {"partial", true}, {"next", 100}}, false);
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"segments", QJsonArray{QJsonObject{{"text", "first batch"}, {"lineStart", 1}, {"lineEnd", 3}}}}, {"partial", true}, {"next", 100}}, false);
         QVERIFY(!button->isEnabled());
         QTRY_COMPARE(requests.count(), 2);
         QCOMPARE(requests.last().at(2).toInt(), 100);
-        preview.setDocumentPreview({{"segments", QJsonArray{QJsonObject{{"text", "target();"}, {"lineStart", 5005}, {"lineEnd", 5006}}}}, {"partial", false}, {"next", 0}}, true);
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"segments", QJsonArray{QJsonObject{{"text", "target();"}, {"lineStart", 5005}, {"lineEnd", 5006}}}}, {"partial", false}, {"next", 0}}, true);
         auto *body = preview.findChild<QTextBrowser *>("textPreview");
         QCOMPARE(body->textCursor().position(), int(body->toPlainText().indexOf("target();")));
         QVERIFY(body->textCursor().position() > 0);
         QCOMPARE(button->text(), QString("Document loaded"));
+    }
+    void clearingPreviewCancelsQueuedAutomaticContinuation() {
+        TestEnvironment env("gui-cancel-automatic-continuation"); QVERIFY(env.isValid());
+        QVERIFY(env.writeFile("code.cpp", "source"));
+        QVERIFY(env.writeFile("other.cpp", "other source"));
+        PreviewPanel preview; SearchHit hit; hit.path = env.path("code.cpp"); hit.kind = "code";
+        hit.text = "target();"; hit.lineStart = 5005; hit.lineEnd = 5006;
+        preview.showHit(hit);
+        QSignalSpy requests(&preview, &PreviewPanel::documentRequested);
+        preview.loadDocumentText();
+        QCOMPARE(requests.count(), 1);
+        preview.setDocumentPreview({{"sourceVersion", "preview-source-v1"}, {"segments", QJsonArray{QJsonObject{{"text", "first batch"}, {"lineStart", 1}, {"lineEnd", 3}}}},
+            {"partial", true}, {"next", 100}}, false);
+        preview.clear();
+        QCOMPARE(preview.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString());
+        QVERIFY(preview.currentHit().path.isEmpty());
+        SearchHit next = hit; next.path = env.path("other.cpp"); next.text = "other target();";
+        preview.showHit(next);
+        preview.loadDocumentText();
+        QCOMPARE(requests.count(), 2);
+        QCOMPARE(requests.last().at(0).toString(), next.path);
+        QCoreApplication::processEvents();
+        QCOMPARE(requests.count(), 2);
+        QCOMPARE(preview.currentHit().path, next.path);
+        QCOMPARE(preview.findChild<QTextBrowser *>("textPreview")->toPlainText(), next.text);
     }
     void pdfHitPageIsSelected() {
         TestEnvironment env("gui-pdf"); QVERIFY(env.isValid());

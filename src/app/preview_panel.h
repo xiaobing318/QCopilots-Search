@@ -24,6 +24,8 @@ public:
     explicit PreviewPanel(QWidget *parent = nullptr);
     ~PreviewPanel() override;
     void showHit(const SearchHit &hit);
+    // Update an equivalent hit after an index refresh without restarting preview.
+    void refreshHitMetadata(const SearchHit &hit);
     void loadDocumentText();
     void clear();
     void setLanguage(const QString &language);
@@ -65,6 +67,7 @@ private:
     qint64 pendingPosition_ = -1;
     quint64 generation_ = 0;
     int documentNext_ = 0;
+    QString documentSourceVersion_;
     int documentState_ = 0;
     bool documentHitLocated_ = false;
     bool documentAutoLocate_ = false;

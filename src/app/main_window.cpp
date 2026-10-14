@@ -26,6 +26,7 @@
 #include <QPainter>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScreen>
 #include <QScrollBar>
 #include <QShortcut>
@@ -38,6 +39,35 @@
 #include <QVBoxLayout>
 
 namespace qcopilots_search {
+namespace {
+bool preservesSourceVersion(const QString &previous, const QString &current) {
+    if (previous == current) return true;
+    // Publishing another extraction batch changes the index version, but not
+    // the source or pipeline. Only forward partial publication is equivalent.
+    static const QRegularExpression partialVersion(QStringLiteral("\\A([^|\\r\\n]+\\|[^|\\r\\n]+)\\|partial:([1-9][0-9]*)\\z"));
+    const auto oldPartial = partialVersion.match(previous);
+    if (!oldPartial.hasMatch()) return false;
+    bool oldOk = false;
+    const auto oldOffset = oldPartial.captured(2).toLongLong(&oldOk);
+    if (!oldOk) return false;
+    const QString base = oldPartial.captured(1);
+    if (current == base) return true;
+    const auto newPartial = partialVersion.match(current);
+    bool newOk = false;
+    const auto newOffset = newPartial.captured(2).toLongLong(&newOk);
+    return newPartial.hasMatch() && newOk && newPartial.captured(1) == base && newOffset >= oldOffset;
+}
+
+bool preservesPreview(const SearchHit &previous, const SearchHit &current) {
+    // Segment IDs are database row identities and change when an indexed file
+    // is replaced. Preview identity instead follows its source and full locator.
+    return current.path == previous.path && current.kind == previous.kind && current.text == previous.text
+        && current.page == previous.page && current.lineStart == previous.lineStart && current.lineEnd == previous.lineEnd
+        && current.cell == previous.cell && current.startMs == previous.startMs && current.endMs == previous.endMs
+        && preservesSourceVersion(previous.sourceVersion, current.sourceVersion);
+}
+}
+
 void SearchEdit::inputMethodEvent(QInputMethodEvent *event) {
     const bool wasComposing = composing_;
     composing_ = !event->preeditString().isEmpty();
@@ -538,8 +568,7 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
         if (sameContext) {
             for (int row = 0; row < hits.size(); ++row) {
                 const auto &hit = hits.at(row);
-                if (hit.path == previous.path && hit.kind == previous.kind && hit.sourceVersion == previous.sourceVersion
-                    && hit.segmentId == previous.segmentId && hit.text == previous.text && hit.page == previous.page && hit.startMs == previous.startMs) {
+                if (preservesPreview(previous, hit)) {
                     selection = row;
                     sameHit = true;
                     break;
@@ -548,7 +577,10 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
         }
         list->setCurrentRow(selection);
         if (sameContext) list->verticalScrollBar()->setValue(scroll); else list->scrollToTop();
-        if (!popup && !sameHit) selectResult(selection);
+        if (!popup) {
+            if (sameHit) preview_->refreshHitMetadata(hits.at(selection));
+            else selectResult(selection);
+        }
         updateBrowseControls(popup);
         const QString warning = data.value("warning").toString(data.value("error").toString());
         if (popup) {

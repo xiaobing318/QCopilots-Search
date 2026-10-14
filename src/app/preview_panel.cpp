@@ -229,6 +229,7 @@ void PreviewPanel::clear() {
     imagePool_.clear();
     ++generation_;
     documentNext_ = 0;
+    documentSourceVersion_.clear();
     documentState_ = 0;
     documentHitLocated_ = false;
     documentAutoLocate_ = false;
@@ -268,8 +269,7 @@ void PreviewPanel::clear() {
     open_->setEnabled(false);
     reveal_->setEnabled(false);
 }
-void PreviewPanel::showHit(const SearchHit &hit) {
-    clear();
+void PreviewPanel::refreshHitMetadata(const SearchHit &hit) {
     hit_ = hit;
     title_->setText(hit.title.isEmpty() ? QFileInfo(hit.path).fileName() : hit.title);
     QString location = hit.path;
@@ -281,9 +281,13 @@ void PreviewPanel::showHit(const SearchHit &hit) {
     const bool exists = QFileInfo::exists(hit.path);
     open_->setEnabled(exists);
     reveal_->setEnabled(exists);
+}
+void PreviewPanel::showHit(const SearchHit &hit) {
+    clear();
+    refreshHitMetadata(hit);
     text_->setPlainText(hit.text);
     pages_->setCurrentWidget(text_);
-    if (!exists) { error_->setText(label("The source file moved or was removed. Reconcile the index to refresh this result.", "源文件已移动或删除。重新扫描后将更新此结果。")); error_->show(); return; }
+    if (!QFileInfo::exists(hit.path)) { error_->setText(label("The source file moved or was removed. Reconcile the index to refresh this result.", "源文件已移动或删除。重新扫描后将更新此结果。")); error_->show(); return; }
     const QString suffix = QFileInfo(hit.path).suffix().toLower();
     document_->setVisible(hit.kind != "image" && hit.kind != "pdf" && hit.kind != "audio" && hit.kind != "video" && suffix != "pdf");
     if (suffix == "pdf") {
@@ -328,6 +332,24 @@ void PreviewPanel::showHit(const SearchHit &hit) {
     }
 }
 void PreviewPanel::setDocumentPreview(const QJsonObject &result, bool append) {
+    const QString sourceVersion = result.value("sourceVersion").toString();
+    if (sourceVersion.isEmpty() || (append && sourceVersion != documentSourceVersion_)) {
+        // Extraction cursors refer to one source version. Do not combine an
+        // earlier batch with text read after the source changed between requests.
+        ++generation_;
+        documentNext_ = 0;
+        documentSourceVersion_.clear();
+        documentHitLocated_ = false;
+        documentAutoLocate_ = false;
+        documentBatches_ = 0;
+        documentPreviewFailed(sourceVersion.isEmpty()
+            ? label("Unable to verify the document version. Read the document again from the beginning.", "无法确认正文版本，请从头重新读取文档。")
+            : label("The source file changed. Read the document again from the beginning.", "源文件已变化，请从头重新读取文档。"));
+        return;
+    }
+    documentSourceVersion_ = sourceVersion;
+    error_->clear();
+    error_->hide();
     const auto segments = result.value("segments").toArray();
     QString body;
     int matchingOffset = -1;
@@ -367,7 +389,7 @@ void PreviewPanel::setDocumentPreview(const QJsonObject &result, bool append) {
     const QString previousText = append ? text_->toPlainText() : QString();
     const int appendedOffset = append ? int(previousText.size()) + 1 : 0;
     if (previousText.size() + body.size() > 16 * 1024 * 1024) { documentPreviewFailed(label("Preview text limit reached. Open the original file to continue.", "正文预览已达到容量上限，请打开源文件继续阅读。")); return; }
-    if (!body.isEmpty()) {
+    if (!body.isEmpty() || !append) {
         if (append) text_->setPlainText(previousText + QLatin1Char('\n') + body); else text_->setPlainText(body);
         pages_->setCurrentWidget(text_);
         if (matchingOffset >= 0) {
