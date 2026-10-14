@@ -265,6 +265,114 @@ private slots:
         QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString("Already loaded body"));
         QVERIFY(window.findChild<QLabel *>("searchSummary")->text().contains("Refresh"));
     }
+    void initiallyEmptyBrowserLoadsFirstFilesAfterIndexing_data() {
+        QTest::addColumn<bool>("quick");
+        QTest::newRow("main") << false;
+        QTest::newRow("quick") << true;
+    }
+    void initiallyEmptyBrowserLoadsFirstFilesAfterIndexing() {
+        QFETCH(bool, quick);
+        TestEnvironment env("gui-first-index-browser"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoFiles = false; backend.autoStatus = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        QTRY_COMPARE(backend.count("files.list"), 1);
+        const auto emptyPage = [](const char *generation) {
+            return QJsonObject{{"files", QJsonArray{}}, {"hasMore", false}, {"nextCursor", ""}, {"browseGeneration", generation}};
+        };
+        auto initialPage = emptyPage("1");
+        if (quick) {
+            // Keep the main window populated so only the quick browser retries.
+            FileListEntry entry; entry.fileId = 999; entry.path = env.path("main-only.txt"); entry.title = "Main result"; entry.kind = "text";
+            initialPage.insert("files", QJsonArray{entry.toJson()});
+        }
+        emit backend.response(backend.last("files.list").id, initialPage);
+        if (quick) {
+            window.showQuickSearch();
+            emit backend.response(backend.last("files.list").id, emptyPage("1"));
+        }
+        auto *results = window.findChild<QListWidget *>(quick ? "quickSearchResults" : "searchResults");
+        auto *input = window.findChild<SearchEdit *>(quick ? "quickSearchInput" : "searchInput");
+        auto *summary = window.findChild<QLabel *>(quick ? "quickSearchStatus" : "searchSummary");
+        QCOMPARE(results->count(), 0); QCOMPARE(results->currentRow(), -1);
+        input->setFocus();
+        QTRY_VERIFY(input->hasFocus());
+        auto *focus = QApplication::focusWidget();
+        const int initialRequests = backend.count("files.list");
+        emit backend.eventReceived("progress", {{"state", "indexing"}, {"total", 205}, {"completed", 0}});
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "2"}});
+        QTRY_VERIFY(backend.count("files.list") > initialRequests);
+        // A newer publication must invalidate a pending empty snapshot too.
+        const QString obsoleteRequest = backend.last("files.list").id;
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "3"}});
+        QVERIFY(backend.cancelled.contains(obsoleteRequest));
+        emit backend.response(obsoleteRequest, emptyPage("2"));
+        const int afterInvalidation = backend.count("files.list");
+        emit backend.eventReceived("progress", {{"state", "idle"}, {"total", 205}, {"completed", 205}});
+        QTRY_VERIFY(backend.count("files.list") > afterInvalidation);
+        const int pageSize = quick ? 12 : 100;
+        QJsonArray files;
+        for (int row = 0; row < pageSize; ++row) {
+            const QString name = QStringLiteral("indexed-%1.txt").arg(row);
+            QVERIFY(env.writeFile(name, "first indexing preview"));
+            SearchHit hit; hit.path = env.path(name); hit.title = name; hit.kind = "text"; hit.text = "first indexing preview";
+            backend.hits.append(hit);
+            FileListEntry file; file.fileId = row + 1; file.path = hit.path; file.title = name; file.kind = hit.kind;
+            files.append(file.toJson());
+        }
+        const QString currentRequest = backend.last("files.list").id;
+        QCOMPARE(backend.last("files.list").params.value("limit").toInt(), pageSize);
+        emit backend.response(currentRequest, {{"files", files}, {"hasMore", true}, {"nextCursor", "next-page"}, {"browseGeneration", "3"}});
+        QCOMPARE(results->count(), pageSize); QCOMPARE(results->currentRow(), 0);
+        QCOMPARE(QApplication::focusWidget(), focus);
+        if (!quick) QTRY_COMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString("first indexing preview"));
+        const int populatedRequests = backend.count("files.list");
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "4"}});
+        QTest::qWait(350);
+        QCOMPARE(backend.count("files.list"), populatedRequests);
+        QCOMPARE(results->count(), pageSize); QCOMPARE(results->currentRow(), 0);
+        QCOMPARE(QApplication::focusWidget(), focus);
+        QVERIFY(summary->text().contains("Refresh"));
+    }
+    void typingQueryConsumesQueuedEmptyBrowserRefresh() {
+        TestEnvironment env("gui-first-index-query"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoFiles = false; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        QTRY_COMPARE(backend.count("files.list"), 1);
+        emit backend.response(backend.last("files.list").id, {{"files", QJsonArray{}}, {"browseGeneration", "1"}});
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "2"}});
+        window.findChild<SearchEdit *>("searchInput")->setText("new user question");
+        QTRY_COMPARE(backend.count("search"), 1);
+        QCOMPARE(backend.last("search").params.value("query").toString(), QString("new user question"));
+        QCOMPARE(backend.count("files.list"), 1);
+    }
+    void indexChangeKeepsPendingBrowserFilterRequest_data() {
+        QTest::addColumn<QString>("filter");
+        QTest::newRow("kind") << QStringLiteral("kind");
+        QTest::newRow("root") << QStringLiteral("root");
+        QTest::newRow("code") << QStringLiteral("code");
+    }
+    void indexChangeKeepsPendingBrowserFilterRequest() {
+        QFETCH(QString, filter);
+        TestEnvironment env("gui-browse-filter-publication"); QVERIFY(env.isValid());
+        QVERIFY(env.writeFile("selected.txt", "existing preview"));
+        FakeBackend backend; backend.settings.roots = {env.root()};
+        backend.settings.codeRoots = {env.path("code")}; backend.settings.includeCode = true;
+        SearchHit hit; hit.path = env.path("selected.txt"); hit.title = "Selected"; hit.kind = "text"; hit.text = "existing preview";
+        backend.hits = {hit};
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        QTRY_COMPARE(window.findChild<QListWidget *>("searchResults")->count(), 1);
+        const int requests = backend.count("files.list");
+        if (filter == "kind") window.findChild<QComboBox *>("kindFilter")->setCurrentIndex(2);
+        else if (filter == "root") window.findChild<QComboBox *>("rootFilter")->setCurrentIndex(1);
+        else window.findChild<QCheckBox *>("codeSearchCheck")->setChecked(true);
+        // The visible rows still belong to the old context until debounce fires.
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "2"}});
+        QTRY_COMPARE(backend.count("files.list"), requests + 1);
+        const auto parameters = backend.last("files.list").params;
+        if (filter == "kind") QCOMPARE(parameters.value("kind").toString(), QString("pdf"));
+        else if (filter == "root") QCOMPARE(parameters.value("root").toString(), env.root());
+        else QVERIFY(parameters.value("code").toBool());
+    }
     void lateBrowseResponseCannotReplaceTypedSearchBeforeDebounce() {
         TestEnvironment env("gui-browse-stale"); QVERIFY(env.isValid());
         FakeBackend backend; backend.autoFiles = false; backend.autoSearch = false;

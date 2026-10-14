@@ -10,6 +10,60 @@
 
 准备至少 205 个文件作为三页浏览样本，保存文件清单、相对路径、类型、修改时间及内容哈希。修改时间应有可核对的先后顺序，也包含相同修改时间的文件，用于验证默认倒序和重复时间下的稳定分页。另准备中文及空格文件名、长路径、多页 PDF、可继续读取的长文档、图片、带明确命中时刻的音视频、代码和 Notebook。普通文件与代码分别设置根目录及排除目录，包含仅属于其中一个空间的样本和允许在两空间独立出现的文本。样本总量、查询的预期目标和无答案查询必须在操作前记录。
 
+使用同一冻结源码中的 `tools/acceptance/qcs-copy-cu-fixtures.py --prepare-source` 准备专用夹具，不新增独立生成脚本，也不依赖历史语义测试目录。下面的路径占位符均须替换为绝对路径，准备根应位于源码树外，`source` 必须尚不存在。生成器不启动应用、不加载或下载模型，也不修改用户 profile。
+
+```powershell
+$qcsSource = '<冻结候选的源码目录>'
+$qcsPreparation = '<外置构建根>/cu-fixtures/<本次唯一目录>'
+$qcsTools = Join-Path $qcsSource 'tools/acceptance'
+$qcsFixtureSource = Join-Path $qcsPreparation 'source'
+$qcsFixturePlan = Join-Path $qcsPreparation 'copy-plan.json'
+
+python -B "$qcsTools/qcs-copy-cu-fixtures.py" --prepare-source --source-root $qcsFixtureSource
+if ($LASTEXITCODE -ne 0) { throw 'CU 夹具准备失败，保留现场并使用新目录重试' }
+python -B "$qcsTools/qcs-copy-cu-fixtures.py" --create-plan --source-root $qcsFixtureSource --plan $qcsFixturePlan
+if ($LASTEXITCODE -ne 0) { throw 'CU 夹具计划创建失败' }
+```
+
+准备结果由 `negative-models/qcs-fixture-source.json` 逐文件记录用途、查询、字节数、SHA-256 和毫秒修改时间。生成器只读取源码中的 `tests/semantic/assets.json`、`assets/NOTICE.md`、`assets/photo-002.jpg`、`assets/speech-001.wav`、`assets/speech-002.wav`，其中后二级 `assets/` 均相对 `tests/semantic/`。照片和语音先校验锁定资产哈希，许可说明原样保留在不索引的 `negative-models/fixture-licenses/`。其他文件由当前脚本确定性生成，清单绑定脚本本身及上述输入的哈希。不会自动寻找或复制旧 corpus、模型、索引、报告，也不读取相关性留出集。后续创建计划和复制时会复核这些来源与实际文件，脚本或资产变化后必须重新准备，不能只修改旧清单中的哈希。
+
+准备中途失败时保留已写文件及 `.qcs-fixture-preparing.json` 标记，便于调查，不自动清理目录。带标记的目录不能创建计划或复制，不能当作手工样本继续使用，应选择一个新输出根重新准备。遍历权限不足、链接或重定向会明确失败，不静默省略目录。复制中途失败也保留本次已写副本与可写入的失败报告，不删除或改写源夹具。
+
+| 相对准备根的目录 | 内容与用途 |
+| --- | --- |
+| `samples/分页 普通文件` | 恰好 205 个普通 UTF-8 文本，包含中文、空格和多层长路径。只将该目录设为普通 root 时，空查询应产生 100/100/5 三页 |
+| `samples/内容定位` | 原创三页 PDF、DOCX 文档、固定猫照片、75 秒组合语音及 12 秒原创 AVI。PDF 的唯一目标在物理第 3 页，语音目标在第 55 秒后，视频蓝色方块在第 6 秒后 |
+| `samples/代码 单元格` | Python 源码和四单元格 Notebook，含 `{line}` 字面文件名。清单记录目标源码行和 Notebook 第 4 单元格，外部编辑器须核对实际命中片段起始行 |
+| `samples/共享 文本` | 可分别加入普通与代码 root 的同一个文本，用于独立清理与范围验证 |
+| `samples/普通 排除`、`samples/代码 排除` | 两空间独立排除的 canary，先记录范围，再验证所属空间的可见性 |
+| `samples/变更与续读` | 修改、删除 canary 和 240 段原创长文本。长文包含头、中、尾独立标记，供续读、暂停和公平调度观察 |
+| `samples/故障输入` | 明确损坏的 DOCX 和 WAV，只在故障场景中加入，不影响最初 205 个普通文件 |
+| `negative-models` | 故意损坏的模型、来源与许可清单、待新增短文件及修改后的内容模板，整个目录不作为索引 root |
+
+分页文件使用固定整秒修改时间，第 99–102 项、第 199–202 项分别形成相同时间组，跨越两处分页边界。预期首先按修改时间倒序分组，同时间组的正式次序由本次索引产生的 `file_id DESC` 决定，不能用文件名次序替代。记录首次浏览的实际 ID/次序，再核对刷新稳定、无重复和漏项。CU-05 开始前把普通 roots 恢复为仅含 `samples/分页 普通文件`，清空查询与筛选，其他普通场景目录随后按需要加入。代码目录不计入这 205 个普通文件。
+
+实际媒体命中时刻必须由最终包检索和界面验证。语音按当前 30 秒窗口、25 秒步长设计为目标窗口起点 50 秒，AVI 按当前抽帧策略设计为目标帧起点 6.5 秒，清单中的值只是待验证预期。没有实际命中、只打开文件、只定位到起点或只看到进程启动，均不能标记外部定位通过。生成夹具也不替代语义质量和容量门禁。
+
+取得同一候选的 `package-candidate.json` 与最终包后，先初始化记录器，再复制夹具。`--fixture-manifest` 传准备结果中的来源清单，将它保留为候选输入。示例中的包、解包目录及运行根均来自本次冻结候选。
+
+```powershell
+python -B "$qcsTools/qcs-cu-recorder.py" init `
+  --candidate-record '<package-candidate.json绝对路径>' --package '<最终ZIP绝对路径>' `
+  --app-dir '<该ZIP的解包应用目录>' --source $qcsSource `
+  --run-parent '<外置CU运行父目录>' `
+  --fixture-manifest "$qcsFixtureSource/negative-models/qcs-fixture-source.json"
+if ($LASTEXITCODE -ne 0) { throw 'CU 记录器初始化失败' }
+
+# 使用 init 实际输出的 runRoot，不猜测它生成的唯一目录名。
+$qcsRun = '<init输出的runRoot>'
+python -B "$qcsTools/qcs-copy-cu-fixtures.py" --run-json "$qcsRun/run.json" --plan $qcsFixturePlan
+if ($LASTEXITCODE -ne 0) { throw 'CU 夹具复制预检失败' }
+python -B "$qcsTools/qcs-copy-cu-fixtures.py" --run-json "$qcsRun/run.json" --plan $qcsFixturePlan --execute
+if ($LASTEXITCODE -ne 0) { throw 'CU 夹具复制失败，保留本次失败记录' }
+```
+
+复制计划使用 schema 2，逐项绑定 `mtimeMs`，写入目标后恢复并核验实际修改时间，不修改源文件的字节或修改时间。旧 schema 1 计划需重新创建。复制必须在启动应用、模型导入及 `begin` 场景之前完成，因为此时 `samples`、`profile`、`models`、`evidence` 和 `exports` 必须为空。完成记录写入 `negative-models/qcs-fixture-copy.json`，`acceptancePassed` 始终为 false。CU-09 只操作本次 run 内的 canary，将 `negative-models/actions/待新增 short.txt` 复制到本次已索引的变更目录作为新增事件，用对应模板改写修改 canary，删除 canary 也仅针对本次副本，保留原始准备集及时间线证据。
+
 本轮便携 SumatraPDF、mpv 工具已在外部构建根准备，但准备完成不代表运行或定位已通过。执行时记录实际工具版本、路径和文件哈希，显式配置为这些程序，不通过 PATH 偶然命中其他安装。只用本次样本验证首次启动、应用运行中以及同一文件已经打开三种状态，记录工具自身显示的页码或时间，不用启动进程成功代替定位成功。
 
 Computer Use 应先读取当前安装版本的 Windows Computer Use 技能及其 guidance、api 和 confirmations 文档，通过实际可用的 `mcp__node_repl__js` 初始化 `@oai/sky`。调用 `sky.list_apps()` 实际枚举应用，选择唯一目标窗口，再调用 `sky.get_window_state` 获取最新状态。浏览器入口没有原生应用能力不代表 Windows 插件不可用。每次操作依据最新窗口状态，错误后按技能执行有界恢复，不复用失效控件索引。

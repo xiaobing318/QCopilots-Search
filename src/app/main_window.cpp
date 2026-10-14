@@ -122,13 +122,23 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
                 return (!generation.isEmpty() && generation != state.generation)
                     || (!visibilityEpoch.isEmpty() && visibilityEpoch != state.visibilityEpoch);
             };
-            if (query_->text().trimmed().isEmpty() && !browse_.generation.isEmpty() && !browse_.pending) {
-                if (changed(browse_)) markFilesStale();
+            if (query_->text().trimmed().isEmpty() && !browse_.generation.isEmpty() && !browse_.pending
+                && displayedSearchContext_ == searchContext(false)) {
+                if (changed(browse_)) {
+                    markFilesStale();
+                    // An empty page has no selection or preview to preserve.
+                    // Coalesce publications until the first files become visible.
+                    if (hits_.isEmpty() && !debounce_.isActive()) debounce_.start();
+                }
             }
             else debounce_.start();
             if (popup_ && popup_->isVisible()) {
-                if (popupQuery_->text().trimmed().isEmpty() && !popupBrowse_.generation.isEmpty() && !popupBrowse_.pending) {
-                    if (changed(popupBrowse_)) markFilesStale(true);
+                if (popupQuery_->text().trimmed().isEmpty() && !popupBrowse_.generation.isEmpty() && !popupBrowse_.pending
+                    && popupDisplayedContext_ == searchContext(true)) {
+                    if (changed(popupBrowse_)) {
+                        markFilesStale(true);
+                        if (popupHits_.isEmpty() && !popupDebounce_.isActive()) popupDebounce_.start();
+                    }
                 }
                 else popupDebounce_.start();
             }
@@ -360,6 +370,7 @@ void MainWindow::sendSearch(bool popup) {
     if (!connected_) return;
     SearchEdit *input = popup ? popupQuery_ : query_;
     if (!input || input->isComposing()) return;
+    (popup ? popupDebounce_ : debounce_).stop();
     QString &previous = popup ? popupSearch_ : currentSearch_;
     if (!previous.isEmpty()) { backend_->cancel(previous); pending_.remove(previous); resultRequests_.remove(previous); }
     const auto context = searchContext(popup);
@@ -422,6 +433,7 @@ void MainWindow::updateBrowseControls(bool popup) {
     if (!message.isEmpty()) (popup ? popupStatus_ : summary_)->setText(message);
 }
 void MainWindow::markFilesStale(bool popup) {
+    if (!(popup ? popupHits_ : hits_).isEmpty()) (popup ? popupDebounce_ : debounce_).stop();
     auto &state = popup ? popupBrowse_ : browse_;
     state.stale = true;
     state.loading = false;
@@ -477,6 +489,9 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
             if (request.browse) item->setData(Qt::UserRole + 1, value.toObject().value("fileId").toString());
         }
         if (request.browse) {
+            // A successful first page consumes any queued empty-page refresh.
+            // Populated pages follow the normal explicit refresh policy.
+            if (!hits.isEmpty()) (popup ? popupDebounce_ : debounce_).stop();
             state.cursor = data.value("hasMore").toBool() ? data.value("nextCursor").toString() : QString();
             state.generation = data.value("browseGeneration").toString();
             state.visibilityEpoch = data.value("visibilityEpoch").toString();

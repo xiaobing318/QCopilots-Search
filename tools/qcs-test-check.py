@@ -57,6 +57,31 @@ class CheckTests(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
+    def test_local_linux_installer_binds_real_commit_without_ci_environment(self):
+        environment = dict(self.environment)
+        with patch.object(workflow.platform, "system", return_value="Linux"), \
+                patch.object(workflow.os, "name", "posix"), \
+                patch.object(workflow, "helper_module", side_effect=self.helper), \
+                patch.object(evidence, "source_identity", return_value=deepcopy(IDENTITY)), \
+                patch.object(workflow, "package_for_suffix", return_value=self.root / "pkg/qcs-fixture.deb"), \
+                patch.object(workflow, "run") as execute:
+            workflow.execute_action("installers", self.args("full"), self.root, self.root / "release",
+                self.root / "stage", self.reports, self.root / "sdk", self.root / "sdk/qt", environment)
+        self.assertEqual(execute.call_args.kwargs["env"]["QCOPILOTS_SEARCH_CANDIDATE_HEAD"], HEAD)
+        self.assertNotIn("QCOPILOTS_SEARCH_CANDIDATE_HEAD", environment)
+
+    def test_linux_installer_rejects_candidate_mismatch_before_launch(self):
+        environment = dict(self.environment, QCOPILOTS_SEARCH_CANDIDATE_HEAD="d" * 40)
+        with patch.object(workflow.platform, "system", return_value="Linux"), \
+                patch.object(workflow.os, "name", "posix"), \
+                patch.object(workflow, "helper_module", side_effect=self.helper), \
+                patch.object(evidence, "source_identity", return_value=deepcopy(IDENTITY)), \
+                patch.object(workflow, "run") as execute:
+            with self.assertRaisesRegex(RuntimeError, "candidate differs"):
+                workflow.execute_action("installers", self.args("full"), self.root, self.root / "release",
+                    self.root / "stage", self.reports, self.root / "sdk", self.root / "sdk/qt", environment)
+        execute.assert_not_called()
+
     def helper(self, relative, name):
         if relative == "tools/qcs-release-evidence.py":
             return evidence

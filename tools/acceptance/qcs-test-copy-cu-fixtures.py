@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
+import struct
 import sys
 import tempfile
 import unittest
@@ -98,6 +99,85 @@ class FixtureCopyTests(unittest.TestCase):
             copy.materialize(self.run_json, self.plan, True)
         self.assertFalse(any((self.run / "samples").iterdir()))
 
+    def test_source_mtime_change_alone_is_rejected_before_any_copy(self):
+        source = self.sources / "samples/笔记.txt"
+        original = source.read_bytes()
+        before = source.stat()
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 5_000_000_000))
+        self.assertEqual(source.read_bytes(), original)
+        with self.assertRaises(ValueError):
+            copy.materialize(self.run_json, self.plan, True)
+        self.assertFalse(any((self.run / "samples").iterdir()))
+        self.assertFalse((self.run / "negative-models").exists())
+
+    def test_copy_restores_planned_mtimes_and_preserves_source_bytes_and_times(self):
+        paths = sorted(path for path in self.sources.rglob("*") if path.is_file())
+        for index, path in enumerate(paths):
+            timestamp = 1_600_000_000_000_000_000 + index * 1_000_000_000
+            os.utime(path, ns=(timestamp, timestamp))
+        originals = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        plan_path = self.root / "qcs-fixed-times-plan.json"
+        copy.create_plan(self.sources, plan_path)
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        self.assertEqual(plan["schemaVersion"], 2)
+        self.assertEqual(len(plan["files"]), len(originals))
+        result = copy.materialize(self.run_json, plan_path, True)
+        report = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        copied = {row["targetRelativePath"]: row for row in report["files"]}
+        for row in plan["files"]:
+            with self.subTest(path=row["sourceRelativePath"]):
+                source = self.sources / row["sourceRelativePath"]
+                destination = self.run / row["targetRelativePath"]
+                content, original_ns = originals[source]
+                self.assertEqual(row["mtimeMs"], original_ns // 1_000_000)
+                self.assertEqual(source.read_bytes(), content)
+                self.assertEqual(source.stat().st_mtime_ns, original_ns)
+                self.assertEqual(destination.read_bytes(), content)
+                self.assertEqual(destination.stat().st_mtime_ns // 1_000_000, row["mtimeMs"])
+                self.assertEqual(copied[row["targetRelativePath"]]["verifiedTarget"]["mtimeMs"], row["mtimeMs"])
+
+    def test_mtime_verification_is_optional_but_detects_time_only_damage(self):
+        source = self.sources / "samples/笔记.txt"
+        size, digest = source.stat().st_size, copy.sha(source)
+        before = source.stat()
+        expected_ms = before.st_mtime_ns // 1_000_000
+        copy.check_file(source, size, digest, mtime_ms=expected_ms)
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 5_000_000_000))
+        copy.check_file(source, size, digest)
+        with self.assertRaises(ValueError):
+            copy.check_file(source, size, digest, mtime_ms=expected_ms)
+
+    def test_plan_without_timestamp_contract_is_rejected(self):
+        self.mutate_plan(lambda plan: plan.update(schemaVersion=1))
+        with self.assertRaises(ValueError):
+            copy.materialize(self.run_json, self.plan, True)
+        self.assertFalse(any((self.run / "samples").iterdir()))
+
+    def test_plan_timestamp_tampering_is_rejected_before_copy(self):
+        self.mutate_plan(lambda plan: plan["files"][0].update(mtimeMs=0))
+        with self.assertRaises(ValueError):
+            copy.materialize(self.run_json, self.plan, True)
+        self.assertFalse(any((self.run / "samples").iterdir()))
+
+    def test_generated_source_materializes_into_a_fresh_recorder_run(self):
+        generated = self.root / "generated 中文 source"
+        prepared = copy.prepare_source(generated)
+        source_manifest = json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))
+        plan_path = self.root / "generated-plan.json"
+        copy.create_plan(generated, plan_path)
+        result = copy.materialize(self.run_json, plan_path, True)
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["acceptancePassed"])
+        browse = self.run / copy.BROWSE_ROOT
+        self.assertEqual(sum(path.is_file() for path in browse.rglob("*")), 205)
+        self.assertEqual((self.run / copy.SOURCE_MANIFEST).read_bytes(), Path(prepared["manifest"]).read_bytes())
+        for row in source_manifest["files"]:
+            with self.subTest(path=row["relativePath"]):
+                copied = self.run / row["relativePath"]
+                copy.check_file(copied, row["bytes"], row["sha256"], mtime_ms=row["mtimeMs"])
+        self.assertFalse(any((self.run / "profile").iterdir()))
+        self.assertFalse(any((self.run / "models").iterdir()))
+
     def test_candidate_input_tampering_is_rejected(self):
         with (self.run / "inputs/package-candidate.json").open("a", encoding="utf-8") as output:
             output.write(" ")
@@ -178,6 +258,36 @@ class FixtureCopyTests(unittest.TestCase):
         self.assertIn("fixture disk failure", report["error"])
         self.assertTrue((self.sources / "samples/笔记.txt").is_file())
 
+    def test_copy_and_report_failure_preserve_original_exception_without_add_note(self):
+        class LegacyFailure(OSError):
+            @property
+            def add_note(self):
+                raise AttributeError("Python 3.10 has no BaseException.add_note")
+        original = LegacyFailure("original copy failure")
+        with patch.object(copy.shutil, "copyfileobj", side_effect=original), \
+                patch.object(copy, "write_json", side_effect=OSError("failure report is unwritable")):
+            with self.assertRaises(LegacyFailure) as caught:
+                copy.materialize(self.run_json, self.plan, True)
+        self.assertIs(caught.exception, original)
+        self.assertEqual(str(caught.exception), "original copy failure")
+        self.assertTrue((self.sources / "samples/笔记.txt").is_file())
+
+    def test_unreadable_subdirectory_cannot_silently_disappear_from_manual_plan(self):
+        blocked = self.sources / "samples/unreadable"
+        blocked.mkdir()
+        (blocked / "must-not-disappear.txt").write_text("must remain in the input set", encoding="utf-8")
+        plan = self.root / "unreadable-plan.json"
+        original_scandir = copy.os.scandir
+        def scandir(path):
+            if Path(path) == blocked:
+                raise PermissionError("directory cannot be enumerated")
+            return original_scandir(path)
+        with patch.object(copy.os, "scandir", side_effect=scandir):
+            with self.assertRaisesRegex(PermissionError, "cannot be enumerated"):
+                copy.create_plan(self.sources, plan)
+        self.assertFalse(plan.exists())
+        self.assertEqual((blocked / "must-not-disappear.txt").read_text(encoding="utf-8"), "must remain in the input set")
+
     def test_linked_source_guard_rejects_before_reading_file(self):
         # Exercise the guard on every host, without requiring Windows symlink
         # privileges. Actual filesystem-link behavior is a platform test.
@@ -213,6 +323,262 @@ class FixtureCopyTests(unittest.TestCase):
         empty_source.mkdir()
         with self.assertRaisesRegex(ValueError, "At least one sample"):
             copy.create_plan(empty_source, self.root / "qcs-empty.json")
+
+
+class FixtureSourceTests(unittest.TestCase):
+    def setUp(self):
+        requested = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
+        if requested and not Path(requested).is_dir():
+            raise RuntimeError("QCOPILOTS_SEARCH_TEST_ROOT must be an existing directory")
+        self.temp = tempfile.TemporaryDirectory(prefix="qcs-cu-source-", dir=requested)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    def prepare(self, name):
+        root = self.root / name
+        result = copy.prepare_source(root)
+        self.assertEqual(Path(result["sourceRoot"]), root)
+        self.assertEqual(result["browsingFiles"], 205)
+        manifest_path = root / copy.SOURCE_MANIFEST
+        self.assertEqual(Path(result["manifest"]), manifest_path)
+        self.assertEqual(result["manifestSha256"], copy.sha(manifest_path))
+        return root, json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    def test_cli_preparation_and_plan_emit_utf8_under_legacy_stream_encoding(self):
+        import subprocess
+        source = self.root / "CLI 中文 source"
+        plan = self.root / "CLI 中文 plan.json"
+        environment = dict(os.environ, PYTHONIOENCODING="ascii")
+        script = str(Path(__file__).with_name("qcs-copy-cu-fixtures.py"))
+        for arguments in (("--prepare-source", "--source-root", str(source)),
+                          ("--create-plan", "--source-root", str(source), "--plan", str(plan))):
+            result = subprocess.run([sys.executable, "-B", script, *arguments],
+                                    capture_output=True, env=environment, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+            self.assertIsInstance(json.loads(result.stdout.decode("utf-8")), dict)
+        self.assertEqual(json.loads(plan.read_text(encoding="utf-8"))["schemaVersion"], 2)
+
+    def test_partial_preparation_is_preserved_and_cannot_be_reclassified_as_manual_source(self):
+        root = self.root / "failed preparation"
+        original_check = copy.check_file
+        calls = 0
+        def check(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("fixture verification failed")
+            return original_check(*args, **kwargs)
+        with patch.object(copy, "check_file", side_effect=check):
+            with self.assertRaisesRegex(OSError, "fixture verification failed"):
+                copy.prepare_source(root)
+        self.assertTrue((root / copy.PREPARING).is_file())
+        self.assertFalse((root / copy.SOURCE_MANIFEST).exists())
+        before = {path.relative_to(root).as_posix(): path.read_bytes()
+                  for path in root.rglob("*") if path.is_file()}
+        self.assertGreater(len(before), 1)
+        plan = self.root / "partial-plan.json"
+        with self.assertRaisesRegex(ValueError, "Incomplete fixture preparation"):
+            copy.create_plan(root, plan)
+        self.assertFalse(plan.exists())
+        after = {path.relative_to(root).as_posix(): path.read_bytes()
+                 for path in root.rglob("*") if path.is_file()}
+        self.assertEqual(before, after)
+
+    def snapshot(self, root):
+        return {path.relative_to(root).as_posix(): (path.stat().st_size, copy.sha(path), path.stat().st_mtime_ns)
+                for path in root.rglob("*") if path.is_file()}
+
+    def test_generated_browsing_files_and_manifest_match_actual_content(self):
+        root, manifest = self.prepare("中文 source with spaces")
+        rows = manifest["files"]
+        relative_paths = [row["relativePath"] for row in rows]
+        self.assertEqual(len(relative_paths), len(set(relative_paths)))
+        self.assertEqual(len(relative_paths), len({value.casefold() for value in relative_paths}))
+        for row in rows:
+            with self.subTest(path=row["relativePath"]):
+                relative = PurePosixPath(row["relativePath"])
+                self.assertFalse(relative.is_absolute())
+                self.assertNotIn("..", relative.parts)
+                self.assertIn(relative.parts[0], ("samples", "negative-models"))
+                path = root.joinpath(*relative.parts)
+                self.assertTrue(path.is_file())
+                self.assertFalse(path.is_symlink())
+                self.assertEqual(row["bytes"], path.stat().st_size)
+                self.assertEqual(row["sha256"], copy.sha(path))
+                self.assertEqual(row["mtimeMs"], path.stat().st_mtime_ns // 1_000_000)
+                self.assertTrue(row["role"])
+        prefix = copy.BROWSE_ROOT + "/"
+        browsing_rows = [row for row in rows if row["relativePath"].startswith(prefix)]
+        actual = {path.relative_to(root).as_posix() for path in (root / copy.BROWSE_ROOT).rglob("*") if path.is_file()}
+        self.assertEqual(len(browsing_rows), 205)
+        self.assertEqual(actual, {row["relativePath"] for row in browsing_rows})
+        for relative in actual:
+            self.assertEqual(PurePosixPath(relative).suffix, ".txt")
+            self.assertTrue((root / relative).read_text(encoding="utf-8").strip())
+        self.assertTrue(any(any(ord(char) > 127 for char in Path(value).name) for value in actual))
+        self.assertTrue(any(" " in Path(value).name for value in actual))
+        self.assertTrue(any(len(PurePosixPath(value).parts) >= 5 for value in actual))
+        other_samples = [value for value in relative_paths if value.startswith("samples/") and not value.startswith(prefix)]
+        self.assertTrue(other_samples, "Interaction fixtures must have a root separate from the 205 browsing files")
+        suffixes = {PurePosixPath(value).suffix.lower() for value in other_samples}
+        self.assertTrue({".ipynb", ".pdf"}.issubset(suffixes))
+        self.assertTrue({".docx", ".xlsx", ".pptx", ".odt", ".rtf"} & suffixes)
+        self.assertTrue(any(value.startswith("negative-models/") and value.endswith(".gguf") for value in relative_paths))
+
+    def test_fixed_timestamps_include_ties_across_both_page_boundaries(self):
+        _, manifest = self.prepare("page boundaries")
+        prefix = copy.BROWSE_ROOT + "/"
+        times = sorted((row["mtimeMs"] for row in manifest["files"] if row["relativePath"].startswith(prefix)), reverse=True)
+        self.assertEqual(len(times), 205)
+        self.assertGreater(times[0], times[-1])
+        for boundary in (100, 200):
+            with self.subTest(boundary=boundary):
+                self.assertEqual(len(set(times[boundary - 2:boundary + 1])), 1)
+        # Equal-time rows are intentionally not ordered by filename here. The
+        # product's tie breaker is the file ID assigned by the real index.
+
+    def test_generated_fixture_identity_is_reproducible_across_roots(self):
+        _, first = self.prepare("first source")
+        _, second = self.prepare("second 中文 source")
+        def identities(manifest):
+            return {row["relativePath"]: (row["bytes"], row["sha256"], row["mtimeMs"], row["role"])
+                    for row in manifest["files"]}
+        self.assertEqual(identities(first), identities(second))
+
+    def test_changed_generator_identity_rejects_plan_without_modifying_sources(self):
+        root, manifest = self.prepare("generator identity")
+        manifest["generator"]["sha256"] = "0" * 64
+        (root / copy.SOURCE_MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        before = self.snapshot(root)
+        plan = self.root / "changed-generator-plan.json"
+        with self.assertRaisesRegex(ValueError, "generator differs"):
+            copy.create_plan(root, plan)
+        self.assertFalse(plan.exists())
+        self.assertEqual(self.snapshot(root), before)
+
+    def test_changed_prepared_file_set_rejects_plan_without_modifying_sources(self):
+        root, manifest = self.prepare("file membership")
+        extra = root / copy.BROWSE_ROOT / "unrecorded extra.txt"
+        extra.write_text("This file was not in the prepared manifest.", encoding="utf-8")
+        before = self.snapshot(root)
+        extra_plan = self.root / "extra-file-plan.json"
+        with self.assertRaisesRegex(ValueError, "unrecorded or missing"):
+            copy.create_plan(root, extra_plan)
+        self.assertFalse(extra_plan.exists())
+        self.assertEqual(self.snapshot(root), before)
+        extra.unlink()
+        (root / manifest["files"][0]["relativePath"]).unlink()
+        before = self.snapshot(root)
+        missing_plan = self.root / "missing-file-plan.json"
+        with self.assertRaises(ValueError):
+            copy.create_plan(root, missing_plan)
+        self.assertFalse(missing_plan.exists())
+        self.assertEqual(self.snapshot(root), before)
+
+    def test_late_video_scene_survives_coarse_grayscale_deduplication(self):
+        root, manifest = self.prepare("late video scene")
+        videos = [row for row in manifest["files"] if row["role"] == "video"]
+        self.assertEqual(len(videos), 1)
+        row = videos[0]
+        data = (root / row["relativePath"]).read_bytes()
+        self.assertEqual(data[:4], b"RIFF")
+        self.assertEqual(data[8:12], b"AVI ")
+        self.assertEqual(struct.unpack_from("<I", data, 4)[0] + 8, len(data))
+
+        def chunks(payload):
+            position = 0
+            while position < len(payload):
+                self.assertGreaterEqual(len(payload) - position, 8)
+                tag = payload[position:position + 4]
+                length = struct.unpack_from("<I", payload, position + 4)[0]
+                start, end = position + 8, position + 8 + length
+                self.assertLessEqual(end, len(payload))
+                content = payload[start:end]
+                yield tag, content
+                if tag == b"LIST":
+                    self.assertGreaterEqual(length, 4)
+                    yield from chunks(content[4:])
+                position = end + length % 2
+            self.assertEqual(position, len(payload))
+
+        parts = list(chunks(data[12:]))
+        headers = [payload for tag, payload in parts if tag == b"avih"]
+        formats = [payload for tag, payload in parts if tag == b"strf"]
+        frames = [payload for tag, payload in parts if tag == b"00db"]
+        self.assertEqual(len(headers), 1)
+        self.assertEqual(len(formats), 1)
+        frame_us = struct.unpack_from("<I", headers[0])[0]
+        self.assertGreater(frame_us, 0)
+        self.assertEqual(struct.unpack_from("<I", headers[0], 16)[0], len(frames))
+        _, width, height, planes, bits, compression = struct.unpack_from("<IiiHHI", formats[0])
+        self.assertEqual((planes, bits, compression), (1, 24, 0))
+        self.assertGreater(width, 0)
+        self.assertGreater(height, 0)
+        self.assertEqual((width % 8, height % 8), (0, 0))
+        late_ms = row["expectedFrameStartMs"]
+        self.assertLessEqual(row["targetRegionMs"][0], late_ms)
+        self.assertLess(late_ms, row["targetRegionMs"][1])
+        self.assertLessEqual(row["targetRegionMs"][1] * 1000, len(frames) * frame_us)
+        late_frame = late_ms * 1000 // frame_us
+        self.assertGreater(late_frame, 1)
+        self.assertLess(late_frame, len(frames))
+
+        def coarse_hash(frame):
+            # This independent area average checks the fixture's spatial
+            # distinction. Real Qt/FFmpeg extraction remains separate evidence.
+            stride = ((width * 3 + 3) // 4) * 4
+            self.assertEqual(len(frame), stride * height)
+            cells = []
+            for cell_y in range(8):
+                for cell_x in range(8):
+                    total = 0
+                    for y in range(cell_y * height // 8, (cell_y + 1) * height // 8):
+                        for x in range(cell_x * width // 8, (cell_x + 1) * width // 8):
+                            blue, green, red = frame[y * stride + x * 3:y * stride + x * 3 + 3]
+                            total += (red * 11 + green * 16 + blue * 5) // 32
+                    cells.append(total // ((width // 8) * (height // 8)))
+            mean = sum(cells) // 64
+            return sum((value > mean) << index for index, value in enumerate(cells))
+
+        distance = (coarse_hash(frames[1]) ^ coarse_hash(frames[late_frame])).bit_count()
+        self.assertGreater(distance, 4, "Late scene must differ spatially enough to avoid frame deduplication")
+
+    def test_existing_empty_and_nonempty_roots_are_never_overwritten(self):
+        empty = self.root / "existing empty"
+        empty.mkdir()
+        occupied = self.root / "existing content"
+        occupied.mkdir()
+        canary = occupied / "canary.txt"
+        canary.write_bytes(b"unrelated existing content")
+        original = (canary.read_bytes(), canary.stat().st_mtime_ns)
+        for target in (empty, occupied):
+            with self.subTest(root=target), self.assertRaises((OSError, ValueError)):
+                copy.prepare_source(target)
+        self.assertEqual(list(empty.iterdir()), [])
+        self.assertEqual(list(occupied.iterdir()), [canary])
+        self.assertEqual((canary.read_bytes(), canary.stat().st_mtime_ns), original)
+
+    def test_relative_output_is_rejected_before_creating_anything(self):
+        relative = Path("qcs-forbidden-relative-" + uuid.uuid4().hex)
+        with self.assertRaises(ValueError):
+            copy.prepare_source(relative)
+        self.assertFalse(relative.exists())
+
+    def test_output_within_checkout_is_rejected_before_creating_anything(self):
+        checkout = Path(__file__).resolve().parents[2]
+        target = checkout / ("qcs-forbidden-source-" + uuid.uuid4().hex)
+        with self.assertRaises(ValueError):
+            copy.prepare_source(target)
+        self.assertFalse(target.exists())
+
+    def test_linked_output_ancestor_is_rejected_before_creation(self):
+        ancestor = self.root / "linked ancestor"
+        ancestor.mkdir()
+        target = ancestor / "new source"
+        with patch.object(Path, "is_symlink", autospec=True, side_effect=lambda path: path == ancestor):
+            with self.assertRaisesRegex(ValueError, "Linked path"):
+                copy.prepare_source(target)
+        self.assertEqual(list(ancestor.iterdir()), [])
 
 
 if __name__ == "__main__":

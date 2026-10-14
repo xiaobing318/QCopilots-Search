@@ -64,9 +64,57 @@ class V2CalibrationTests(unittest.TestCase):
         self.assertTrue(result["crossValidation"]["complete"])
         self.assertEqual(result["crossValidation"]["outOfFold"]["positive"]["queries"], 12)
         self.assertEqual(result["crossValidation"]["outOfFold"]["noAnswer"]["queries"], 12)
-        self.assertEqual(result["thresholds"], {m: 0.5 for m in v2.MODALITIES})
+        for threshold in result["thresholds"].values():
+            self.assertAlmostEqual(threshold, 0.35)
         self.assertEqual(result["rawReplay"]["holdout"]["validatedQueries"], 8)
         self.assertEqual(result["development"]["search"]["status"], "optimal")
+
+    def test_cv_gate_uses_complete_pooled_predictions_not_each_small_fold(self):
+        report = fixture()
+        for fold in range(3):
+            report["queries"].extend(query("development", "text", True, fold, str(i)) for i in range(5))
+        report["queries"][0]["rawCandidates"][0]["cosine"] = 0.3
+        policy = v2.calibrate_report(report, max_states=1000)
+        self.assertFalse(policy["crossValidation"]["folds"][0]["validation"]["passed"])
+        self.assertTrue(policy["crossValidation"]["complete"])
+        self.assertTrue(policy["crossValidation"]["outOfFold"]["passed"])
+        self.assertTrue(policy["accepted"])
+
+    def test_quarter_rule_is_uniform_and_distinguishes_reference_from_deployment_margin(self):
+        result = v2.calibrate_report(fixture(), max_states=1000)
+        placement = result["thresholdSelection"]
+        self.assertEqual(result["calibrationProtocol"], "grouped-cv-v2-quarter")
+        self.assertEqual(placement["method"], "calibration-interval-quarter")
+        self.assertEqual(placement["interiorFraction"], 0.25)
+        for modality in v2.MODALITIES:
+            interval = placement["intervals"][modality]
+            self.assertAlmostEqual(result["thresholds"][modality], 0.2 + (0.8 - 0.2) * 0.25)
+            self.assertAlmostEqual(interval["midpointReferenceThreshold"], 0.5)
+            self.assertAlmostEqual(interval["midpointReferenceMargin"], 0.3)
+            self.assertAlmostEqual(interval["rejectedMargin"], 0.15)
+            self.assertAlmostEqual(interval["acceptedMargin"], 0.45)
+        self.assertAlmostEqual(placement["minimumDeploymentMargin"], 0.15)
+        self.assertAlmostEqual(result["development"]["search"]["objective"]["minimumMidpointReferenceMargin"], 0.3)
+
+    def test_quarter_adjacent_doubles_and_all_accept_reject_boundaries(self):
+        for low, high in ((0.2, math.nextafter(0.2, math.inf)),
+                          (-1.000001, -1.0), (-1.0, 1.0), (1.0, 1.000001)):
+            for modality in v2.MODALITIES:
+                row = query("development", modality, True, 0)
+                row["rawCandidates"] = [candidate("low", modality, low, 1), candidate("high", modality, high, 2)]
+                rows = [(row, True)]
+                boundaries = {m: v2.v1.REJECT_ALL for m in v2.MODALITIES}
+                boundaries[modality] = math.nextafter(low, math.inf)
+                thresholds, placement = v2._representative_thresholds(rows, boundaries)
+                self.assertGreater(thresholds[modality], low)
+                self.assertLessEqual(thresholds[modality], high)
+                self.assertTrue(placement["calibrationAcceptanceEquivalent"])
+                self.assertEqual(v2.v1.rank_query(row, thresholds), ["high"])
+        rows = [(query("development", modality, True, 0), True) for modality in v2.MODALITIES]
+        for accept_all in (True, False):
+            boundaries = {m: 0.8 if accept_all else math.nextafter(0.8, math.inf) for m in v2.MODALITIES}
+            thresholds, _ = v2._representative_thresholds(rows, boundaries)
+            self.assertEqual(thresholds, {m: 0.8 if accept_all else v2.v1.REJECT_ALL for m in v2.MODALITIES})
 
     def test_family_topic_and_same_file_cannot_cross_folds(self):
         for field in ("family", "topic", "expectedFile"):
@@ -225,7 +273,7 @@ class V2CalibrationTests(unittest.TestCase):
         original = v2.calibrate_report(report, max_states=1000)
         for row in report["queries"]:
             if row["partition"] == "holdout":
-                row["rawCandidates"][0]["cosine"] = 0.4
+                row["rawCandidates"][0]["cosine"] = 0.3
         changed = v2.calibrate_report(report, max_states=1000)
         self.assertFalse(changed["accepted"])
         self.assertEqual(changed["status"], "holdout-failed")
@@ -254,7 +302,7 @@ class V2CalibrationTests(unittest.TestCase):
             Path(configured).mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="qcs-calibration-v2-", dir=configured) as temporary:
             root = Path(temporary)
-            raw_path, output, header = root / "raw.json", root / "policy.json", root / "policy.h"
+            raw_path, output, header = root / "原始 raw.json", root / "策略 policy.json", root / "策略 policy.h"
             report = fixture()
             raw = b"\xef\xbb\xbf" + json.dumps(report, indent=3).encode("utf-8")
             raw_path.write_bytes(raw)
@@ -267,7 +315,7 @@ class V2CalibrationTests(unittest.TestCase):
             self.assertIn(hashlib.sha256(output.read_bytes()).hexdigest().encode(), header_bytes)
             for row in report["queries"]:
                 if row["partition"] == "holdout":
-                    row["rawCandidates"][0]["cosine"] = 0.4
+                    row["rawCandidates"][0]["cosine"] = 0.3
             raw_path.write_text(json.dumps(report), encoding="utf-8")
             result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=20)
             self.assertEqual(result.returncode, 1, result.stderr)

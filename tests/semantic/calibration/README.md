@@ -19,3 +19,48 @@
 不能在读取这份 holdout 结果后重新选择阈值、移动主题或修改标签，再把同一组宣称为首次独立验证。后续若改变拟合策略或检索行为，需要预先固定新的独立验证主题，并保留本次失败快照。
 
 复核使用外置目录中的 `raw-relevance.json` 与 `policy.json`。快照是当时 `policy.json` 的逐字节副本，`reportSha256` 绑定原始采样文件。运行 `calibrate_relevance.py` 可以从相同原始文件重现该结果，失败时命令返回非零状态且不覆盖已有策略头文件。
+
+## V2 开发阶段固定审核
+
+V1 失败后，全部旧 238 条正例及 96 条无答案查询，共 334 条，均改作 development。`relevance_development_groups.json` 在不查看模型分数的情况下，将 143 个非背景主题固定为 43 个语义家族、3 个折，其中 24 个主题仅作干扰。新 40 主题的 80 条正例与 80 条无答案查询另作真正独立 holdout，未参与下列比较。
+
+下列三个文件是外置 development 诊断报告的逐字节副本，保留完整逐查询结果，不能当作最终策略或独立验证证据。其 `accepted` 均为 false，`finalHoldoutEvaluated` 均为 false。原始采样 SHA-256 均为 `d61f9ad52f5742a8a7387e40748fdf455918cb7bdbc05eac31bdab8b02350cc5`，开发分组 SHA-256 均为 `b6d71ecb8700a11b497366fdb660298ea0c377aede0f5970d23a00c3d1362db3`。
+
+| 审核快照 | 内容 | SHA-256 |
+|---|---|---|
+| [v2-development-cv-diagnostic.json](v2-development-cv-diagnostic.json) | 首版 midpoint 的三折诊断，保留 PDF 分组失败 | `0e298167c37880c1367174ee2e2dd7644240a909a75f19da748cf268dd43752f` |
+| [v2-development-cv-placement-comparison.json](v2-development-cv-placement-comparison.json) | midpoint、quarter 与 loweredge 的逐折和 OOF 对照 | `cf2d262975339cf1cc6c19764a3108448a90790f46e15b2f0846311b3c5d0584` |
+| [v2-development-full-fit-quarter-diagnostic.json](v2-development-full-fit-quarter-diagnostic.json) | 全部旧 development 的 raw 重放及 quarter 拟合 | `6a0d84aaa0338bc92e2aaa09225f73ae93ab0390a8b052492fa71338c26bffae` |
+
+| 开发诊断 | 正例 Recall@10 | PDF Recall@10 | 无答案误返回率 | 最小区间余量 |
+|---|---:|---:|---:|---:|
+| midpoint OOF | 228/238，95.80% | 6/8，75.00%，失败 | 5/96，5.21% | 0.00031185727418181486 |
+| quarter OOF | 229/238，96.22% | 7/8，87.50% | 5/96，5.21% | 0.00015592863709090743 |
+| loweredge OOF | 230/238，96.64% | 8/8，100% | 5/96，5.21% | 1.1102230246251565e-16 |
+| quarter 全部旧 development 拟合 | 233/238，97.90% | 8/8，100% | 4/96，4.17% | 0.00015592863709090743 |
+
+midpoint 与 quarter 在每折训练数据上的接受集合及指标完全一致。quarter 将四通道门槛统一放在等价区间的 25% 位置，相比 midpoint 的 OOF 多命中一个英文 PDF 正例，中文和其余内容模态不变。loweredge 虽多命中一个正例，但余量接近机器浮点边界，未采用。选定协议是 `grouped-cv-v2-quarter`，训练无答案上限 5%，OOF 和独立 holdout 仍为总体 90%、分组 80%、无答案至多 10%，没有降低验收门槛。
+
+全部旧 development 拟合的 raw 重放验证了 334 条查询。有限观测网格上的分支定界访问 460 个 box、剪枝 373 个、剩余 0，`optimalityProven` 为 true。该证明针对报告中的训练目标和有限观测网格，不能外推为开放领域检索最优。
+
+**这些诊断仅使用旧 146 文件索引。** 新 40 文件接入后，完整索引为 186 文件、318 条正例和 176 条无答案查询。它们会改变旧查询的候选及排名，必须重新采样完整索引，先通过 development 的三折校准与全部开发拟合并冻结门槛，再首次评价新 holdout。旧诊断门槛不能直接视为最终完整语料策略。
+
+上述三份诊断冻结时，新 holdout 尚未测量和评估。随后执行的完整语料首次独立评估见下一节，其失败结果没有回写这些开发诊断。新清单身份、固定执行顺序与失败规则见 [V2 协议](v2-protocol.md)。原始 raw、工作策略、运行日志、临时语料及数据库持续保存在源码树外，仅明确列出的审核副本进入版本控制，V1 原失败 JSON 保持不动。
+
+## V2 完整语料首次独立 holdout 失败
+
+[qcs-relevance-v2-quarter-aa26a4593aa2-holdout-failed.json](qcs-relevance-v2-quarter-aa26a4593aa2-holdout-failed.json) 是完整语料首次独立评估 `policy.json` 的逐字节副本。它基于 186 个实际文件、1,364 个实际提取并编码片段，包含 318 条正例和 176 条无答案查询。文件 SHA-256 为 `56eca5eb3a981ad3d0d7e1625a1f79d651927c2bc31670759c5560f83cf167de`，`reportSha256` 绑定外置原始采样 `b68d44e8c2860dc462ea15979c6c8e5b1d58fcf9bdc958d1d162c5b675441205`。原始采样文件不复制到仓库。
+
+| 指标 | 完整语料 OOF | 全部 development 拟合 | 首次独立 holdout |
+|---|---:|---:|---:|
+| 总体正例 Recall@10 | 229/238，96.22% | 231/238，97.06% | 72/80，90.00% |
+| 无答案误返回率 | 5/96，5.21% | 3/96，3.125% | 14/80，17.50%，失败 |
+| 阶段结果 | 通过 | 通过 | **失败** |
+
+holdout 的代码分组为 17/24，70.83%，低于 80% 门槛。英文为 39/40，97.50%，中文为 33/40，82.50%，语言门槛均通过。其他 9 个内容模态通过，其中普通文本 15/16，其余 8 个模态全部命中。总体召回刚好达到 90% 不能覆盖代码分组或无答案误返回失败，标准未降低。
+
+新增文件改变了开发查询的候选，本轮已重新拟合。最终代码门槛为 `0.7715758570852469`，不是旧 146 文件诊断的 `0.7623789748366625`。development 的 334 条查询和 holdout 的 160 条查询，共 494 条 raw RRF 重放全部一致，内容分组覆盖检查也通过。这些是执行与实现契约证据，不能替代相关性质量门槛。
+
+策略版本为 `qcs-relevance-v2-quarter-aa26a4593aa2`，最终状态为 `holdout-failed`、`accepted: false`。其中 `calibrated: true` 仅表示开发侧拟合完成，**没有生成生产头文件，受控生产头仍为 `calibrated = false`，相关性发行验收未通过。** 原始导出中的 `finalHoldoutEvaluated: false` 记录的是仅采样阶段，该阶段之后的独立评价结果以本次策略快照的 `holdout` 为准。
+
+这 40 个 V2 主题现在已经观察，只能继续用于已观察回归和开发分析。不得依据本次失败调整参数或算法后，再将同一组结果声称为首次独立验证。未来独立验证必须另行固定未观察数据，V1、旧 development 诊断和本次 V2 失败快照均保持原样。

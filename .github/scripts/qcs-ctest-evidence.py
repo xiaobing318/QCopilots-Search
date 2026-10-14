@@ -76,6 +76,9 @@ ACCEPTANCE_WINDOWS_CASES = set(ACCEPTANCE_WINDOWS_SKIP_REASONS)
 UNITTEST_CASE = re.compile(r"^(test\S+) \((\S+)\) \.\.\. (ok|FAIL|ERROR|expected failure|unexpected success|skipped [^\r\n]*)\r?$", re.MULTILINE)
 UNITTEST_TOTAL = re.compile(r"^Ran (\d+) tests? in [\d.]+s\r?$", re.MULTILINE)
 UNITTEST_RESULT = re.compile(r"^(OK(?: \(skipped=\d+\))?|FAILED(?: \([^\r\n]*\))?)\r?$", re.MULTILINE)
+REGISTRATION_PREFIX = "QCS_CASE_REGISTRATION"
+SIGNING_REGISTRATION_REASON = "POSIX macOS bundle symbolic-link contract is covered on macOS/Linux. Portable resolution contracts run on Windows."
+WORKFLOW_REGISTRATION_REASON = "POSIX framework and versioned-library symlink contract is covered on macOS/Linux. Windows junction boundaries run separately."
 
 
 def unittest_case_identifier(method, identifier):
@@ -90,6 +93,49 @@ def unittest_case_identifier(method, identifier):
         # a Python 3.10 class name and accepted under a synthetic identity.
         raise ValueError("Python unittest method and case identity disagree")
     return identifier + "." + method
+
+
+def inspect_unittest_registration(output, records, operating_system, program):
+    """Optional source-emitted suite inventory, distinct from executed passes."""
+    lines = [line for line in output.splitlines() if line.startswith(REGISTRATION_PREFIX)]
+    if not lines:
+        return None, []
+    errors = []
+    if len(lines) != 1:
+        return None, ["Python unittest has duplicate case registration records"]
+    try:
+        document = json.loads(lines[0][len(REGISTRATION_PREFIX):].strip())
+        if (not isinstance(document, dict) or set(document) != {"suite", "selected", "notApplicable"}
+                or not isinstance(document["suite"], str) or not document["suite"].strip()):
+            raise ValueError("Python unittest case registration schema is invalid")
+        selected, excluded = document["selected"], document["notApplicable"]
+        if (not isinstance(selected, list) or not selected
+                or any(not isinstance(name, str) or not re.fullmatch(r"(?:\w+\.)+test\w*", name) for name in selected)
+                or len(set(selected)) != len(selected)):
+            raise ValueError("Python unittest selected case registration is invalid or duplicated")
+        if selected != [record["case"] for record in records]:
+            errors.append("Python unittest selected case registration differs from the observed ordered case records")
+        if not isinstance(excluded, list):
+            raise ValueError("Python unittest notApplicable registration must be a list")
+        excluded_names = []
+        for item in excluded:
+            if (not isinstance(item, dict) or set(item) != {"case", "reason"}
+                    or not isinstance(item["case"], str) or not isinstance(item["reason"], str)
+                    or not item["reason"].strip()):
+                raise ValueError("Python unittest notApplicable case registration is invalid")
+            name = item["case"]
+            excluded_names.append(name)
+            accepted = operating_system == "Windows" and (
+                (program == SIGNING_TEST and name in SIGNING_WINDOWS_SKIPS and item["reason"] == SIGNING_REGISTRATION_REASON)
+                or (program in (WORKFLOW_TEST, WORKFLOW_NATIVE_TEST) and name in WORKFLOW_POSIX_LINK_CASES
+                    and item["reason"] == WORKFLOW_REGISTRATION_REASON))
+            if not accepted:
+                errors.append("Python unittest registration excludes an applicable or unknown case: " + name)
+        if len(set(excluded_names)) != len(excluded_names) or set(selected) & set(excluded_names):
+            errors.append("Python unittest registered exclusions are duplicated or overlap selected cases")
+        return document, errors
+    except (ValueError, KeyError, TypeError) as error:
+        return None, ["Malformed or truncated Python unittest case registration: " + str(error)]
 
 
 def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
@@ -149,6 +195,8 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
         errors.append("Python unittest total does not match complete individual case records")
     counts["run"] = int(totals[0]) if len(totals) == 1 else len(records)
     identifiers = [record["case"] for record in records]
+    _, registration_errors = inspect_unittest_registration(output, records, operating_system, program)
+    errors.extend(registration_errors)
     if len(set(identifiers)) != len(identifiers):
         errors.append("Python unittest contains duplicate case records")
     expected_conclusion = f"OK (skipped={counts['skipped']})" if counts["skipped"] else "OK"
@@ -186,7 +234,7 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
         raise ValueError(f"Unknown test profile: {test_profile!r}")
     document = {"schemaVersion": 1, "platform": operating_system, "source": str(path),
                 "testProfile": test_profile, "testsComplete": False, "releaseComplete": False,
-                "ctestPrograms": [], "qtTestSkips": [], "pythonTestSkips": [],
+                "ctestPrograms": [], "qtTestSkips": [], "pythonTestSkips": [], "pythonRegisteredNotApplicable": [],
                 "pythonTestTotals": {"run": 0, "passed": 0, "failed": 0, "skipped": 0, "notApplicable": 0},
                 "inventoryVerified": False, "expectedPrograms": [],
                 "errors": [], "qtTestTotals": {"passed": 0, "failed": 0,
@@ -282,6 +330,13 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
         elif kind == "python-unittest":
             counts, records, python_skips, python_errors = inspect_signing_unittest(output, operating_system, name)
             summary.update({"pythonTest": True, "pythonTestTotals": counts, "cases": records})
+            registration, registration_errors = inspect_unittest_registration(output, records, operating_system, name)
+            if registration is not None:
+                summary["caseRegistration"] = registration
+            if registration is not None and not registration_errors:
+                document["pythonRegisteredNotApplicable"].extend(
+                    {"program": name, **item, "classification": "notApplicable", "stage": "registration"}
+                    for item in registration["notApplicable"])
             errors.extend(python_errors)
             document["pythonTestSkips"].extend(python_skips)
             for key, value in counts.items():

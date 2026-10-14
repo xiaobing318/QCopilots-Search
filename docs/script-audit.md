@@ -2,16 +2,16 @@
 
 本清单覆盖应用仓库自有的 Python、PowerShell、Shell 和 CMake 脚本，核对开发入口、CMake、CI、测试注册、动态导入与文档化专项入口。第三方源码、下载缓存、生成脚本和外置历史副本不计入。静态引用证明脚本有调用方，实际测试结果仍以对应候选的报告为准。
 
-本轮审查基线为 **66 个 Python / PowerShell / Shell 脚本和 19 个 `.cmake` 脚本**。删除两个仅转发参数的安装包 PowerShell 包装，保留其 Python 实现。新增外置输出根、配置幂等、流程编排、测试策略、语义校准与发布工具共 9 个已接入脚本，以及 2 个 CMake 模块。另有 2 个已落盘但尚未注册验收的第二版语义校准脚本。当前实际源树为 **75 个 Python / PowerShell / Shell 脚本和 21 个 `.cmake` 脚本**，其中 73 个脚本已接入现有流程，2 个仍在开发。所有 `CMakeLists.txt`、`CMakePresets.json`、原生 Actions 工作流、桌面资源和 NSIS 模板也参与调用关系审查，但不重复计入这些数量。
+本轮审查基线为 **66 个 Python / PowerShell / Shell 脚本和 19 个 `.cmake` 脚本**。删除两个仅转发参数的安装包 PowerShell 包装，保留其 Python 实现。新增外置输出根、配置幂等、流程编排、测试策略、语义校准与证据校验、发布工具共 13 个已接入脚本，以及 2 个 CMake 模块。当前实际源树为 **77 个 Python / PowerShell / Shell 脚本和 21 个 `.cmake` 脚本**。第二版语义校准已注册工具回归，quarter 版本的完整相关性与候选验收仍未完成。所有 `CMakeLists.txt`、`CMakePresets.json`、原生 Actions 工作流、桌面资源和 NSIS 模板也参与调用关系审查，但不重复计入这些数量。
 
 | 脚本分组 | 审查基线 | 当前文件数 |
 | --- | --- | --- |
 | 根目录入口 | 2 | 2 |
-| `tools/` 根目录 | 19 | 24 |
+| `tools/` 根目录 | 19 | 26 |
 | `.github/scripts/` | 5 | 5 |
 | `tests/` | 6 | 12 |
 | `tools/acceptance/` | 34 | 32 |
-| 合计，不含 `.cmake` | 66 | 75 |
+| 合计，不含 `.cmake` | 66 | 77 |
 
 ## 审查结论
 
@@ -37,6 +37,8 @@
 | `tools/qcs-package-symbols.py` | 保留，符号包与 manifest | `tools/qcs-dev.py` 的 `package` 动作，`tools/acceptance/qcs-package-phase1.py` |
 | `tools/qcs-path-budget.py` | 保留，生成路径长度诊断 | `tools/qcs-dev.py` 的配置、doctor 与打包路径检查 |
 | `tools/qcs-release-evidence.py` | 保留，候选来源与必需证据验证 | `.github/workflows/qcs-native.yml`、原生 CI 和候选验收运行器 |
+| `tools/qcs-semantic-policy-evidence.py` | 新增，校验冻结的 quarter 策略身份、完整查询集、分组隔离及重算质量统计，不重新拟合或运行模型 | `tools/qcs-release-evidence.py` 的 `relevance_calibration_errors()` 动态加载并调用 `validate_calibration_snapshot()` |
+| `tools/qcs-semantic-policy-evidence-tests.py` | 新增，语义策略证据的合成合约与失败拒绝回归 | `tests/CMakeLists.txt` 注册 fast 范围的 `qcs-tests-semantic-policy-evidence`，动态加载校验器与 `calibrate_relevance_v2.py` |
 | `tools/qcs-release.py` | 新增，校验并冻结完整候选材料，显式上传未公开的 GitHub 草稿 | `tools/qcs-dev.py` 的 `release-prepare`、`release-upload-draft` 动作分别调用 `prepare`、`upload-draft` |
 | `tools/qcs-test-release.py` | 新增，发布材料、草稿上传与拒绝边界的合成回归 | 顶层 `CMakeLists.txt` 注册 `qcs-tests-release-tool`，测试动态加载 `qcs-release.py` |
 | `tools/qcs-source-bundle.py` | 保留，对应源码材料生成与内容校验 | `.github/scripts/qcs-native-ci.py` 的 `sources` 阶段，`tools/acceptance/qcs-package-phase2.py` |
@@ -73,8 +75,8 @@
 | `tests/runtime/configure_idempotency_test.py` | 新增，重复配置与 libgit2 补丁准备的内容、时间戳稳定性 | `tests/runtime/CMakeLists.txt` 注册 `qcs-tests-configure-idempotency`，传入实际 CMake 和 libgit2 源码目录 |
 | `tests/semantic/calibrate_relevance.py` | 新增，从冻结的真实语义报告校准模态阈值，独立校验留出集 | `tests/semantic/README.md` 的显式 Python 校准命令，`test_calibrate_relevance.py` 动态导入 |
 | `tests/semantic/test_calibrate_relevance.py` | 新增，校准输入、分组隔离、搜索及策略输出回归 | `tests/semantic/CMakeLists.txt` 注册 `qcs-tests-relevance-calibration` |
-| `tests/semantic/calibrate_relevance_v2.py` | 开发中，分组交叉验证与新的独立留出校准，尚未验收 | 已有独立 `main()` 入口并复用 v1 helper，尚未接入 CTest 或冻结候选流程 |
-| `tests/semantic/test_calibrate_relevance_v2.py` | 开发中，第二版校准协议、数据隔离及搜索回归，尚未注册 | 动态导入同目录 `calibrate_relevance_v2.py`，尚未接入 CTest |
+| `tests/semantic/calibrate_relevance_v2.py` | 新增，分组交叉验证与独立留出校准，quarter 版本尚未完成相关性验收 | 独立 `main()` 入口复用 v1 helper，由同目录 v2 工具回归动态加载 |
+| `tests/semantic/test_calibrate_relevance_v2.py` | 新增，第二版校准协议、数据隔离及搜索回归 | `tests/semantic/CMakeLists.txt` 注册 `qcs-tests-relevance-calibration-v2`，动态导入同目录 `calibrate_relevance_v2.py` |
 
 ## 专项验收运行器
 
@@ -154,7 +156,9 @@
 
 ## 后续维护规则
 
-第二版语义校准仍在开发。`calibrate_relevance_v2.py` 和配套 `test_calibrate_relevance_v2.py` 已落盘并计入当前数量，尚待注册与候选验收。相关第二版语料 JSON、资产和许可清单是数据材料，不计作脚本。新增或接入脚本后须同步调用关系和计数，注册与验收前不能标记为已完成。
+第二版语义校准仍在开发。`calibrate_relevance_v2.py` 和配套 `test_calibrate_relevance_v2.py` 已计入当前数量，工具回归注册到 fast 范围，不代表 quarter 版本的完整相关性或候选验收通过。相关第二版语料 JSON、资产和许可清单是数据材料，不计作脚本。新增或接入脚本后须同步调用关系和计数，候选验收前不能标记为已完成。
+
+`qcs-semantic-policy-evidence.py` 对真实失败或不完整的交叉验证、留出覆盖和质量统计返回拒绝。配套回归通过只能证明校验器执行了这些拒绝规则，真实相关性仍须由冻结候选的实际模型报告达到既定质量门槛，并通过完整证据验证。
 
 增加脚本前先确认已有入口是否可以复用。删除时核对动态 `import`、CMake `include`、CPack 配置、工作流、专项验收和文档入口。共享 helper 变更后同步来源捕获与哈希验证，不能让报告继续绑定已经移除的重复实现。
 

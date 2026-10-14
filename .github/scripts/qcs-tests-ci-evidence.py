@@ -547,6 +547,82 @@ class PythonSigningEvidenceTests(unittest.TestCase):
             self.assertFalse(self.inspect(signing_verbose(rows, footer=footer))["releaseComplete"])
 
 
+class PythonCaseRegistrationTests(unittest.TestCase):
+    def document(self):
+        return {"suite": "all", "selected": ["__main__.SigningTests." + name
+                for name in SIGNING_CASES if name not in SIGNING_SYMLINK_CASES],
+                "notApplicable": [{"case": "__main__.SigningTests." + name,
+                    "reason": evidence.SIGNING_REGISTRATION_REASON} for name in SIGNING_SYMLINK_CASES]}
+
+    def inspect(self, document=None, *, registration=None, legacy=False, system="Windows"):
+        selected = [name for name in SIGNING_CASES if name not in SIGNING_SYMLINK_CASES]
+        output = signing_verbose([(name, "ok") for name in selected])
+        if legacy:
+            for name in selected:
+                output = output.replace(f"(__main__.SigningTests.{name})", "(__main__.SigningTests)")
+        line = registration if registration is not None else json.dumps(
+            self.document() if document is None else document)
+        output = evidence.REGISTRATION_PREFIX + " " + line + "\n" + output
+        return EvidenceTests.inspect(self, output, name=SIGNING_PROGRAM, system=system, raw=True)
+
+    def test_registration_exclusions_are_not_executed_passes_or_runtime_skips(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                result = self.inspect(legacy=legacy)
+                self.assertTrue(result["releaseComplete"], result["errors"])
+                self.assertEqual(result["pythonTestTotals"],
+                    {"run": 8, "passed": 8, "failed": 0, "skipped": 0, "notApplicable": 0})
+                excluded = result["pythonRegisteredNotApplicable"]
+                self.assertEqual(len(excluded), 4)
+                self.assertTrue(all(item["classification"] == "notApplicable" and
+                    item["stage"] == "registration" for item in excluded))
+                self.assertEqual(result["ctestPrograms"][0]["caseRegistration"], self.document())
+
+    def test_selected_registration_requires_exact_observed_ordered_cases(self):
+        for change in (lambda rows: rows[:-1],
+                       lambda rows: rows + ["__main__.SigningTests.test_unobserved"],
+                       lambda rows: rows[::-1], lambda rows: rows + rows[:1]):
+            document = self.document()
+            document["selected"] = change(document["selected"])
+            result = self.inspect(document)
+            self.assertFalse(result["releaseComplete"])
+            self.assertTrue(any("registration" in error for error in result["errors"]))
+
+    def test_exclusions_cannot_hide_selected_unknown_or_other_platform_cases(self):
+        for change in (lambda document: document["notApplicable"].append(document["notApplicable"][0]),
+                       lambda document: document["notApplicable"][0].update(case=document["selected"][0]),
+                       lambda document: document["notApplicable"][0].update(case="__main__.SigningTests.test_unknown"),
+                       lambda document: document["notApplicable"][0].update(reason="not supported")):
+            document = self.document()
+            change(document)
+            result = self.inspect(document)
+            self.assertFalse(result["releaseComplete"])
+            self.assertEqual(result["pythonRegisteredNotApplicable"], [])
+        for system in ("Linux", "Darwin"):
+            self.assertFalse(self.inspect(system=system)["releaseComplete"])
+
+    def test_registration_missing_fields_malformed_or_duplicate_records_fail(self):
+        for registration in ("", "{", json.dumps(self.document())[:-1], "[]",
+                             json.dumps({"suite": "all", "selected": []}),
+                             json.dumps(self.document()) + "\n" + evidence.REGISTRATION_PREFIX + " " + json.dumps(self.document())):
+            with self.subTest(registration=registration):
+                result = self.inspect(registration=registration)
+                self.assertFalse(result["releaseComplete"])
+                self.assertTrue(any("registration" in error for error in result["errors"]))
+
+    def test_registered_workflow_native_case_uses_the_same_exclusion_contract(self):
+        name = evidence.WORKFLOW_NATIVE_CASE
+        output = (evidence.REGISTRATION_PREFIX + " " + json.dumps({"suite": "native",
+            "selected": [name], "notApplicable": [{"case": value,
+                "reason": evidence.WORKFLOW_REGISTRATION_REASON}
+                for value in sorted(evidence.WORKFLOW_POSIX_LINK_CASES)]}) + "\n"
+            + name.rsplit(".", 1)[-1] + " (" + name + ") ... ok\nRan 1 test in 0.001s\n\nOK\n")
+        counts, records, skips, errors = evidence.inspect_signing_unittest(output, "Windows", evidence.WORKFLOW_NATIVE_TEST)
+        self.assertEqual(errors, [])
+        self.assertEqual(counts["passed"], 1)
+        self.assertEqual(counts["notApplicable"], 0)
+
+
 class PythonWorkflowEvidenceTests(unittest.TestCase):
     def inspect(self, output=None, *, system="Windows", program=WORKFLOW_PROGRAM):
         return EvidenceTests.inspect(self, workflow_verbose() if output is None else output,

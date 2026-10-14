@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "support"))
@@ -41,8 +42,8 @@ class OutputPathTests(unittest.TestCase):
                               encoding="utf-8", errors="replace", timeout=30)
 
     def assert_rejected(self, result):
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("must be outside the source tree", result.stderr)
+        self.assertNotEqual(result.returncode, 0, (result.stdout or "") + (result.stderr or ""))
+        self.assertIn("must be outside the source tree", result.stderr or "")
 
     def test_external_and_same_prefix_sibling_are_allowed(self):
         for output in (self.root / "runs", self.root / (self.source.name + "-build")):
@@ -72,7 +73,7 @@ class OutputPathTests(unittest.TestCase):
         link = self.root / "linked source"
         if os.name == "nt":
             result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(self.source)],
-                                    capture_output=True, text=True, timeout=30)
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.addCleanup(os.rmdir, link)
         else:
@@ -107,13 +108,13 @@ class OutputPathTests(unittest.TestCase):
             'file(WRITE "${CMAKE_BINARY_DIR}/payload.txt" "fixture")\n'
             f'install(FILES "${{CMAKE_BINARY_DIR}}/payload.txt" DESTINATION "{destination}")\n', encoding="utf-8")
         result = subprocess.run([CMAKE, "-S", str(self.source), "-B", str(self.build)],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_install_prefix_override_is_checked_before_payload(self):
         self.configure_install_fixture()
         result = subprocess.run([CMAKE, "--install", str(self.build), "--prefix", str(self.source / "forbidden")],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         self.assert_rejected(result)
         self.assertFalse((self.source / "forbidden/payload.txt").exists())
 
@@ -123,7 +124,7 @@ class OutputPathTests(unittest.TestCase):
                                        settings=f'set(CMAKE_INSTALL_BINDIR [=[{directory}]=])')
         prefix = self.root / "allowed stage"
         result = subprocess.run([CMAKE, "--install", str(self.build), "--prefix", str(prefix)],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((prefix / directory / "payload.txt").read_text(), "fixture")
 
@@ -134,10 +135,57 @@ class OutputPathTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["DESTDIR"] = self.root.as_posix()
         result = subprocess.run([CMAKE, "--install", str(self.build), "--prefix", "/outside-prefix"],
-                                env=environment, capture_output=True, text=True, timeout=30)
+                                env=environment, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         self.assert_rejected(result)
         self.assertIn("DESTDIR/CMAKE_INSTALL_BINDIR", result.stderr)
         self.assertFalse((self.source / "forbidden").exists())
+
+    def test_install_diagnostics_do_not_use_cp1252_default(self):
+        # U+5E90 contains UTF-8 byte 0x90, which is undefined in CP1252. Exercise
+        # both real install failures under the hosted Windows default encoding.
+        unicode_source = self.root / "source 中文 庐"
+        self.source.rename(unicode_source)
+        self.source = unicode_source
+        with mock.patch.object(subprocess, "_text_encoding", return_value="cp1252") as default_encoding:
+            self.test_install_prefix_override_is_checked_before_payload()
+            self.test_install_destdir_uses_captured_absolute_directory()
+        default_encoding.assert_not_called()
+
+    def test_nsis_icon_path_survives_cpack_generation_and_parsing(self):
+        # Execute the production setting through both CMake parsing stages,
+        # then let CPack consume the generated config without requiring NSIS.
+        package_module = MODULE.with_name("qcs-package.cmake")
+        settings = [line.strip() for line in package_module.read_text(encoding="utf-8").splitlines()
+                    if line.strip().startswith("set(CPACK_NSIS_INSTALLED_ICON_NAME ")]
+        self.assertEqual(len(settings), 1)
+        (self.source / "CMakeLists.txt").write_text(
+            'cmake_minimum_required(VERSION 3.28)\nproject(qcs_icon_fixture NONE)\n'
+            + settings[0] + '\n'
+            'set(CPACK_PACKAGE_VERSION 1.0.0)\nset(CPACK_PACKAGE_FILE_NAME qcs-icon-fixture)\n'
+            'set(CPACK_GENERATOR ZIP)\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/payload.txt" "fixture")\n'
+            'install(FILES "${CMAKE_BINARY_DIR}/payload.txt" DESTINATION bin)\n'
+            'include(CPack)\n', encoding="utf-8")
+        result = subprocess.run([CMAKE, "-S", str(self.source), "-B", str(self.build)],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        parse = self.build / "parse-config.cmake"
+        parse.write_text(
+            'cmake_minimum_required(VERSION 3.28)\n'
+            f'include("{(self.build / "CPackConfig.cmake").as_posix()}")\n'
+            f'file(WRITE "{(self.build / "decoded-icon.txt").as_posix()}" "${{CPACK_NSIS_INSTALLED_ICON_NAME}}")\n',
+            encoding="utf-8")
+        result = subprocess.run([CMAKE, "-P", str(parse)], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.build / "decoded-icon.txt").read_text(encoding="utf-8"), r"bin\qcs-gui.exe")
+        cpack = Path(CMAKE).with_name("cpack.exe" if os.name == "nt" else "cpack")
+        result = subprocess.run([str(cpack), "--config", str(self.build / "CPackConfig.cmake"),
+                                 "-B", str(self.root / "packages"), "-G", "ZIP"],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Invalid escape sequence", result.stdout + result.stderr)
+        self.assertTrue((self.root / "packages/qcs-icon-fixture.zip").is_file())
 
 
 if __name__ == "__main__":

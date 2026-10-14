@@ -97,7 +97,10 @@ qcopilots_search_add_test(NAME qcs-tests-test-policy
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-policy-tests.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-check
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-check.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-semantic-policy-evidence
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-semantic-policy-evidence-tests.py" -v)
 set_tests_properties(qcs-tests-ci-evidence qcs-tests-release-evidence qcs-tests-test-policy qcs-tests-check
+  qcs-tests-semantic-policy-evidence
   PROPERTIES LABELS "unit;tooling;evidence" TIMEOUT 240)
 
 qcopilots_search_add_test(NAME qcs-tests-runner

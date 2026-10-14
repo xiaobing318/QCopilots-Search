@@ -280,6 +280,55 @@ def compiled_relevance_policy():
     return result
 
 
+SEMANTIC_PROTOCOL = "grouped-cv-v2-quarter"
+SEMANTIC_CORPUS_FILES = {
+    "fixtureManifestSha256": "assets.json", "topicManifestSha256": "topics.tsv",
+    "generatorSha256": "semantic_acceptance.cpp", "relevanceManifestSha256": "relevance_queries.json",
+    "groupPlanSha256": "relevance_development_groups.json",
+    "v2TextCodeManifestSha256": "relevance_v2_text_code.json",
+    "v2MediaManifestSha256": "relevance_v2_media.json",
+}
+SEMANTIC_MODALITIES = {"text", "ocr", "image", "pdf", "speech", "environment", "video", "code",
+                      "image-natural", "video-natural"}
+
+
+def semantic_corpus_contract():
+    root = SOURCE / "tests/semantic"
+    identity = {field: digest(root / name) for field, name in SEMANTIC_CORPUS_FILES.items()}
+    plan = read_json(root / SEMANTIC_CORPUS_FILES["groupPlanSha256"])
+    groups = {}
+    families = set()
+    for group in plan["groups"]:
+        family, fold = group["family"], group["fold"]
+        if not isinstance(family, str) or not family or family in families or type(fold) is not int or fold not in (0, 1, 2):
+            raise ValueError("Invalid frozen semantic development family or fold")
+        families.add(family)
+        for topic in group["topics"]:
+            if not isinstance(topic, str) or not topic or topic in groups:
+                raise ValueError("Invalid or repeated frozen semantic development topic")
+            groups[topic] = {"family": family, "fold": fold}
+    text = read_json(root / SEMANTIC_CORPUS_FILES["v2TextCodeManifestSha256"])
+    media = read_json(root / SEMANTIC_CORPUS_FILES["v2MediaManifestSha256"])
+    holdout = [row["id"] for row in text["topics"]] + ["v2-media-" + row["id"] for row in media["topics"]]
+    if len(groups) != 143 or len(holdout) != 40 or len(set(holdout)) != 40 or set(groups) & set(holdout):
+        raise ValueError("Frozen semantic development and final holdout coverage is invalid")
+    return {"identity": identity, "development": groups, "holdout": set(holdout)}
+
+
+def relevance_calibration_errors(policy, report):
+    """Bind the reviewed calibration snapshot by bytes, then recompute its gates."""
+    wanted = policy.get("calibrationReportSha256", "")
+    root = SOURCE / "tests/semantic/calibration"
+    matches = [path for path in root.glob("*.json") if digest(path) == wanted]
+    if len(matches) != 1:
+        return ["The candidate needs exactly one frozen calibration snapshot matching its compiled SHA-256"]
+    snapshot = read_json(matches[0])
+    spec = importlib.util.spec_from_file_location("qcs_semantic_policy_evidence", SOURCE / "tools/qcs-semantic-policy-evidence.py")
+    validator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validator)
+    return validator.validate_calibration_snapshot(snapshot, policy, report)
+
+
 @malformed_as_error
 def validate_nsis_contract(doc, output):
     """Recompute the package-stage NSIS contract from its preserved raw output."""
@@ -302,18 +351,24 @@ def validate_nsis_contract(doc, output):
 def validate_semantic(doc):
     errors = []
     check(errors, doc.get("passed") is True and doc.get("mode") == "release", "semantic acceptance was not a successful full run")
+    check(errors, doc.get("calibrationProtocol") == SEMANTIC_PROTOCOL,
+          "semantic acceptance must use the frozen grouped-cv-v2-quarter protocol")
+    check(errors, doc.get("finalHoldoutEvaluated") is True and doc.get("metricsScope") == "all-production-queries",
+          "semantic final holdout has not been evaluated by a complete production run")
     check(errors, doc.get("semanticCandidateMode") == "matches-only", "semantic acceptance used raw unfiltered candidates")
     policy = doc.get("relevancePolicy", {})
     check(errors, policy.get("calibrated") is True, "semantic relevance policy was not calibrated for the running model")
+    check(errors, isinstance(policy.get("version"), str) and re.fullmatch(r"qcs-relevance-v2-quarter-[0-9a-f]{12}", policy["version"]) is not None,
+          "semantic relevance policy is not the accepted v2 quarter policy")
     check(errors, policy.get("modelFingerprint") == doc.get("modelFingerprint"), "semantic relevance policy uses another model")
     for field in ("corpusSha256", "rawExportSha256", "calibrationReportSha256"):
         check(errors, isinstance(policy.get(field), str) and re.fullmatch(r"[0-9a-f]{64}", policy[field]) is not None,
               f"semantic relevance policy {field} is missing or invalid")
     identity = doc.get("corpusIdentity", {})
-    identity_fields = {"fixtureManifestSha256", "topicManifestSha256", "generatorSha256", "relevanceManifestSha256"}
+    identity_fields = set(SEMANTIC_CORPUS_FILES)
     check(errors, set(identity) == identity_fields and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
           for value in identity.values()), "semantic calibration corpus identity is incomplete")
-    for field in identity_fields - {"relevanceManifestSha256"}:
+    for field in ("fixtureManifestSha256", "topicManifestSha256", "generatorSha256", "relevanceManifestSha256"):
         check(errors, identity.get(field) == doc.get(field), "semantic corpus identity differs from its raw manifest hashes")
     corpus_hash = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True,
                                             separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -325,15 +380,26 @@ def validate_semantic(doc):
     try:
         compiled = compiled_relevance_policy()
         check(errors, compiled == policy, "semantic report policy differs from the immutable candidate's compiled policy")
+        contract = semantic_corpus_contract()
+        check(errors, contract["identity"] == identity, "semantic corpus hashes differ from the immutable candidate's frozen source")
+        errors.extend(relevance_calibration_errors(policy, doc))
     except (OSError, ValueError) as error:
-        errors.append("Cannot verify the candidate's compiled relevance policy: " + str(error))
+        errors.append("Cannot verify the candidate's frozen relevance evidence: " + str(error))
+        contract = {"development": {}, "holdout": set()}
     check(errors, at_least(doc.get("actualEmbeddedSegments"), 1000), "semantic corpus has fewer than 1000 embedded segments")
+    files = doc.get("files", [])
+    file_names = [row.get("file") for row in files]
+    check(errors, doc.get("fixtures") == 186 and doc.get("completedFiles") == 186 and len(files) == 186
+          and all(isinstance(name, str) and name for name in file_names) and len(set(file_names)) == 186,
+          "semantic corpus must preserve all 186 distinct completed fixtures, including background distractors")
     queries = doc.get("queries", [])
-    check(errors, isinstance(queries, list) and len(queries) >= 200 and len(queries) == doc.get("positiveQueries"), "semantic positive query records are incomplete")
+    check(errors, isinstance(queries, list) and len(queries) == 318 and doc.get("positiveQueries") == 318,
+          "semantic positive query records must retain all 318 frozen labels")
     texts = [row.get("query") for row in queries]
     check(errors, all(isinstance(value, str) and value.strip() for value in texts)
           and len(set(texts)) == len(texts), "semantic query texts must be nonempty and distinct")
     totals = defaultdict(lambda: [0, 0, 0])
+    partition_totals = {partition: defaultdict(lambda: [0, 0, 0]) for partition in ("development", "holdout")}
     for row in queries:
         expected = row.get("expectedFile")
         production = [item.get("file") for item in row.get("productionTop10", [])]
@@ -342,15 +408,21 @@ def validate_semantic(doc):
               and all(within(item.get("cosine"), -1.00001, 1.00001) for item in row.get("exactSemanticTop10", [])),
               "semantic exact result list contains invalid cosines or duplicates")
         rank = production.index(expected) + 1 if expected in production else 0
-        check(errors, bool(expected) and len(production) <= 10 and len(set(production)) == len(production)
-              and row.get("rank") == rank, "semantic query rank disagrees with its raw result list")
+        check(errors, expected in file_names and len(production) <= 10 and len(set(production)) == len(production)
+              and all(name in file_names for name in production + exact)
+              and type(row.get("rank")) is int and row["rank"] == rank,
+              "semantic query rank disagrees with its raw result list")
         for key in ("overall", "language:" + str(row.get("language")), "modality:" + str(row.get("modality"))):
             totals[key][0] += 1
             totals[key][1] += int(rank > 0)
             totals[key][2] += int(expected in exact)
-    required = {"overall", "language:en", "language:zh"} | {"modality:" + value for value in
-                ("text", "ocr", "image", "pdf", "speech", "environment", "video", "code")}
-    check(errors, required.issubset(totals), "semantic language or modality groups are missing")
+            if row.get("partition") in partition_totals:
+                group = partition_totals[row["partition"]][key]
+                group[0] += 1
+                group[1] += int(rank > 0)
+                group[2] += int(expected in exact)
+    required = {"overall", "language:en", "language:zh"} | {"modality:" + value for value in SEMANTIC_MODALITIES}
+    check(errors, set(totals) == required, "semantic language or modality groups differ from the frozen protocol")
     for key, (count, hits, exact_hits) in totals.items():
         metric = doc.get("metrics", {}).get(key, {})
         recall = hits / count
@@ -358,19 +430,72 @@ def validate_semantic(doc):
               and same_number(metric.get("recallAt10"), recall)
               and same_number(metric.get("exactSemanticRecallAt10"), exact_hits / count)
               and recall >= (.9 if key == "overall" else .8), f"semantic {key} counts or recall do not satisfy acceptance")
+    check(errors, set(doc.get("partitionMetrics", {})) == {"development", "holdout"},
+          "semantic production metrics must separate development from the independent final holdout")
+    for partition, groups in partition_totals.items():
+        summary = doc.get("partitionMetrics", {}).get(partition, {})
+        metrics = summary.get("metrics", {})
+        check(errors, summary.get("passed") is True and set(groups) == required and set(metrics) == required,
+              f"semantic {partition} metrics omit a language or modality group")
+        for key, (count, hits, _) in groups.items():
+            metric = metrics.get(key, {})
+            gate = .9 if key == "overall" else .8
+            check(errors, metric.get("queries") == count and metric.get("hits") == hits
+                  and same_number(metric.get("recallAt10"), hits / count)
+                  and same_number(metric.get("requiredRecallAt10"), gate)
+                  and metric.get("passed") is True and hits / count >= gate,
+                  f"semantic {partition} {key} counts or recall do not satisfy independent acceptance")
     for key in ("modelFingerprint", "extractionFingerprint", "fixtureManifestSha256", "topicManifestSha256", "generatorSha256"):
         check(errors, isinstance(doc.get(key), str) and bool(doc[key]), f"semantic {key} is missing")
     negatives = doc.get("noAnswerQueries", [])
-    check(errors, bool(negatives) and {row.get("partition") for row in negatives} == {"calibration", "holdout"},
+    check(errors, len(negatives) == 176 and {row.get("partition") for row in negatives} == {"development", "holdout"},
           "semantic independent absent-query evidence is missing")
     negative_texts = [row.get("query") for row in negatives]
     check(errors, all(isinstance(value, str) and value.strip() for value in negative_texts)
           and len(set(negative_texts)) == len(negative_texts), "semantic absent-query texts must be nonempty and distinct")
-    topics = {partition: {row.get("topic") for row in negatives if row.get("partition") == partition}
-              for partition in ("calibration", "holdout")}
-    check(errors, all(all(isinstance(topic, str) and topic for topic in group) for group in topics.values())
-          and not topics["calibration"] & topics["holdout"], "semantic absent-query topics overlap calibration and holdout")
-    for partition in ("calibration", "holdout"):
+    groups, topic_groups, expected_files = {}, {}, {}
+    for field, expected_counts in (("queries", {"development": 238, "holdout": 80}),
+                                   ("noAnswerQueries", {"development": 96, "holdout": 80})):
+        rows = doc[field]
+        check(errors, {row.get("partition") for row in rows} == set(expected_counts)
+              and all(sum(row.get("partition") == partition for row in rows) == count for partition, count in expected_counts.items()),
+              f"semantic {field} development/holdout counts differ from the frozen protocol")
+        fold_counts = (74, 82, 82) if field == "queries" else (30, 26, 40)
+        check(errors, all(sum(row.get("partition") == "development" and row.get("fold") == fold for row in rows) == count
+                          for fold, count in enumerate(fold_counts)), "semantic development fold coverage differs from the frozen plan")
+        topic_languages = defaultdict(list)
+        for row in rows:
+            partition, topic, family = row.get("partition"), row.get("topic"), row.get("family")
+            location = (partition, row.get("fold"))
+            valid = isinstance(topic, str) and bool(topic) and isinstance(family, str) and bool(family)
+            if partition == "development":
+                assigned = contract["development"].get(topic, {})
+                valid = valid and type(row.get("fold")) is int and row["fold"] in (0, 1, 2)
+                valid = valid and assigned == {"family": family, "fold": row.get("fold")}
+            elif partition == "holdout":
+                valid = valid and "fold" not in row and family == "holdout:" + topic and topic in contract["holdout"]
+            else:
+                valid = False
+            check(errors, valid, "semantic row differs from its frozen family, fold or final-holdout assignment")
+            check(errors, groups.setdefault(family, location) == location and topic_groups.setdefault(topic, location) == location,
+                  "semantic topic or family leaks across development folds or final holdout")
+            check(errors, type(row.get("code")) is bool and row.get("code") == (row.get("modality") == "code"),
+                  "semantic query space differs from the frozen target modality")
+            topic_languages[(partition, topic)].append(row.get("language"))
+            if field == "queries":
+                modality = row.get("modality")
+                channel = "code" if modality == "code" else "audio" if modality in ("speech", "environment") else (
+                    "image" if modality in ("image", "image-natural", "video", "video-natural") else "text")
+                check(errors, row.get("policyModality") == channel and row.get("code") == (modality == "code"),
+                      "semantic policy modality differs from the frozen target modality or query space")
+                file_group = (family, location)
+                check(errors, expected_files.setdefault((row.get("code"), row.get("expectedFile")), file_group) == file_group,
+                      "semantic expected file leaks across families, folds or final holdout")
+        check(errors, all(sorted(languages) == ["en", "zh"] for languages in topic_languages.values()),
+              "semantic frozen topics require exactly one English and one Chinese label")
+        check(errors, {row.get("topic") for row in rows if row.get("partition") == "holdout"} == contract["holdout"],
+              "semantic final holdout must contain every one of the 40 frozen topics")
+    for partition in ("development", "holdout"):
         rows = [row for row in negatives if row.get("partition") == partition]
         summary = doc.get("noAnswerSummary", {}).get(partition, {})
         check(errors, summary.get("queries") == len(rows) and len(rows) > 0
@@ -387,6 +512,7 @@ def validate_semantic(doc):
             check(errors, integer_at_least(row.get("returnedCount"), 0) and row["returnedCount"] <= 10
                   and len(returned) == row["returnedCount"] and len(set(names)) == len(names)
                   and all(isinstance(name, str) and name for name in names)
+                  and all(name in file_names for name in names)
                   and all(within(item.get("cosine"), -1.00001, 1.00001) for item in row.get("exactSemanticTop10", [])),
                   "semantic absent-query similarity evidence is invalid")
     return errors

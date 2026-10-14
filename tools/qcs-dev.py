@@ -591,9 +591,15 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
             installer_args.report_dir = reports / "package-nsis"
             execute_action("verify-package", installer_args, root, build, stage, reports, sdk_root, prefix, environment)
         elif platform.system() == "Linux":
+            evidence = helper_module("tools/qcs-release-evidence.py", "qcs_installer_identity")
+            identity = evidence.source_identity(SOURCE)
+            candidate = environment.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD")
+            if candidate and candidate != identity["checkoutCommit"]:
+                raise RuntimeError("Installer candidate differs from the current source checkout")
+            installer_environment = dict(environment, QCOPILOTS_SEARCH_CANDIDATE_HEAD=identity["checkoutCommit"])
             run([sys.executable, SOURCE / ".github/scripts/qcs-deb-ci.py", "--build-root", root,
                  "--package-file", package_for_suffix(root, ".deb"), "--model-dir", args.model_dir or root / "models",
-                 "--report-dir", reports / "package-deb"], cwd=root, env=environment)
+                 "--report-dir", reports / "package-deb"], cwd=root, env=installer_environment)
         else:
             raise RuntimeError("This platform has no additional installer beyond its DMG package verification")
 

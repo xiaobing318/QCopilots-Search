@@ -25,14 +25,16 @@ _spec = importlib.util.spec_from_file_location("qcs_relevance_v1_helpers", Path(
 v1 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(v1)
 
-PROTOCOL = "grouped-cv-v2"
-POLICY_VERSION = "qcs-relevance-v2"
+PROTOCOL = "grouped-cv-v2-quarter"
+POLICY_VERSION = "qcs-relevance-v2-quarter"
+THRESHOLD_PLACEMENT = "calibration-interval-quarter"
+PLACEMENT_FRACTION = 0.25
 MODALITIES = v1.MODALITIES
 DEFAULT_MAX_STATES = 25000
 TRAIN_NEGATIVE_DIVISOR = 20
 EVALUATION_NEGATIVE_DIVISOR = 10
 OBJECTIVE = ["minimum-language-or-policy-modality-recall", "overall-recall", "fewer-negative-returns",
-             "larger-minimum-calibration-margin", "larger-total-calibration-margin", "lower-thresholds"]
+             "larger-minimum-midpoint-reference-margin", "larger-total-midpoint-reference-margin", "lower-thresholds"]
 
 
 def validate_metadata(report):
@@ -236,17 +238,56 @@ class _Evidence:
                    for keyword, maxima in self.negative)
 
 
+def _quarter_threshold(rejected, retained):
+    interior = rejected + (retained - rejected) * PLACEMENT_FRACTION
+    return min(retained, max(math.nextafter(rejected, math.inf), interior))
+
+
+def _representative_thresholds(rows, boundaries):
+    """Place every channel one quarter into its training-equivalent interval.
+
+    The optimizer ranks acceptance intervals by their midpoint reference
+    margins, independent of deployment placement. A fixed quarter placement
+    then favors recall without using the numerically fragile lower edge. The
+    two kinds of margin are reported separately. No per-channel adjustment or
+    held-out score influences this rule.
+    """
+    midpoint, placement = v1._representative_thresholds(rows, boundaries)
+    thresholds = dict(midpoint)
+    deployment_margins = []
+    for modality, interval in placement["intervals"].items():
+        rejected, retained = interval["rejectedMaximum"], interval["acceptedMinimum"]
+        interval["midpointReferenceThreshold"] = midpoint[modality]
+        reference_margins = [margin for margin in (interval["rejectedMargin"], interval["acceptedMargin"])
+                             if margin is not None]
+        interval["midpointReferenceMargin"] = min(reference_margins) if reference_margins else None
+        if rejected is not None and retained is not None:
+            thresholds[modality] = _quarter_threshold(rejected, retained)
+        interval["rejectedMargin"] = thresholds[modality] - rejected if rejected is not None else None
+        interval["acceptedMargin"] = retained - thresholds[modality] if retained is not None else None
+        deployment_margins.extend(margin for margin in (interval["rejectedMargin"], interval["acceptedMargin"])
+                                  if margin is not None)
+    if any((candidate["cosine"] >= boundaries[candidate["policyModality"]])
+           != (candidate["cosine"] >= thresholds[candidate["policyModality"]])
+           for row, _ in rows for candidate in row["rawCandidates"]):
+        raise ValueError("internal error: quarter placement changed training acceptance")
+    placement.update(method=THRESHOLD_PLACEMENT, interiorFraction=PLACEMENT_FRACTION,
+                     minimumDeploymentMargin=min(deployment_margins) if deployment_margins else None)
+    return thresholds, placement
+
+
 class _Axis:
     def __init__(self, values):
         self.values = values
         self.boundaries = [values[0]] + [math.nextafter(value, math.inf) for value in values]
         self.thresholds = [values[0]]
+        self.margins = [0.0]
         for rejected, retained in zip(values, values[1:]):
             middle = rejected + (retained - rejected) / 2.0
-            self.thresholds.append(min(retained, math.nextafter(rejected, math.inf) if middle <= rejected else middle))
+            reference = min(retained, math.nextafter(rejected, math.inf) if middle <= rejected else middle)
+            self.thresholds.append(_quarter_threshold(rejected, retained))
+            self.margins.append(min(reference - rejected, retained - reference))
         self.thresholds.append(v1.REJECT_ALL)
-        self.margins = [0.0] + [min(threshold - values[i - 1], values[i] - threshold)
-                               for i, threshold in enumerate(self.thresholds[1:-1], 1)]
         self.margins.append(v1.REJECT_ALL - values[-1])
         self.maximum = [self.margins]
         step = 1
@@ -264,7 +305,7 @@ class _Axis:
 def _objective_json(objective):
     return {"minimumLanguageOrPolicyRecallAt10": float(objective[0]),
             "overallRecallAt10": float(objective[1]), "noAnswerReturns": -objective[2],
-            "minimumCalibrationMargin": objective[3], "totalCalibrationMargin": objective[4]}
+            "minimumMidpointReferenceMargin": objective[3], "totalMidpointReferenceMargin": objective[4]}
 
 
 def optimize(rows, max_states=DEFAULT_MAX_STATES):
@@ -350,8 +391,8 @@ def optimize(rows, max_states=DEFAULT_MAX_STATES):
         inspect(low)
         if low == high:
             continue
-        # Midpoint and maximum-margin representatives obtain useful incumbents
-        # early. They do not replace exhaustive, safely bounded subdivision.
+        # The midpoint of the index box obtains another useful incumbent.
+        # This heuristic does not replace exhaustive, bounded subdivision.
         inspect(tuple((low[i] + high[i]) // 2 for i in range(4)))
         axis = max(range(4), key=lambda i: (high[i] - low[i], -i))
         middle = (low[axis] + high[axis]) // 2
@@ -367,9 +408,9 @@ def optimize(rows, max_states=DEFAULT_MAX_STATES):
     stats["status"] = "optimal" if not pending else "feasible-search-budget-exhausted"
     stats["objective"] = _objective_json(incumbent_objective)
     boundaries = {modality: axes[i].boundaries[incumbent_indices[i]] for i, modality in enumerate(MODALITIES)}
-    thresholds, placement = v1._representative_thresholds(rows, boundaries)
+    thresholds, placement = _representative_thresholds(rows, boundaries)
     if tuple(thresholds[m] for m in MODALITIES) != incumbent:
-        raise ValueError("internal error: optimized midpoint representation changed")
+        raise ValueError("internal error: optimized quarter representation changed")
     return {"thresholds": thresholds, "thresholdSelection": placement}, stats
 
 
@@ -395,7 +436,10 @@ def calibrate_report(report, *, report_sha256=None, max_states=DEFAULT_MAX_STATE
               "holdout": {"status": "not-evaluated", "validatedQueries": 0}}
     config = {"protocol": PROTOCOL, "folds": 3, "maxStatesPerFit": max_states,
               "trainingMaximumFalseReturnRate": 0.05, "evaluationMaximumFalseReturnRate": 0.1,
-              "objectiveOrder": OBJECTIVE, "thresholdPlacement": v1.THRESHOLD_PLACEMENT}
+              "objectiveOrder": OBJECTIVE, "thresholdPlacement": THRESHOLD_PLACEMENT,
+              "thresholdInteriorFraction": PLACEMENT_FRACTION,
+              "optimizationMarginReference": "midpoint of each training-equivalent interval",
+              "deploymentMarginReference": "actual fixed quarter threshold to observed training scores"}
     development_identity = {"config": config, "modelFingerprint": report["modelFingerprint"],
                             "corpusIdentity": report["corpusIdentity"],
                             "rows": [{"positive": positive, **row} for row, positive in development]}
@@ -469,6 +513,9 @@ def cpp_header(policy):
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
     parser.add_argument("--output", type=Path, required=True)

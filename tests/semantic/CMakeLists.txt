@@ -2,6 +2,9 @@ add_executable(qcs-tests-semantic semantic_acceptance.cpp)
 qcopilots_search_add_test(NAME qcs-tests-relevance-calibration
   COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/test_calibrate_relevance.py")
 set_tests_properties(qcs-tests-relevance-calibration PROPERTIES LABELS "unit;semantic;tooling" TIMEOUT 120)
+qcopilots_search_add_test(NAME qcs-tests-relevance-calibration-v2
+  COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/test_calibrate_relevance_v2.py")
+set_tests_properties(qcs-tests-relevance-calibration-v2 PROPERTIES LABELS "unit;semantic;tooling" TIMEOUT 120)
 target_link_libraries(qcs-tests-semantic PRIVATE
   qcs-test-support qcs-runtime
   qcs-extraction qcs-storage Qt6::Gui Qt6::Pdf)

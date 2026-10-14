@@ -496,33 +496,45 @@ def capacity_fixture():
 
 
 def semantic_fixture():
-    """Build 200 labelled validator records without executing or claiming inference."""
-    modalities = ("text", "ocr", "image", "pdf", "speech", "environment", "video", "code")
-    files = [{"file": f"fixture-{i}.txt", "modality": modality, "segments": 125,
-              "sha256": f"{i + 1:064x}", "extractedModalities": {"text": 125},
-              "extractedTextCharacters": 1000}
-             for i, modality in enumerate(modalities)]
-    queries = []
-    counts = Counter()
-    for n in range(200):
-        i = n % len(modalities)
-        language = "en" if (n // len(modalities)) % 2 == 0 else "zh"
-        name = files[i]["file"]
-        queries.append({"query": f"validator fixture {n}", "language": language,
-                        "modality": modalities[i], "expectedFile": name, "rank": 1,
-                        "encodingMilliseconds": 1, "retrievalMilliseconds": 2,
-                        "productionTop10": [{"file": name, "score": 1 / 61, "source": "semantic"}],
-                        "exactSemanticTop10": [{"file": name, "cosine": 0.9}]})
-        counts["overall"] += 1
-        counts[f"language:{language}"] += 1
-        counts[f"modality:{modalities[i]}"] += 1
-    metrics = {key: {"queries": count, "hits": count, "recallAt10": 1.0,
-                     "exactSemanticRecallAt10": 1.0, "passed": True,
-                     "requiredRecallAt10": 0.9 if key == "overall" else 0.8}
-               for key, count in counts.items()}
+    """Build the frozen v2 counts with synthetic labels, never inference evidence."""
+    modalities = ("text", "ocr", "image", "pdf", "speech", "environment", "video", "code", "image-natural", "video-natural")
+    files = [{"file": f"fixture-{i}.txt", "modality": modalities[i % 10], "segments": 6,
+              "sha256": f"{i + 1:064x}", "extractedModalities": {"text": 6}, "extractedTextCharacters": 1000}
+             for i in range(186)]
+    queries, negatives = [], []
+    for partition, count, offset in (("development", 119, 0), ("holdout", 40, 119)):
+        for n in range(count):
+            topic = f"{partition}-topic-{n}"
+            modality = modalities[n % 10]
+            channel = "code" if modality == "code" else "audio" if modality in ("speech", "environment") else (
+                "image" if modality in ("image", "image-natural", "video", "video-natural") else "text")
+            metadata = {"topic": topic, "partition": partition,
+                        "family": ("holdout:" if partition == "holdout" else "family:") + topic,
+                        "modality": modality, "code": modality == "code"}
+            if partition == "development":
+                metadata["fold"] = 0 if n < 37 else 1 if n < 78 else 2
+            name = files[offset + n]["file"]
+            for language in ("en", "zh"):
+                queries.append({**metadata, "query": f"validator fixture {partition} {n} {language}",
+                    "language": language, "policyModality": channel, "expectedFile": name, "rank": 1,
+                    "encodingMilliseconds": 1, "retrievalMilliseconds": 2,
+                    "productionTop10": [{"file": name, "score": 1 / 61, "source": "semantic"}],
+                    "exactSemanticTop10": [{"file": name, "cosine": .9}]})
+                if partition == "holdout" or n < 15 or 37 <= n < 50 or 78 <= n < 98:
+                    negatives.append({**metadata, "query": f"absent fixture {partition} {n} {language}",
+                        "language": language, "returnedCount": 0, "productionTop10": [],
+                        "exactSemanticTop10": [{"file": files[0]["file"], "cosine": .2}]})
+    def metrics(rows, exact=False):
+        counts = Counter(key for row in rows for key in
+            ("overall", "language:" + row["language"], "modality:" + row["modality"]))
+        return {key: {"queries": count, "hits": count, "recallAt10": 1., "passed": True,
+                       "requiredRecallAt10": .9 if key == "overall" else .8,
+                       **({"exactSemanticRecallAt10": 1.} if exact else {})} for key, count in counts.items()}
     corpus = {"fixtureManifestSha256": "3" * 64, "generatorSha256": "4" * 64,
-              "topicManifestSha256": "5" * 64, "relevanceManifestSha256": "6" * 64}
-    policy = {"version": "synthetic-fixture-v1", "calibrated": True,
+              "topicManifestSha256": "5" * 64, "relevanceManifestSha256": "6" * 64,
+              "groupPlanSha256": "9" * 64, "v2TextCodeManifestSha256": "a" * 64,
+              "v2MediaManifestSha256": "b" * 64}
+    policy = {"version": "qcs-relevance-v2-quarter-123456789abc", "calibrated": True,
               "modelFingerprint": "qcopilots-search-embedding-v1:" + "1" * 64,
               "corpusSha256": hashlib.sha256(json.dumps(corpus, ensure_ascii=False,
                   sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
@@ -530,28 +542,34 @@ def semantic_fixture():
               "thresholds": {key: .5 for key in ("text", "image", "audio", "code")}}
     return {
         "schema": 1, "mode": "release", "status": "passed", "passed": True,
+        "calibrationProtocol": "grouped-cv-v2-quarter", "metricsScope": "all-production-queries",
+        "finalHoldoutEvaluated": True,
         "semanticCandidateMode": "matches-only", "relevancePolicy": policy, "corpusIdentity": corpus,
-        "actualEmbeddedSegments": 1000, "completedFiles": len(files), "fixtures": len(files),
-        "files": files, "queries": queries, "positiveQueries": 200, "metrics": metrics,
+        "actualEmbeddedSegments": 1116, "completedFiles": len(files), "fixtures": len(files),
+        "files": files, "queries": queries, "positiveQueries": 318, "metrics": metrics(queries, True),
+        "partitionMetrics": {partition: {"passed": True, "metrics": metrics(
+            [row for row in queries if row["partition"] == partition])} for partition in ("development", "holdout")},
         "modelFingerprint": "qcopilots-search-embedding-v1:" + "1" * 64,
         "extractionFingerprint": "qcopilots-search-extraction-v3:" + "2" * 64,
-        "fixtureManifestSha256": "3" * 64, "generatorSha256": "4" * 64,
-        "topicManifestSha256": "5" * 64,
+        **{key: value for key, value in corpus.items() if key in (
+            "fixtureManifestSha256", "generatorSha256", "topicManifestSha256", "relevanceManifestSha256")},
         "annotationProtocol": "Synthetic validator fixture, not acceptance evidence.",
         "corpusScope": "Synthetic validator fixture, not an executed corpus.",
         "noAnswerInterpretation": "Synthetic fixture exercises calibrated rejection validation.",
-        "noAnswerQueries": [{"partition": partition, "query": f"absent fixture {partition} {n}",
-                             "topic": f"absent-topic-{partition}-{n}",
-                             "returnedCount": 0, "productionTop10": [],
-                             "exactSemanticTop10": [{"file": files[0]["file"], "cosine": 0.2}]}
-                            for partition in ("calibration", "holdout") for n in range(10)],
-        "noAnswerSummary": {partition: {"queries": 10, "queriesReturningCandidates": 0,
+        "noAnswerQueries": negatives,
+        "noAnswerSummary": {partition: {"queries": count, "queriesReturningCandidates": 0,
                                          "falseReturnRate": 0, "maximumFalseReturnRate": .1, "passed": True,
-                                         "minimumTopCosine": 0.2, "maximumTopCosine": 0.2,
-                                         "meanTopCosine": 0.2}
-                            for partition in ("calibration", "holdout")},
+                                         "minimumTopCosine": .2, "maximumTopCosine": .2, "meanTopCosine": .2}
+                            for partition, count in (("development", 96), ("holdout", 80))},
         "startedAt": "2026-01-01T00:00:00Z", "finishedAt": "2026-01-01T00:01:00Z",
     }
+
+
+def semantic_contract_fixture(doc):
+    return {"identity": doc["corpusIdentity"],
+            "development": {row["topic"]: {"family": row["family"], "fold": row["fold"]}
+                            for row in doc["queries"] if row["partition"] == "development"},
+            "holdout": {row["topic"] for row in doc["queries"] if row["partition"] == "holdout"}}
 
 
 def physical_fixture():
@@ -837,16 +855,181 @@ class NsisContractEvidenceTests(unittest.TestCase):
         self.assertTrue(evidence.validate_nsis_contract(summary, altered))
 
 
+class CalibrationSnapshotBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="qcs-policy-binding-",
+            dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.snapshots = self.root / "tests/semantic/calibration"
+        self.snapshots.mkdir(parents=True)
+        self.source = mock.patch.object(evidence, "SOURCE", self.root)
+        self.source.start()
+        self.addCleanup(self.source.stop)
+
+    def bound_fixture(self, accepted=True):
+        source = Path(__file__).resolve().parents[2]
+        spec = importlib.util.spec_from_file_location("qcs_semantic_snapshot_fixture",
+            source / "tools/qcs-semantic-policy-evidence-tests.py")
+        fixtures = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixtures)
+        snapshot, policy, report = fixtures.fixture()
+        snapshot["accepted"] = accepted
+        path = self.snapshots / "reviewed.json"
+        path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        policy["calibrationReportSha256"] = evidence.digest(path)
+        report["relevancePolicy"] = deepcopy(policy)
+        (self.root / "tools").mkdir()
+        (self.root / "tools/qcs-semantic-policy-evidence.py").write_bytes(
+            (source / "tools/qcs-semantic-policy-evidence.py").read_bytes())
+        return policy, report
+
+    def test_exact_bound_snapshot_is_loaded_and_independently_validated(self):
+        self.assertEqual(evidence.relevance_calibration_errors(*self.bound_fixture()), [])
+
+    def test_digest_matching_failed_snapshot_is_still_rejected(self):
+        self.assertTrue(evidence.relevance_calibration_errors(*self.bound_fixture(accepted=False)))
+
+    def test_self_claimed_accepted_document_without_compiled_digest_is_not_loaded(self):
+        (self.snapshots / "accepted.json").write_text('{"accepted":true}', encoding="utf-8")
+        self.assertTrue(evidence.relevance_calibration_errors({"calibrationReportSha256": "0" * 64}, {}))
+
+    def test_missing_frozen_snapshot_is_not_replaced_by_report_claims(self):
+        self.assertTrue(evidence.relevance_calibration_errors({"calibrationReportSha256": "1" * 64}, {}))
+
+    def test_duplicate_byte_identical_snapshot_is_ambiguous(self):
+        for name in ("one.json", "two.json"):
+            (self.snapshots / name).write_bytes(b'{"accepted":true}\n')
+        digest = evidence.digest(self.snapshots / "one.json")
+        self.assertTrue(evidence.relevance_calibration_errors({"calibrationReportSha256": digest}, {}))
+
+    def test_snapshot_changed_after_header_generation_fails_before_summary_parse(self):
+        path = self.snapshots / "reviewed.json"
+        path.write_bytes(b'{"accepted":true}\n')
+        digest = evidence.digest(path)
+        path.write_bytes(b'{"accepted":false}\n')
+        self.assertTrue(evidence.relevance_calibration_errors({"calibrationReportSha256": digest}, {}))
+
+
 class SemanticEvidenceTests(unittest.TestCase):
     def setUp(self):
         # Synthetic fixture headers never replace the real candidate's policy.
+        fixture = semantic_fixture()
         self.compiled_policy = mock.patch.object(evidence, "compiled_relevance_policy",
-                                                 return_value=semantic_fixture()["relevancePolicy"])
+                                                 return_value=fixture["relevancePolicy"])
         self.compiled_policy.start()
         self.addCleanup(self.compiled_policy.stop)
+        self.contract = mock.patch.object(evidence, "semantic_corpus_contract", return_value=semantic_contract_fixture(fixture))
+        self.contract.start()
+        self.addCleanup(self.contract.stop)
+        # Snapshot CV recomputation has its own independent helper test suite.
+        self.calibration = mock.patch.object(evidence, "relevance_calibration_errors", return_value=[])
+        self.calibration.start()
+        self.addCleanup(self.calibration.stop)
 
     def test_complete_synthetic_validation_fixture(self):
         self.assertEqual(evidence.validate_semantic(semantic_fixture()), [])
+
+    @staticmethod
+    def recompute_positive_summaries(doc):
+        for partition, summary in [(None, doc)] + list(doc["partitionMetrics"].items()):
+            rows = [row for row in doc["queries"] if partition is None or row["partition"] == partition]
+            for key, metric in summary["metrics"].items():
+                group = [row for row in rows if key == "overall" or
+                         key in ("language:" + row["language"], "modality:" + row["modality"])]
+                metric["queries"] = len(group)
+                metric["hits"] = sum(row["rank"] > 0 for row in group)
+                metric["recallAt10"] = metric["hits"] / len(group)
+                metric["passed"] = metric["recallAt10"] >= metric["requiredRecallAt10"]
+            summary["passed"] = all(metric["passed"] for metric in summary["metrics"].values())
+
+    def test_old_v1_or_midpoint_protocol_never_becomes_final_acceptance(self):
+        for protocol in (None, "grouped-cv-v2", "v1", "calibration-holdout-v1"):
+            doc = semantic_fixture()
+            doc["calibrationProtocol"] = protocol
+            with self.subTest(protocol=protocol):
+                self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_final_holdout_must_be_actually_evaluated(self):
+        for field, value in (("finalHoldoutEvaluated", False), ("finalHoldoutEvaluated", 1),
+                             ("metricsScope", "development-only-raw-ranking")):
+            doc = semantic_fixture()
+            doc[field] = value
+            self.assertTrue(evidence.validate_semantic(doc))
+        doc = semantic_fixture()
+        doc["partitionMetrics"]["holdout"] = {"status": "not-evaluated"}
+        self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_each_new_corpus_hash_is_required_and_must_match_candidate_source(self):
+        for name in ("groupPlanSha256", "v2TextCodeManifestSha256", "v2MediaManifestSha256"):
+            for remove in (False, True):
+                doc = semantic_fixture()
+                if remove:
+                    del doc["corpusIdentity"][name]
+                else:
+                    doc["corpusIdentity"][name] = "c" * 64
+                with self.subTest(name=name, remove=remove):
+                    self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_preserved_failed_calibration_snapshot_is_not_a_pass(self):
+        with mock.patch.object(evidence, "relevance_calibration_errors", return_value=["Frozen grouped CV failed"]):
+            self.assertIn("Frozen grouped CV failed", evidence.validate_semantic(semantic_fixture()))
+
+    def test_negative_query_space_cannot_be_flipped_without_changing_labels(self):
+        doc = semantic_fixture()
+        doc["noAnswerQueries"][0]["code"] = not doc["noAnswerQueries"][0]["code"]
+        self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_development_cannot_hide_weak_independent_holdout_recall(self):
+        for group in ("overall", "modality:pdf"):
+            doc = semantic_fixture()
+            rows = [row for row in doc["queries"] if row["partition"] == "holdout"
+                    and (group == "overall" or row["modality"] == "pdf")]
+            for row in rows[:9 if group == "overall" else 2]:
+                row.update(rank=0, productionTop10=[])
+            self.recompute_positive_summaries(doc)
+            self.assertTrue(doc["metrics"]["overall"]["passed"])
+            # The overall summary cannot override the separate final-holdout gate.
+            doc["passed"] = True
+            errors = evidence.validate_semantic(doc)
+            self.assertTrue(any(f"holdout {group}" in error for error in errors), errors)
+
+    def test_missing_or_repeated_fixture_cannot_keep_the_old_denominators(self):
+        for field, value in (("fixtures", 185), ("completedFiles", 185), ("positiveQueries", 317)):
+            doc = semantic_fixture()
+            doc[field] = value
+            self.assertTrue(evidence.validate_semantic(doc))
+        for replacement in (None, semantic_fixture()["files"][0]):
+            doc = semantic_fixture()
+            if replacement is None:
+                doc["files"].pop()
+            else:
+                doc["files"][-1] = replacement
+            self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_observed_v1_query_cannot_be_relabelled_as_new_holdout(self):
+        doc = semantic_fixture()
+        old, final = doc["queries"][0], doc["queries"][-1]
+        old["partition"], final["partition"] = final["partition"], old["partition"]
+        self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_fold_changes_and_heldout_fold_metadata_fail_closed(self):
+        for field, value in (("fold", 2), ("fold", True), ("family", "other-family")):
+            doc = semantic_fixture()
+            doc["queries"][0][field] = value
+            self.assertTrue(evidence.validate_semantic(doc))
+        for field in ("queries", "noAnswerQueries"):
+            doc = semantic_fixture()
+            doc[field][-1]["fold"] = 0
+            self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_same_expected_file_cannot_cross_frozen_families(self):
+        doc = semantic_fixture()
+        row = doc["queries"][2]
+        other = doc["queries"][0]["expectedFile"]
+        row.update(expectedFile=other, productionTop10=[{"file": other, "score": .01}],
+                   exactSemanticTop10=[{"file": other, "cosine": .9}])
+        self.assertTrue(any("expected file leaks" in error for error in evidence.validate_semantic(doc)))
 
     def test_passed_alone_is_not_model_quality_evidence(self):
         self.assertTrue(evidence.validate_semantic({"passed": True}))
@@ -874,7 +1057,7 @@ class SemanticEvidenceTests(unittest.TestCase):
         self.assertTrue(evidence.validate_semantic(doc))
 
     def test_positive_query_text_must_be_nonempty_and_distinct(self):
-        for value in ("validator fixture 1", "", "  ", None, True):
+        for value in (semantic_fixture()["queries"][1]["query"], "", "  ", None, True):
             with self.subTest(value=value):
                 doc = semantic_fixture()
                 doc["queries"][0]["query"] = value
@@ -897,13 +1080,13 @@ class SemanticEvidenceTests(unittest.TestCase):
         self.assertTrue(evidence.validate_semantic(doc))
 
     def test_no_answer_holdout_gate_recomputes_rate_from_returned_lists(self):
-        for count in (1, 2):
+        for count in (8, 9):
             doc = semantic_fixture()
             rows = [row for row in doc["noAnswerQueries"] if row["partition"] == "holdout"]
             for row in rows[:count]:
-                row.update(returnedCount=1, productionTop10=[{"file": "unexpected.txt", "score": .01}])
-            doc["noAnswerSummary"]["holdout"].update(queriesReturningCandidates=count, falseReturnRate=count / 10)
-            self.assertEqual(bool(evidence.validate_semantic(doc)), count > 1)
+                row.update(returnedCount=1, productionTop10=[{"file": doc["files"][0]["file"], "score": .01}])
+            doc["noAnswerSummary"]["holdout"].update(queriesReturningCandidates=count, falseReturnRate=count / 80)
+            self.assertEqual(bool(evidence.validate_semantic(doc)), count > 8)
 
     def test_negative_count_cannot_hide_actual_results(self):
         doc = semantic_fixture()
