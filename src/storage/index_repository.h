@@ -5,6 +5,7 @@
 #include <QSet>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace qcopilots_search {
 using PublicationGate = std::function<std::shared_ptr<void>()>;
@@ -14,6 +15,21 @@ struct IndexedFile {
   QString version;
   bool code = false;
   QVector<Segment> segments;
+  std::optional<qint64> modifiedMs = std::nullopt;
+  QString kind = {};
+};
+
+struct FileMetadata {
+  QString path;
+  bool code = false;
+  qint64 modifiedMs = 0;
+  QString kind;
+  // When present, stale scan metadata cannot overwrite a different source.
+  QString sourceFingerprint;
+  // A scan may describe a changed source while its old index is retained.
+  // This exact indexed-version snapshot permits metadata-only refresh without
+  // allowing an older scan to overwrite a newly published file version.
+  QString expectedIndexedVersion = {};
 };
 
 struct StorageOptions {
@@ -42,16 +58,32 @@ public:
   bool replaceFile(const QString &path, const QString &version,
                    const QVector<Segment> &segments, bool code = false,
                    QString *error = nullptr,
-                   const PublicationGate &publicationGate = {});
+                   const PublicationGate &publicationGate = {},
+                   std::optional<qint64> modifiedMs = std::nullopt,
+                   const QString &kind = {});
   // Offline initial imports may defer derived ANN maintenance until flush.
   // Keyword search remains available. Semantic queries reject a deferred
   // import explicitly until flush completes, preventing unbounded delta work.
   bool replaceFiles(const QVector<IndexedFile> &files, QString *error = nullptr,
                     bool deferMaintenance = false,
                     const PublicationGate &publicationGate = {});
+  // The legacy overloads affect the ordinary space only.
   bool removeFile(const QString &path, QString *error = nullptr);
+  bool removeFile(const QString &path, bool code, QString *error = nullptr);
   bool prune(const QString &root, const QSet<QString> &presentPaths,
              QString *error = nullptr);
+  bool prune(const QString &root, const QSet<QString> &presentPaths,
+             bool code, QString *error = nullptr);
+  // Reconciliation fills metadata for existing indexed members only. Missing
+  // members and stale scan snapshots are left untouched. An explicit indexed
+  // version snapshot also permits refreshing metadata for a changed source.
+  bool updateFileMetadata(const QVector<FileMetadata> &files,
+                          QString *error = nullptr,
+                          const PublicationGate &publicationGate = {});
+  // Each page owns a short read snapshot. Cursors become stale when file
+  // membership or sorting metadata changes, never on segment-only progress.
+  FileListPage listFiles(const FileListOptions &options) const;
+  qint64 browseGeneration(QString *error = nullptr) const;
   QString fileVersion(const QString &path, bool code = false,
                       QString *error = nullptr) const;
   QVector<Segment> fileSegments(const QString &path, bool code = false,

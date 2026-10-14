@@ -27,6 +27,7 @@ install(TARGETS qcs-owned-fixture qcs-module-fixture
 install(TARGETS qcs-deploy-fixture RUNTIME DESTINATION bin)
 
 include("${QCOPILOTS_SEARCH_LINUX_DEPLOY_CMAKE}")
+qcopilots_search_install_linux_desktop()
 qcopilots_search_linux_deploy_arguments(_arguments
   qcs-owned-fixture qcs-module-fixture)
 qt_generate_deploy_script(TARGET qcs-deploy-fixture OUTPUT_SCRIPT _deploy

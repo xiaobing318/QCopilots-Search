@@ -78,7 +78,7 @@ class PackageRunnerContracts(unittest.TestCase):
         parsed = PHASE1.parse_args(args)
         self.assertEqual(parsed.source, HERE.parents[1])
         self.assertEqual(parsed.model_dir, self.external / 'models')
-        self.assertEqual(PHASE1.APPLICATIONS, {'qcs', 'qcs-cli', 'qcs-worker', 'qcs-service'})
+        self.assertEqual(PHASE1.APPLICATIONS, {'qcs-gui', 'qcs-cli', 'qcs-worker', 'qcs-service'})
 
     def test_tests_honor_nondefault_unicode_temporary_root_and_release_files(self):
         custom = self.root / '测试 temp root'

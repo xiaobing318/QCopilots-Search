@@ -21,12 +21,16 @@ struct FileRecord {
     qint64 size = 0;
     qint64 modifiedMs = 0;
     QString kind; // text, pdf, image, audio, video, code
+    bool screenshot = false;
 };
 
 struct FolderRules {
+    enum class Scope { General, Code };
     QStringList roots;
     QStringList excludes;
+    // Retained for legacy mixed callers. Services use an explicit Code scope.
     bool includeCode = false;
+    Scope scope = Scope::General;
 };
 
 struct ScanResult {
@@ -44,7 +48,9 @@ public:
     // Rejects links, non-regular files and unsupported file kinds.
     static bool describe(const QString &path, FileRecord *record, QString *error = nullptr);
     // Partial results are returned on cancellation or per-root/file failures.
-    // Explicitly chosen roots inside an excluded ancestor remain searchable.
+    // Explicit roots override default directory and dataset exclusions at that
+    // root only. Hidden/bundle/cache descendants remain excluded. A project
+    // root still limits General content to screenshots, as in DigUp.
     // Directory links are never followed, so cycles cannot escape selected roots.
     // Called synchronously after each accepted record is appended. The count is
     // cumulative and the callback may set cancel. No locks are held by scan.

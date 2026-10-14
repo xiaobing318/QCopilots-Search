@@ -2,11 +2,11 @@
 
 这些工具与应用源码一起版本管理，不依赖外置 `reports` 目录中的代码。所有运行记录必须由当前候选重新产生。脚本的快速单元测试使用合成输入，不构成真实模型、容量、安装包或 Computer Use 通过证据。
 
-日常 `qcs-dev test` 默认 `fast`，完整候选入口 `qcs-candidate-ctest-run.py` 内部显式传递 `--test-profile full`，继续核对全部注册程序和逐用例证据。通过 `qcs-dev` 手动执行完整候选测试时也必须指定 `full`。CTest 的 `qcs-tests-acceptance-runners` 和 `qcs-tests-file-capacity` 标记为 `slow`，默认快速范围不会运行它们。独立的十万文件、百万向量、双 checkout、服务延迟及包级验收仍按下面的执行顺序显式运行，不会因为切换日常默认范围而取消。
+日常 `qcs-dev test` 默认 `fast`，完整候选入口 `qcs-candidate-ctest-run.py` 内部显式传递 `--test-profile full`，继续核对全部注册程序和逐用例证据。通过 `qcs-dev` 手动执行完整候选测试时也必须指定 `full`。CTest 的 `qcs-tests-acceptance-runners` 执行 `--suite pure` 并纳入 fast，`qcs-tests-acceptance-native` 执行 `--suite native`，与 `qcs-tests-file-capacity` 一起标记为 `slow`。独立的十万文件、百万向量、双 checkout、服务延迟及包级验收仍按下面的执行顺序显式运行，不会因为切换日常默认范围而取消。
 
 ## 输入与执行顺序
 
-源码默认从脚本位置定位。构建根、Qt kit、模型、报告根及候选完整提交 SHA 由参数传入。`qcs-dev.ps1 build` 只执行构建，完整构建记录必须由 `tools/qcs-release-evidence.py record-build` 捕获该真实构建命令产生。每个入口的完整参数由 `--help` 或 PowerShell `Get-Help` 查看。
+源码默认从脚本位置定位。Python 入口统一使用选定的 Python 解释器，例如 `& $qcsPython -B <脚本路径>`，不再提供单独的包阶段 PowerShell 包装脚本。构建根、Qt kit、模型、报告根及候选完整提交 SHA 由参数传入。`qcs-dev.ps1 build` 只执行构建，完整构建记录必须由 `tools/qcs-release-evidence.py record-build` 捕获该真实构建命令产生。每个入口的完整参数由 `--help` 或 PowerShell `Get-Help` 查看。
 
 先完成依赖准备及 Release 配置，将候选提交冻结为干净的工作树。以下 Windows PowerShell 7 示例从任意 cwd 均可执行。只需将前三个目录改为本机位置，并确认 `python` 与 `pwsh` 在 PATH 中。如果已设置 `QCOPILOTS_SEARCH_PYTHON`，继续使用该 Python。
 
@@ -24,7 +24,7 @@ $qcsRecordArgs = @(
     '--source', $qcsSource,
     '--output-root', (Join-Path $qcsBuildRoot 'reports'),
     '--working-directory', $qcsBuildRoot,
-    '--program', ('qcs=' + (Join-Path $qcsBin 'qcs.exe')),
+    '--program', ('qcs-gui=' + (Join-Path $qcsBin 'qcs-gui.exe')),
     '--program', ('qcs-service=' + (Join-Path $qcsBin 'qcs-service.exe')),
     '--program', ('qcs-worker=' + (Join-Path $qcsBin 'qcs-worker.exe')),
     '--program', ('qcs-cli=' + (Join-Path $qcsBin 'qcs-cli.exe')),
@@ -47,17 +47,17 @@ Write-Output $qcsBuildRecord
 | 阶段 | 入口 | 关键输入和行为 |
 |---|---|---|
 | 完整本机 CTest | `qcs-candidate-ctest-run.py` | `--head`、`--source-tree`、`--build-record`、`--expected-tests`、`--extraction-prefix`、`--build-root`、`--qt-root`、`--qt-prefix`、`--launch-cwd`、`--report-parent`。校验全部用例、18 条 Windows 双后端参考向量和完整语义语料 |
-| 安装包阶段一 | `qcs-package-phase1.py` 或同名 `.ps1` | 完整构建及 CTest 记录、语义报告和 SHA-256、Qt、模型及外置输出根。生成 ZIP、NSIS 和包级验证，必须传 `--defer-source-bundle`，整体 `passed` 保持 false |
+| 安装包阶段一 | `qcs-package-phase1.py` | 完整构建及 CTest 记录、语义报告和 SHA-256、Qt、模型及外置输出根。生成 ZIP、NSIS 和包级验证，必须传 `--defer-source-bundle`，整体 `passed` 保持 false |
 | 百万向量 | `qcs-run-million.ps1` | 默认 `-Mode Validate`。正式验收通过下方 `run-local` 命令传入 `-Mode Run` 和 `-ReportRoot {evidence}`，将原始监视器文件与构建证明一同封装，保留 7 GiB 产物预算和 3 GiB 空闲默认值 |
 | 十万物理文件 | `qcs-run-physical.ps1` | `-ExpectedCommit`、`-BuildRecord`、`-BuildRoot`、`-QtPrefix`、`-Python`。真实执行添加 `-Execute` |
-| 安装包阶段二 | `qcs-package-phase2.py` 或同名 `.ps1` | `--phase1-summary` 及其 `--phase1-summary-sha256`。重新核对候选身份和阶段一产物，再创建和验证源码材料，不能仅凭阶段一声明完整交付 |
+| 安装包阶段二 | `qcs-package-phase2.py` | `--phase1-summary` 及其 `--phase1-summary-sha256`。重新核对候选身份和阶段一产物，再创建和验证源码材料，不能仅凭阶段一声明完整交付 |
 | 服务端延迟 | `qcs-service-latency.py` | `--semantic-report`、`--source`、`--expected-commit`、`--package-candidate`、`--app-dir`、`--model-dir`、`--working-directory`、`--artifact-root`、`--report`。真实运行创建独立 profile 和 cwd |
 | 普通窗口哨兵 | `qcs-launch-portability-sentinel.py` | `--head`、`--source-tree`、`--build-record`、`--app-bin`、`--qt-prefix`、`--run-parent`，使用最终包时选择 `--runtime-mode packaged` |
 | 双 checkout 与只读源码 | `qcs-two-checkout-portability.py` | 完整候选身份、构建记录、Qt、`--calligra-source` 和外置 `--run-parent`，通过 `--sentinel-launch-record` 同时验证普通窗口隔离 |
 
-Python 执行型入口默认只检查或展示计划，添加 `--execute` 才实际执行。计划阶段可能读取现有记录或校验身份，不能代替真正的执行记录。Windows 原生容量、Job Object、ACL 和 NSIS 运行器在其他平台明确不可用，其他平台的原生构建与包验证通过项目 CI 完成。
+Python 执行型入口默认只检查或展示计划，添加 `--execute` 才实际执行。计划阶段可能读取现有记录或校验身份，不能代替真正的执行记录。Windows 原生容量、服务延迟执行、Job Object、ACL 和 NSIS 运行器在其他平台明确不可用，其他平台的原生构建与包验证通过项目 CI 完成。
 
-`qcs-physical-preflight.py`、`qcs-portability-sentinel.py` 和 `qcs_owned_processes.py` 为共享实现。它们分别验证候选及产物、观察普通应用身份、限定本次创建的 Windows 子进程。不得通过运行器的报告参数加载外部任意 Python 实现。
+`qcs-physical-preflight.py`、`qcs-portability-sentinel.py` 和 `qcs_owned_processes.py` 为共享实现。它们分别验证候选及产物、观察普通应用身份、限定本次创建的 Windows 子进程。双 checkout 运行器和服务延迟运行器共用同一份进程 helper，并捕获其原始文件、哈希及执行结束后的稳定性。不得通过运行器的报告参数加载外部任意 Python 实现。
 
 候选 CTest 记录还保存 `tests/support/temp_paths.py` 的原始副本和 SHA-256，并在执行结束后再次校验。该共享临时路径 helper 同时属于完整源码提交身份，不能在冻结候选测试期间修改。
 
@@ -109,13 +109,17 @@ Write-Output $qcsMillionRecord
 
 记录器不操作 Windows UI，也不生成通过场景。真实用户流程必须由 Windows Computer Use 插件执行并观察。普通窗口哨兵也不会代替 UI 验收。
 
-## 轻量测试
+## 运行器自身测试
 
 ```text
-python -B tools/acceptance/qcs-test-runners.py
+python -B tools/acceptance/qcs-test-runners.py --suite pure
+python -B tools/acceptance/qcs-test-runners.py --suite native
+python -B tools/acceptance/qcs-test-runners.py --suite all
 ```
 
-统一入口产生一份完整 unittest 逐例报告。测试临时根默认来自系统，支持 `QCOPILOTS_SEARCH_TEST_ROOT`。可从任意 cwd 执行，只需给出脚本实际路径。临时目录创建失败会直接失败，不回退到源码或用户配置。
+日常快速检查使用 `--suite pure`。`native` 包含真实 ACL、进程令牌、超时输出及自有进程收尾等较慢检查，`all` 执行两组，省略 `--suite` 时也默认执行 `all`。两组共用同一注册表，不删除完整范围中的用例。Windows 专用能力在其他平台只按精确用例和原因记录不适用，跨平台超时回归仍实际执行。
+
+统一入口为实际选择的范围产生 unittest 逐例报告。测试临时根默认来自系统，支持 `QCOPILOTS_SEARCH_TEST_ROOT`。可从任意 cwd 执行，只需给出脚本实际路径。临时目录创建失败会直接失败，不回退到源码或用户配置。
 
 测试包含候选身份与文件哈希篡改、越界路径、短名产物清单、CTest 隔离 wrapper、阶段一与最终门槛区别、源包校验、容量监视器负例、真实目录链接边界和自有进程清理。Windows 用真实 NTFS junction 验证目录重定向，POSIX 用真实符号链接。文件符号链接用例在 POSIX 注册，Windows 独立报告该权限能力不适用，不把模拟分支声明为真实文件符号链接通过。平台能力清单以 `QCS_ACCEPTANCE_TEST_CAPABILITIES` 行输出。
 

@@ -3,7 +3,7 @@ include_guard(GLOBAL)
 # redistributable package is stripped separately by CPack, symbols stay external.
 foreach(_target qcs-core qcs-runtime
     qcs-extraction qcs-storage qcs-client qcs-service-core
-    qcs-app-components qcs qcs-service
+    qcs-app-components qcs-gui qcs-service
     qcs-worker qcs-cli)
   if(TARGET ${_target})
     if(MSVC)
@@ -19,7 +19,7 @@ foreach(_target qcs-core qcs-runtime
 endforeach()
 
 set(_symbol_programs)
-foreach(_target qcs qcs-service qcs-worker qcs-cli)
+foreach(_target qcs-gui qcs-service qcs-worker qcs-cli)
   if(TARGET ${_target})
     if(_symbol_programs)
       string(APPEND _symbol_programs ",\n")

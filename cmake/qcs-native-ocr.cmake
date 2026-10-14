@@ -1,4 +1,5 @@
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/qcs-write-if-different.cmake")
 
 # The embedded Leptonica bitmap fonts are CCITT G4 TIFF images. Keep this
 # decoder independent of all optional TIFF external codecs and system packages.
@@ -49,22 +50,22 @@ function(qcopilots_search_add_ocr_codec_dependencies)
     # variable-based discovery to the exact targets already built in this tree.
     set(find_modules "${qcs_png_BINARY_DIR}/find")
     file(MAKE_DIRECTORY "${find_modules}")
-    file(WRITE "${find_modules}/FindZLIB.cmake"
+    qcopilots_search_write_if_different("${find_modules}/FindZLIB.cmake"
         "set(ZLIB_FOUND TRUE)\nset(ZLIB_VERSION 1.3.2)\n"
         "set(ZLIB_LIBRARY ZLIB::ZLIB)\nset(ZLIB_LIBRARIES ZLIB::ZLIB)\n"
         "set(ZLIB_INCLUDE_DIR [==[${qcs_zlib_SOURCE_DIR}]==])\n"
         "set(ZLIB_INCLUDE_DIRS [==[${qcs_zlib_SOURCE_DIR}]==])\n")
-    file(WRITE "${find_modules}/FindJPEG.cmake"
+    qcopilots_search_write_if_different("${find_modules}/FindJPEG.cmake"
         "set(JPEG_FOUND TRUE)\nset(JPEG_VERSION 3.1.4.1)\n"
         "set(JPEG_LIBRARY JPEG::JPEG)\nset(JPEG_LIBRARIES JPEG::JPEG)\n"
         "get_target_property(JPEG_INCLUDE_DIR JPEG::JPEG INTERFACE_INCLUDE_DIRECTORIES)\n"
         "set(JPEG_INCLUDE_DIRS \"\${JPEG_INCLUDE_DIR}\")\n")
-    file(WRITE "${find_modules}/FindPNG.cmake"
+    qcopilots_search_write_if_different("${find_modules}/FindPNG.cmake"
         "set(PNG_FOUND TRUE)\nset(PNG_VERSION 1.6.59)\n"
         "set(PNG_LIBRARY PNG::PNG)\nset(PNG_LIBRARIES PNG::PNG)\n"
         "set(PNG_INCLUDE_DIR [==[${qcs_png_SOURCE_DIR};${qcs_png_BINARY_DIR}]==])\n"
         "set(PNG_INCLUDE_DIRS [==[${qcs_png_SOURCE_DIR};${qcs_png_BINARY_DIR}]==])\n")
-    file(WRITE "${find_modules}/FindTIFF.cmake"
+    qcopilots_search_write_if_different("${find_modules}/FindTIFF.cmake"
         "set(TIFF_FOUND TRUE)\nset(TIFF_VERSION 4.7.2)\n"
         "set(TIFF_LIBRARY TIFF::tiff)\nset(TIFF_LIBRARIES TIFF::tiff)\n"
         "set(TIFF_INCLUDE_DIR [==[${qcs_tiff_SOURCE_DIR}/libtiff;${qcs_tiff_BINARY_DIR}/libtiff]==])\n"
@@ -199,7 +200,7 @@ function(qcopilots_search_add_ocr_dependencies)
     # build-tree package referencing the already-created pinned target instead.
     set(Leptonica_DIR "${qcs_tesseract_BINARY_DIR}/lept")
     file(MAKE_DIRECTORY "${Leptonica_DIR}")
-    file(WRITE "${Leptonica_DIR}/LeptonicaConfig.cmake"
+    qcopilots_search_write_if_different("${Leptonica_DIR}/LeptonicaConfig.cmake"
         "set(Leptonica_FOUND TRUE)\n"
         "set(Leptonica_VERSION 1.87.0)\n"
         "set(Leptonica_LIBRARIES leptonica)\n"

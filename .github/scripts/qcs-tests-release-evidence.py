@@ -520,8 +520,17 @@ def semantic_fixture():
                      "exactSemanticRecallAt10": 1.0, "passed": True,
                      "requiredRecallAt10": 0.9 if key == "overall" else 0.8}
                for key, count in counts.items()}
+    corpus = {"fixtureManifestSha256": "3" * 64, "generatorSha256": "4" * 64,
+              "topicManifestSha256": "5" * 64, "relevanceManifestSha256": "6" * 64}
+    policy = {"version": "synthetic-fixture-v1", "calibrated": True,
+              "modelFingerprint": "qcopilots-search-embedding-v1:" + "1" * 64,
+              "corpusSha256": hashlib.sha256(json.dumps(corpus, ensure_ascii=False,
+                  sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+              "rawExportSha256": "7" * 64, "calibrationReportSha256": "8" * 64,
+              "thresholds": {key: .5 for key in ("text", "image", "audio", "code")}}
     return {
         "schema": 1, "mode": "release", "status": "passed", "passed": True,
+        "semanticCandidateMode": "matches-only", "relevancePolicy": policy, "corpusIdentity": corpus,
         "actualEmbeddedSegments": 1000, "completedFiles": len(files), "fixtures": len(files),
         "files": files, "queries": queries, "positiveQueries": 200, "metrics": metrics,
         "modelFingerprint": "qcopilots-search-embedding-v1:" + "1" * 64,
@@ -530,12 +539,14 @@ def semantic_fixture():
         "topicManifestSha256": "5" * 64,
         "annotationProtocol": "Synthetic validator fixture, not acceptance evidence.",
         "corpusScope": "Synthetic validator fixture, not an executed corpus.",
-        "noAnswerInterpretation": "Ranked candidates do not assert calibrated rejection.",
+        "noAnswerInterpretation": "Synthetic fixture exercises calibrated rejection validation.",
         "noAnswerQueries": [{"partition": partition, "query": f"absent fixture {partition} {n}",
-                             "returnedCount": 1,
+                             "topic": f"absent-topic-{partition}-{n}",
+                             "returnedCount": 0, "productionTop10": [],
                              "exactSemanticTop10": [{"file": files[0]["file"], "cosine": 0.2}]}
                             for partition in ("calibration", "holdout") for n in range(10)],
-        "noAnswerSummary": {partition: {"queries": 10, "queriesReturningCandidates": 10,
+        "noAnswerSummary": {partition: {"queries": 10, "queriesReturningCandidates": 0,
+                                         "falseReturnRate": 0, "maximumFalseReturnRate": .1, "passed": True,
                                          "minimumTopCosine": 0.2, "maximumTopCosine": 0.2,
                                          "meanTopCosine": 0.2}
                             for partition in ("calibration", "holdout")},
@@ -791,7 +802,49 @@ class CapacityEvidenceTests(unittest.TestCase):
             self.assertTrue(self.inspect(doc))
 
 
+class NsisContractEvidenceTests(unittest.TestCase):
+    def fixture(self):
+        identifier = "__main__.WorkflowTests.test_nsis_compiles_recursive_unicode_payload_beyond_max_path"
+        raw = f"{identifier.rsplit('.', 1)[-1]} ({identifier}) ... ok\n\nRan 1 test in 0.001s\n\nOK\n"
+        summary = {"schemaVersion": 1, "passed": True, "exitCode": 0, "log": "nsis-contract.log",
+                   "counts": {"run": 1, "passed": 1, "failed": 0, "skipped": 0, "notApplicable": 0},
+                   "cases": [{"case": identifier, "status": "ok"}], "errors": []}
+        return summary, raw
+
+    def test_exact_native_case_passes_without_unrelated_cleanup_cases(self):
+        self.assertEqual(evidence.validate_nsis_contract(*self.fixture()), [])
+
+    def test_skip_failure_wrong_case_or_missing_raw_output_cannot_pass(self):
+        summary, raw = self.fixture()
+        for output in ("", "Ran 1 test in 0.001s\n\nOK\n", raw.replace("... ok", "... skipped 'NSIS unavailable'"),
+                       raw.replace("... ok", "... FAIL"), raw.replace("test_nsis_compiles_recursive_unicode_payload_beyond_max_path", "test_other"),
+                       raw + "[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]\n"):
+            with self.subTest(output=output):
+                self.assertTrue(evidence.validate_nsis_contract(summary, output))
+
+    def test_summary_false_flags_counts_cases_exit_or_log_are_rejected(self):
+        for key, value in (("passed", False), ("passed", 1), ("exitCode", False), ("exitCode", 1),
+                           ("counts", {}), ("cases", []), ("errors", ["failed"]), ("log", "other.log")):
+            summary, raw = self.fixture()
+            summary[key] = value
+            with self.subTest(key=key, value=value):
+                self.assertTrue(evidence.validate_nsis_contract(summary, raw))
+
+    def test_extra_duplicate_case_cannot_satisfy_single_native_case_contract(self):
+        summary, raw = self.fixture()
+        line = raw.splitlines()[0]
+        altered = raw.replace("Ran 1 test", "Ran 2 tests").replace(line, line + "\n" + line)
+        self.assertTrue(evidence.validate_nsis_contract(summary, altered))
+
+
 class SemanticEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        # Synthetic fixture headers never replace the real candidate's policy.
+        self.compiled_policy = mock.patch.object(evidence, "compiled_relevance_policy",
+                                                 return_value=semantic_fixture()["relevancePolicy"])
+        self.compiled_policy.start()
+        self.addCleanup(self.compiled_policy.stop)
+
     def test_complete_synthetic_validation_fixture(self):
         self.assertEqual(evidence.validate_semantic(semantic_fixture()), [])
 
@@ -841,6 +894,47 @@ class SemanticEvidenceTests(unittest.TestCase):
     def test_no_answer_summary_must_match_records(self):
         doc = semantic_fixture()
         doc["noAnswerSummary"]["holdout"]["queries"] = 1
+        self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_no_answer_holdout_gate_recomputes_rate_from_returned_lists(self):
+        for count in (1, 2):
+            doc = semantic_fixture()
+            rows = [row for row in doc["noAnswerQueries"] if row["partition"] == "holdout"]
+            for row in rows[:count]:
+                row.update(returnedCount=1, productionTop10=[{"file": "unexpected.txt", "score": .01}])
+            doc["noAnswerSummary"]["holdout"].update(queriesReturningCandidates=count, falseReturnRate=count / 10)
+            self.assertEqual(bool(evidence.validate_semantic(doc)), count > 1)
+
+    def test_negative_count_cannot_hide_actual_results(self):
+        doc = semantic_fixture()
+        doc["noAnswerQueries"][0]["productionTop10"] = [{"file": "hidden-match.txt"}]
+        self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_calibration_export_and_unbound_policy_cannot_be_release_evidence(self):
+        for field, value in (("semanticCandidateMode", "raw-candidates"), ("mode", "calibration-export")):
+            doc = semantic_fixture()
+            doc[field] = value
+            self.assertTrue(evidence.validate_semantic(doc))
+        for field, value in (("calibrated", False), ("calibrated", 1), ("modelFingerprint", "other-model"),
+                             ("corpusSha256", "0" * 64), ("rawExportSha256", ""),
+                             ("calibrationReportSha256", "1" * 64), ("version", "different-version")):
+            with self.subTest(field=field):
+                doc = semantic_fixture()
+                doc["relevancePolicy"][field] = value
+                self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_threshold_change_nan_and_missing_modality_fail(self):
+        for value in (.6, float("nan"), float("inf"), True, 2):
+            doc = semantic_fixture()
+            doc["relevancePolicy"]["thresholds"]["audio"] = value
+            self.assertTrue(evidence.validate_semantic(doc))
+        doc = semantic_fixture()
+        del doc["relevancePolicy"]["thresholds"]["code"]
+        self.assertTrue(evidence.validate_semantic(doc))
+
+    def test_holdout_topics_must_be_independent(self):
+        doc = semantic_fixture()
+        doc["noAnswerQueries"][-1]["topic"] = doc["noAnswerQueries"][0]["topic"]
         self.assertTrue(evidence.validate_semantic(doc))
 
     def test_nonfinite_recall_and_cosine_rejected(self):
@@ -1082,7 +1176,7 @@ class ComputerUseEvidenceTests(unittest.TestCase):
         self.package = "5" * 64
         self.fingerprint = "qcopilots-search-embedding-v1:" + "6" * 64
         self.executables = {name: {"sha256": f"{n + 1:064x}", "packageMember": name + ".exe"}
-                            for n, name in enumerate(("qcs", "qcs-service",
+                            for n, name in enumerate(("qcs-gui", "qcs-service",
                                                       "qcs-worker", "qcs-cli"))}
         self.doc = {
             "schemaVersion": 1, "kind": "windows-computer-use", "passed": True,
@@ -1145,7 +1239,7 @@ class ComputerUseEvidenceTests(unittest.TestCase):
         self.doc["scenarios"][0]["packageSha256"] = "0" * 64
         self.assertTrue(self.inspect())
         self.doc = original
-        self.doc["scenarios"][0]["executables"]["qcs"]["sha256"] = "0" * 64
+        self.doc["scenarios"][0]["executables"]["qcs-gui"]["sha256"] = "0" * 64
         self.assertTrue(self.inspect())
 
     def test_session_and_scene_timestamp_ranges_are_enforced(self):
@@ -1473,7 +1567,7 @@ class ExecutionProvenanceTests(unittest.TestCase):
         self.output = self.root / "synthetic programs"
         self.output.mkdir()
         self.programs = {name: self.output / (name + ".exe") for name in (
-            "qcs", "qcs-service", "qcs-worker", "qcs-cli")}
+            "qcs-gui", "qcs-service", "qcs-worker", "qcs-cli")}
         self.build_command = [sys.executable, "-c",
             "import pathlib,sys\nfor name in sys.argv[1:]:\n p=pathlib.Path(name)\n p.write_bytes(b'SYNTHETIC VALIDATOR FIXTURE '+p.name.encode())",
             *[str(path) for path in self.programs.values()]]

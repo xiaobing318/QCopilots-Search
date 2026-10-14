@@ -179,8 +179,8 @@ class TestRunner(unittest.TestCase):
             f'set(PROJECT_SOURCE_DIR "{source.as_posix()}")\n'
             f'set(Python3_EXECUTABLE "{Path(sys.executable).as_posix()}")\n'
             f'set(QCOPILOTS_SEARCH_TEST_ROOT "{self.root.as_posix()}")\n' + helper + "\n"
-            'qcopilots_search_add_test(NAME qcs-tests-default COMMAND "${CMAKE_COMMAND}" -E true)\n'
-            'qcopilots_search_add_test(NAME qcs-tests-kept KEEP_SUCCESS_ARTIFACTS COMMAND "${CMAKE_COMMAND}" -E true)\n',
+            'qcopilots_search_add_test(NAME qcs-tests-default EVIDENCE_KIND program COMMAND "${CMAKE_COMMAND}" -E true)\n'
+            'qcopilots_search_add_test(NAME qcs-tests-kept EVIDENCE_KIND program KEEP_SUCCESS_ARTIFACTS COMMAND "${CMAKE_COMMAND}" -E true)\n',
             encoding="utf-8")
         build = self.base / "cmake build"
         configured = subprocess.run(["cmake", "-S", str(project), "-B", str(build)],

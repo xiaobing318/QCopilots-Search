@@ -1,4 +1,5 @@
 #include "storage/index_repository.h"
+#include "core/embedding_math.h"
 #include "support/test_environment.h"
 #include "support/sqlite_database.h"
 
@@ -6,6 +7,7 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QJsonDocument>
 #include <QStandardPaths>
 #include <QtTest>
 
@@ -16,6 +18,7 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <future>
 #include <mutex>
 #include <stdexcept>
@@ -532,6 +535,389 @@ private slots:
         QCOMPARE(hits[1].path, oldest);
     }
 
+    void fileListPagesEveryFileOnceWithStableModificationTies()
+    {
+        TestEnvironment environment(QStringLiteral("file-list-pages"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        QVector<IndexedFile> fixtures;
+        QStringList insertedPaths;
+        for (int index = 0; index < 205; ++index) {
+            const QString path = environment.path(QStringLiteral("files/%1.txt").arg(index));
+            insertedPaths.append(path);
+            fixtures.append({path, QStringLiteral("one"), false,
+                             {makeSegment(QStringLiteral("body must not be a list preview"))},
+                             1000, QStringLiteral("text")});
+        }
+        QVERIFY2(repository.replaceFiles(fixtures, &error), qPrintable(error));
+
+        FileListOptions options;
+        options.limit = 100;
+        QSet<qint64> identities;
+        QSet<QString> paths;
+        qint64 generation = -1;
+        qint64 previousId = 0;
+        qsizetype seen = 0;
+        for (const int expectedCount : {100, 100, 5}) {
+            const auto page = repository.listFiles(options);
+            QVERIFY2(page.error.isEmpty(), qPrintable(page.error));
+            QVERIFY(page.errorCode.isEmpty());
+            QVERIFY(!page.metadataPending);
+            QCOMPARE(page.files.size(), qsizetype(expectedCount));
+            if (generation < 0)
+                generation = page.browseGeneration;
+            QCOMPARE(page.browseGeneration, generation);
+            for (const auto &file : page.files) {
+                QVERIFY(file.fileId > 0);
+                if (seen > 0)
+                    QVERIFY(file.fileId < previousId);
+                QVERIFY(!identities.contains(file.fileId));
+                QVERIFY(!paths.contains(file.path));
+                QCOMPARE(file.path, insertedPaths.at(204 - seen));
+                QCOMPARE(file.modifiedMs, qint64(1000));
+                QCOMPARE(file.kind, QStringLiteral("text"));
+                QCOMPARE(file.title, QFileInfo(file.path).fileName());
+                QCOMPARE(file.sourceVersion, QStringLiteral("one"));
+                QVERIFY(!file.code);
+                identities.insert(file.fileId);
+                paths.insert(file.path);
+                previousId = file.fileId;
+                ++seen;
+            }
+            QCOMPARE(page.hasMore, seen < 205);
+            QCOMPARE(page.nextCursor.isEmpty(), seen == 205);
+            options.cursor = page.nextCursor;
+        }
+        QCOMPARE(seen, qsizetype(205));
+        QCOMPARE(identities.size(), qsizetype(205));
+        QCOMPARE(paths, QSet<QString>(insertedPaths.cbegin(), insertedPaths.cend()));
+    }
+
+    void fileListCursorRejectsChangedVisibilityContext()
+    {
+        TestEnvironment environment(QStringLiteral("file-list-context"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        const QString root = environment.path(QStringLiteral("selected"));
+        const QString first = QDir(root).filePath(QStringLiteral("first.txt"));
+        const QString second = QDir(root).filePath(QStringLiteral("second.txt"));
+        const QString otherRoot = environment.path(QStringLiteral("other"));
+        QVERIFY2(repository.replaceFiles({
+            {first, QStringLiteral("one"), false, {makeSegment(QStringLiteral("first"))},
+             1000, QStringLiteral("text")},
+            {second, QStringLiteral("one"), false, {makeSegment(QStringLiteral("second"))},
+             2000, QStringLiteral("text")},
+            {QDir(root).filePath(QStringLiteral("source.cpp")), QStringLiteral("one"), true,
+             {makeSegment(QStringLiteral("code"))}, 3000, QStringLiteral("code")}
+        }, &error), qPrintable(error));
+        FileListOptions original;
+        original.limit = 1;
+        original.root = root;
+        original.kind = QStringLiteral("text");
+        original.allowedRoots = {root};
+        original.enforceFolderRules = true;
+        original.configurationToken = QStringLiteral("configuration-one");
+        const auto firstPage = repository.listFiles(original);
+        QVERIFY2(firstPage.error.isEmpty(), qPrintable(firstPage.error));
+        QCOMPARE(firstPage.files.size(), qsizetype(1));
+        QVERIFY(firstPage.hasMore);
+        QVERIFY(!firstPage.nextCursor.isEmpty());
+        original.cursor = firstPage.nextCursor;
+
+        const QList<std::pair<QString, std::function<void(FileListOptions &)>>> changes{
+            {QStringLiteral("code"), [](auto &options) { options.code = true; }},
+            {QStringLiteral("kind"), [](auto &options) { options.kind = QStringLiteral("image"); }},
+            {QStringLiteral("root"), [&](auto &options) { options.root = otherRoot; }},
+            {QStringLiteral("allowed roots"), [&](auto &options) { options.allowedRoots = {otherRoot}; }},
+            {QStringLiteral("excluded roots"), [&](auto &options) { options.excludedRoots = {first}; }},
+            {QStringLiteral("folder enforcement"), [](auto &options) { options.enforceFolderRules = false; }},
+            {QStringLiteral("configuration"), [](auto &options) {
+                options.configurationToken = QStringLiteral("configuration-two");
+            }}
+        };
+        for (const auto &[description, change] : changes) {
+            auto changed = original;
+            change(changed);
+            const auto rejected = repository.listFiles(changed);
+            QCOMPARE(rejected.errorCode, QStringLiteral("cursor_stale"));
+            QVERIFY2(!rejected.error.isEmpty(), qPrintable(description));
+            QVERIFY(rejected.files.isEmpty());
+            QVERIFY(rejected.nextCursor.isEmpty());
+            QVERIFY(!rejected.hasMore);
+        }
+        auto malformed = original;
+        malformed.cursor = QStringLiteral("***not-a-cursor***");
+        const auto rejected = repository.listFiles(malformed);
+        QCOMPARE(rejected.errorCode, QStringLiteral("invalid_cursor"));
+        QVERIFY(!rejected.error.isEmpty());
+        QVERIFY(rejected.files.isEmpty());
+        auto cursorFields = QJsonDocument::fromJson(QByteArray::fromBase64(
+            original.cursor.toLatin1(), QByteArray::Base64UrlEncoding)).object();
+        QVERIFY(!cursorFields.isEmpty());
+        cursorFields.insert(QStringLiteral("v"), 2);
+        malformed.cursor = QString::fromLatin1(QJsonDocument(cursorFields).toJson(QJsonDocument::Compact)
+            .toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+        const auto unsupportedVersion = repository.listFiles(malformed);
+        QCOMPARE(unsupportedVersion.errorCode, QStringLiteral("invalid_cursor"));
+        QVERIFY(unsupportedVersion.files.isEmpty());
+        cursorFields.insert(QStringLiteral("v"), 1);
+        cursorFields.insert(QStringLiteral("index"), QStringLiteral("another-index-uuid"));
+        malformed.cursor = QString::fromLatin1(QJsonDocument(cursorFields).toJson(QJsonDocument::Compact)
+            .toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+        const auto differentIndex = repository.listFiles(malformed);
+        QCOMPARE(differentIndex.errorCode, QStringLiteral("cursor_stale"));
+        QVERIFY(differentIndex.files.isEmpty());
+        const auto secondPage = repository.listFiles(original);
+        QVERIFY2(secondPage.error.isEmpty(), qPrintable(secondPage.error));
+        QCOMPARE(secondPage.files.size(), qsizetype(1));
+        QCOMPARE(secondPage.files.first().path, first);
+        QVERIFY(!secondPage.hasMore);
+    }
+
+    void fileListCursorBecomesStaleAfterMembershipOrMetadataChanges_data()
+    {
+        QTest::addColumn<QString>("change");
+        for (const auto *change : {"insert", "remove", "modified-time", "kind", "code-membership"})
+            QTest::newRow(change) << QString::fromLatin1(change);
+    }
+
+    void fileListCursorBecomesStaleAfterMembershipOrMetadataChanges()
+    {
+        QFETCH(QString, change);
+        TestEnvironment environment(QStringLiteral("file-list-generation"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        const QString first = environment.path(QStringLiteral("first.txt"));
+        const QString second = environment.path(QStringLiteral("second.txt"));
+        const QString third = environment.path(QStringLiteral("third.txt"));
+        const auto segment = makeSegment(QStringLiteral("body"));
+        QVERIFY2(repository.replaceFiles({
+            {first, QStringLiteral("one"), false, {segment}, 1000, QStringLiteral("text")},
+            {second, QStringLiteral("one"), false, {segment}, 2000, QStringLiteral("text")},
+            {third, QStringLiteral("one"), false, {segment}, 3000, QStringLiteral("text")}
+        }, &error), qPrintable(error));
+        FileListOptions options;
+        options.limit = 1;
+        const auto before = repository.listFiles(options);
+        QVERIFY2(before.error.isEmpty(), qPrintable(before.error));
+        QVERIFY(before.hasMore);
+        options.cursor = before.nextCursor;
+        if (change == QStringLiteral("insert")) {
+            QVERIFY2(repository.replaceFile(environment.path(QStringLiteral("fourth.txt")),
+                QStringLiteral("one"), {segment}, false, &error, {}, 4000,
+                QStringLiteral("text")), qPrintable(error));
+        } else if (change == QStringLiteral("remove")) {
+            QVERIFY2(repository.removeFile(first, false, &error), qPrintable(error));
+        } else if (change == QStringLiteral("modified-time")) {
+            QVERIFY2(repository.updateFileMetadata({{first, false, 4000, QStringLiteral("text"), {}}},
+                &error), qPrintable(error));
+        } else if (change == QStringLiteral("kind")) {
+            QVERIFY2(repository.updateFileMetadata({{first, false, 1000, QStringLiteral("image"), {}}},
+                &error), qPrintable(error));
+        } else {
+            QCOMPARE(change, QStringLiteral("code-membership"));
+            QVERIFY2(repository.removeFile(first, false, &error), qPrintable(error));
+            QVERIFY2(repository.replaceFile(first, QStringLiteral("one"), {segment}, true,
+                &error, {}, 1000, QStringLiteral("code")), qPrintable(error));
+        }
+        const auto stale = repository.listFiles(options);
+        QCOMPARE(stale.errorCode, QStringLiteral("cursor_stale"));
+        QVERIFY(!stale.error.isEmpty());
+        QVERIFY(stale.files.isEmpty());
+        QVERIFY(stale.nextCursor.isEmpty());
+        QVERIFY(!stale.hasMore);
+        options.cursor.clear();
+        const auto refreshed = repository.listFiles(options);
+        QVERIFY2(refreshed.error.isEmpty(), qPrintable(refreshed.error));
+        QVERIFY(refreshed.browseGeneration > before.browseGeneration);
+        QVERIFY(!refreshed.files.isEmpty());
+    }
+
+    void fileListCursorSurvivesSegmentContinuationAndAnnPublication()
+    {
+        TestEnvironment environment(QStringLiteral("file-list-segment-continuation"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        QVector<float> vector(embeddingDimensions, 0.0f);
+        vector[0] = 1.0f;
+        const QString first = environment.path(QStringLiteral("first.txt"));
+        const QString second = environment.path(QStringLiteral("second.txt"));
+        const QString third = environment.path(QStringLiteral("third.txt"));
+        const auto originalSegment = makeSegment(QStringLiteral("first segment"), vector);
+        QVERIFY2(repository.replaceFiles({
+            {first, QStringLiteral("one"), false, {originalSegment}, 1000, QStringLiteral("text")},
+            {second, QStringLiteral("one"), false, {originalSegment}, 2000, QStringLiteral("text")},
+            {third, QStringLiteral("one|partial:1"), false, {originalSegment}, 3000, QStringLiteral("text")}
+        }, &error), qPrintable(error));
+        FileListOptions options;
+        options.limit = 1;
+        const auto firstPage = repository.listFiles(options);
+        QVERIFY2(firstPage.error.isEmpty(), qPrintable(firstPage.error));
+        QCOMPARE(firstPage.files.size(), qsizetype(1));
+        QCOMPARE(firstPage.files.first().path, third);
+        QVERIFY(firstPage.hasMore);
+        const auto originalId = firstPage.files.first().fileId;
+        options.cursor = firstPage.nextCursor;
+        const auto initialStatus = repository.status(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(repository.replaceFile(third, QStringLiteral("one|partial:2"),
+            {originalSegment, makeSegment(QStringLiteral("continued segment"), vector)},
+            false, &error, {}, 3000, QStringLiteral("text")), qPrintable(error));
+        auto nextPage = repository.listFiles(options);
+        QVERIFY2(nextPage.error.isEmpty(), qPrintable(nextPage.error));
+        QCOMPARE(nextPage.browseGeneration, firstPage.browseGeneration);
+        QCOMPARE(nextPage.files.size(), qsizetype(1));
+        QCOMPARE(nextPage.files.first().path, second);
+        QVERIFY(repository.status(&error).value(QStringLiteral("generation")).toInteger()
+                > initialStatus.value(QStringLiteral("generation")).toInteger());
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(repository.flush(&error), qPrintable(error));
+        const auto published = repository.status(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(published.value(QStringLiteral("pendingShards")).toInteger(), qint64(0));
+        QCOMPARE(published.value(QStringLiteral("annVectors")).toInteger(), qint64(4));
+        nextPage = repository.listFiles(options);
+        QVERIFY2(nextPage.error.isEmpty(), qPrintable(nextPage.error));
+        QCOMPARE(nextPage.browseGeneration, firstPage.browseGeneration);
+        QCOMPARE(nextPage.files.size(), qsizetype(1));
+        QCOMPARE(nextPage.files.first().path, second);
+        options.cursor = nextPage.nextCursor;
+        const auto lastPage = repository.listFiles(options);
+        QVERIFY2(lastPage.error.isEmpty(), qPrintable(lastPage.error));
+        QCOMPARE(lastPage.files.size(), qsizetype(1));
+        QCOMPARE(lastPage.files.first().path, first);
+        QVERIFY(!lastPage.hasMore);
+        options.cursor.clear();
+        const auto refreshed = repository.listFiles(options);
+        QVERIFY2(refreshed.error.isEmpty(), qPrintable(refreshed.error));
+        QCOMPARE(refreshed.files.size(), qsizetype(1));
+        QCOMPARE(refreshed.files.first().fileId, originalId);
+        QCOMPARE(refreshed.files.first().sourceVersion, QStringLiteral("one|partial:2"));
+        QCOMPARE(refreshed.browseGeneration, firstPage.browseGeneration);
+    }
+
+    void fileListPageDoesNotPinReadTransactionBetweenRequests()
+    {
+        TestEnvironment environment(QStringLiteral("file-list-short-transaction"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        const QString first = environment.path(QStringLiteral("first.txt"));
+        const QString second = environment.path(QStringLiteral("second.txt"));
+        const auto segment = makeSegment(QStringLiteral("body"));
+        QVERIFY2(repository.replaceFiles({
+            {first, QStringLiteral("one"), false, {segment}, 1000, QStringLiteral("text")},
+            {second, QStringLiteral("one"), false, {segment}, 2000, QStringLiteral("text")}
+        }, &error), qPrintable(error));
+        auto checkpoint = openTestDatabase(repository.databasePath(), SQLITE_OPEN_READWRITE, &error);
+        QVERIFY2(checkpoint != nullptr, qPrintable(error));
+        QCOMPARE(testFileCount(checkpoint.get()), qint64(2));
+        QCOMPARE(sqlite3_wal_checkpoint_v2(checkpoint.get(), "main", SQLITE_CHECKPOINT_TRUNCATE,
+            nullptr, nullptr), SQLITE_OK);
+        FileListOptions options;
+        options.limit = 1;
+        // Keep the returned page and cursor alive while committing new frames.
+        const auto page = repository.listFiles(options);
+        QVERIFY2(page.error.isEmpty(), qPrintable(page.error));
+        QVERIFY(page.hasMore);
+        QVERIFY2(repository.replaceFile(first, QStringLiteral("one|partial:2"),
+            {segment, makeSegment(QStringLiteral("appended body"))}, false, &error, {},
+            1000, QStringLiteral("text")), qPrintable(error));
+        const QString walPath = repository.databasePath() + QStringLiteral("-wal");
+        QVERIFY(QFileInfo(walPath).size() > 0);
+        // TRUNCATE fails with SQLITE_BUSY if listFiles retained the old read mark.
+        QCOMPARE(sqlite3_wal_checkpoint_v2(checkpoint.get(), "main", SQLITE_CHECKPOINT_TRUNCATE,
+            nullptr, nullptr), SQLITE_OK);
+        QCOMPARE(QFileInfo(walPath).size(), qint64(0));
+        options.cursor = page.nextCursor;
+        const auto nextPage = repository.listFiles(options);
+        QVERIFY2(nextPage.error.isEmpty(), qPrintable(nextPage.error));
+        QCOMPARE(nextPage.files.size(), qsizetype(1));
+        QCOMPARE(nextPage.files.first().path, first);
+        QCOMPARE(nextPage.browseGeneration, page.browseGeneration);
+    }
+
+    void punctuationOnlySearchDoesNotReturnRecentFiles()
+    {
+        TestEnvironment environment(QStringLiteral("punctuation-search"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        QVERIFY2(repository.replaceFile(environment.path(QStringLiteral("indexed.txt")),
+            QStringLiteral("one"), {makeSegment(QStringLiteral("searchable body"))}, false,
+            &error, {}, 1000, QStringLiteral("text")), qPrintable(error));
+        SearchOptions options;
+        options.query = QStringLiteral("searchable");
+        QCOMPARE(repository.search(options, &error).size(), qsizetype(1));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        for (const auto &query : {QStringLiteral("!!!"), QStringLiteral("，。！？"),
+                                 QStringLiteral("()[]{}\""), QStringLiteral("***"),
+                                 QStringLiteral("  ...  ")}) {
+            options.query = query;
+            const auto hits = repository.search(options, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY2(hits.isEmpty(), qPrintable(QStringLiteral("Punctuation query returned recent files: %1").arg(query)));
+        }
+    }
+
+    void exactCosineUsesTheSameFloatBoundaryForCalibration()
+    {
+        QVector<float> query(embeddingDimensions, 0.0f);
+        query[0] = 0.6f;
+        query[1] = 0.8f;
+        QVector<float> stored(embeddingDimensions, 0.0f);
+        stored[0] = 1.0f;
+        const auto normalized = embedding_math::normalized(query);
+        const double production = embedding_math::cosine(normalized, stored);
+        const double calibration = embedding_math::cosine(embedding_math::normalized(query), stored);
+        QCOMPARE(production, calibration);
+        QCOMPARE(production, double(normalized[0]));
+        const double threshold = std::nextafter(calibration, std::numeric_limits<double>::infinity());
+        QVERIFY(production < threshold);
+        // Re-normalizing the rounded float query in double precision changes
+        // the boundary and cannot be used to fit production thresholds.
+        const double doubleNorm = double(normalized[0]) * normalized[0]
+            + double(normalized[1]) * normalized[1];
+        const double otherCosine = double(normalized[0]) / std::sqrt(doubleNorm);
+        QVERIFY(otherCosine < production);
+        QVERIFY(std::nextafter(otherCosine, std::numeric_limits<double>::infinity()) < production);
+    }
+
+    void tokenlessSemanticQueriesKeepProvidedEmbedding()
+    {
+        TestEnvironment environment(QStringLiteral("tokenless-semantic-search"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        QVector<float> embedding(embeddingDimensions, 0.0f);
+        embedding[0] = 1.0f;
+        auto image = makeSegment({}, embedding);
+        image.kind = QStringLiteral("image");
+        image.modality = QStringLiteral("image");
+        const QString path = environment.path(QStringLiteral("cat.png"));
+        QVERIFY2(repository.replaceFile(path, QStringLiteral("one"), {image}, false,
+            &error, {}, 1000, QStringLiteral("image")), qPrintable(error));
+        SearchOptions options;
+        options.query = QString::fromUtf8("\xf0\x9f\x90\xb1");
+        options.queryEmbedding = embedding;
+        options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
+        const auto hits = repository.search(options, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hits.size(), qsizetype(1));
+        QCOMPARE(hits.first().path, path);
+    }
+
     void scatteredCommonWordsDoNotDisplaceStrongSemanticImage()
     {
         TestEnvironment environment(QStringLiteral("conjunctive-hybrid"));
@@ -563,6 +949,7 @@ private slots:
         SearchOptions options;
         options.query = QStringLiteral("where can I find a bicycle beside a bridge");
         options.queryEmbedding = queryVector;
+        options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         options.limit = 10;
         const auto hits = repository.search(options, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
@@ -701,9 +1088,10 @@ private slots:
 
         SearchOptions options;
         options.limit = 1;
-        if (semantic)
+        if (semantic) {
             options.queryEmbedding = nearest;
-        else
+            options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
+        } else
             options.query = QStringLiteral("needle");
         const auto withoutRules = repository.search(options, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
@@ -756,9 +1144,10 @@ private slots:
         for (const bool semantic : {false, true}) {
             SearchOptions options;
             options.limit = 20;
-            if (semantic)
+            if (semantic) {
                 options.queryEmbedding = embedding;
-            else
+                options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
+            } else
                 options.query = QStringLiteral("needle");
             options.root = root + u'/';
             QCOMPARE(distinctPaths(repository.search(options, &error)),
@@ -805,9 +1194,10 @@ private slots:
         // exclusion at or above itself, while strict descendants remain active.
         for (const bool semantic : {false, true}) {
             SearchOptions options;
-            if (semantic)
+            if (semantic) {
                 options.queryEmbedding = embedding;
-            else
+                options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
+            } else
                 options.query = QStringLiteral("needle");
             options.enforceFolderRules = true;
             options.allowedRoots = {outerRoot, nestedRoot};
@@ -903,6 +1293,7 @@ private slots:
 
         SearchOptions options;
         options.queryEmbedding = queryVector;
+        options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         options.limit = 2;
         // No text, root or kind filter: FTS and allow-list construction must not
         // accidentally hide either regression in the unfiltered ANN path.

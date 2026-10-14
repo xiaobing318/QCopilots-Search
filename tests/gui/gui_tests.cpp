@@ -25,6 +25,7 @@
 #include <QPdfView>
 #include <QPdfWriter>
 #include <QPersistentModelIndex>
+#include <QPlainTextEdit>
 #include <QProcess>
 #include <QProxyStyle>
 #include <QPushButton>
@@ -72,6 +73,7 @@ public:
     AppSettings settings;
     QList<SearchHit> hits;
     bool autoSearch = true;
+    bool autoFiles = true;
     bool autoStatus = true;
     int next = 1;
     FakeBackend() { settings.language = "en"; settings.checkUpdates = false; settings.minimizeToTray = false; }
@@ -91,6 +93,20 @@ public:
                 QJsonArray values;
                 for (const auto &hit : hits) values.append(hit.toJson());
                 emit response(id, {{"hits", values}, {"semantic", false}});
+            } else if (method == "files.list" && autoFiles) {
+                QJsonArray files;
+                for (const auto &hit : hits) {
+                    FileListEntry file;
+                    file.fileId = files.size() + 1; file.path = hit.path; file.title = hit.title;
+                    file.kind = hit.kind; file.code = params.value("code").toBool(); file.sourceVersion = hit.sourceVersion;
+                    files.append(file.toJson());
+                }
+                emit response(id, {{"files", files}, {"nextCursor", ""}, {"hasMore", false}, {"browseGeneration", "1"}, {"metadataPending", false}});
+            } else if (method == "document.preview") {
+                for (const auto &hit : hits) if (hit.path == params.value("path").toString()) {
+                    emit response(id, {{"text", hit.text}, {"partial", false}, {"next", 0}});
+                    break;
+                }
             } else if (method == "index.pause") { settings.indexingPaused = true; emit response(id, {{"state", "paused"}}); }
             else if (method == "index.resume") { settings.indexingPaused = false; emit response(id, {{"state", "indexing"}}); }
             else if (method.startsWith("index.")) emit response(id, {{"state", "indexing"}});
@@ -132,12 +148,17 @@ private slots:
         QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), hit.text);
         QVERIFY(window.findChild<QPushButton *>("openResultButton")->isEnabled());
         QVERIFY(backend.last("search").params.value("semantic").toBool());
+        QVERIFY(!results->item(0)->text().contains(hit.text));
+        QCOMPARE(results->item(0)->text().count('\n'), 1);
+        QCOMPARE(results->item(0)->toolTip(), hit.path);
     }
     void filtersAndSeparateCodeSearch() {
         TestEnvironment env("gui-filters"); QVERIFY(env.isValid());
         FakeBackend backend; backend.settings.includeCode = true; backend.settings.roots << env.root();
+        backend.settings.codeRoots << env.path("source code");
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("filter");
         auto *code = window.findChild<QCheckBox *>("codeSearchCheck");
         QTRY_VERIFY(code->isEnabled());
         auto *kind = window.findChild<QComboBox *>("kindFilter");
@@ -149,23 +170,195 @@ private slots:
         QCOMPARE(backend.last("search").params.value("root").toString(), env.root());
         code->setChecked(true);
         QTRY_VERIFY(backend.last("search").params.value("code").toBool());
+        QCOMPARE(root->itemData(1).toString(), env.path("source code"));
+        QCOMPARE(root->currentData().toString(), QString());
         QVERIFY(!kind->isEnabled());
         QCOMPARE(backend.last("search").params.value("kind").toString(), QString());
+    }
+    void emptyQueryBrowsesFilesAndLoadsOnlySelectedBody() {
+        TestEnvironment env("gui-file-browser"); QVERIFY(env.isValid());
+        FakeBackend backend;
+        for (int i = 0; i < 3; ++i) {
+            const QString name = QStringLiteral("file-%1.txt").arg(i);
+            QVERIFY(env.writeFile(name, "fixture"));
+            SearchHit hit; hit.path = env.path(name); hit.title = name; hit.kind = "text";
+            hit.text = QStringLiteral("Private body content %1").arg(i); backend.hits.append(hit);
+        }
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        auto *results = window.findChild<QListWidget *>("searchResults");
+        QTRY_COMPARE(results->count(), 3);
+        QCOMPARE(backend.count("search"), 0);
+        QCOMPARE(backend.last("files.list").params.value("limit").toInt(), 100);
+        QVERIFY(!backend.last("files.list").params.contains("query"));
+        QCOMPARE(results->currentRow(), 0);
+        QTRY_COMPARE(backend.count("document.preview"), 1);
+        QTRY_COMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), backend.hits.first().text);
+        for (int row = 0; row < results->count(); ++row) {
+            QCOMPARE(results->item(row)->text().count('\n'), 1);
+            QVERIFY(!results->item(row)->text().contains("Private body content"));
+            QVERIFY(results->item(row)->icon().isNull());
+        }
+        results->setCurrentRow(2);
+        QTRY_COMPARE(backend.count("document.preview"), 2);
+        QTRY_COMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), backend.hits.last().text);
+        QVERIFY(!window.findChild<QPushButton *>("loadMoreFilesButton")->isEnabled());
+    }
+    void browsingAppendAndStaleCursorPreserveSelectionAndPreview() {
+        TestEnvironment env("gui-file-pages"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoFiles = false;
+        QJsonArray first, second;
+        for (int i = 0; i < 45; ++i) {
+            const QString name = QStringLiteral("file-%1.txt").arg(i);
+            QVERIFY(env.writeFile(name, "fixture"));
+            FileListEntry entry; entry.fileId = i + 1; entry.path = env.path(name); entry.title = name; entry.kind = "text"; entry.sourceVersion = "v1";
+            (i < 30 ? first : second).append(entry.toJson());
+        }
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.resize(850, 540); window.show(); window.start();
+        QTRY_COMPARE(backend.count("files.list"), 1);
+        emit backend.response(backend.last("files.list").id, {{"files", first}, {"nextCursor", "cursor-1"}, {"hasMore", true}, {"browseGeneration", "7"}});
+        auto *results = window.findChild<QListWidget *>("searchResults");
+        auto *preview = window.findChild<PreviewPanel *>();
+        auto *more = window.findChild<QPushButton *>("loadMoreFilesButton");
+        QCOMPARE(results->count(), 30); QVERIFY(more->isEnabled());
+        results->setCurrentRow(20); results->scrollToItem(results->currentItem(), QAbstractItemView::PositionAtTop);
+        QTRY_VERIFY(results->verticalScrollBar()->value() > 0);
+        const int scroll = results->verticalScrollBar()->value();
+        const QString selected = results->currentItem()->data(Qt::UserRole).toString();
+        preview->setDocumentPreview({{"text", "Already loaded body"}, {"partial", false}}, false);
+        const int reads = backend.count("document.preview");
+        more->click();
+        QCOMPARE(backend.last("files.list").params.value("cursor").toString(), QString("cursor-1"));
+        QVERIFY(!more->isEnabled());
+        emit backend.response(backend.last("files.list").id, {{"files", second}, {"nextCursor", "cursor-2"}, {"hasMore", true}, {"browseGeneration", "7"}});
+        QCOMPARE(results->count(), 45); QCOMPARE(results->currentRow(), 20);
+        QCOMPARE(results->verticalScrollBar()->value(), scroll);
+        QCOMPARE(preview->currentHit().path, selected);
+        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString("Already loaded body"));
+        QCOMPARE(backend.count("document.preview"), reads);
+        const int pageRequests = backend.count("files.list");
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "7"}});
+        QVERIFY(more->isEnabled());
+        backend.settings.language = "zh_CN";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QTest::qWait(300);
+        QCOMPARE(backend.count("files.list"), pageRequests);
+        QCOMPARE(results->currentRow(), 20);
+        QCOMPARE(results->count(), 45);
+        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString("Already loaded body"));
+        backend.settings.language = "en";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        more->click();
+        emit backend.failed(backend.last("files.list").id, "cursor_stale", "The catalog changed");
+        QCOMPARE(results->count(), 45); QCOMPARE(results->currentRow(), 20);
+        QCOMPARE(results->verticalScrollBar()->value(), scroll);
+        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString("Already loaded body"));
+        QVERIFY(!more->isEnabled());
+        QVERIFY(window.findChild<QLabel *>("searchSummary")->text().contains("Refresh"));
+        window.findChild<QPushButton *>("refreshFilesButton")->click();
+        QVERIFY(!backend.last("files.list").params.contains("cursor"));
+        emit backend.response(backend.last("files.list").id, {{"files", first}, {"nextCursor", ""}, {"hasMore", false}, {"browseGeneration", "8"}});
+        QCOMPARE(results->currentRow(), 20);
+        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString("Already loaded body"));
+        QVERIFY(!more->isEnabled());
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "8"}, {"visibilityEpoch", "changed-eligibility"}});
+        QCOMPARE(results->currentRow(), 20);
+        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), QString("Already loaded body"));
+        QVERIFY(window.findChild<QLabel *>("searchSummary")->text().contains("Refresh"));
+    }
+    void lateBrowseResponseCannotReplaceTypedSearchBeforeDebounce() {
+        TestEnvironment env("gui-browse-stale"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoFiles = false; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        QTRY_COMPARE(backend.count("files.list"), 1);
+        const QString request = backend.last("files.list").id;
+        window.findChild<SearchEdit *>("searchInput")->setText("new question");
+        FileListEntry entry; entry.fileId = 1; entry.path = env.path("old.txt"); entry.title = "Old result";
+        emit backend.response(request, {{"files", QJsonArray{entry.toJson()}}, {"browseGeneration", "1"}});
+        QCOMPARE(window.findChild<QListWidget *>("searchResults")->count(), 0);
+        QTRY_COMPARE(backend.last("search").params.value("query").toString(), QString("new question"));
+    }
+    void metadataPendingSearchShowsProgressAndRetriesAfterIndexChange() {
+        TestEnvironment env("gui-search-metadata-pending"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("catalog question");
+        QTRY_COMPARE(backend.count("search"), 1);
+        emit backend.failed(backend.last("search").id, "metadata_pending", "Checking folder metadata");
+        QVERIFY(window.findChild<QLabel *>("searchSummary")->text().contains("Checking folders"));
+        emit backend.eventReceived("indexChanged", {{"browseGeneration", "2"}});
+        QTRY_COMPARE(backend.count("search"), 2);
+    }
+    void quickBrowserUsesTwelveAndRefreshesLanguage() {
+        TestEnvironment env("gui-quick-browser"); QVERIFY(env.isValid());
+        FakeBackend backend; SearchHit hit; hit.path = env.path("summary.txt"); hit.title = "Summary"; hit.text = "Secret body"; backend.hits << hit;
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        window.showQuickSearch();
+        auto *results = window.findChild<QListWidget *>("quickSearchResults");
+        QTRY_COMPARE(results->count(), 1);
+        QCOMPARE(backend.last("files.list").params.value("limit").toInt(), 12);
+        QVERIFY(!window.findChild<QPushButton *>("quickLoadMoreFilesButton"));
+        QVERIFY(!results->item(0)->text().contains(hit.text));
+        QCOMPARE(results->item(0)->text().count('\n'), 1);
+        backend.settings.language = "zh_CN";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(window.findChild<QPushButton *>("openFullSearchButton")->text(), QString::fromUtf8("打开完整搜索"));
+        QCOMPARE(window.findChild<SearchEdit *>("quickSearchInput")->placeholderText(), QString::fromUtf8("描述您想查找的内容…"));
+    }
+    void quickBrowseFailureRemainsVisibleAcrossStatusRefresh() {
+        TestEnvironment env("gui-quick-browse-error"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoStatus = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        window.showQuickSearch();
+        QTRY_VERIFY(backend.count("files.list") > 0);
+        QTRY_VERIFY(window.findChild<QPushButton *>("quickRefreshFilesButton")->isEnabled());
+        backend.autoFiles = false;
+        window.findChild<QPushButton *>("quickRefreshFilesButton")->click();
+        emit backend.failed(backend.last("files.list").id, "storage_error", "Unable to read the catalog");
+        auto *message = window.findChild<QLabel *>("quickSearchStatus"); QVERIFY(message);
+        QCOMPARE(message->text(), QString("Unable to read the catalog"));
+        emit backend.response(backend.last("status").id, {{"modelAvailable", false}});
+        QCOMPARE(message->text(), QString("Unable to read the catalog"));
+        QVERIFY(window.findChild<QPushButton *>("quickRefreshFilesButton")->isEnabled());
+        window.findChild<QPushButton *>("quickRefreshFilesButton")->click();
+        emit backend.failed(backend.last("files.list").id, "unknown_method", "Unknown method: files.list");
+        QVERIFY(message->text().contains("incompatible versions"));
+        QCOMPARE(backend.count("search"), 0);
+    }
+    void independentFoldersAndExternalApplicationArgumentsRoundTrip() {
+        AppSettings settings; settings.language = "en"; settings.roots = {"ordinary"}; settings.excludes = {"ordinary/private"};
+        settings.codeRoots = {"code"}; settings.codeExcludes = {"code/build"}; settings.includeCode = false;
+        settings.pdfOpener.preset = "custom"; settings.pdfOpener.program = "custom-pdf";
+        settings.pdfOpener.arguments = {"--page", "{page}", "", "{file}"};
+        SettingsDialog dialog(settings, false, false);
+        QVERIFY(!dialog.startupChangeRequested());
+        QCOMPARE(dialog.settings().pdfOpener.arguments, settings.pdfOpener.arguments);
+        QCOMPARE(dialog.settings().codeRoots, settings.codeRoots);
+        auto *enable = dialog.findChild<QCheckBox *>("includeCodeCheck");
+        auto *codeRoots = dialog.findChild<QListWidget *>("codeRootFolders");
+        QVERIFY(!codeRoots->isEnabled()); enable->setChecked(true); QVERIFY(codeRoots->isEnabled());
+        codeRoots->addItem("extra code"); enable->setChecked(false); enable->setChecked(true);
+        QCOMPARE(dialog.settings().codeRoots, QStringList({"code", "extra code"}));
+        QCOMPARE(dialog.settings().roots, settings.roots); QCOMPARE(dialog.settings().excludes, settings.excludes);
+        auto *arguments = dialog.findChild<QPlainTextEdit *>("pdfOpenerArguments"); QVERIFY(arguments);
+        arguments->setPlainText("--page\n{page}\n{file}");
+        QCOMPARE(dialog.settings().pdfOpener.arguments, QStringList({"--page", "{page}", "{file}"}));
     }
     void inputMethodPreeditDoesNotSearch() {
         TestEnvironment env("gui-ime"); QVERIFY(env.isValid());
         FakeBackend backend;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
-        QTRY_VERIFY(backend.count("search") > 0);
+        QTRY_VERIFY(backend.count("files.list") > 0);
         auto *query = window.findChild<SearchEdit *>("searchInput");
         query->setFocus();
-        const int before = backend.count("search");
+        const int before = backend.count("search") + backend.count("files.list");
         QInputMethodEvent preedit(QString::fromUtf8("中文"), {});
         QApplication::sendEvent(query, &preedit);
         QVERIFY(query->isComposing());
         QTest::qWait(350);
-        QCOMPARE(backend.count("search"), before);
+        QCOMPARE(backend.count("search") + backend.count("files.list"), before);
         QInputMethodEvent commit;
         commit.setCommitString(QString::fromUtf8("中文"));
         QApplication::sendEvent(query, &commit);
@@ -221,18 +414,18 @@ private slots:
         QCOMPARE(window.findChild<PreviewPanel *>()->currentHit().path, previousPath);
         backend.hits.move(29, 0);
         const auto expected = backend.hits.first();
-        const int before = backend.count("search");
+        const int before = backend.count("search") + backend.count("files.list");
         if (change == "query") query->setText(QString::fromUtf8("兰花港口"));
         else if (change == "clear-query") query->clear();
         else if (change == "kind") window.findChild<QComboBox *>("kindFilter")->setCurrentIndex(1);
         else if (change == "root") window.findChild<QComboBox *>("rootFilter")->setCurrentIndex(1);
         else window.findChild<QCheckBox *>("codeSearchCheck")->setChecked(true);
-        QTRY_VERIFY(backend.count("search") > before);
+        QTRY_VERIFY(backend.count("search") + backend.count("files.list") > before);
         QTRY_COMPARE(results->item(0)->data(Qt::UserRole).toString(), expected.path);
         QCOMPARE(results->currentRow(), 0);
         QCOMPARE(results->verticalScrollBar()->value(), results->verticalScrollBar()->minimum());
         QCOMPARE(window.findChild<PreviewPanel *>()->currentHit().path, expected.path);
-        QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), expected.text);
+        QTRY_COMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), expected.text);
         QVERIFY(results->item(21)->data(Qt::UserRole).toString() == previousPath);
     }
     void sameSearchRefreshPreservesSelectedPreview() {
@@ -282,6 +475,7 @@ private slots:
         FakeBackend backend; backend.autoSearch = false;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("semantic question");
         QTRY_VERIFY(backend.count("search") > 0);
         emit backend.response(backend.last("search").id, {{"hits", QJsonArray()}, {"semantic", false}, {"warning", "Semantic encoder failed. Keyword results remain available."}});
         auto *warning = window.findChild<QLabel *>("applicationError");
@@ -422,6 +616,21 @@ private slots:
         preview.setLanguage("zh_CN");
         QCOMPARE(button->text(), QString::fromUtf8("正文已读取"));
     }
+    void browsingDocumentLoadsOneBatchWithoutInventingSearchLocation() {
+        TestEnvironment env("gui-browse-document-batch"); QVERIFY(env.isValid()); QVERIFY(env.writeFile("large.txt", "body"));
+        PreviewPanel preview; SearchHit hit; hit.path = env.path("large.txt"); hit.kind = "text";
+        preview.showHit(hit);
+        QSignalSpy requests(&preview, &PreviewPanel::documentRequested);
+        preview.loadDocumentText();
+        QCOMPARE(requests.count(), 1);
+        preview.setDocumentPreview({{"segments", QJsonArray{QJsonObject{{"text", "first batch"}}}}, {"partial", true}, {"next", 100}}, false);
+        QCoreApplication::processEvents();
+        QCOMPARE(requests.count(), 1);
+        QVERIFY(preview.findChild<QPushButton *>("loadDocumentPreviewButton")->isEnabled());
+        preview.loadDocumentText();
+        QCOMPARE(requests.count(), 2);
+        QCOMPARE(requests.last().at(2).toInt(), 100);
+    }
     void repeatedCodeUsesCellAndLineLocation() {
         TestEnvironment env("gui-code-location"); QVERIFY(env.isValid()); QVERIFY(env.writeFile("notebook.ipynb", "{}"));
         PreviewPanel preview; SearchHit hit; hit.path = env.path("notebook.ipynb"); hit.kind = "code"; hit.text = "repeat();"; hit.cell = 3; hit.lineStart = 90; hit.lineEnd = 91;
@@ -537,6 +746,7 @@ private slots:
         backend.hits = {audio, document};
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("media moment");
         auto *results = window.findChild<QListWidget *>("searchResults"); QVERIFY(results);
         QTRY_COMPARE(results->count(), 2);
         QTRY_VERIFY(backend.count("status") >= 1);
@@ -634,6 +844,7 @@ private slots:
         FakeBackend backend; backend.autoStatus = false;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("filter navigation");
         QTRY_VERIFY(backend.count("search") > 0);
         QTRY_VERIFY(backend.count("status") >= 1);
         const QString heldStatus = backend.last("status").id;
@@ -679,6 +890,7 @@ private slots:
         backend.hits = {pdf};
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("second page");
         auto *results = window.findChild<QListWidget *>("searchResults"); QVERIFY(results);
         QTRY_COMPARE(results->count(), 1);
         QTRY_VERIFY(backend.count("status") >= 1);

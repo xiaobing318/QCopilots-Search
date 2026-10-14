@@ -29,7 +29,8 @@ LOCKS = ("dependencies.lock.json", "tools/qt-packages.lock.json", "tools/nsis-pa
          "tools/qcs-source-packages.lock.json", "cmake/qcs-native-deps.cmake")
 FAULTS = {"committed-before-ann", "uncommitted-sqlite", "ann-file-saved-before-manifest",
           "ann-manifest-published-before-outbox-cleanup"}
-APPLICATIONS = {"qcs", "qcs-service", "qcs-worker", "qcs-cli"}
+GUI_EXECUTABLE = "qcs-gui"
+APPLICATIONS = {GUI_EXECUTABLE, "qcs-service", "qcs-worker", "qcs-cli"}
 PACKAGE_GOLDENS = {"query": "text", "screen-280": "image", "speech": "audio"}
 
 
@@ -262,10 +263,70 @@ def validate_capacity(doc, *, minimum_segments, minimum_queries, minimum_timings
     return errors
 
 
+def compiled_relevance_policy():
+    """Read the policy compiled from this candidate, without executing supplied code."""
+    source = (SOURCE / "src/core/relevance_policy_data.h").read_text(encoding="utf-8")
+    def constant(name, declaration):
+        values = re.findall(r"inline constexpr " + declaration + r"\s*" + re.escape(name) +
+                            r"\s*=\s*(.+?);", source)
+        if len(values) != 1:
+            raise ValueError(f"Compiled relevance policy constant is missing or duplicated: {name}")
+        return values[0]
+    result = {name: json.loads(constant(name, r"const char \*")) for name in
+              ("version", "modelFingerprint", "corpusSha256", "rawExportSha256", "calibrationReportSha256")}
+    result["calibrated"] = json.loads(constant("calibrated", "bool"))
+    result["thresholds"] = {name: float(constant(name + "Minimum", "double"))
+                            for name in ("text", "image", "audio", "code")}
+    return result
+
+
+@malformed_as_error
+def validate_nsis_contract(doc, output):
+    """Recompute the package-stage NSIS contract from its preserved raw output."""
+    spec = importlib.util.spec_from_file_location("qcs_nsis_release_cases", SOURCE / ".github/scripts/qcs-ctest-evidence.py")
+    parser = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parser)
+    counts, records, skips, errors = parser.inspect_signing_unittest(output, "Windows", parser.WORKFLOW_NATIVE_TEST)
+    check(errors, not parser.TRUNCATED.search(output), "NSIS contract output was truncated")
+    check(errors, counts == {"run": 1, "passed": 1, "failed": 0, "skipped": 0, "notApplicable": 0}
+          and len(records) == 1 and not skips, "NSIS contract did not execute exactly one successful native case")
+    check(errors, doc.get("schemaVersion") == 1 and doc.get("passed") is True
+          and type(doc.get("exitCode")) is int and doc["exitCode"] == 0
+          and doc.get("log") == "nsis-contract.log", "NSIS contract summary or child exit is incomplete")
+    check(errors, doc.get("counts") == counts and doc.get("cases") == records and doc.get("errors") == [],
+          "NSIS contract summary disagrees with its original case records")
+    return errors
+
+
 @malformed_as_error
 def validate_semantic(doc):
     errors = []
     check(errors, doc.get("passed") is True and doc.get("mode") == "release", "semantic acceptance was not a successful full run")
+    check(errors, doc.get("semanticCandidateMode") == "matches-only", "semantic acceptance used raw unfiltered candidates")
+    policy = doc.get("relevancePolicy", {})
+    check(errors, policy.get("calibrated") is True, "semantic relevance policy was not calibrated for the running model")
+    check(errors, policy.get("modelFingerprint") == doc.get("modelFingerprint"), "semantic relevance policy uses another model")
+    for field in ("corpusSha256", "rawExportSha256", "calibrationReportSha256"):
+        check(errors, isinstance(policy.get(field), str) and re.fullmatch(r"[0-9a-f]{64}", policy[field]) is not None,
+              f"semantic relevance policy {field} is missing or invalid")
+    identity = doc.get("corpusIdentity", {})
+    identity_fields = {"fixtureManifestSha256", "topicManifestSha256", "generatorSha256", "relevanceManifestSha256"}
+    check(errors, set(identity) == identity_fields and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+          for value in identity.values()), "semantic calibration corpus identity is incomplete")
+    for field in identity_fields - {"relevanceManifestSha256"}:
+        check(errors, identity.get(field) == doc.get(field), "semantic corpus identity differs from its raw manifest hashes")
+    corpus_hash = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                                            separators=(",", ":")).encode("utf-8")).hexdigest()
+    check(errors, policy.get("corpusSha256") == corpus_hash, "semantic policy was calibrated against another corpus")
+    thresholds = policy.get("thresholds", {})
+    check(errors, set(thresholds) == {"text", "image", "audio", "code"}
+          and all(within(value, -1.000001, 1.000001) for value in thresholds.values()),
+          "semantic policy thresholds are incomplete or invalid")
+    try:
+        compiled = compiled_relevance_policy()
+        check(errors, compiled == policy, "semantic report policy differs from the immutable candidate's compiled policy")
+    except (OSError, ValueError) as error:
+        errors.append("Cannot verify the candidate's compiled relevance policy: " + str(error))
     check(errors, at_least(doc.get("actualEmbeddedSegments"), 1000), "semantic corpus has fewer than 1000 embedded segments")
     queries = doc.get("queries", [])
     check(errors, isinstance(queries, list) and len(queries) >= 200 and len(queries) == doc.get("positiveQueries"), "semantic positive query records are incomplete")
@@ -302,14 +363,30 @@ def validate_semantic(doc):
     negatives = doc.get("noAnswerQueries", [])
     check(errors, bool(negatives) and {row.get("partition") for row in negatives} == {"calibration", "holdout"},
           "semantic independent absent-query evidence is missing")
+    negative_texts = [row.get("query") for row in negatives]
+    check(errors, all(isinstance(value, str) and value.strip() for value in negative_texts)
+          and len(set(negative_texts)) == len(negative_texts), "semantic absent-query texts must be nonempty and distinct")
+    topics = {partition: {row.get("topic") for row in negatives if row.get("partition") == partition}
+              for partition in ("calibration", "holdout")}
+    check(errors, all(all(isinstance(topic, str) and topic for topic in group) for group in topics.values())
+          and not topics["calibration"] & topics["holdout"], "semantic absent-query topics overlap calibration and holdout")
     for partition in ("calibration", "holdout"):
         rows = [row for row in negatives if row.get("partition") == partition]
         summary = doc.get("noAnswerSummary", {}).get(partition, {})
         check(errors, summary.get("queries") == len(rows) and len(rows) > 0
               and summary.get("queriesReturningCandidates") == sum(row.get("returnedCount", 0) > 0 for row in rows),
               "semantic absent-query counts disagree with raw records")
+        rate = sum(row.get("returnedCount", 0) > 0 for row in rows) / len(rows) if rows else 1
+        check(errors, same_number(summary.get("falseReturnRate"), rate)
+              and same_number(summary.get("maximumFalseReturnRate"), .1)
+              and summary.get("passed") is True and rate <= .1,
+              f"semantic {partition} absent-query false return rate exceeds .10 or its summary is inconsistent")
         for row in rows:
-            check(errors, within(row.get("returnedCount"), 0, 10)
+            returned = row.get("productionTop10", [])
+            names = [item.get("file") for item in returned]
+            check(errors, integer_at_least(row.get("returnedCount"), 0) and row["returnedCount"] <= 10
+                  and len(returned) == row["returnedCount"] and len(set(names)) == len(names)
+                  and all(isinstance(name, str) and name for name in names)
                   and all(within(item.get("cosine"), -1.00001, 1.00001) for item in row.get("exactSemanticTop10", [])),
                   "semantic absent-query similarity evidence is invalid")
     return errors
@@ -602,6 +679,11 @@ def inspect_native(root: Path, *, expected_head: str | None = None):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         system, architecture = PLATFORMS.get(platform_id, ("unknown", "unknown"))
+        if system == "Windows":
+            nsis = document("reports/nsis-contract.json")
+            nsis_log = "reports/nsis-contract.log"
+            check(errors, nsis_log in paths, "NSIS compiler contract has no bound original output")
+            errors.extend(validate_nsis_contract(nsis, safe_file(root, nsis_log).read_text(encoding="utf-8")))
         native = document("reports/native-acceptance.json")
         check(errors, native.get("sourceIdentity") == identity and native.get("system") == system
               and native.get("expectedArchitecture") == architecture, "Native runner source or platform identity differs from its evidence unit")
@@ -909,7 +991,7 @@ def record_package(build_record: Path, package: Path, verification: Path, parent
         raise ValueError("Package release evidence is incomplete: " + "; ".join(errors))
     executables = {}
     with zipfile.ZipFile(package) as archive:
-        for name in ("qcs", "qcs-service", "qcs-worker", "qcs-cli"):
+        for name in sorted(APPLICATIONS):
             matches = [item for item in archive.infolist() if PurePosixPath(item.filename).name == name + ".exe"]
             if len(matches) != 1:
                 raise ValueError(f"The candidate ZIP does not contain one {name} executable")

@@ -221,6 +221,94 @@ private slots:
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcs-ipc-token"))));
     }
 
+    void newProfileCodeIndexUsesIndependentRoots_data()
+    {
+        QTest::addColumn<bool>("rootOption");
+        QTest::newRow("positional-root") << false;
+        QTest::newRow("root-option") << true;
+    }
+
+    void newProfileCodeIndexUsesIndependentRoots()
+    {
+        QFETCH(bool, rootOption);
+        TestEnvironment environment(QStringLiteral("cli-code-index"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile(QStringLiteral("代码 root/source.cpp"), "int clifreshcodekeyword = 1;\n"));
+        QVERIFY(environment.writeFile(QStringLiteral("代码 root/skip/ignored.cpp"), "int cliexcludedcodekeyword = 1;\n"));
+        const QString codeRoot = environment.path(QStringLiteral("代码 root"));
+        const QString codeExclude = environment.path(QStringLiteral("代码 root/skip"));
+        OwnedService service(environment);
+        QVERIFY2(service.start(), service.process.readAllStandardError().constData());
+        QStringList arguments{QStringLiteral("index"), QStringLiteral("--code")};
+        if (rootOption) arguments.append(QStringLiteral("--root"));
+        arguments.append(codeRoot);
+        arguments.append({QStringLiteral("--exclude"), codeExclude, QStringLiteral("--wait"),
+            QStringLiteral("--no-start"), QStringLiteral("--timeout"), QStringLiteral("10000")});
+        const auto indexed = invoke(environment, arguments);
+        QVERIFY2(indexed.started && indexed.finished, indexed.errors.constData());
+        QCOMPARE(indexed.exitCode, 0);
+        QVERIFY2(indexed.json().value(QStringLiteral("ok")).toBool(), indexed.output.constData());
+        const auto config = invoke(environment, {QStringLiteral("config"), QStringLiteral("get"), QStringLiteral("--no-start")});
+        QCOMPARE(config.exitCode, 0);
+        const auto settings = config.json().value(QStringLiteral("result")).toObject();
+        QVERIFY(settings.value(QStringLiteral("includeCode")).toBool());
+        QCOMPARE(settings.value(QStringLiteral("codeRoots")).toArray(), QJsonArray{codeRoot});
+        QCOMPARE(settings.value(QStringLiteral("codeExcludes")).toArray(), QJsonArray{codeExclude});
+        QVERIFY(settings.value(QStringLiteral("roots")).toArray().isEmpty());
+        QVERIFY(settings.value(QStringLiteral("excludes")).toArray().isEmpty());
+        const auto search = invoke(environment, {QStringLiteral("search"), QStringLiteral("clifreshcodekeyword"),
+            QStringLiteral("--code"), QStringLiteral("--keyword-only"), QStringLiteral("--no-start")});
+        QCOMPARE(search.exitCode, 0);
+        const auto hits = search.json().value(QStringLiteral("result")).toObject().value(QStringLiteral("hits")).toArray();
+        QCOMPARE(hits.size(), 1);
+        QCOMPARE(hits.first().toObject().value(QStringLiteral("path")).toString(), environment.path(QStringLiteral("代码 root/source.cpp")));
+        const auto excluded = invoke(environment, {QStringLiteral("search"), QStringLiteral("cliexcludedcodekeyword"),
+            QStringLiteral("--code"), QStringLiteral("--keyword-only"), QStringLiteral("--no-start")});
+        QCOMPARE(excluded.exitCode, 0);
+        QVERIFY(excluded.json().value(QStringLiteral("result")).toObject().value(QStringLiteral("hits")).toArray().isEmpty());
+    }
+
+    void configSetCodePreservesOrdinaryRootsAndExcludes()
+    {
+        TestEnvironment environment(QStringLiteral("cli-code-config"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QString ordinaryRoot = environment.path(QStringLiteral("ordinary"));
+        const QString ordinaryExclude = environment.path(QStringLiteral("ordinary/skip"));
+        const QString codeRoot = environment.path(QStringLiteral("code-one"));
+        const QString secondCodeRoot = environment.path(QStringLiteral("code-two"));
+        const QString codeExclude = environment.path(QStringLiteral("code-one/skip"));
+        const QString secondCodeExclude = environment.path(QStringLiteral("code-two/skip"));
+        for (const auto &directory : {ordinaryExclude, codeExclude, secondCodeExclude})
+            QVERIFY(QDir().mkpath(directory));
+        OwnedService service(environment);
+        QVERIFY2(service.start(), service.process.readAllStandardError().constData());
+        const QString initialJson = QString::fromUtf8(QJsonDocument(QJsonObject{
+            {QStringLiteral("roots"), QJsonArray{ordinaryRoot}}, {QStringLiteral("excludes"), QJsonArray{ordinaryExclude}},
+            {QStringLiteral("indexingPaused"), true}}).toJson(QJsonDocument::Compact));
+        const auto initial = invoke(environment, {QStringLiteral("config"), QStringLiteral("set"), initialJson, QStringLiteral("--no-start")});
+        QCOMPARE(initial.exitCode, 0);
+        const auto changed = invoke(environment, {QStringLiteral("config"), QStringLiteral("set"), QStringLiteral("--code"),
+            QStringLiteral("--root"), codeRoot, QStringLiteral("--root"), secondCodeRoot,
+            QStringLiteral("--exclude"), codeExclude, QStringLiteral("--exclude"), secondCodeExclude, QStringLiteral("--no-start")});
+        QVERIFY2(changed.started && changed.finished, changed.errors.constData());
+        QCOMPARE(changed.exitCode, 0);
+        const auto settings = changed.json().value(QStringLiteral("result")).toObject();
+        QCOMPARE(settings.value(QStringLiteral("roots")).toArray(), QJsonArray{ordinaryRoot});
+        QCOMPARE(settings.value(QStringLiteral("excludes")).toArray(), QJsonArray{ordinaryExclude});
+        QCOMPARE(settings.value(QStringLiteral("codeRoots")).toArray(), (QJsonArray{codeRoot, secondCodeRoot}));
+        QCOMPARE(settings.value(QStringLiteral("codeExcludes")).toArray(), (QJsonArray{codeExclude, secondCodeExclude}));
+        QVERIFY(settings.value(QStringLiteral("includeCode")).toBool());
+        QVERIFY(settings.value(QStringLiteral("indexingPaused")).toBool());
+        const auto persisted = invoke(environment, {QStringLiteral("config"), QStringLiteral("get"), QStringLiteral("--no-start")});
+        QCOMPARE(persisted.exitCode, 0);
+        QCOMPARE(persisted.json().value(QStringLiteral("result")).toObject(), settings);
+        // Updating ordinary folder options must also preserve the code selection.
+        const auto ordinary = invoke(environment, {QStringLiteral("config"), QStringLiteral("set"),
+            QStringLiteral("--root"), ordinaryRoot, QStringLiteral("--exclude"), ordinaryExclude, QStringLiteral("--no-start")});
+        QCOMPARE(ordinary.exitCode, 0);
+        QCOMPARE(ordinary.json().value(QStringLiteral("result")).toObject(), settings);
+    }
+
     void indexWaitReportsRealCorruptFileAsPartialFailure()
     {
         TestEnvironment environment(QStringLiteral("cli-partial-index"));

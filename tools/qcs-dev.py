@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import importlib.util
+from datetime import datetime, timezone
 from contextlib import contextmanager
 import hashlib
 import json
@@ -19,13 +22,16 @@ import uuid
 import venv
 import xml.etree.ElementTree as ET
 
+sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parent.parent
 PRODUCT = "qcs"
+GUI_EXECUTABLE = "qcs-gui"
 MARKER = ".qcs-build-root.json"
 OPERATION_LOCK = ".qcs-dev.lock"
 GENERATED_DIRECTORIES = frozenset({"release", "debug", "relwithdebinfo", "deps", "runs", "stage", "pkg", "reports", "bootstrap"})
 PRESERVED_DIRECTORIES = frozenset({"models", "sdk", "development-profile"})
 SLOW_TEST_LABEL_REGEX = "^slow$"
+_ACTIVE_LOG = None
 
 
 def validate_owner(owner: object, root: Path):
@@ -226,7 +232,21 @@ def check_path_budget(root: Path, build: Path, stage: Path, reports: Path, *, co
 def run(command, *, cwd=None, env=None):
     command = [str(item) for item in command]
     print("+ " + subprocess.list2cmdline(command), flush=True)
-    subprocess.run(command, cwd=cwd, env=env, check=True)
+    if _ACTIVE_LOG is None:
+        return subprocess.run(command, cwd=cwd, env=env, check=True)
+    with _ACTIVE_LOG.open("ab") as log:
+        log.write(("+ " + subprocess.list2cmdline(command) + "\n").encode("utf-8"))
+        log.flush()
+        process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in iter(process.stdout.readline, b""):
+            log.write(line)
+            log.flush()
+            print(line.decode("utf-8", errors="replace"), end="", flush=True)
+        process.stdout.close()
+        status = process.wait()
+        if status:
+            raise subprocess.CalledProcessError(status, command)
+        return subprocess.CompletedProcess(command, status)
 
 
 def report_package_errors(root: Path, started: float):
@@ -303,12 +323,24 @@ def qt_prefix(root: Path):
 def executable(directory: Path, name: str):
     suffix = ".exe" if os.name == "nt" else ""
     candidates = [directory / "bin" / (name + suffix),
-                  directory / "bin/qcs.app/Contents/MacOS" / name,
-                  directory / "qcs.app/Contents/MacOS" / name]
+                  directory / f"bin/{GUI_EXECUTABLE}.app/Contents/MacOS" / name,
+                  directory / f"{GUI_EXECUTABLE}.app/Contents/MacOS" / name]
     for candidate in candidates:
         if candidate.exists():
             return candidate
     return candidates[0]
+
+
+def helper_module(filename, name):
+    spec = importlib.util.spec_from_file_location(name, SOURCE / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def case_evidence(junit, inventory, profile):
+    parser = helper_module(".github/scripts/qcs-ctest-evidence.py", "qcs_case_evidence")
+    return parser.inspect_junit(junit, platform.system(), inventory, profile)
 
 
 def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
@@ -359,6 +391,7 @@ def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
     save()
     try:
         registered = inventory("test-inventory", [])
+        shutil.copyfile(run_report / "test-inventory.json", run_report / "ctest-inventory.json")
         selection["registeredTests"] = [test["name"] for test in registered]
         selected = inventory("test-selected-inventory", filters)
         selected_names = [test["name"] for test in selected]
@@ -395,6 +428,14 @@ def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
         if any(case.get("status") != "run" or case.find("failure") is not None
                or case.find("error") is not None or case.find("skipped") is not None for case in cases):
             raise RuntimeError("Selected CTest programs include failed or unexecuted tests")
+        # The same parser is used locally and by native CI. CTest exit zero
+        # alone cannot prove that QtTest ran every required case.
+        evidence = case_evidence(run_report / "ctest.xml", run_report / "test-selected-inventory.json",
+                                 args.test_profile)
+        (run_report / "qt-test-cases.json").write_text(
+            json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if not evidence["testsComplete"]:
+            raise RuntimeError("Selected test case evidence is incomplete: " + ", ".join(evidence["errors"]))
         selection.update(status="passed", passed=True, exitCode=0,
                          fullSuitePassed=args.test_profile == "full" and not args.test_label
                          and not selection["excludedTests"])
@@ -403,12 +444,355 @@ def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
                          exitCode=error.returncode if isinstance(error, subprocess.CalledProcessError) else 1)
         raise
     finally:
+        if (run_report / "ctest.xml").is_file() and not (run_report / "qt-test-cases.json").is_file():
+            diagnostic = case_evidence(run_report / "ctest.xml", run_report / "test-selected-inventory.json",
+                                       args.test_profile)
+            (run_report / "qt-test-cases.json").write_text(
+                json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding="utf-8")
         save()
+    return run_report
+
+
+def package_for_suffix(root, suffix):
+    candidates = [path for path in (root / "pkg").glob(PRODUCT + "-*" + suffix)
+                  if "-source-materials-" not in path.name and "-symbols-" not in path.name]
+    if len(candidates) != 1:
+        raise RuntimeError(f"Expected one final {suffix} package, found {len(candidates)}")
+    return candidates[0]
+
+
+def nsis_contract(root, reports, environment):
+    """Run the real compiler/install contract only in the NSIS package stage."""
+    command = [sys.executable, "-B", SOURCE / "tools/qcs-test-workflow.py", "--suite", "native"]
+    result = subprocess.run([str(item) for item in command], cwd=root, env=environment,
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    output = result.stdout + result.stderr
+    (reports / "nsis-contract.log").write_text(output, encoding="utf-8")
+    print(output, end="")
+    parser = helper_module(".github/scripts/qcs-ctest-evidence.py", "qcs_nsis_cases")
+    counts, records, skips, errors = parser.inspect_signing_unittest(output, platform.system(), "qcs-tests-workflow-native")
+    if result.returncode:
+        errors.append(f"NSIS compiler contract exited {result.returncode}")
+    if counts["passed"] != 1 or counts["skipped"] or len(records) != 1:
+        errors.append("The native NSIS compiler/install contract did not execute exactly once")
+    document = {"schemaVersion": 1, "passed": not errors, "counts": counts, "cases": records,
+                "errors": errors, "exitCode": result.returncode, "log": "nsis-contract.log"}
+    (reports / "nsis-contract.json").write_text(json.dumps(document, indent=2), encoding="utf-8")
+    if errors:
+        raise RuntimeError("NSIS compiler contract failed: " + ", ".join(errors))
+
+
+def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, environment):
+    """The only implementation of local and CI single-stage operations."""
+    if action == "bootstrap":
+        tools_root = root / "bootstrap/python"
+        python = tools_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if not python.is_file():
+            venv.EnvBuilder(with_pip=True).create(tools_root)
+        run([python, "-m", "pip", "install", "py7zr==1.1.3"], cwd=root)
+        run([python, SOURCE / "tools/qcs-bootstrap-qt.py", "--qt-root", sdk_root, "--cache-dir", root / "bootstrap/qt-downloads"], cwd=root)
+    elif action == "doctor":
+        report = {"source": str(SOURCE), "buildRoot": str(root), "qtPrefix": str(prefix), "platform": platform.platform(), "freeGiB": round(shutil.disk_usage(root).free / 1024**3, 2), "tools": {name: shutil.which(name) for name in ("cmake", "ctest", "cpack", "ninja", "git", "cl" if os.name == "nt" else "c++")}}
+        report["qtInstalled"] = (prefix / "lib/cmake/Qt6/Qt6Config.cmake").is_file()
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        (reports / "doctor.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        check_path_budget(root, build, stage, reports, configured=False)
+        if not report["qtInstalled"] or not all(report["tools"].values()):
+            raise RuntimeError("Toolchain is incomplete. Install missing tools or run bootstrap.")
+    elif action == "configure":
+        command = ["cmake", "-S", SOURCE, "-B", build, "-G", "Ninja", f"-DCMAKE_BUILD_TYPE={args.config}", f"-DCMAKE_PREFIX_PATH={prefix}", f"-DCMAKE_INSTALL_PREFIX={stage}", f"-DQCOPILOTS_SEARCH_DEPENDENCY_ROOT={root / 'deps'}", f"-DQCOPILOTS_SEARCH_TEST_ROOT={root / 'runs'}", f"-DPython3_EXECUTABLE={sys.executable}", "-DQCOPILOTS_SEARCH_BUILD_TESTS=ON"]
+        if args.model_dir:
+            command.append(f"-DQCOPILOTS_SEARCH_MODEL_DIR={args.model_dir.resolve()}")
+        command.extend(args.cmake_arg)
+        run(command, cwd=root, env=environment)
+        check_path_budget(root, build, stage, reports, configured=True)
+    elif action == "build":
+        run(["cmake", "--build", build, "--config", args.config, "--parallel", args.jobs], cwd=root, env=environment)
+    elif action == "test":
+        run_tests(args, root, build, reports, environment)
+    elif action == "run":
+        run([executable(build, GUI_EXECUTABLE), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=environment)
+    elif action == "install":
+        run(["cmake", "--install", build, "--config", args.config, "--prefix", stage], cwd=root, env=environment)
+    elif action == "package":
+        if os.name == "nt" and (not args.generator or "NSIS" in args.generator.split(";")):
+            python = root / "bootstrap/python/Scripts/python.exe"
+            if not python.is_file():
+                venv.EnvBuilder(with_pip=True).create(python.parent.parent)
+            run([python, "-m", "pip", "install", "py7zr==1.1.3"], cwd=root, env=environment)
+            run([python, SOURCE / "tools/qcs-bootstrap-nsis.py", "--output-dir", root / "bootstrap/nsis",
+                 "--cache-dir", root / "bootstrap/nsis-downloads"], cwd=root, env=environment)
+            nsis_contract(root, reports, environment)
+        check_path_budget(root, build, stage, reports, configured=True)
+        run([sys.executable, SOURCE / "tools/qcs-package-symbols.py",
+             "--manifest", build / f"qcs-symbol-inputs-{args.config}.json",
+             "--output-dir", root / "pkg"], cwd=root, env=environment)
+        command = ["cpack", "--config", build / "CPackConfig.cmake", "-C", args.config, "-B", root / "pkg"]
+        if args.generator:
+            command.extend(["-G", args.generator])
+        started = time.time()
+        try:
+            run(command, cwd=root, env=environment)
+        except subprocess.CalledProcessError:
+            report_package_errors(root, started)
+            raise
+        checksums = []
+        for package in sorted((root / "pkg").glob("qcs-*")):
+            if package.is_file() and package.suffix != ".sha256":
+                with package.open("rb") as stream:
+                    hasher = hashlib.sha256()
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+                    digest = hasher.hexdigest()
+                checksums.append(f"{digest}  {package.name}")
+        (root / "pkg/SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+    elif action == "verify-package":
+        command = [sys.executable, SOURCE / "tools/qcs-verify-package.py", "--build-root", root]
+        if args.keyword_only:
+            command.append("--keyword-only")
+        elif args.model_dir:
+            command.extend(["--model-dir", args.model_dir.expanduser().resolve()])
+        if args.package_file:
+            command.extend(["--package-file", args.package_file.expanduser().resolve()])
+        if args.report_dir:
+            command.extend(["--report-dir", args.report_dir.expanduser().resolve()])
+        run(command, cwd=root, env=environment)
+    elif action == "models":
+        models = (args.model_dir or root / "models").expanduser().resolve()
+        assert_external(models)
+        models.mkdir(parents=True, exist_ok=True)
+        common = [executable(build, "qcs-cli"), "--model-dir", models,
+                  "--profile-dir", root / "runs/model-management"]
+        manifest = subprocess.run([str(item) for item in [*common, "models", "manifest"]], cwd=root,
+                                  env=environment, capture_output=True, check=True)
+        (reports / "models-manifest.json").write_bytes(manifest.stdout)
+        run([*common, "--timeout", "1800000", "--progress", "models", "download"], cwd=root, env=environment)
+        result = subprocess.run([str(item) for item in [*common, "models", "verify"]], cwd=root,
+                                env=environment, capture_output=True)
+        (reports / "models.json").write_bytes(result.stdout)
+        (reports / "models.stderr.log").write_bytes(result.stderr)
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, common, result.stdout, result.stderr)
+    elif action == "sources":
+        run([sys.executable, SOURCE / "tools/qcs-source-bundle.py", "--build-root", root,
+             "--qt-root", sdk_root, "--download"], cwd=root, env=environment)
+        archives = [root / "deps/sources/llama.cpp-b11461.tar.gz", root / "deps/llama-b11461.tar.gz"]
+        archive = next((path for path in archives if path.is_file()), None)
+        if archive is None:
+            raise RuntimeError("Collected llama source archive is unavailable for rebuild verification")
+        run([sys.executable, SOURCE / "tests/runtime/source_integrity_test.py", "--archive", archive,
+             "--report", reports / "source-integrity.json"], cwd=root, env=environment)
+        if json.loads((reports / "source-integrity.json").read_text(encoding="utf-8")).get("passed") is not True:
+            raise RuntimeError("Required source-integrity cases failed or did not execute")
+    elif action == "installers":
+        if os.name == "nt":
+            installer_args = copy.copy(args)
+            installer_args.package_file = package_for_suffix(root, ".exe")
+            installer_args.report_dir = reports / "package-nsis"
+            execute_action("verify-package", installer_args, root, build, stage, reports, sdk_root, prefix, environment)
+        elif platform.system() == "Linux":
+            run([sys.executable, SOURCE / ".github/scripts/qcs-deb-ci.py", "--build-root", root,
+                 "--package-file", package_for_suffix(root, ".deb"), "--model-dir", args.model_dir or root / "models",
+                 "--report-dir", reports / "package-deb"], cwd=root, env=environment)
+        else:
+            raise RuntimeError("This platform has no additional installer beyond its DMG package verification")
+
+
+def check_plan(profile, system):
+    stages = [(action, None) for action in ("doctor", "configure", "build")]
+    if profile == "full":
+        stages.append(("models", None))
+    stages.append(("test", None))
+    if profile == "full":
+        stages.append(("install", None))
+        stages.extend(("package", generator) for generator in {
+            "Windows": ("ZIP", "NSIS"), "Linux": ("TGZ", "DEB"), "Darwin": ("DragNDrop",)}[system])
+        stages.append(("verify-package", None))
+        if system in ("Windows", "Linux"):
+            stages.append(("installers", None))
+        stages.append(("sources", None))
+    return stages
+
+
+def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
+    global _ACTIVE_LOG
+    if args.test_label or args.keyword_only or args.generator or args.package_file:
+        raise ValueError("check requires the entire selected profile. Use individual actions for filtered work.")
+    directory = args.report_dir.expanduser().resolve() if args.report_dir else Path(tempfile.mkdtemp(prefix="check-", dir=reports))
+    assert_external(directory)
+    if root not in directory.parents:
+        raise ValueError("check report directory must be inside this external build root for portable evidence")
+    if directory.exists() and any(directory.iterdir()):
+        raise RuntimeError("check requires an empty, unique report directory")
+    directory.mkdir(parents=True, exist_ok=True)
+    evidence = helper_module("tools/qcs-release-evidence.py", "qcs_check_release")
+    identity = evidence.source_identity(SOURCE)
+    document = {"schemaVersion": 1, "kind": "developer-check", "testProfile": args.test_profile,
+                "system": platform.system(), "buildRoot": str(root), "identity": identity,
+                "passed": False, "releaseComplete": False, "startedAt": datetime.now(timezone.utc).isoformat(),
+                "stages": [{"action": action, "generator": generator, "status": "notRun"}
+                           for action, generator in check_plan(args.test_profile, platform.system())], "files": []}
+    report_path = directory / "check-report.json"
+    document["reportPath"] = report_path.relative_to(root).as_posix()
+    evidence.write_json(reports / "latest-check.json", {"report": str(report_path), "testProfile": args.test_profile})
+    local_args = copy.copy(args)
+    if args.test_profile == "full":
+        local_args.model_dir = args.model_dir or root / "models"
+        environment["QCOPILOTS_SEARCH_MODEL_DIR"] = str(local_args.model_dir.resolve())
+        environment["QCOPILOTS_SEARCH_SEMANTIC_REPORT"] = str(directory / "semantic-quality.json")
+        environment["QCOPILOTS_SEARCH_PHYSICAL_FILE_REPORT"] = str(directory / "physical-files.json")
+    try:
+        for index, record in enumerate(document["stages"]):
+            local_args.generator = record["generator"]
+            local_args.report_dir = directory / ("tests" if record["action"] == "test" else "package")
+            log = directory / f"{index + 1:02d}-{record['action']}.log"
+            log.write_text("", encoding="utf-8")
+            record.update(status="running", startedAt=datetime.now(timezone.utc).isoformat(),
+                          log=log.relative_to(root).as_posix())
+            evidence.write_json(report_path, document)
+            started = time.monotonic()
+            _ACTIVE_LOG = log
+            try:
+                execute_action(record["action"], local_args, root, build, stage, directory, sdk_root, prefix, environment)
+                record.update(status="passed", exitCode=0)
+            except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, ET.ParseError) as error:
+                record.update(status="failed", error=str(error),
+                              exitCode=error.returncode if isinstance(error, subprocess.CalledProcessError) else 1)
+                raise
+            finally:
+                _ACTIVE_LOG = None
+                record.update(elapsedSeconds=round(time.monotonic() - started, 3),
+                              finishedAt=datetime.now(timezone.utc).isoformat())
+                evidence.write_json(report_path, document)
+        if evidence.source_identity(SOURCE) != identity:
+            raise RuntimeError("Source identity changed during the developer check")
+        document["passed"] = True
+    finally:
+        _ACTIVE_LOG = None
+        document["finishedAt"] = datetime.now(timezone.utc).isoformat()
+        paths = [path for path in directory.rglob("*") if path.is_file() and path != report_path]
+        if args.test_profile == "full":
+            paths.extend(path for path in (root / "pkg").glob("qcs-*") if path.is_file())
+            if (root / "pkg/SHA256SUMS").is_file():
+                paths.append(root / "pkg/SHA256SUMS")
+        document["files"] = [evidence.file_record(root, path) for path in sorted(set(paths))]
+        evidence.write_json(report_path, document)
+        print(f"Developer {args.test_profile} check report: {report_path}")
+    return report_path
+
+
+def inspect_check(report_path: Path, expected_head: str):
+    """Revalidate original local full evidence for release preparation."""
+    evidence = helper_module("tools/qcs-release-evidence.py", "qcs_check_release")
+    result = {"passed": False, "errors": [], "files": []}
+    try:
+        document = evidence.read_json(report_path)
+        relative_report = Path(document["reportPath"])
+        if relative_report.is_absolute() or ".." in relative_report.parts:
+            raise ValueError("Local check report path is not relative")
+        root = report_path.resolve().parents[len(relative_report.parts) - 1]
+        if root.joinpath(relative_report).resolve() != report_path.resolve():
+            raise ValueError("Local check report was moved without its evidence tree")
+        errors = evidence.verify_manifest(root, document)
+        result.update(identity=document["identity"], files=document["files"], buildRoot=str(root))
+        if (document.get("kind") != "developer-check" or document.get("testProfile") != "full"
+                or document.get("passed") is not True or document.get("releaseComplete") is not False
+                or document["identity"].get("candidateHead") != expected_head
+                or document["identity"].get("checkoutCommit") != expected_head):
+            errors.append("Local check is not a successful full check of the immutable candidate")
+        expected = check_plan("full", document["system"])
+        stages = document.get("stages", [])
+        if [(item.get("action"), item.get("generator")) for item in stages] != expected:
+            errors.append("Local full stages are incomplete or changed")
+        bound = {item["path"] for item in document["files"]}
+        required = [report_path.parent / "tests" / name for name in (
+            "test-selection.json", "test-inventory.json", "test-selected-inventory.json", "ctest.xml", "qt-test-cases.json")]
+        required += [report_path.parent / name for name in (
+            "models.json", "models-manifest.json", "semantic-quality.json", "physical-files.json",
+            "source-integrity.json", "package/report.json")]
+        if document["system"] == "Windows":
+            required += [report_path.parent / name for name in ("nsis-contract.json", "nsis-contract.log", "package-nsis/report.json")]
+        if document["system"] == "Linux":
+            required.append(report_path.parent / "package-deb/report.json")
+        if not {path.relative_to(root).as_posix() for path in required}.issubset(bound):
+            errors.append("Local full check omits required bound original evidence")
+        for item in stages:
+            if (item.get("status") != "passed" or item.get("exitCode") != 0
+                    or item.get("log") not in bound or item.get("elapsedSeconds", -1) < 0):
+                errors.append("Local full stage failed, did not run, or lacks its bound raw log")
+        selected = evidence.read_json(report_path.parent / "tests/test-selection.json")
+        if selected.get("fullSuitePassed") is not True or selected.get("excludedTests"):
+            errors.append("Local full CTest selection is incomplete")
+        parser = helper_module(".github/scripts/qcs-ctest-evidence.py", "qcs_full_cases")
+        cases = parser.inspect_junit(report_path.parent / "tests/ctest.xml", document["system"],
+                                     report_path.parent / "tests/test-inventory.json", "full")
+        errors.extend(cases["errors"])
+        models = evidence.read_json(report_path.parent / "models.json")
+        model_manifest = evidence.read_json(report_path.parent / "models-manifest.json")
+        actual_models = models.get("result", {}).get("artifacts", [])
+        expected_models = model_manifest.get("result", {}).get("artifacts", [])
+        pins = evidence.package_contract()[0]
+        if (models.get("ok") is not True or models.get("result", {}).get("valid") is not True
+                or len(actual_models) != len(pins) or len(expected_models) != len(pins)
+                or {item.get("name") for item in actual_models} != set(pins)):
+            errors.append("Local full model verification is incomplete")
+        for item in actual_models:
+            if item.get("present") is not True or (item.get("bytes"), item.get("sha256")) != pins.get(item.get("name")):
+                errors.append("Local full model bytes differ from the immutable model lock")
+        for item in expected_models:
+            if (item.get("size"), item.get("sha256")) != pins.get(item.get("name")):
+                errors.append("Local full model manifest differs from the immutable model lock")
+        semantic = evidence.read_json(report_path.parent / "semantic-quality.json")
+        errors.extend(evidence.validate_semantic(semantic))
+        errors.extend(evidence.validate_physical(evidence.read_json(report_path.parent / "physical-files.json"), minimum_files=1000))
+        package_reports = [report_path.parent / "package/report.json"]
+        if document["system"] == "Windows":
+            package_reports.append(report_path.parent / "package-nsis/report.json")
+        elif document["system"] == "Linux":
+            package_reports.append(report_path.parent / "package-deb/report.json")
+        package_hashes = {item["sha256"] for item in document["files"] if item["path"].startswith("pkg/")}
+        for package_path in package_reports:
+            package = evidence.read_json(package_path)
+            if (package.get("passed") is not True or package.get("releaseComplete") is not True
+                    or package.get("commit") != expected_head or package.get("workingTreeModified", False) is not False
+                    or package.get("packageSha256") not in package_hashes
+                    or len(package.get("checks", [])) < (3 if "package-deb" in str(package_path) else 9)):
+                errors.append("Local full package result is incomplete, stale or unbound")
+            smoke_path = package_path.parent / "smoke/report.json" if "package-deb" in str(package_path) else package_path
+            if smoke_path.relative_to(root).as_posix() not in bound:
+                errors.append("Local full package smoke report is not bound")
+            smoke = evidence.read_json(smoke_path)
+            for name in evidence.package_evidence_paths(smoke, smoke_path.parent):
+                if (smoke_path.parent / name).relative_to(root).as_posix() not in bound:
+                    errors.append("Local full package raw reply or license material is not bound")
+            errors.extend(evidence.validate_package_release(smoke, smoke_path.parent,
+                model_fingerprint=semantic.get("modelFingerprint"),
+                extraction_fingerprint=semantic.get("extractionFingerprint")))
+        integrity = evidence.read_json(report_path.parent / "source-integrity.json")
+        if (integrity.get("passed") is not True or integrity.get("tests_run", 0) < 10
+                or integrity.get("skipped") != 0 or len(integrity.get("cases", [])) != integrity.get("tests_run")
+                or any(item.get("status") != "passed" for item in integrity.get("cases", []))):
+            errors.append("Local full source-integrity cases are incomplete")
+        source_manifest = evidence.read_json(evidence.safe_file(root, "pkg/qcs-source-manifest.json"))
+        if (source_manifest.get("commit") != expected_head or source_manifest.get("workingTreeModified") is not False
+                or "pkg/qcs-source-manifest.json" not in bound
+                or not any("-source-materials-" in name and name.endswith(".zip") for name in bound)
+                or not any("-symbols-" in name and name.endswith(".zip") for name in bound)):
+            errors.append("Local full source archive or debug symbols are missing or stale")
+        if document["system"] == "Windows":
+            native = evidence.read_json(report_path.parent / "nsis-contract.json")
+            raw = (report_path.parent / "nsis-contract.log").read_text(encoding="utf-8")
+            errors.extend(evidence.validate_nsis_contract(native, raw))
+        result["errors"] = errors
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, ET.ParseError) as error:
+        result["errors"].append(f"Cannot inspect local full check: {error}")
+    result["passed"] = not result["errors"]
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "clean"])
+    parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "models", "sources", "installers", "check", "release-prepare", "release-upload-draft", "clean"])
     default_root = SOURCE.parent.parent / (SOURCE.parent.name + "-compilations") / PRODUCT
     parser.add_argument("--build-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_BUILD_ROOT") or default_root)
     parser.add_argument("--qt-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_QT_ROOT") or None)
@@ -430,7 +814,28 @@ def main():
     parser.add_argument("--scope", choices=("build", "generated"), default="build", help="clean scope, models and SDKs are always preserved")
     parser.add_argument("--dry-run", action="store_true", help="Validate and list clean targets without deleting or creating files")
     parser.add_argument("--program-arg", action="append", default=[])
+    parser.add_argument("--candidate-commit")
+    parser.add_argument("--native-artifacts-dir", type=Path)
+    parser.add_argument("--local-evidence-dir", type=Path)
+    parser.add_argument("--local-full-report", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--tag")
+    parser.add_argument("--title")
     args = parser.parse_args()
+    if args.action in ("release-prepare", "release-upload-draft"):
+        command = [sys.executable, SOURCE / "tools/qcs-release.py",
+                   "prepare" if args.action == "release-prepare" else "upload-draft"]
+        fields = (("candidate_commit", "native_artifacts_dir", "local_evidence_dir", "local_full_report", "output_dir")
+                  if args.action == "release-prepare" else ("manifest", "tag"))
+        for field in fields:
+            if getattr(args, field) is None:
+                parser.error("--" + field.replace("_", "-") + " is required for " + args.action)
+            command.extend(["--" + field.replace("_", "-"), getattr(args, field)])
+        if args.action == "release-upload-draft" and args.title:
+            command.extend(["--title", args.title])
+        run(command, cwd=SOURCE)
+        return
     selected_root = args.build_root.expanduser().absolute()
     if selected_root.exists() and is_redirect(selected_root):
         raise RuntimeError(f"Build root cannot be a symlink or junction: {selected_root}")
@@ -461,73 +866,11 @@ def main():
             environment["QCOPILOTS_SEARCH_KEEP_TEST_ARTIFACTS"] = "1"
         if args.action not in ("doctor", "clean", "verify-package", "run"):
             disk_guard(root, args.reserve_gib)
-        if args.action == "bootstrap":
-            tools_root = root / "bootstrap/python"
-            python = tools_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-            if not python.is_file():
-                venv.EnvBuilder(with_pip=True).create(tools_root)
-            run([python, "-m", "pip", "install", "py7zr==1.1.3"], cwd=root)
-            run([python, SOURCE / "tools/qcs-bootstrap-qt.py", "--qt-root", sdk_root, "--cache-dir", root / "bootstrap/qt-downloads"], cwd=root)
-            if os.name == "nt":
-                run([python, SOURCE / "tools/qcs-bootstrap-nsis.py", "--output-dir", root / "bootstrap/nsis", "--cache-dir", root / "bootstrap/nsis-downloads"], cwd=root)
-        elif args.action == "doctor":
-            report = {"source": str(SOURCE), "buildRoot": str(root), "qtPrefix": str(prefix), "platform": platform.platform(), "freeGiB": round(shutil.disk_usage(root).free / 1024**3, 2), "tools": {name: shutil.which(name) for name in ("cmake", "ctest", "cpack", "ninja", "git", "cl" if os.name == "nt" else "c++")}}
-            report["qtInstalled"] = (prefix / "lib/cmake/Qt6/Qt6Config.cmake").is_file()
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-            (reports / "doctor.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-            check_path_budget(root, build, stage, reports, configured=False)
-            if not report["qtInstalled"] or not all(report["tools"].values()):
-                raise RuntimeError("Toolchain is incomplete. Install missing tools or run bootstrap.")
-        elif args.action == "configure":
-            command = ["cmake", "-S", SOURCE, "-B", build, "-G", "Ninja", f"-DCMAKE_BUILD_TYPE={args.config}", f"-DCMAKE_PREFIX_PATH={prefix}", f"-DCMAKE_INSTALL_PREFIX={stage}", f"-DQCOPILOTS_SEARCH_DEPENDENCY_ROOT={root / 'deps'}", f"-DQCOPILOTS_SEARCH_TEST_ROOT={root / 'runs'}", f"-DPython3_EXECUTABLE={sys.executable}", "-DQCOPILOTS_SEARCH_BUILD_TESTS=ON"]
-            if args.model_dir:
-                command.append(f"-DQCOPILOTS_SEARCH_MODEL_DIR={args.model_dir.resolve()}")
-            command.extend(args.cmake_arg)
-            run(command, cwd=root, env=environment)
-            check_path_budget(root, build, stage, reports, configured=True)
-        elif args.action == "build":
-            run(["cmake", "--build", build, "--config", args.config, "--parallel", args.jobs], cwd=root, env=environment)
-        elif args.action == "test":
-            run_tests(args, root, build, reports, environment)
-        elif args.action == "run":
-            run([executable(build, PRODUCT), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=environment)
-        elif args.action == "install":
-            run(["cmake", "--install", build, "--config", args.config, "--prefix", stage], cwd=root, env=environment)
-        elif args.action == "package":
-            check_path_budget(root, build, stage, reports, configured=True)
-            run([sys.executable, SOURCE / "tools/qcs-package-symbols.py",
-                 "--manifest", build / f"qcs-symbol-inputs-{args.config}.json",
-                 "--output-dir", root / "pkg"], cwd=root, env=environment)
-            command = ["cpack", "--config", build / "CPackConfig.cmake", "-C", args.config, "-B", root / "pkg"]
-            if args.generator:
-                command.extend(["-G", args.generator])
-            started = time.time()
-            try:
-                run(command, cwd=root, env=environment)
-            except subprocess.CalledProcessError:
-                report_package_errors(root, started)
-                raise
-            checksums = []
-            for package in sorted((root / "pkg").glob("qcs-*")):
-                if package.is_file() and package.suffix != ".sha256":
-                    with package.open("rb") as stream:
-                        hasher = hashlib.sha256()
-                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                            hasher.update(chunk)
-                        digest = hasher.hexdigest()
-                    checksums.append(f"{digest}  {package.name}")
-            (root / "pkg/SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
-        elif args.action == "verify-package":
-            command = [sys.executable, SOURCE / "tools/qcs-verify-package.py", "--build-root", root]
-            if args.keyword_only:
-                command.append("--keyword-only")
-            elif args.model_dir:
-                command.extend(["--model-dir", args.model_dir.expanduser().resolve()])
-            if args.package_file:
-                command.extend(["--package-file", args.package_file.expanduser().resolve()])
-            if args.report_dir:
-                command.extend(["--report-dir", args.report_dir.expanduser().resolve()])
-            run(command, cwd=root)
+        if args.action == "check":
+            run_check(args, root, build, stage, reports, sdk_root, prefix, environment)
+        else:
+            execute_action(args.action, args, root, build, stage, reports, sdk_root, prefix, environment)
+
 
 if __name__ == "__main__":
     for stream in (sys.stdout, sys.stderr):

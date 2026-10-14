@@ -51,11 +51,11 @@ def main():
             run([options.cmake, "--install", str(build), "--config", "Release", "--prefix", str(stage)])
             base, cpu = (build / "files.txt").read_text(encoding="utf-8").splitlines()
             if apple:
-                base_dir = Path("qcs.app/Contents/Frameworks")
-                cpu_dir = Path("qcs.app/Contents/PlugIns/ggml")
+                base_dir = Path("qcs-gui.app/Contents/Frameworks")
+                cpu_dir = Path("qcs-gui.app/Contents/PlugIns/ggml")
                 assert (build / "cpu-rpath.txt").read_text() == "@loader_path/../../Frameworks"
                 assert not (stage / base_dir / cpu).exists(), "CPU module remained in Frameworks"
-                assert not (stage / "qcs.app/Contents/MacOS" / cpu).exists()
+                assert not (stage / "qcs-gui.app/Contents/MacOS" / cpu).exists()
             else:
                 base_dir = Path("bin" if os.name == "nt" else "lib")
                 cpu_dir = Path("lib")

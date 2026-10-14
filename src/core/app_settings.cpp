@@ -35,20 +35,60 @@ bool readStrings(const QJsonObject &object, const QString &key, QStringList &val
     }
     return true;
 }
+
+QJsonObject openerJson(const ExternalOpenerSettings &opener)
+{
+    return {{QStringLiteral("preset"), opener.preset}, {QStringLiteral("program"), opener.program},
+            {QStringLiteral("arguments"), QJsonArray::fromStringList(opener.arguments)}};
+}
+
+bool readOpener(const QJsonObject &object, const QString &key, const QStringList &presets,
+                ExternalOpenerSettings &opener, QString *error)
+{
+    if (!object.contains(key)) return true;
+    if (!object.value(key).isObject())
+        return fail(error, QStringLiteral("Setting '%1' must be an object").arg(key));
+    const auto value = object.value(key).toObject();
+    for (const auto &field : {QStringLiteral("preset"), QStringLiteral("program")}) {
+        if (value.contains(field) && (!value.value(field).isString()
+            || value.value(field).toString().contains(QChar::Null)))
+            return fail(error, QStringLiteral("Setting '%1.%2' must be a string without NUL").arg(key, field));
+    }
+    opener.preset = value.value(QStringLiteral("preset")).toString(opener.preset);
+    opener.program = value.value(QStringLiteral("program")).toString();
+    if (!presets.contains(opener.preset))
+        return fail(error, QStringLiteral("Unsupported '%1' preset: %2").arg(key, opener.preset));
+    if (value.contains(QStringLiteral("arguments"))) {
+        if (!value.value(QStringLiteral("arguments")).isArray())
+            return fail(error, QStringLiteral("Setting '%1.arguments' must be an array").arg(key));
+        for (const auto &argument : value.value(QStringLiteral("arguments")).toArray()) {
+            if (!argument.isString() || argument.toString().contains(QChar::Null))
+                return fail(error, QStringLiteral("Setting '%1.arguments' contains an invalid argument").arg(key));
+            opener.arguments.append(argument.toString());
+        }
+    }
+    if (opener.preset == QStringLiteral("custom") && opener.program.trimmed().isEmpty())
+        return fail(error, QStringLiteral("Setting '%1.program' is required for a custom opener").arg(key));
+    return true;
+}
 }
 
 QJsonObject AppSettings::toJson() const
 {
-    return {{QStringLiteral("version"), 1},
+    return {{QStringLiteral("version"), 2},
             {QStringLiteral("roots"), QJsonArray::fromStringList(roots)},
             {QStringLiteral("excludes"), QJsonArray::fromStringList(excludes)},
+            {QStringLiteral("codeRoots"), QJsonArray::fromStringList(codeRoots)},
+            {QStringLiteral("codeExcludes"), QJsonArray::fromStringList(codeExcludes)},
             {QStringLiteral("includeCode"), includeCode},
             {QStringLiteral("language"), language},
             {QStringLiteral("startAtLogin"), startAtLogin},
             {QStringLiteral("minimizeToTray"), minimizeToTray},
             {QStringLiteral("checkUpdates"), checkUpdates},
             {QStringLiteral("indexingPaused"), indexingPaused},
-            {QStringLiteral("editorCommand"), editorCommand}};
+            {QStringLiteral("editorCommand"), editorCommand},
+            {QStringLiteral("pdfOpener"), openerJson(pdfOpener)},
+            {QStringLiteral("mediaOpener"), openerJson(mediaOpener)}};
 }
 
 bool AppSettings::fromJson(const QJsonObject &object, AppSettings *settings, QString *error)
@@ -57,8 +97,8 @@ bool AppSettings::fromJson(const QJsonObject &object, AppSettings *settings, QSt
         error->clear();
     if (!settings)
         return fail(error, QStringLiteral("Settings output is null"));
-    if (!object.value(QStringLiteral("version")).isDouble()
-        || object.value(QStringLiteral("version")).toDouble() != 1.0)
+    const auto version = object.value(QStringLiteral("version"));
+    if (!version.isDouble() || (version.toDouble() != 1.0 && version.toDouble() != 2.0))
         return fail(error, QStringLiteral("Unsupported or missing settings version"));
     AppSettings parsed;
     if (!readStrings(object, QStringLiteral("roots"), parsed.roots, error)
@@ -78,8 +118,19 @@ bool AppSettings::fromJson(const QJsonObject &object, AppSettings *settings, QSt
             *field.destination = object.value(key).toBool();
         }
     }
+    parsed.migrationPending_ = version.toDouble() == 1.0;
+    if (parsed.migrationPending_) {
+        if (parsed.includeCode) {
+            parsed.codeRoots = parsed.roots;
+            parsed.codeExcludes = parsed.excludes;
+        }
+    } else if (!readStrings(object, QStringLiteral("codeRoots"), parsed.codeRoots, error)
+               || !readStrings(object, QStringLiteral("codeExcludes"), parsed.codeExcludes, error)) {
+        return false;
+    }
     for (const auto &key : {QStringLiteral("language"), QStringLiteral("editorCommand")}) {
-        if (object.contains(key) && !object.value(key).isString())
+        if (object.contains(key) && (!object.value(key).isString()
+            || object.value(key).toString().contains(QChar::Null)))
             return fail(error, QStringLiteral("Setting '%1' must be a string").arg(key));
     }
     parsed.language = object.value(QStringLiteral("language")).toString(parsed.language);
@@ -89,6 +140,11 @@ bool AppSettings::fromJson(const QJsonObject &object, AppSettings *settings, QSt
     if (!languages.contains(parsed.language))
         return fail(error, QStringLiteral("Unsupported interface language: %1").arg(parsed.language));
     parsed.editorCommand = object.value(QStringLiteral("editorCommand")).toString();
+    if (!readOpener(object, QStringLiteral("pdfOpener"), {"system", "sumatra", "okular", "skim", "custom"},
+                    parsed.pdfOpener, error)
+        || !readOpener(object, QStringLiteral("mediaOpener"), {"system", "mpv", "custom"},
+                       parsed.mediaOpener, error))
+        return false;
     *settings = parsed;
     return true;
 }
@@ -134,6 +190,8 @@ QString AppSettings::fingerprint() const
     // Only options which affect indexing invalidate in-flight extraction jobs.
     QJsonObject object{{QStringLiteral("roots"), QJsonArray::fromStringList(roots)},
                        {QStringLiteral("excludes"), QJsonArray::fromStringList(excludes)},
+                       {QStringLiteral("codeRoots"), QJsonArray::fromStringList(codeRoots)},
+                       {QStringLiteral("codeExcludes"), QJsonArray::fromStringList(codeExcludes)},
                        {QStringLiteral("includeCode"), includeCode}};
     return QString::fromLatin1(QCryptographicHash::hash(QJsonDocument(object).toJson(QJsonDocument::Compact),
                                                        QCryptographicHash::Sha256).toHex());

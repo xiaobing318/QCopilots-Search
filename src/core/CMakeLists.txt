@@ -1,4 +1,5 @@
 add_library(qcs-core STATIC
+    relevance_policy.cpp relevance_policy.h relevance_policy_data.h
     app_settings.cpp app_settings.h
     file_catalog.cpp file_catalog.h
     model_files.cpp model_files.h

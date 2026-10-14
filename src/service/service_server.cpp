@@ -28,6 +28,7 @@
 #include <QTimer>
 #include <QUuid>
 #include <QtConcurrent>
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -82,9 +83,34 @@ struct Job {
     quint64 generation = 0;
     int offset = 0;
     QVector<Segment> segments;
+    quint64 batch = 0;
+    bool retry = false;
+    quint64 queueToken = 0;
 };
 
-struct ScanPackage { ScanResult scan; QHash<QString, QString> versions; };
+struct QueueEntry { QString key; quint64 token = 0; };
+
+QString pathKey(QString path, bool code)
+{
+#ifdef Q_OS_WIN
+    path = path.toCaseFolded();
+#endif
+    return (code ? QStringLiteral("code:") : QStringLiteral("general:")) + path;
+}
+
+QString fileKey(const FileRecord &file) { return pathKey(file.path, file.kind == "code"); }
+
+QString failureKey(const FileRecord &file)
+{
+    return file.kind == "code" ? QStringLiteral("code:") + file.path : file.path;
+}
+
+struct ScanPackage {
+    ScanResult scan;
+    QHash<QString, QString> versions;
+    QStringList generalRoots, codeRoots;
+    quint64 generation = 0;
+};
 struct SearchPackage { QList<SearchHit> hits; QString error; };
 }
 
@@ -93,8 +119,12 @@ public:
     explicit Private(ServiceServer *owner, RuntimePaths value, ServiceDependencies dependencies) : q(owner), paths(std::move(value)),
         repository(std::move(dependencies.storage)), modelVerifier(std::move(dependencies.verifyModels)),
         listenFunction(std::move(dependencies.listen)),
+        configureWorker(std::move(dependencies.configureWorker)),
+        indexIdleMs(qMax(1, dependencies.indexIdleMs)), queryIdleMs(qMax(1, dependencies.queryIdleMs)),
+        shutdownGraceMs(qMax(1, dependencies.workerShutdownGraceMs)), reconcileMs(qMax(1, dependencies.reconcileMs)),
         lock(nativeLockFilePath(paths.lockFile)), server(owner), monitor(owner), reconcile(owner), debounce(owner),
-        indexWorker(owner), queryWorker(owner), indexTimeout(owner), queryTimeout(owner) {
+        indexWorker(owner), queryWorker(owner), indexTimeout(owner), queryTimeout(owner),
+        indexIdle(owner), queryIdle(owner), indexShutdownGrace(owner), queryShutdownGrace(owner) {
         scanPool.setMaxThreadCount(1);
         writePool.setMaxThreadCount(1);
         searchPool.setMaxThreadCount(2);
@@ -102,6 +132,7 @@ public:
         // once before listening so an early client is not left pending.
         QObject::connect(&server, &QLocalServer::newConnection, q, [this] { accept(); });
     }
+    ~Private() { releaseClients(); }
 
     struct Pending {
         QPointer<QLocalSocket> socket;
@@ -116,12 +147,17 @@ public:
     IndexRepository repository;
     std::function<bool(QString *)> modelVerifier;
     std::function<bool(QLocalServer &, const QString &)> listenFunction;
+    std::function<void(QProcess &, bool)> configureWorker;
+    int indexIdleMs, queryIdleMs, shutdownGraceMs, reconcileMs;
     QLockFile lock;
     QLocalServer server;
     QFileSystemWatcher monitor;
     QTimer reconcile, debounce;
     QProcess indexWorker, queryWorker;
     QTimer indexTimeout, queryTimeout;
+    QTimer indexIdle, queryIdle, indexShutdownGrace, queryShutdownGrace;
+    enum class ExitReason { None, Idle, Restart, Fault, Stop };
+    ExitReason indexExit = ExitReason::None, queryExit = ExitReason::None;
     QByteArray indexBuffer, queryBuffer, token;
     QHash<QLocalSocket *, QByteArray> buffers;
     QHash<QString, Pending> requests;
@@ -129,8 +165,18 @@ public:
     QHash<QString, QPointer<QProcess>> previewWorkers;
     QQueue<QString> queryQueue;
     QString activeQuery;
-    QQueue<Job> jobs;
+    // Queues hold only keys. The map owns metadata, never accumulated segments.
+    QQueue<QueueEntry> recentJobs, backfillJobs, continuationJobs;
+    QHash<QString, Job> jobs;
+    int queueTurn = 0;
+    quint64 nextBatch = 0;
+    quint64 nextQueueToken = 0;
     std::unique_ptr<Job> current;
+    std::unique_ptr<ScanPackage> pendingCatalog;
+    QSet<QString> scanProtectedGeneral, scanProtectedCode;
+    QHash<QString, QString> knownVersions;
+    QSet<QString> completedFiles, failedFiles;
+    QSet<QString> catalogFiles;
     QString currentWorkerId;
     QJsonObject failures;
     IndexProgress progress;
@@ -138,18 +184,39 @@ public:
     std::mutex publicationConfigurationMutex;
     std::atomic_bool scanCancelled{false};
     quint64 generation = 1;
+    quint64 visibilityEpoch = 1;
     bool started = false, stopping = false, scanning = false, publishing = false;
     bool indexRestartPending = false, queryRestartPending = false;
     bool modelAvailable = false, pendingScan = false;
     bool pipelineReady = false, retryIncomplete = false;
+    bool catalogReady = false, firstScan = true;
     QString pipeline;
     QString pipelineError;
     QString watcherMode = QStringLiteral("periodic");
     QString watcherWarning;
     QStringList previousRoots;
+    QStringList previousCodeRoots;
+    QStringList catalogRoots, catalogCodeRoots;
 
     QString tokenPath() const { return QDir(paths.profileDir).filePath(QStringLiteral("qcs-ipc-token")); }
     QString journalPath() const { return QDir(paths.indexDir).filePath(QStringLiteral("qcs-progress.json")); }
+
+    void releaseClients() {
+        // QLocalServer owns accepted sockets. Destroy them before Private's
+        // maps: a Windows socket destructor can emit disconnected synchronously.
+        // deleteLater is insufficient when the event loop is already stopping.
+        QSet<QLocalSocket *> clients;
+        for (auto *socket : buffers.keys()) clients.insert(socket);
+        // A peer may already have disconnected and been removed from buffers,
+        // while its deleteLater event is still pending on the server's child.
+        for (auto *socket : server.findChildren<QLocalSocket *>()) clients.insert(socket);
+        buffers.clear();
+        for (auto *socket : clients) {
+            QObject::disconnect(socket, nullptr, q, nullptr);
+            socket->abort();
+            delete socket;
+        }
+    }
 
     void log(const QString &message) {
         QFile file(QDir(paths.logDir).filePath(QStringLiteral("qcs-service.log")));
@@ -176,6 +243,7 @@ public:
         // Reject symlinks and ordinary files instead of unlinking arbitrary data.
         if (!removeStaleIpcSocket(paths, error)) { lock.unlock(); return false; }
         if (!repository.open(paths, error)) { lock.unlock(); return false; }
+        if (settings.needsMigration() && !settings.save(paths.configFile, error)) { lock.unlock(); return false; }
         if (!refreshModels(error)) { lock.unlock(); return false; }
         token.resize(32);
         for (int i = 0; i < 32; i += 4) {
@@ -203,25 +271,26 @@ public:
         debounce.setSingleShot(true);
         debounce.setInterval(750);
         QObject::connect(&debounce, &QTimer::timeout, q, [this] { startScan(); });
-        reconcile.setInterval(30000);
+        reconcile.setInterval(reconcileMs);
         QObject::connect(&reconcile, &QTimer::timeout, q, [this] { startScan(); });
         setupWorker(indexWorker, false);
         setupWorker(queryWorker, true);
+        setupIdle(false);
+        setupIdle(true);
         indexTimeout.setSingleShot(true);
         queryTimeout.setSingleShot(true);
         QObject::connect(&indexTimeout, &QTimer::timeout, q, [this] {
-            indexRestartPending = indexWorker.state() != QProcess::NotRunning;
-            publishFailedCurrent(QStringLiteral("Index worker timed out")); indexWorker.kill();
+            publishFailedCurrent(QStringLiteral("Index worker timed out")); stopWorkerForRestart(false, ExitReason::Fault);
         });
         QObject::connect(&queryTimeout, &QTimer::timeout, q, [this] {
             const QString id = activeQuery;
             activeQuery.clear();
             finishError(id, QStringLiteral("timeout"), QStringLiteral("Query encoder timed out"));
-            queryRestartPending = queryWorker.state() != QProcess::NotRunning;
-            queryWorker.kill();
+            stopWorkerForRestart(true, ExitReason::Fault);
         });
         loadJournal();
         previousRoots = settings.roots;
+        previousCodeRoots = settings.codeRoots;
         updateWatchers();
         started = true;
         reconcile.start();
@@ -236,12 +305,13 @@ public:
         for (const auto &request : std::as_const(requests)) request.cancelled->store(true);
         for (const auto &request : std::as_const(activeSearches)) request.cancelled->store(true);
         reconcile.stop(); debounce.stop(); indexTimeout.stop(); queryTimeout.stop();
+        indexIdle.stop(); queryIdle.stop(); indexShutdownGrace.stop(); queryShutdownGrace.stop();
+        indexExit = queryExit = ExitReason::Stop;
         scanCancelled.store(true);
         { const std::lock_guard guard(publicationConfigurationMutex); ++generation; }
         saveJournal();
         server.close();
-        const auto clients = buffers.keys();
-        for (auto *socket : clients) socket->disconnectFromServer();
+        releaseClients();
         for (auto *worker : {&indexWorker, &queryWorker}) {
             if (worker->state() != QProcess::NotRunning) {
                 worker->write("{\"id\":\"shutdown\",\"operation\":\"shutdown\"}\n");
@@ -314,8 +384,15 @@ public:
         send(socket, {{"id", id}, {"ok", false}, {"error", QJsonObject{{"code", code}, {"message", message}}}});
     }
     void event(const QString &name, const QJsonObject &data) {
+        auto payload = data;
+        if (name == "indexChanged") {
+            QString error;
+            const auto value = repository.browseGeneration(&error);
+            if (error.isEmpty() && value >= 0) payload.insert(QStringLiteral("browseGeneration"), QString::number(value));
+            payload.insert(QStringLiteral("visibilityEpoch"), QString::number(visibilityEpoch));
+        }
         for (auto *socket : buffers.keys()) if (socket->property("authenticated").toBool())
-            send(socket, {{"event", name}, {"data", data}});
+            send(socket, {{"event", name}, {"data", payload}});
     }
     void publishProgress() { event(QStringLiteral("progress"), progress.toJson()); }
 
@@ -337,7 +414,7 @@ public:
             if (pending.id == id) { sendError(socket, id, QStringLiteral("duplicate_id"), QStringLiteral("Request ID is already in flight")); return; }
         }
         for (const auto &pending : std::as_const(activeSearches)) if (pending.socket == socket) ++count;
-        if ((method == "search" || method == "document.preview")
+        if ((method == "search" || method == "files.list" || method == "document.preview")
             && (count >= 64 || requests.size() + activeSearches.size() >= 128)) {
             sendError(socket, id, QStringLiteral("busy"), QStringLiteral("Too many queued or running requests")); return;
         }
@@ -350,7 +427,7 @@ public:
                 {"failures", failures}, {"warning", error},
                 {"watcherMode", watcherMode}, {"watcherWarning", watcherWarning}, {"reconcileIntervalMs", reconcile.interval()},
                 {"activeSearches", activeSearches.size()}, {"queuedQueries", queryQueue.size()},
-                {"queuedFiles", jobs.size() + (current ? 1 : 0)}});
+                {"queuedFiles", jobs.size() + (current ? 1 : 0)}, {"catalogReady", catalogReady}});
         } else if (method == "settings.get") sendResult(socket, id, settings.toJson());
         else if (method == "settings.set") {
             auto json = settings.toJson();
@@ -363,8 +440,10 @@ public:
             const bool changed = next.fingerprint() != settings.fingerprint();
             previousRoots.append(settings.roots);
             previousRoots.removeDuplicates();
+            previousCodeRoots.append(settings.codeRoots);
+            previousCodeRoots.removeDuplicates();
             settings = next;
-            if (changed) invalidateIndexing();
+            if (changed) { ++visibilityEpoch; invalidateIndexing(); }
             updateWatchers();
             sendResult(socket, id, settings.toJson());
             event(QStringLiteral("settings"), settings.toJson());
@@ -379,18 +458,39 @@ public:
                 || params.value("limit").toInt(100) < 1 || params.value("limit").toInt(100) > 500) {
                 sendError(socket, id, QStringLiteral("invalid_request"), QStringLiteral("Search requires a query up to 8192 characters and limit 1–500")); return;
             }
+            if (!catalogReady) {
+                sendError(socket, id, QStringLiteral("metadata_pending"), QStringLiteral("Folder metadata reconciliation has not completed successfully")); return;
+            }
             const QString internal = QUuid::createUuid().toString(QUuid::WithoutBraces);
             requests.insert(internal, {socket, id, params, generation});
             QTimer::singleShot(120000, q, [this, internal] {
                 if (!requests.contains(internal)) return;
                 finishError(internal, QStringLiteral("timeout"), QStringLiteral("Search request timed out"));
                 if (activeQuery == internal) {
-                    activeQuery.clear(); queryRestartPending = queryWorker.state() != QProcess::NotRunning; queryWorker.kill();
+                    activeQuery.clear(); stopWorkerForRestart(true, ExitReason::Fault);
                 }
             });
             if (modelAvailable && params.value("semantic").toBool(true) && !params.value("query").toString().trimmed().isEmpty()) {
                 queryQueue.enqueue(internal); nextQuery();
             } else runSearch(internal, {}, pipelineError);
+        } else if (method == "files.list") {
+            if (params.value("code").toBool() && !settings.includeCode) {
+                sendError(socket, id, QStringLiteral("code_search_disabled"), QStringLiteral("Enable code search before browsing the code index")); return;
+            }
+            if ((!params.value("cursor").isUndefined() && !params.value("cursor").isString())
+                || params.value("cursor").toString().size() > 8192
+                || params.value("limit").toInt(100) < 1 || params.value("limit").toInt(100) > 100) {
+                sendError(socket, id, QStringLiteral("invalid_request"), QStringLiteral("File browsing requires a bounded cursor and limit 1–100")); return;
+            }
+            if (!catalogReady) {
+                const bool oldCursor = !params.value("cursor").toString().isEmpty();
+                sendError(socket, id, oldCursor ? QStringLiteral("cursor_stale") : QStringLiteral("metadata_pending"),
+                    oldCursor ? QStringLiteral("Folder selection changed. Refresh the list.")
+                              : QStringLiteral("Folder metadata reconciliation has not completed successfully")); return;
+            }
+            const QString internal = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            requests.insert(internal, {socket, id, params, generation});
+            runFileList(internal);
         } else if (method == "document.preview") {
             startPreview(socket, id, params);
         } else if (method == "cancel") {
@@ -411,16 +511,17 @@ public:
                 else if (jobs.isEmpty() && !current) startScan();
                 else scheduleNext();
             }
+            updateIdleWorkers();
             publishProgress(); sendResult(socket, id, progress.toJson());
         } else if (method == "index.start" || method == "index.reconcile" || method == "index.retry") {
             if (method == "index.retry") { failures = {}; retryIncomplete = true; }
             startScan(); sendResult(socket, id, progress.toJson());
         } else if (method == "models.reload") {
             if (publishing) { sendError(socket, id, QStringLiteral("busy"), QStringLiteral("Index publication is in progress, retry shortly")); return; }
-            invalidateIndexing();
+            invalidateIndexing(false);
             for (const auto &key : requests.keys()) finishError(key, QStringLiteral("model_changed"), QStringLiteral("Model configuration changed"));
             activeQuery.clear(); queryQueue.clear();
-            queryRestartPending = queryWorker.state() != QProcess::NotRunning; queryWorker.kill();
+            stopWorkerForRestart(true);
             QString error;
             if (!refreshModels(&error)) {
                 progress.state = QStringLiteral("error"); progress.error = error; publishProgress();
@@ -461,7 +562,11 @@ public:
     void updateWatchers(QStringList directories = {}) {
         if (!monitor.directories().isEmpty()) monitor.removePaths(monitor.directories());
         watcherWarning.clear();
-        if (directories.isEmpty()) for (const auto &root : settings.roots) if (QFileInfo(root).isDir()) directories.append(root);
+        if (directories.isEmpty()) {
+            auto roots = settings.roots;
+            if (settings.includeCode) roots.append(settings.codeRoots);
+            for (const auto &root : roots) if (QFileInfo(root).isDir()) directories.append(root);
+        }
         directories.removeDuplicates();
         constexpr qsizetype watchLimit = 8192;
         if (directories.size() > watchLimit) {
@@ -476,82 +581,275 @@ public:
         if (!watcherWarning.isEmpty()) log(watcherWarning);
     }
 
-    void invalidateIndexing() {
+    void invalidateIndexing(bool invalidateCatalog = true) {
         { const std::lock_guard guard(publicationConfigurationMutex); ++generation; }
         scanCancelled.store(true);
         jobs.clear();
+        recentJobs.clear(); backfillJobs.clear(); continuationJobs.clear();
+        pendingCatalog.reset(); knownVersions.clear(); completedFiles.clear(); failedFiles.clear();
+        if (invalidateCatalog) { catalogReady = false; catalogRoots.clear(); catalogCodeRoots.clear(); catalogFiles.clear(); }
+        firstScan = true;
         if (!currentWorkerId.isEmpty()) indexWorker.write(QJsonDocument(QJsonObject{{"id", "cancel"}, {"operation", "cancel"},
             {"targetId", currentWorkerId}}).toJson(QJsonDocument::Compact) + '\n');
         if (!publishing) current.reset();
         currentWorkerId.clear(); indexTimeout.stop();
-        indexRestartPending = indexWorker.state() != QProcess::NotRunning; indexWorker.kill();
+        stopWorkerForRestart(false);
         pendingScan = true;
+    }
+
+    void refreshProgressCounts() {
+        progress.total = knownVersions.size();
+        progress.completed = completedFiles.size();
+        progress.failed = failedFiles.size();
+    }
+
+    void protectForScan(const Job &job) {
+        if (!scanning && !pendingCatalog) return;
+        (job.file.kind == "code" ? scanProtectedCode : scanProtectedGeneral).insert(job.file.path);
+    }
+
+    enum class QueueClass { Recent, Backfill, Continuation };
+    void enqueue(Job job, QueueClass queue) {
+        const QString key = fileKey(job.file);
+        job.segments = {};
+        if (auto found = jobs.find(key); found != jobs.end()) {
+            if (found->indexedVersion == job.indexedVersion) {
+                found->retry = found->retry || job.retry; return;
+            }
+        }
+        protectForScan(job);
+        job.queueToken = ++nextQueueToken;
+        const auto token = job.queueToken;
+        jobs.insert(key, std::move(job));
+        (queue == QueueClass::Recent ? recentJobs : queue == QueueClass::Backfill ? backfillJobs : continuationJobs).enqueue({key, token});
+    }
+
+    void mergeCatalog() {
+        if (!pendingCatalog || current || publishing || stopping) return;
+        auto result = std::move(pendingCatalog);
+        const quint64 epoch = result->generation;
+        if (epoch != generation) { scheduleNext(); return; }
+        updateWatchers(result->scan.directories);
+        progress.error = result->scan.errors.join(u'\n');
+        QSet<QString> generalPresent, codePresent, presentKeys;
+        QVector<FileMetadata> metadata;
+        QList<Job> added;
+        const bool retryCapped = std::exchange(retryIncomplete, false);
+        for (const auto &file : result->scan.files) {
+            const QString key = fileKey(file);
+            const QString version = file.fingerprint + u'|' + pipeline;
+            const QString stored = result->versions.value(key);
+            (file.kind == "code" ? codePresent : generalPresent).insert(file.path);
+            presentKeys.insert(key);
+            metadata.append({file.path, file.kind == "code", file.modifiedMs, file.kind, file.fingerprint, stored});
+            const bool unchanged = knownVersions.value(key) == version;
+            knownVersions.insert(key, version);
+            if (!unchanged) { completedFiles.remove(key); failedFiles.remove(key); }
+            if (unchanged && completedFiles.contains(key) && !retryCapped) continue;
+            if (!retryCapped && (stored == version + QStringLiteral("|capped:5000")
+                || stored == version + QStringLiteral("|partial:5000"))) {
+                const QString message = QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it.");
+                failures.insert(failureKey(file), message); failedFiles.insert(key); progress.error = message;
+                continue;
+            }
+            if (stored == version && !failures.contains(failureKey(file))) {
+                completedFiles.insert(key); failedFiles.remove(key); continue;
+            }
+            if (jobs.contains(key) && jobs.value(key).indexedVersion == version && !retryCapped) continue;
+            Job job{file, sourceVersion(file.path), version, epoch};
+            job.retry = retryCapped && (stored == version + QStringLiteral("|capped:5000")
+                || stored == version + QStringLiteral("|partial:5000"));
+            added.append(std::move(job));
+        }
+        std::stable_sort(added.begin(), added.end(), [](const Job &a, const Job &b) {
+            if (a.file.screenshot != b.file.screenshot) return a.file.screenshot;
+            if (a.file.modifiedMs != b.file.modifiedMs) return a.file.modifiedMs > b.file.modifiedMs;
+            return a.file.path < b.file.path;
+        });
+        const auto lane = !firstScan && added.size() <= 50 ? QueueClass::Recent : QueueClass::Backfill;
+        firstScan = false;
+        for (auto &job : added) enqueue(std::move(job), lane);
+        // A successful root scan is authoritative about eligibility. In
+        // particular, an unchanged file newly ignored by Git must not retain
+        // an old queued extraction. Unavailable-root work is rediscovered on
+        // recovery, with its committed partial cursor still in SQLite.
+        for (auto it = jobs.begin(); it != jobs.end();) {
+            if (!presentKeys.contains(it.key())) it = jobs.erase(it);
+            else ++it;
+        }
+        for (auto *queue : {&recentJobs, &backfillJobs, &continuationJobs}) {
+            for (auto it = queue->begin(); it != queue->end();) {
+                const auto found = jobs.constFind(it->key);
+                if (found == jobs.cend() || found->queueToken != it->token) it = queue->erase(it);
+                else ++it;
+            }
+        }
+        // The scan may predate a completed publication or a newly observed job.
+        // Protect these paths for this scan only, then let the next scan settle them.
+        generalPresent.unite(scanProtectedGeneral); codePresent.unite(scanProtectedCode);
+        scanProtectedGeneral.clear(); scanProtectedCode.clear();
+        refreshProgressCounts();
+        const bool completeScan = result->scan.errors.isEmpty();
+        for (auto it = knownVersions.begin(); it != knownVersions.end();) {
+            if (!presentKeys.contains(it.key()) && !jobs.contains(it.key())) {
+                completedFiles.remove(it.key()); failedFiles.remove(it.key()); it = knownVersions.erase(it);
+            } else ++it;
+        }
+        for (const auto &key : failures.keys()) {
+            const bool code = key.startsWith(QStringLiteral("code:"));
+            const auto path = code ? key.mid(5) : key;
+            const auto &successfulRoots = code ? result->codeRoots : result->generalRoots;
+            const bool scanned = std::any_of(successfulRoots.cbegin(), successfulRoots.cend(), [&path](const QString &root) {
+                return isPathWithin(path, root);
+            });
+            if ((!code || settings.includeCode) && (completeScan || scanned)
+                && !(code ? codePresent : generalPresent).contains(path)) failures.remove(key);
+        }
+        const auto generalRoots = completeScan ? previousRoots : result->generalRoots;
+        const auto codeRoots = completeScan ? previousCodeRoots : result->codeRoots;
+        auto visibleGeneral = result->generalRoots;
+        auto visibleCode = result->codeRoots;
+        visibleGeneral.removeDuplicates(); visibleGeneral.sort();
+        visibleCode.removeDuplicates(); visibleCode.sort();
+        const bool includeCode = settings.includeCode;
+        publishing = true;
+        auto *writer = new QFutureWatcher<QString>(q);
+        QObject::connect(writer, &QFutureWatcher<QString>::finished, q, [this, writer, epoch, includeCode, completeScan,
+                                                                        visibleGeneral, visibleCode, presentKeys] {
+            const QString error = writer->result(); writer->deleteLater(); publishing = false;
+            if (stopping) return;
+            if (!error.isEmpty()) { progress.error = error; log(error); }
+            else if (epoch == generation) {
+                if (completeScan) {
+                    previousRoots = settings.roots;
+                    if (includeCode) previousCodeRoots = settings.codeRoots;
+                }
+                if (catalogRoots != visibleGeneral || catalogCodeRoots != visibleCode || catalogFiles != presentKeys) ++visibilityEpoch;
+                catalogRoots = visibleGeneral; catalogCodeRoots = visibleCode; catalogFiles = presentKeys;
+                catalogReady = !catalogRoots.isEmpty() || !catalogCodeRoots.isEmpty()
+                    || (settings.roots.isEmpty() && (!settings.includeCode || settings.codeRoots.isEmpty()));
+            }
+            refreshProgressCounts(); event(QStringLiteral("indexChanged"), {}); scheduleNext();
+        });
+        writer->setFuture(QtConcurrent::run(&writePool, [this, generalRoots, codeRoots, generalPresent, codePresent,
+                                                        metadata = std::move(metadata), epoch, includeCode] {
+            QString error;
+            const std::lock_guard guard(publicationConfigurationMutex);
+            if (epoch != generation) return QString{};
+            if (!repository.updateFileMetadata(metadata, &error)) return error;
+            for (const auto &root : generalRoots) if (!repository.prune(root, generalPresent, false, &error)) return error;
+            if (includeCode) for (const auto &root : codeRoots) if (!repository.prune(root, codePresent, true, &error)) return error;
+            return error;
+        }));
+        publishProgress();
     }
 
     void startScan() {
         if (stopping) return;
         if (!pipelineReady) { progress.state = QStringLiteral("error"); progress.error = pipelineError; publishProgress(); return; }
-        if (settings.indexingPaused) { progress.state = QStringLiteral("paused"); publishProgress(); return; }
-        if (scanning || current || publishing || !jobs.isEmpty()) { pendingScan = true; return; }
+        // Catalog reconciliation is metadata-only and remains available while
+        // extraction is paused. One pending result bounds memory and merge work.
+        if (scanning || pendingCatalog) { pendingScan = true; return; }
         scanning = true; pendingScan = false; scanCancelled.store(false);
         const quint64 epoch = generation;
-        const FolderRules rules{settings.roots, settings.excludes, settings.includeCode};
-        progress.state = QStringLiteral("scanning"); progress.error.clear(); publishProgress();
+        FolderRules general{settings.roots, settings.excludes, false};
+        FolderRules code{settings.codeRoots, settings.codeExcludes, true};
+        code.scope = FolderRules::Scope::Code;
+        const bool includeCode = settings.includeCode;
+        scanProtectedGeneral.clear(); scanProtectedCode.clear();
+        for (const auto &job : std::as_const(jobs)) protectForScan(job);
+        if (current) protectForScan(*current);
+        if (!current && jobs.isEmpty()) progress.state = QStringLiteral("scanning");
+        publishProgress();
         auto *watcher = new QFutureWatcher<ScanPackage>(q);
         QObject::connect(watcher, &QFutureWatcher<ScanPackage>::finished, q, [this, watcher, epoch] {
-            const auto result = watcher->result(); watcher->deleteLater(); scanning = false;
+            auto result = watcher->result(); watcher->deleteLater(); scanning = false;
             if (stopping) return;
             if (epoch != generation || result.scan.cancelled) { startScan(); return; }
-            updateWatchers(result.scan.directories);
-            progress = {}; progress.state = QStringLiteral("indexing"); progress.total = result.scan.files.size();
-            progress.error = result.scan.errors.join(u'\n');
-            QSet<QString> present;
-            const bool retryCapped = std::exchange(retryIncomplete, false);
-            for (const auto &file : result.scan.files) {
-                present.insert(file.path);
-                const QString version = file.fingerprint + u'|' + pipeline;
-                const QString stored = result.versions.value(file.path);
-                if (!retryCapped && (stored == version + QStringLiteral("|capped:5000")
-                    || stored == version + QStringLiteral("|partial:5000"))) {
-                    const QString message = QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it.");
-                    failures.insert(file.path, message); ++progress.failed; progress.error = message;
-                    continue;
-                }
-                if (result.versions.value(file.path) == version && !failures.contains(file.path)) { ++progress.completed; continue; }
-                Job job{file, sourceVersion(file.path), version, epoch};
-                restoreContinuation(job, result.versions.value(file.path));
-                jobs.enqueue(std::move(job));
-            }
-            // An incomplete traversal must never erase valid data from an inaccessible directory.
-            if (result.scan.errors.isEmpty()) {
-                for (const auto &path : failures.keys()) if (!present.contains(path)) failures.remove(path);
-                const QStringList roots = previousRoots;
-                publishing = true;
-                auto *pruner = new QFutureWatcher<QString>(q);
-                QObject::connect(pruner, &QFutureWatcher<QString>::finished, q, [this, pruner, epoch] {
-                    const QString error = pruner->result(); pruner->deleteLater(); publishing = false;
-                    if (!error.isEmpty()) { progress.error = error; log(error); }
-                    else if (epoch == generation) previousRoots = settings.roots;
-                    event(QStringLiteral("indexChanged"), {}); scheduleNext();
-                });
-                pruner->setFuture(QtConcurrent::run(&writePool, [this, roots, present, epoch] {
-                    QString error;
-                    const std::lock_guard guard(publicationConfigurationMutex);
-                    if (epoch != generation) return QString{};
-                    for (const auto &root : roots) if (!repository.prune(root, present, &error)) break;
-                    return error;
-                }));
-            } else scheduleNext();
-            publishProgress();
+            pendingCatalog = std::make_unique<ScanPackage>(std::move(result));
+            mergeCatalog();
         });
-        watcher->setFuture(QtConcurrent::run(&scanPool, [this, rules] {
-            ScanPackage result; result.scan = FileCatalog::scan(rules, &scanCancelled);
+        watcher->setFuture(QtConcurrent::run(&scanPool, [this, general, code, includeCode, epoch] {
+            ScanPackage result; result.generation = epoch;
+            QSet<QString> seen;
+            const auto scanSpace = [this, &result, &seen](const FolderRules &rules, QStringList &successfulRoots) {
+                for (const auto &root : rules.roots) {
+                    if (scanCancelled.load()) { result.scan.cancelled = true; return; }
+                    auto selected = rules; selected.roots = {root};
+                    const auto source = FileCatalog::scan(selected, &scanCancelled);
+                    result.scan.directories.append(source.directories); result.scan.errors.append(source.errors);
+                    if (source.cancelled) { result.scan.cancelled = true; return; }
+                    if (!source.errors.isEmpty()) continue;
+                    successfulRoots.append(root);
+                    for (const auto &file : source.files) {
+                        const auto key = fileKey(file);
+                        if (!seen.contains(key)) { seen.insert(key); result.scan.files.append(file); }
+                    }
+                }
+            };
+            scanSpace(general, result.generalRoots);
+            if (includeCode && !result.scan.cancelled) scanSpace(code, result.codeRoots);
             for (const auto &file : result.scan.files) {
                 if (scanCancelled.load()) { result.scan.cancelled = true; break; }
-                result.versions.insert(file.path, repository.fileVersion(file.path, file.kind == "code"));
+                result.versions.insert(fileKey(file), repository.fileVersion(file.path, file.kind == "code"));
             }
             return result;
         }));
+    }
+
+    bool workerIdle(bool query) const {
+        if (query) {
+            if (!activeQuery.isEmpty()) return false;
+            for (const auto &id : queryQueue) if (requests.contains(id)) return false;
+            return true;
+        }
+        return currentWorkerId.isEmpty() && (!publishing || !current)
+            && (settings.indexingPaused || (!current && jobs.isEmpty()));
+    }
+
+    void updateIdleWorkers() {
+        if (stopping) return;
+        for (const bool query : {false, true}) {
+            auto &worker = query ? queryWorker : indexWorker;
+            auto &timer = query ? queryIdle : indexIdle;
+            const auto reason = query ? queryExit : indexExit;
+            if (worker.state() != QProcess::Running || reason != ExitReason::None || !workerIdle(query)) {
+                timer.stop(); continue;
+            }
+            // Repeated empty scans must not extend the existing idle deadline.
+            if (!timer.isActive()) timer.start(query ? queryIdleMs : indexIdleMs);
+        }
+    }
+
+    void setupIdle(bool query) {
+        auto &idle = query ? queryIdle : indexIdle;
+        auto &grace = query ? queryShutdownGrace : indexShutdownGrace;
+        idle.setSingleShot(true); grace.setSingleShot(true);
+        QObject::connect(&idle, &QTimer::timeout, q, [this, query] {
+            auto &worker = query ? queryWorker : indexWorker;
+            auto &reason = query ? queryExit : indexExit;
+            if (stopping || reason != ExitReason::None || worker.state() != QProcess::Running || !workerIdle(query)) return;
+            reason = ExitReason::Idle;
+            (query ? queryRestartPending : indexRestartPending) = true;
+            worker.write("{\"id\":\"shutdown\",\"operation\":\"shutdown\"}\n");
+            worker.closeWriteChannel();
+            (query ? queryShutdownGrace : indexShutdownGrace).start(shutdownGraceMs);
+        });
+        QObject::connect(&grace, &QTimer::timeout, q, [this, query] {
+            auto &worker = query ? queryWorker : indexWorker;
+            if ((query ? queryExit : indexExit) == ExitReason::Idle && worker.state() != QProcess::NotRunning)
+                worker.kill();
+        });
+    }
+
+    void stopWorkerForRestart(bool query, ExitReason reason = ExitReason::Restart) {
+        auto &worker = query ? queryWorker : indexWorker;
+        (query ? queryIdle : indexIdle).stop();
+        (query ? queryShutdownGrace : indexShutdownGrace).stop();
+        (query ? queryExit : indexExit) = reason;
+        (query ? queryRestartPending : indexRestartPending) = worker.state() != QProcess::NotRunning;
+        if (worker.state() != QProcess::NotRunning) worker.kill();
+        else (query ? queryExit : indexExit) = ExitReason::None;
     }
 
     void setupWorker(QProcess &worker, bool query) {
@@ -560,8 +858,8 @@ public:
             QByteArray &buffer = query ? queryBuffer : indexBuffer;
             buffer += worker.readAllStandardOutput();
             if (buffer.size() > maxMessageBytes) {
-                if (query) queryRestartPending = true; else indexRestartPending = true;
-                worker.kill(); workerFailure(query, QStringLiteral("Worker response exceeds protocol limit")); return;
+                workerFailure(query, QStringLiteral("Worker response exceeds protocol limit"));
+                stopWorkerForRestart(query, ExitReason::Fault); return;
             }
             while (true) {
                 const qsizetype line = buffer.indexOf('\n');
@@ -570,8 +868,8 @@ public:
                 QJsonParseError parse;
                 const auto document = QJsonDocument::fromJson(bytes, &parse);
                 if (parse.error != QJsonParseError::NoError || !document.isObject()) {
-                    if (query) queryRestartPending = true; else indexRestartPending = true;
-                    worker.kill(); workerFailure(query, QStringLiteral("Malformed worker response")); return;
+                    workerFailure(query, QStringLiteral("Malformed worker response"));
+                    stopWorkerForRestart(query, ExitReason::Fault); return;
                 }
                 if (query) receiveQuery(document.object()); else receiveIndex(document.object());
             }
@@ -581,52 +879,105 @@ public:
             if (!text.isEmpty()) log(text.left(16384));
         });
         QObject::connect(&worker, &QProcess::errorOccurred, q, [this, query](QProcess::ProcessError error) {
-            if (error == QProcess::FailedToStart) workerFailure(query, QStringLiteral("Cannot start installed worker executable"));
+            if (error != QProcess::FailedToStart) return;
+            (query ? queryIdle : indexIdle).stop();
+            (query ? queryShutdownGrace : indexShutdownGrace).stop();
+            (query ? queryRestartPending : indexRestartPending) = false;
+            (query ? queryExit : indexExit) = ExitReason::None;
+            // ensureWorker's caller owns the one failed-start reply/publication.
         });
         QObject::connect(&worker, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), q,
             [this, query](int code, QProcess::ExitStatus status) {
                 if (stopping) return;
+                (query ? queryIdle : indexIdle).stop();
+                (query ? queryShutdownGrace : indexShutdownGrace).stop();
+                auto &reason = query ? queryExit : indexExit;
+                const auto previousReason = std::exchange(reason, ExitReason::None);
                 if (query) queryRestartPending = false; else indexRestartPending = false;
                 if (query) queryBuffer.clear(); else indexBuffer.clear();
-                workerFailure(query, QStringLiteral("Worker exited (%1, %2)").arg(code).arg(int(status)));
-                QTimer::singleShot(50, q, [this, query] { if (query) nextQuery(); else scheduleNext(); });
+                if (previousReason == ExitReason::None)
+                    workerFailure(query, QStringLiteral("Worker exited (%1, %2)").arg(code).arg(int(status)));
+                QTimer::singleShot(0, q, [this, query] {
+                    if (query) nextQuery();
+                    else if (current && currentWorkerId.isEmpty() && !publishing) dispatchIndex();
+                    else scheduleNext();
+                });
             });
     }
 
     bool ensureWorker(QProcess &worker, bool query) {
+        if ((query ? queryExit : indexExit) != ExitReason::None) return false;
         if (worker.state() == QProcess::Running) return true;
         if (worker.state() == QProcess::Starting) return false;
         worker.setProgram(executablePath(QStringLiteral("qcs-worker")));
         worker.setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir,
                              "--mode", query ? "query" : (modelAvailable ? "full" : "extract"), "--threads", query ? "4" : "2"});
+        if (configureWorker) configureWorker(worker, query);
         worker.start();
         // Process startup is bounded. File decoding and inference are always asynchronous.
         return worker.waitForStarted(3000);
     }
 
     void scheduleNext() {
-        if (stopping || scanning || publishing || current) return;
+        if (stopping || publishing || current) { updateIdleWorkers(); return; }
+        if (pendingCatalog) { mergeCatalog(); return; }
+        if (pendingScan && !scanning) startScan();
         if (!pipelineReady) { progress.state = QStringLiteral("error"); progress.error = pipelineError; publishProgress(); return; }
-        if (indexRestartPending && indexWorker.state() != QProcess::NotRunning) return;
-        if (settings.indexingPaused) { progress.state = QStringLiteral("paused"); publishProgress(); return; }
+        if (indexExit != ExitReason::None || (indexRestartPending && indexWorker.state() != QProcess::NotRunning)) return;
+        if (settings.indexingPaused) { progress.state = QStringLiteral("paused"); publishProgress(); updateIdleWorkers(); return; }
         if (jobs.isEmpty()) {
-            progress.state = progress.failed > 0 || !progress.error.isEmpty() ? QStringLiteral("partial") : QStringLiteral("idle");
+            progress.state = scanning ? QStringLiteral("scanning")
+                : progress.failed > 0 || !progress.error.isEmpty() ? QStringLiteral("partial") : QStringLiteral("idle");
             progress.currentPath.clear(); publishProgress(); saveJournal();
-            if (pendingScan) QTimer::singleShot(0, q, [this] { startScan(); });
+            updateIdleWorkers();
             return;
         }
-        current = std::make_unique<Job>(jobs.dequeue());
-        if (current->generation != generation) { current.reset(); scheduleNext(); return; }
+        // Four recent batches, one bulk first pass and one continuation. Empty
+        // classes are skipped, retaining a finite batch bound for every class.
+        QString key;
+        for (int attempts = 0; attempts < 6 && key.isEmpty(); ++attempts) {
+            auto &queue = queueTurn < 4 ? recentJobs : queueTurn == 4 ? backfillJobs : continuationJobs;
+            queueTurn = (queueTurn + 1) % 6;
+            while (!queue.isEmpty()) {
+                const auto candidate = queue.dequeue();
+                const auto found = jobs.constFind(candidate.key);
+                if (found != jobs.cend() && found->queueToken == candidate.token) { key = candidate.key; break; }
+            }
+        }
+        if (key.isEmpty()) return;
+        current = std::make_unique<Job>(jobs.take(key));
+        if (current->generation != generation) { current.reset(); QTimer::singleShot(0, q, [this] { scheduleNext(); }); return; }
+        QString error;
+        const auto stored = repository.fileVersion(current->file.path, current->file.kind == "code", &error);
+        if (!error.isEmpty()) { failCurrent(error); return; }
+        if (!current->retry && stored == current->indexedVersion && !failures.contains(failureKey(current->file))) {
+            completedFiles.insert(key); failedFiles.remove(key); refreshProgressCounts(); current.reset();
+            QTimer::singleShot(0, q, [this] { scheduleNext(); }); return;
+        }
+        if (!current->retry && (stored == current->indexedVersion + QStringLiteral("|capped:5000")
+            || stored == current->indexedVersion + QStringLiteral("|partial:5000"))) {
+            failCurrent(QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it.")); return;
+        }
+        current->offset = 0;
+        if (!current->retry) {
+            const auto restoreError = restoreContinuation(*current, stored);
+            if (!restoreError.isEmpty()) { failCurrent(restoreError); return; }
+        }
+        current->retry = false;
+        current->batch = ++nextBatch;
         progress.currentPath = current->file.path; progress.state = QStringLiteral("indexing"); publishProgress();
         dispatchIndex();
     }
 
     void dispatchIndex() {
-        if (!current || stopping || settings.indexingPaused || !pipelineReady) return;
+        if (!current || stopping || settings.indexingPaused || !pipelineReady) { updateIdleWorkers(); return; }
+        if (publishing || !currentWorkerId.isEmpty() || indexExit != ExitReason::None
+            || (indexRestartPending && indexWorker.state() != QProcess::NotRunning)) return;
         // A paused job can outlive its source version. Reconcile now instead of
         // sending a knowingly stale request and waiting for the periodic scan.
         if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
         if (!ensureWorker(indexWorker, false)) { publishFailedCurrent(QStringLiteral("Cannot start index worker")); return; }
+        indexIdle.stop();
         currentWorkerId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         const QJsonObject request{{"id", currentWorkerId}, {"operation", "extract"}, {"path", current->file.path},
             {"expectedVersion", current->workerVersion}, {"code", current->file.kind == "code"}, {"embed", modelAvailable},
@@ -686,23 +1037,30 @@ public:
         QObject::connect(watcher, &QFutureWatcher<QString>::finished, q, [this, watcher, job, complete, capped, resume, extractionError, previousCount] {
             const auto error = watcher->result(); watcher->deleteLater(); publishing = false;
             if (stopping) return;
-            if (!current || current->generation != generation) { current.reset(); scheduleNext(); return; }
+            if (!current || current->batch != job.batch || job.generation != generation) {
+                if (current && current->batch == job.batch) current.reset();
+                scheduleNext(); return;
+            }
             // The source can change after decoding or while the writer waits
             // to enter its publication gate. Such a rejection requires work
             // for the new version, never a failed placeholder for the old one.
             if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
             if (!error.isEmpty()) { failCurrent(error); return; }
             progress.segments += current->segments.size() - previousCount;
+            protectForScan(job);
             event(QStringLiteral("indexChanged"), {{"path", job.file.path}});
             saveJournal();
             if (complete) {
-                failures.remove(job.file.path); ++progress.completed; current.reset();
+                failures.remove(failureKey(job.file)); completedFiles.insert(fileKey(job.file));
+                failedFiles.remove(fileKey(job.file)); refreshProgressCounts(); current.reset();
                 scheduleNext();
             } else if (capped) {
                 failCurrent(QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it."));
             } else if (resume) {
+                Job continuation = std::move(*current); current.reset();
+                enqueue(std::move(continuation), QueueClass::Continuation);
                 publishProgress();
-                if (!settings.indexingPaused) QTimer::singleShot(0, q, [this] { dispatchIndex(); });
+                QTimer::singleShot(0, q, [this] { scheduleNext(); });
             } else failCurrent(extractionError.isEmpty() ? QStringLiteral("Worker returned a partial result without a continuation") : extractionError);
         });
         watcher->setFuture(QtConcurrent::run(&writePool, [this, job, version] {
@@ -716,7 +1074,8 @@ public:
                     || now.fingerprint != job.file.fingerprint) return {};
                 return lease;
             };
-            if (!repository.replaceFile(job.file.path, version, job.segments, job.file.kind == "code", &error, gate)) return error;
+            if (!repository.replaceFile(job.file.path, version, job.segments, job.file.kind == "code", &error, gate,
+                                        job.file.modifiedMs, job.file.kind)) return error;
             return QString{};
         }));
     }
@@ -731,9 +1090,12 @@ public:
         QObject::connect(watcher, &QFutureWatcher<QString>::finished, q, [this, watcher, job, failure] {
             const QString error = watcher->result(); watcher->deleteLater(); publishing = false;
             if (stopping) return;
-            if (!current || current->generation != generation) { current.reset(); scheduleNext(); return; }
+            if (!current || current->batch != job.batch || job.generation != generation) {
+                if (current && current->batch == job.batch) current.reset();
+                scheduleNext(); return;
+            }
             if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
-            if (error.isEmpty()) event(QStringLiteral("indexChanged"), {{"path", job.file.path}});
+            if (error.isEmpty()) { protectForScan(job); event(QStringLiteral("indexChanged"), {{"path", job.file.path}}); }
             failCurrent(error.isEmpty() ? failure : failure + QStringLiteral("\nCannot preserve filename index: ") + error);
         });
         watcher->setFuture(QtConcurrent::run(&writePool, [this, job] {
@@ -762,13 +1124,14 @@ public:
                 return lease;
             };
             repository.replaceFile(job.file.path, job.indexedVersion + QStringLiteral("|failed:%1").arg(job.offset),
-                segments, job.file.kind == "code", &error, gate);
+                segments, job.file.kind == "code", &error, gate, job.file.modifiedMs, job.file.kind);
             return error;
         }));
     }
 
     bool currentSourceMatches() const {
         if (!current || current->generation != generation) return false;
+        if (!pathAllowed(current->file.path, current->file.kind == "code")) return false;
         FileRecord now;
         return FileCatalog::describe(current->file.path, &now)
             && now.fingerprint == current->file.fingerprint
@@ -789,7 +1152,9 @@ public:
     void failCurrent(const QString &error) {
         indexTimeout.stop(); currentWorkerId.clear();
         if (current) {
-            failures.insert(current->file.path, error); ++progress.failed;
+            failures.insert(failureKey(current->file), error);
+            failedFiles.insert(fileKey(current->file)); completedFiles.remove(fileKey(current->file));
+            refreshProgressCounts();
             log(QStringLiteral("Index failed %1: %2").arg(current->file.path, error));
         }
         progress.error = error; current.reset(); saveJournal(); publishProgress();
@@ -806,15 +1171,16 @@ public:
 
     void nextQuery() {
         if (stopping || !activeQuery.isEmpty()) return;
-        if (queryRestartPending && queryWorker.state() != QProcess::NotRunning) return;
+        if (queryExit != ExitReason::None || (queryRestartPending && queryWorker.state() != QProcess::NotRunning)) return;
         while (!queryQueue.isEmpty() && !requests.contains(queryQueue.head())) queryQueue.dequeue();
-        if (queryQueue.isEmpty()) return;
+        if (queryQueue.isEmpty()) { updateIdleWorkers(); return; }
         activeQuery = queryQueue.dequeue();
         if (!ensureWorker(queryWorker, true)) {
             const QString id = activeQuery; activeQuery.clear(); runSearch(id, {}, QStringLiteral("Query encoder unavailable"));
             QTimer::singleShot(0, q, [this] { nextQuery(); }); return;
         }
         const auto params = requests.value(activeQuery).params;
+        queryIdle.stop();
         const QJsonObject request{{"id", activeQuery}, {"operation", "query"}, {"query", params.value("query")}, {"code", params.value("code").toBool()}};
         queryWorker.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
         queryTimeout.start(90000);
@@ -835,15 +1201,69 @@ public:
         runSearch(id, embedding, warning); nextQuery();
     }
 
-    bool pathAllowed(const QString &path) const {
-        for (const auto &root : settings.roots) {
+    bool pathAllowed(const QString &path, bool code = false) const {
+        if (code && !settings.includeCode) return false;
+        if (!catalogReady || !catalogFiles.contains(pathKey(normalizePath(path), code))) return false;
+        const auto &roots = code ? catalogCodeRoots : catalogRoots;
+        const auto &excludes = code ? settings.codeExcludes : settings.excludes;
+        for (const auto &root : roots) {
             if (!isPathWithin(path, root)) continue;
             bool excluded = false;
-            for (const auto &exclude : settings.excludes)
+            for (const auto &exclude : excludes)
                 if (isPathWithin(exclude, root) && normalizePath(exclude) != normalizePath(root) && isPathWithin(path, exclude)) excluded = true;
             if (!excluded) return true;
         }
         return false;
+    }
+
+    void runFileList(const QString &id) {
+        if (!requests.contains(id)) return;
+        const auto request = requests.value(id);
+        FileListOptions options;
+        options.kind = request.params.value("kind").toString();
+        options.root = request.params.value("root").toString();
+        options.code = request.params.value("code").toBool();
+        options.allowedRoots = options.code ? catalogCodeRoots : catalogRoots;
+        options.excludedRoots = options.code ? settings.codeExcludes : settings.excludes;
+        options.enforceFolderRules = true;
+        options.limit = request.params.value("limit").toInt(100);
+        options.cursor = request.params.value("cursor").toString();
+        options.configurationToken = settings.fingerprint() + u':' + QString::number(visibilityEpoch);
+        options.cancelled = request.cancelled;
+        activeSearches.insert(id, request);
+        auto *watcher = new QFutureWatcher<FileListPage>(q);
+        const auto requestVisibility = visibilityEpoch;
+        QObject::connect(watcher, &QFutureWatcher<FileListPage>::finished, q, [this, watcher, id, requestVisibility] {
+            auto page = watcher->result(); watcher->deleteLater(); activeSearches.remove(id);
+            if (!requests.contains(id) || stopping) return;
+            const auto pending = requests.value(id);
+            const bool code = pending.params.value("code").toBool();
+            if (pending.generation != generation || requestVisibility != visibilityEpoch || !catalogReady) {
+                finishError(id, QStringLiteral("cursor_stale"), QStringLiteral("Folder selection changed during browsing. Refresh the list.")); return;
+            }
+            if (code && !settings.includeCode) {
+                finishError(id, QStringLiteral("code_search_disabled"), QStringLiteral("Code search was disabled while browsing")); return;
+            }
+            if (!page.errorCode.isEmpty() || !page.error.isEmpty()) {
+                finishError(id, page.errorCode.isEmpty() ? QStringLiteral("storage_error") : page.errorCode, page.error); return;
+            }
+            // Native identity is rechecked after the read transaction. The page
+            // cursor still advances over stale rows, avoiding an endless page.
+            for (auto it = page.files.begin(); it != page.files.end();) {
+                FileRecord source;
+                if (!pathAllowed(it->path, code) || !FileCatalog::describe(it->path, &source)
+                    || !it->sourceVersion.startsWith(source.fingerprint + u'|')) it = page.files.erase(it);
+                else ++it;
+            }
+            requests.remove(id);
+            auto payload = page.toJson();
+            payload.insert(QStringLiteral("visibilityEpoch"), QString::number(requestVisibility));
+            sendResult(pending.socket, pending.id, payload);
+        });
+        watcher->setFuture(QtConcurrent::run(&searchPool, [this, options] { return repository.listFiles(options); }));
+        QTimer::singleShot(120000, q, [this, id] {
+            finishError(id, QStringLiteral("timeout"), QStringLiteral("File browsing timed out"));
+        });
     }
 
     void runSearch(const QString &id, const QVector<float> &embedding, const QString &warning = {}) {
@@ -852,12 +1272,14 @@ public:
         SearchOptions options;
         options.query = request.params.value("query").toString(); options.kind = request.params.value("kind").toString();
         options.root = request.params.value("root").toString(); options.code = request.params.value("code").toBool();
-        options.allowedRoots = settings.roots; options.excludedRoots = settings.excludes; options.enforceFolderRules = true;
+        options.allowedRoots = options.code ? catalogCodeRoots : catalogRoots;
+        options.excludedRoots = options.code ? settings.codeExcludes : settings.excludes; options.enforceFolderRules = true;
         options.limit = request.params.value("limit").toInt(100); options.queryEmbedding = embedding;
         options.cancelled = request.cancelled;
         activeSearches.insert(id, request);
         auto *watcher = new QFutureWatcher<SearchPackage>(q);
-        QObject::connect(watcher, &QFutureWatcher<SearchPackage>::finished, q, [this, watcher, id, warning, semantic = !embedding.isEmpty()] {
+        const auto requestVisibility = visibilityEpoch;
+        QObject::connect(watcher, &QFutureWatcher<SearchPackage>::finished, q, [this, watcher, id, warning, requestVisibility, semantic = !embedding.isEmpty()] {
             const auto result = watcher->result(); watcher->deleteLater();
             activeSearches.remove(id);
             if (!requests.contains(id) || stopping) return;
@@ -865,13 +1287,16 @@ public:
             if (pendingSnapshot.params.value("code").toBool() && !settings.includeCode) {
                 finishError(id, QStringLiteral("code_search_disabled"), QStringLiteral("Code search was disabled while the query was running")); return;
             }
-            if (pendingSnapshot.generation != generation) {
+            if (pendingSnapshot.generation != generation || requestVisibility != visibilityEpoch) {
                 finishError(id, QStringLiteral("configuration_changed"), QStringLiteral("Search configuration changed while the query was running")); return;
+            }
+            if (!catalogReady) {
+                finishError(id, QStringLiteral("metadata_pending"), QStringLiteral("Folder metadata reconciliation has not completed successfully")); return;
             }
             if (!result.error.isEmpty()) { finishError(id, QStringLiteral("storage_error"), result.error); return; }
             QJsonArray hits;
             for (const auto &hit : result.hits) {
-                if (!pathAllowed(hit.path)) continue;
+                if (!pathAllowed(hit.path, pendingSnapshot.params.value("code").toBool())) continue;
                 FileRecord current;
                 if (!FileCatalog::describe(hit.path, &current)) continue;
                 if (!hit.sourceVersion.startsWith(current.fingerprint + u'|')) continue;
@@ -902,18 +1327,21 @@ public:
                                   .toJson(QJsonDocument::Compact) + '\n');
             activeQuery.clear(); queryTimeout.stop();
             // Process isolation guarantees the cancelled query cannot delay later requests indefinitely.
-            queryRestartPending = queryWorker.state() != QProcess::NotRunning;
-            queryWorker.kill();
+            stopWorkerForRestart(true);
         }
+        updateIdleWorkers();
     }
 
     void startPreview(QLocalSocket *socket, const QString &id, const QJsonObject &params) {
+        if (!catalogReady) {
+            sendError(socket, id, QStringLiteral("metadata_pending"), QStringLiteral("Folder metadata reconciliation has not completed successfully")); return;
+        }
         const QString path = params.value("path").toString();
         const int start = params.value("start").toInt();
         const int maximum = params.value("maxSegments").toInt(100);
         FileRecord source;
         QString error;
-        if (!QFileInfo(path).isAbsolute() || !pathAllowed(path) || start < 0 || maximum < 1 || maximum > 100
+        if (!QFileInfo(path).isAbsolute() || !pathAllowed(path, params.value("code").toBool()) || start < 0 || maximum < 1 || maximum > 100
             || (params.value("code").toBool() && !settings.includeCode)
             || !FileCatalog::describe(path, &source, &error)) {
             sendError(socket, id, QStringLiteral("invalid_request"), QStringLiteral("Preview requires an allowed source path and a bounded cursor")); return;
@@ -949,7 +1377,10 @@ public:
                 finishError(internal, QStringLiteral("preview_error"), response.value("error").toObject().value("message").toString("Invalid preview worker response")); return;
             }
             FileRecord now;
-            if (!pathAllowed(source.path) || !FileCatalog::describe(source.path, &now) || now.fingerprint != source.fingerprint) {
+            const auto pendingSnapshot = requests.value(internal);
+            if (pendingSnapshot.generation != generation
+                || !pathAllowed(source.path, pendingSnapshot.params.value("code").toBool())
+                || !FileCatalog::describe(source.path, &now) || now.fingerprint != source.fingerprint) {
                 finishError(internal, QStringLiteral("source_changed"), QStringLiteral("Source or folder selection changed during preview")); return;
             }
             auto result = response.value("result").toObject();
@@ -1000,18 +1431,19 @@ public:
             if (json.value("version").toInt() == 1) failures = json.value("failures").toObject();
         }
     }
-    void restoreContinuation(Job &job, const QString &storedVersion) {
+    QString restoreContinuation(Job &job, const QString &storedVersion) {
         const QString prefix = job.indexedVersion + QStringLiteral("|partial:");
-        if (!storedVersion.startsWith(prefix)) return;
+        if (!storedVersion.startsWith(prefix)) return {};
         bool valid = false;
         const int offset = storedVersion.mid(prefix.size()).toInt(&valid);
-        if (!valid || offset <= 0 || offset >= 5000) return;
+        if (!valid || offset <= 0 || offset >= 5000) return {};
         // Cursor and segments are committed in one SQLite transaction. The JSON
         // journal is diagnostic, so losing it cannot invalidate resumable data.
         // Native source fingerprint, pipeline and code space were checked above.
         QString error;
         auto segments = repository.fileSegments(job.file.path, job.file.kind == "code", &error);
         if (error.isEmpty()) { job.offset = offset; job.segments = std::move(segments); }
+        return error;
     }
     void saveJournal() {
         QJsonObject journal{{"version", 1}, {"failures", failures}, {"progress", progress.toJson()}};

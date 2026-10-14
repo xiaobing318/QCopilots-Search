@@ -1,4 +1,5 @@
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/qcs-write-if-different.cmake")
 include(FetchContent)
 # Qt 6.12.0 deploys FFmpeg 9.0.1. Only the official public headers are used
 # here, no FFmpeg source is compiled and the runtime is loaded via QLibrary.
@@ -26,7 +27,7 @@ foreach(_module libavcodec libavformat libavutil libswresample libswscale)
   endforeach()
 endforeach()
 file(MAKE_DIRECTORY "${_qcopilots_ffmpeg_generated}/libavutil")
-file(WRITE "${_qcopilots_ffmpeg_generated}/libavutil/avconfig.h"
+qcopilots_search_write_if_different("${_qcopilots_ffmpeg_generated}/libavutil/avconfig.h"
   "#ifndef AVUTIL_AVCONFIG_H\n#define AVUTIL_AVCONFIG_H\n#define AV_HAVE_BIGENDIAN 0\n#define AV_HAVE_FAST_UNALIGNED 1\n#endif\n")
 add_library(qcs-ffmpeg-headers INTERFACE)
 add_library(qcs::ffmpeg-headers ALIAS qcs-ffmpeg-headers)

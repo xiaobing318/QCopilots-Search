@@ -23,6 +23,7 @@ public:
     explicit PreviewPanel(QWidget *parent = nullptr);
     ~PreviewPanel() override;
     void showHit(const SearchHit &hit);
+    void loadDocumentText();
     void clear();
     void setLanguage(const QString &language);
     void setDocumentPreview(const QJsonObject &result, bool append);

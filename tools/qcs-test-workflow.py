@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Safety and relocation contracts for the developer workflow."""
+import argparse
 import importlib.util
 import json
 import math
@@ -165,14 +166,14 @@ finally:
         (project / "CMakeLists.txt").write_text('''
 cmake_minimum_required(VERSION 3.28)
 project(qcs-package-layout VERSION 1.0 LANGUAGES NONE)
-set(bundle "qcs.app/Contents")
+set(bundle "qcs-gui.app/Contents")
 install(FILES application.txt DESTINATION "${bundle}/MacOS")
 install(FILES runtime.txt DESTINATION "${bundle}/Resources"
   COMPONENT qcs-runtime)
 install(FILES internal-export.cmake DESTINATION "${bundle}/Frameworks/cmake"
   EXCLUDE_FROM_ALL)
 install(CODE [[
-  set(bundle "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/qcs.app/Contents")
+  set(bundle "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/qcs-gui.app/Contents")
   foreach(resource MacOS/application.txt Resources/runtime.txt)
     if(NOT EXISTS "${bundle}/${resource}")
       message(FATAL_ERROR "Final bundle hook ran before runtime installation: ${resource}")
@@ -197,7 +198,7 @@ include(CPack)
             result = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue((stage / "qcs.app/Contents/Resources/final-hook.txt").is_file())
+        self.assertTrue((stage / "qcs-gui.app/Contents/Resources/final-hook.txt").is_file())
         self.assertFalse(list(stage.rglob("*.cmake")))
         with zipfile.ZipFile(self.root / "qcs-layout.zip") as archive:
             names = archive.namelist()
@@ -688,7 +689,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
     @unittest.skipUnless(os.name == "nt", "NSIS is native to Windows")
     def test_nsis_compiles_recursive_unicode_payload_beyond_max_path(self):
         compiler = shutil.which("makensis")
-        self.assertIsNotNone(compiler, "NSIS compiler missing: run bootstrap before Windows CTest")
+        self.assertIsNotNone(compiler, "NSIS compiler missing: invoke the NSIS package stage")
         template = (workflow.SOURCE / "cmake/nsis/NSIS.template.in").read_text(encoding="utf-8")
         macro = template[template.index("!macro QCOPILOTS_SEARCH_COMPILER_PATH"):
                          template.index("!macroend") + len("!macroend")]
@@ -1100,6 +1101,10 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         tools = checkout / "tools"
         tools.mkdir(parents=True)
         shutil.copy2(SCRIPT, tools / SCRIPT.name)
+        shutil.copy2(SCRIPT.with_name("qcs-test-policy.py"), tools / "qcs-test-policy.py")
+        evidence_scripts = checkout / ".github/scripts"
+        evidence_scripts.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(workflow.SOURCE / ".github/scripts/qcs-ctest-evidence.py", evidence_scripts / "qcs-ctest-evidence.py")
         shutil.copy2(SCRIPT.with_name("qcs-path-budget.py"), tools / "qcs-path-budget.py")
         (checkout / "CMakeLists.txt").write_text('''
 cmake_minimum_required(VERSION 3.28)
@@ -1140,6 +1145,10 @@ add_test(NAME qcs-tests-second-marker
         tools = checkout / "tools"
         tools.mkdir(parents=True)
         shutil.copy2(SCRIPT, tools / SCRIPT.name)
+        shutil.copy2(SCRIPT.with_name("qcs-test-policy.py"), tools / "qcs-test-policy.py")
+        evidence_scripts = checkout / ".github/scripts"
+        evidence_scripts.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(workflow.SOURCE / ".github/scripts/qcs-ctest-evidence.py", evidence_scripts / "qcs-ctest-evidence.py")
         shutil.copy2(SCRIPT.with_name("qcs-path-budget.py"), tools / "qcs-path-budget.py")
         (checkout / "CMakeLists.txt").write_text('''
 cmake_minimum_required(VERSION 3.28)
@@ -1148,9 +1157,9 @@ enable_testing()
 foreach(name quick model similar)
   add_test(NAME "qcs-tests-${name}" COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/${name}-ran")
 endforeach()
-set_tests_properties(qcs-tests-quick PROPERTIES LABELS "unit")
-set_tests_properties(qcs-tests-model PROPERTIES LABELS "real-model;slow;unit")
-set_tests_properties(qcs-tests-similar PROPERTIES LABELS "slow-motion")
+set_tests_properties(qcs-tests-quick PROPERTIES LABELS "unit;program")
+set_tests_properties(qcs-tests-model PROPERTIES LABELS "real-model;slow;unit;program")
+set_tests_properties(qcs-tests-similar PROPERTIES LABELS "slow-motion;program")
 ''' + extra, encoding="utf-8")
         build = self.root / "构建 空格"
         command = [sys.executable, "-B", str(tools / SCRIPT.name)]
@@ -1304,6 +1313,10 @@ set_tests_properties(qcs-tests-quick PROPERTIES FIXTURES_REQUIRED model-data)
         tools.mkdir(parents=True)
         import shutil
         shutil.copy2(SCRIPT, tools / SCRIPT.name)
+        shutil.copy2(SCRIPT.with_name("qcs-test-policy.py"), tools / "qcs-test-policy.py")
+        evidence_scripts = checkout / ".github/scripts"
+        evidence_scripts.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(workflow.SOURCE / ".github/scripts/qcs-ctest-evidence.py", evidence_scripts / "qcs-ctest-evidence.py")
         shutil.copy2(SCRIPT.with_name("qcs-path-budget.py"), tools / "qcs-path-budget.py")
         (checkout / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.28)\nproject(qcs-relocation-test NONE)\n", encoding="utf-8")
         environment = os.environ.copy()
@@ -1330,4 +1343,23 @@ set_tests_properties(qcs-tests-quick PROPERTIES FIXTURES_REQUIRED model-data)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--suite", choices=("pure", "native", "all"), default="pure")
+    options, remaining = parser.parse_known_args()
+    native = {"test_nsis_compiles_recursive_unicode_payload_beyond_max_path"}
+    def load_tests(loader, tests, pattern):
+        cases = loader.loadTestsFromTestCase(WorkflowTests)
+        posix_only = {"test_clean_unlinks_internal_framework_and_versioned_library_links",
+                      "test_clean_rejects_external_symlink_without_deleting_any_target",
+                      "test_clean_rejects_linked_top_level_target"}
+        selected, excluded = [], []
+        for case in cases:
+            name = case._testMethodName
+            if os.name == "nt" and name in posix_only:
+                excluded.append({"case": case.id(), "reason": "POSIX framework and versioned-library symlink contract is covered on macOS/Linux. Windows junction boundaries run separately."})
+            elif options.suite == "all" or ((name in native) == (options.suite == "native")):
+                selected.append(case)
+        print("QCS_CASE_REGISTRATION " + json.dumps({"suite": options.suite,
+              "selected": [case.id() for case in selected], "notApplicable": excluded}, ensure_ascii=False), flush=True)
+        return unittest.TestSuite(selected)
+    unittest.main(argv=[sys.argv[0], *remaining], verbosity=2)

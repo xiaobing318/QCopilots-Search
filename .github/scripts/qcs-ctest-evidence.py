@@ -4,24 +4,18 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
 from pathlib import Path
 import re
 import sys
 import xml.etree.ElementTree as ET
 
-NON_QT_TESTS = {
-    "qcs-tests-semantic-manifest",
-    "qcs-tests-semantic",
-    "qcs-tests-workflow",
-    "qcs-tests-inference-install-layout",
-    "qcs-tests-macos-signing",
-    "qcs-tests-license-materials",
-    "qcs-tests-acceptance-runners",
-    "qcs-tests-runner",
-    "qcs-tests-path-budget",
-    "qcs-tests-temp-paths",
-}
+_policy_spec = importlib.util.spec_from_file_location(
+    "qcs_test_policy", Path(__file__).resolve().parents[2] / "tools/qcs-test-policy.py")
+policy = importlib.util.module_from_spec(_policy_spec)
+_policy_spec.loader.exec_module(policy)
+
 TOTALS = re.compile(r"^Totals:\s+(\d+) passed,\s+(\d+) failed,\s+(\d+) skipped,\s+(\d+) blacklisted", re.MULTILINE)
 SKIP = re.compile(r"^SKIP\s*:\s*(\S+)\s+(.*)$", re.MULTILINE)
 TRUNCATED = re.compile(r"\[This part of the test output was removed since it exceeds the threshold of \d+ bytes\.\]")
@@ -35,8 +29,8 @@ PLATFORM_EXCLUSIONS = {
 }
 SIGNING_TEST = "qcs-tests-macos-signing"
 WORKFLOW_TEST = "qcs-tests-workflow"
-PYTHON_CASE_TESTS = {SIGNING_TEST, WORKFLOW_TEST, "qcs-tests-license-materials",
-                     "qcs-tests-acceptance-runners", "qcs-tests-runner", "qcs-tests-path-budget", "qcs-tests-temp-paths"}
+WORKFLOW_NATIVE_TEST = "qcs-tests-workflow-native"
+WORKFLOW_NATIVE_CASE = "__main__.WorkflowTests.test_nsis_compiles_recursive_unicode_payload_beyond_max_path"
 SIGNING_WINDOWS_SKIP_REASON = "Windows lacks symbolic-link creation privilege (WinError 1314). Native CI must run this case."
 SIGNING_WINDOWS_SKIPS = {
     "__main__.SigningTests." + name for name in (
@@ -62,6 +56,7 @@ RUNNER_TEST = "qcs-tests-runner"
 RUNNER_WINDOWS_HANDLE_CASE = "__main__.TestRunner.test_real_windows_exclusive_handle_still_fails_cleanup"
 RUNNER_WINDOWS_HANDLE_SKIP_REASON = "Windows exclusive file handles require Windows"
 ACCEPTANCE_TEST = "qcs-tests-acceptance-runners"
+ACCEPTANCE_NATIVE_TEST = "qcs-tests-acceptance-native"
 ACCEPTANCE_WINDOWS_SKIP_REASON = "Windows native PowerShell and NTFS ACL contract"
 ACCEPTANCE_WINDOWS_CASES = {
     "qcs_test_portability_runners.PortabilityContracts." + name for name in (
@@ -83,14 +78,30 @@ UNITTEST_TOTAL = re.compile(r"^Ran (\d+) tests? in [\d.]+s\r?$", re.MULTILINE)
 UNITTEST_RESULT = re.compile(r"^(OK(?: \(skipped=\d+\))?|FAILED(?: \([^\r\n]*\))?)\r?$", re.MULTILINE)
 
 
+def unittest_case_identifier(method, identifier):
+    """Normalize Python 3.10's class-only and 3.11+'s full verbose IDs."""
+    if not re.fullmatch(r"test\w*", method) or not re.fullmatch(r"(?:\w+\.)+\w+", identifier):
+        raise ValueError("Python unittest method or case identity is malformed")
+    tail = identifier.rsplit(".", 1)[-1]
+    if tail == method:
+        return identifier
+    if tail.startswith("test"):
+        # An explicit but different test method must not be reinterpreted as
+        # a Python 3.10 class name and accepted under a synthetic identity.
+        raise ValueError("Python unittest method and case identity disagree")
+    return identifier + "." + method
+
+
 def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
     errors, records, skips = [], [], []
     counts = {"run": 0, "passed": 0, "failed": 0, "skipped": 0, "notApplicable": 0}
     for method, identifier, status in UNITTEST_CASE.findall(output):
+        try:
+            identifier = unittest_case_identifier(method, identifier)
+        except ValueError as error:
+            errors.append(str(error))
         record = {"case": identifier, "status": status}
         records.append(record)
-        if not identifier.endswith("." + method):
-            errors.append("Python unittest method and case identity disagree")
         if status == "ok":
             counts["passed"] += 1
         elif status.startswith("skipped "):
@@ -113,7 +124,7 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
                     and identifier == WORKFLOW_JUNCTION_CASE and reason == WORKFLOW_JUNCTION_SKIP_REASON)
                 or (program == RUNNER_TEST and operating_system in ("Linux", "Darwin")
                     and identifier == RUNNER_WINDOWS_HANDLE_CASE and reason == RUNNER_WINDOWS_HANDLE_SKIP_REASON)
-                or (program == ACCEPTANCE_TEST and operating_system in ("Linux", "Darwin")
+                or (program == ACCEPTANCE_NATIVE_TEST and operating_system in ("Linux", "Darwin")
                     and identifier in ACCEPTANCE_WINDOWS_CASES
                     and reason == ACCEPTANCE_WINDOWS_SKIP_REASONS[identifier]))
             entry = {"program": program, "case": identifier, "reason": reason,
@@ -122,7 +133,7 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
                 entry["requiredNativePlatforms"] = ["Linux", "Darwin"]
             if applicable and program == RUNNER_TEST and identifier == RUNNER_WINDOWS_HANDLE_CASE:
                 entry["requiredNativePlatforms"] = ["Windows"]
-            if applicable and program == ACCEPTANCE_TEST and identifier in ACCEPTANCE_WINDOWS_CASES:
+            if applicable and program == ACCEPTANCE_NATIVE_TEST and identifier in ACCEPTANCE_WINDOWS_CASES:
                 entry["requiredNativePlatforms"] = ["Windows"]
             skips.append(entry)
             record["reason"] = reason
@@ -151,16 +162,21 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
         executed = {record["case"] for record in records if record["status"] == "ok"}
         for identifier in sorted(required - executed):
             errors.append(f"Required native cleanup case did not pass: {identifier}")
+    if program == WORKFLOW_NATIVE_TEST:
+        if operating_system != "Windows" or not any(record["case"] == WORKFLOW_NATIVE_CASE and record["status"] == "ok" for record in records):
+            errors.append("The Windows NSIS compiler/install contract did not pass")
     if program == RUNNER_TEST and operating_system == "Windows":
         if not any(record["case"] == RUNNER_WINDOWS_HANDLE_CASE and record["status"] == "ok" for record in records):
             errors.append(f"Required native cleanup case did not pass: {RUNNER_WINDOWS_HANDLE_CASE}")
-    if program == ACCEPTANCE_TEST:
+    if program == ACCEPTANCE_NATIVE_TEST:
         for identifier in sorted(ACCEPTANCE_WINDOWS_CASES - set(identifiers)):
             errors.append(f"Required native portability case is missing: {identifier}")
         if operating_system == "Windows":
             executed = {record["case"] for record in records if record["status"] == "ok"}
             for identifier in sorted(ACCEPTANCE_WINDOWS_CASES - executed):
                 errors.append(f"Required native portability case did not pass: {identifier}")
+    if program == ACCEPTANCE_TEST and ACCEPTANCE_WINDOWS_CASES & set(identifiers):
+        errors.append("Pure acceptance suite unexpectedly executed native portability cases")
     return counts, records, skips, errors
 
 
@@ -183,18 +199,18 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
     cases = list(root.iter("testcase"))
     if not cases:
         document["errors"].append("CTest JUnit contains no test programs")
+    kinds = {}
     if inventory is None:
         document["errors"].append("The registered CTest inventory is missing")
     else:
         try:
             registered = json.loads(inventory.read_text(encoding="utf-8"))
-            if registered.get("kind") != "ctestInfo" or not isinstance(registered.get("tests"), list):
-                raise ValueError("Expected ctest --show-only=json-v1 output")
-            expected = [entry["name"] for entry in registered["tests"]]
-            if not expected or any(not isinstance(name, str) or not name for name in expected):
-                raise ValueError("Registered CTest names must be nonempty strings")
-            if len(set(expected)) != len(expected):
-                raise ValueError("Registered CTest inventory contains duplicate names")
+            selected = policy.select_inventory(registered, test_profile)
+            selection = policy.describe_inventory(registered, test_profile)
+            document["registeredPrograms"] = selection["registeredPrograms"]
+            document["excludedPrograms"] = selection["excludedPrograms"]
+            kinds = selection["evidenceKinds"]
+            expected = [entry["name"] for entry in selected["tests"]]
             document["expectedPrograms"] = sorted(expected)
             actual = [case.get("name", "") for case in cases]
             missing = sorted(set(expected) - set(actual))
@@ -223,7 +239,10 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
             errors.append("CTest truncated captured output, so individual case evidence is incomplete")
         totals = [tuple(map(int, match)) for match in TOTALS.findall(output)]
         skips = SKIP.findall(output)
-        is_qt_test = name not in PYTHON_CASE_TESTS and (name not in NON_QT_TESTS or "Start testing of " in output)
+        kind = kinds.get(name)
+        if kind is None:
+            errors.append("CTest program has no verified registered evidence kind")
+        is_qt_test = kind == "qttest"
         summary = {"name": name, "qtTest": is_qt_test, "errors": errors}
         if is_qt_test:
             if not totals:
@@ -260,7 +279,7 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
                     document["qtTestTotals"]["notApplicable"] += 1
                 else:
                     errors.append(f"Required QtTest case did not run: {identifier}")
-        elif name in PYTHON_CASE_TESTS:
+        elif kind == "python-unittest":
             counts, records, python_skips, python_errors = inspect_signing_unittest(output, operating_system, name)
             summary.update({"pythonTest": True, "pythonTestTotals": counts, "cases": records})
             errors.extend(python_errors)

@@ -19,12 +19,49 @@
 #include <winioctl.h>
 #include <cstring>
 #endif
+#ifdef Q_OS_MACOS
+#include <sys/xattr.h>
+#endif
 
 using namespace qcopilots_search;
 using namespace qcopilots_search::test;
 
 namespace {
 #ifdef Q_OS_WIN
+// Attribute changes are confined to fixture files and restored before their
+// temporary directory is removed, including when an assertion returns early.
+class TestWindowsAttributes {
+public:
+    explicit TestWindowsAttributes(QString path) : path_(QDir::toNativeSeparators(path))
+    {
+        original_ = GetFileAttributesW(reinterpret_cast<LPCWSTR>(path_.utf16()));
+    }
+    ~TestWindowsAttributes()
+    {
+        if (changed_ && !restore())
+            recordCleanupFailure(QStringLiteral("Cannot restore fixture attributes: %1 (Windows error %2)")
+                                     .arg(path_).arg(GetLastError()));
+    }
+    bool add(DWORD attributes)
+    {
+        if (original_ == INVALID_FILE_ATTRIBUTES) return false;
+        changed_ = SetFileAttributesW(reinterpret_cast<LPCWSTR>(path_.utf16()),
+                                     (original_ & ~FILE_ATTRIBUTE_NORMAL) | attributes);
+        return changed_;
+    }
+    bool restore()
+    {
+        if (!changed_) return true;
+        if (!SetFileAttributesW(reinterpret_cast<LPCWSTR>(path_.utf16()), original_)) return false;
+        changed_ = false;
+        return true;
+    }
+private:
+    QString path_;
+    DWORD original_ = INVALID_FILE_ATTRIBUTES;
+    bool changed_ = false;
+};
+
 // A junction is an actual Windows directory reparse point, but unlike a
 // symbolic link it does not need SeCreateSymbolicLinkPrivilege. Every endpoint
 // is contained in this fixture's root and cleanup removes only the link itself.
@@ -268,7 +305,7 @@ private slots:
         const QString root = temporary.root();
         QVERIFY(writeFile(root + "/node_modules/package/readme.txt"));
         QVERIFY(writeFile(root + "/folder.noindex/note.txt"));
-        QVERIFY(writeFile(root + "/.git/internal.txt"));
+        QVERIFY(writeFile(root + "/.svn/internal.txt"));
         QVERIFY(writeFile(root + "/secret-passwords.txt"));
         QVERIFY(writeFile(root + "/credentials.yaml"));
         QVERIFY(writeFile(root + "/notes.txt"));
@@ -277,6 +314,205 @@ private slots:
         QCOMPARE(fileNames(result), QSet<QString>({"notes.txt"}));
         QCOMPARE(result.directories, QStringList{normalizePath(root)});
     }
+
+    void independentScopesAllowSharedTextAndRejectCodeData()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString root = temporary.root();
+        const QStringList names{"shared.txt", "README.md", "guide.markdown", "page.html", "main.cpp",
+            "script.py", "Makefile", "LICENSE.txt", "NOTICE.md", "bundle.min.js", "theme.min.css",
+            "data.json", "records.csv", "photo.png", "recording.wav", "document.pdf", "rich.rtf"};
+        for (const auto &name : names) QVERIFY(writeFile(QDir(root).filePath(name)));
+        const auto general = FileCatalog::scan({{root}, {}, false, FolderRules::Scope::General});
+        QVERIFY2(general.errors.isEmpty(), qPrintable(general.errors.join('\n')));
+        QCOMPARE(fileNames(general), QSet<QString>({"shared.txt", "README.md", "guide.markdown", "page.html",
+            "LICENSE.txt", "NOTICE.md", "photo.png", "recording.wav", "document.pdf", "rich.rtf"}));
+        const auto code = FileCatalog::scan({{root}, {}, false, FolderRules::Scope::Code});
+        QVERIFY2(code.errors.isEmpty(), qPrintable(code.errors.join('\n')));
+        QCOMPARE(fileNames(code), QSet<QString>({"shared.txt", "README.md", "guide.markdown", "page.html",
+            "main.cpp", "script.py", "Makefile"}));
+        for (const auto &record : code.files) QCOMPARE(record.kind, QStringLiteral("code"));
+        const auto sharedIn = [](const ScanResult &result) {
+            for (const auto &record : result.files)
+                if (QFileInfo(record.path).fileName() == "shared.txt") return record;
+            return FileRecord{};
+        };
+        const auto generalShared = sharedIn(general);
+        const auto codeShared = sharedIn(code);
+        QCOMPARE(generalShared.kind, QStringLiteral("text"));
+        QCOMPARE(codeShared.kind, QStringLiteral("code"));
+        QCOMPARE(generalShared.path, codeShared.path);
+        QCOMPARE(generalShared.identity, codeShared.identity);
+        QCOMPARE(generalShared.fingerprint, codeShared.fingerprint);
+    }
+
+    void projectContentIsLimitedToScreenshotsEvenWhenChosen()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString project = temporary.path("project");
+        QVERIFY(writeFile(project + "/package.json", "{}"));
+        QVERIFY(writeFile(project + "/notes.txt"));
+        QVERIFY(writeFile(project + "/photo.png"));
+        QVERIFY(writeFile(project + "/nested/recording.wav"));
+        QVERIFY(writeFile(project + "/nested/source.cpp"));
+        const QStringList screenshots{"Screenshot 2026-10-14.png", "Screen Shot example.jpg",
+            "CleanShot result.webp", "SCR-example.PNG"};
+        for (const auto &name : screenshots) QVERIFY(writeFile(project + "/nested/" + name));
+        // A screenshot-like name on a document must not bypass project rules.
+        QVERIFY(writeFile(project + "/Screenshot notes.txt"));
+        QVERIFY(writeFile(temporary.path("outside.txt")));
+        const auto selectedProject = FileCatalog::scan({{project}, {}, false});
+        QVERIFY2(selectedProject.errors.isEmpty(), qPrintable(selectedProject.errors.join('\n')));
+        QCOMPARE(fileNames(selectedProject), QSet<QString>(screenshots.cbegin(), screenshots.cend()));
+        for (const auto &record : selectedProject.files) {
+            QVERIFY(record.screenshot);
+            QCOMPARE(record.kind, QStringLiteral("image"));
+        }
+        auto expected = fileNames(selectedProject);
+        expected.insert("outside.txt");
+        const auto ancestor = FileCatalog::scan({{temporary.root()}, {}, false});
+        QVERIFY2(ancestor.errors.isEmpty(), qPrintable(ancestor.errors.join('\n')));
+        QCOMPARE(fileNames(ancestor), expected);
+        const auto code = FileCatalog::scan({{project}, {}, false, FolderRules::Scope::Code});
+        QVERIFY2(code.errors.isEmpty(), qPrintable(code.errors.join('\n')));
+        QCOMPARE(fileNames(code), QSet<QString>({"notes.txt", "source.cpp", "Screenshot notes.txt"}));
+        for (const auto &record : code.files) QVERIFY(!record.screenshot);
+    }
+
+    void explicitlyChosenExcludedDirectoriesStillExcludeDescendants_data()
+    {
+        QTest::addColumn<QString>("directory");
+        QTest::addColumn<bool>("code");
+        for (const auto &directory : {".hidden", "node_modules", "Example.app"}) {
+            QTest::newRow(qPrintable(QString::fromLatin1(directory) + "-general")) << QString::fromLatin1(directory) << false;
+            QTest::newRow(qPrintable(QString::fromLatin1(directory) + "-code")) << QString::fromLatin1(directory) << true;
+        }
+    }
+
+    void explicitlyChosenExcludedDirectoriesStillExcludeDescendants()
+    {
+        QFETCH(QString, directory);
+        QFETCH(bool, code);
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString selected = QDir(temporary.root()).filePath(directory);
+        QVERIFY(writeFile(selected + "/kept.txt"));
+        QVERIFY(writeFile(selected + "/nested/visible.txt"));
+        QVERIFY(writeFile(selected + "/.hidden.txt"));
+        QVERIFY(writeFile(selected + "/.hidden/hidden.txt"));
+        QVERIFY(writeFile(selected + "/node_modules/cached.txt"));
+        QVERIFY(writeFile(selected + "/Nested.app/bundled.txt"));
+        const auto scope = code ? FolderRules::Scope::Code : FolderRules::Scope::General;
+        const auto notChosen = FileCatalog::scan({{temporary.root()}, {}, false, scope});
+        QVERIFY2(notChosen.errors.isEmpty(), qPrintable(notChosen.errors.join('\n')));
+        QVERIFY(notChosen.files.isEmpty());
+        const auto chosen = FileCatalog::scan({{temporary.root(), selected}, {}, false, scope});
+        QVERIFY2(chosen.errors.isEmpty(), qPrintable(chosen.errors.join('\n')));
+        QCOMPARE(fileNames(chosen), QSet<QString>({"kept.txt", "visible.txt"}));
+        QVERIFY(!chosen.directories.contains(normalizePath(selected + "/.hidden")));
+        QVERIFY(!chosen.directories.contains(normalizePath(selected + "/node_modules")));
+        QVERIFY(!chosen.directories.contains(normalizePath(selected + "/Nested.app")));
+    }
+
+    void mediaDatasetDetectionUsesCountRatioAndCameraExceptions_data()
+    {
+        QTest::addColumn<int>("total");
+        QTest::addColumn<int>("machine");
+        QTest::addColumn<bool>("camera");
+        QTest::addColumn<bool>("excluded");
+        QTest::newRow("below-minimum-count") << 299 << 299 << false << false;
+        QTest::newRow("below-seventy-percent") << 300 << 209 << false << false;
+        QTest::newRow("at-seventy-percent") << 300 << 210 << false << true;
+        QTest::newRow("camera-names-are-personal-media") << 300 << 300 << true << false;
+    }
+
+    void mediaDatasetDetectionUsesCountRatioAndCameraExceptions()
+    {
+        QFETCH(int, total);
+        QFETCH(int, machine);
+        QFETCH(bool, camera);
+        QFETCH(bool, excluded);
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString dataset = temporary.path("media");
+        const QStringList cameraPrefixes{"IMG_", "DSC_", "PXL_", "VID_", "DJI_"};
+        for (int index = 0; index < total; ++index) {
+            const QString prefix = index < machine
+                ? (camera ? cameraPrefixes[index % cameraPrefixes.size()] : QStringLiteral("sample-"))
+                : QStringLiteral("summer-holiday-view-");
+            QVERIFY(writeFile(QDir(dataset).filePath(prefix + QString::number(index).rightJustified(4, u'0') + ".jpg")));
+        }
+        QVERIFY(writeFile(dataset + "/Screenshot retained.png"));
+        QVERIFY(writeFile(dataset + "/personal-recording.wav"));
+        QVERIFY(writeFile(dataset + "/notes.txt"));
+        const auto result = FileCatalog::scan({{temporary.root()}, {}, false});
+        QVERIFY2(result.errors.isEmpty(), qPrintable(result.errors.join('\n')));
+        if (excluded) {
+            QCOMPARE(fileNames(result), QSet<QString>({"Screenshot retained.png", "notes.txt"}));
+        } else {
+            QCOMPARE(result.files.size(), total + 3);
+        }
+        // Explicitly selecting the media directory opts in, also when an
+        // ancestor was scanned first and excluded this directory's dataset.
+        const auto selected = FileCatalog::scan({{temporary.root(), dataset}, {}, false});
+        QVERIFY2(selected.errors.isEmpty(), qPrintable(selected.errors.join('\n')));
+        QCOMPARE(selected.files.size(), total + 3);
+    }
+
+#ifdef Q_OS_WIN
+    void offlineFilesAreRejectedBeforeContentInspection()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString document = temporary.path("offline.txt");
+        const QString stream = temporary.path("offline.ts");
+        QVERIFY(writeFile(document));
+        QByteArray transport(600, '\0');
+        transport[0] = transport[188] = transport[376] = 0x47;
+        QVERIFY(writeFile(stream, transport));
+        TestWindowsAttributes documentAttributes(document), streamAttributes(stream);
+        QVERIFY(documentAttributes.add(FILE_ATTRIBUTE_OFFLINE));
+        QVERIFY(streamAttributes.add(FILE_ATTRIBUTE_OFFLINE));
+        for (const auto &path : {document, stream}) {
+            FileRecord record;
+            QString error;
+            QVERIFY(!FileCatalog::describe(path, &record, &error));
+            QVERIFY2(error.contains("cloud"), qPrintable(error));
+            QVERIFY(record.path.isEmpty());
+        }
+        const auto offline = FileCatalog::scan({{temporary.root()}, {}, true});
+        QVERIFY2(offline.errors.isEmpty(), qPrintable(offline.errors.join('\n')));
+        QVERIFY(offline.files.isEmpty());
+        QVERIFY(documentAttributes.restore());
+        QVERIFY(streamAttributes.restore());
+        const auto downloaded = FileCatalog::scan({{temporary.root()}, {}, false});
+        QVERIFY2(downloaded.errors.isEmpty(), qPrintable(downloaded.errors.join('\n')));
+        QCOMPARE(fileNames(downloaded), QSet<QString>({"offline.txt", "offline.ts"}));
+    }
+#endif
+
+#ifdef Q_OS_MACOS
+    void macScreenCaptureAttributePreservesProjectScreenshot()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString screenshot = temporary.path("renamed-capture.png");
+        QVERIFY(writeFile(temporary.path("package.json"), "{}"));
+        QVERIFY(writeFile(screenshot));
+        const QByteArray name = QFile::encodeName(screenshot);
+        const char capture[] = "true";
+        QCOMPARE(::setxattr(name.constData(), "com.apple.metadata:kMDItemIsScreenCapture",
+                            capture, sizeof(capture) - 1, 0, XATTR_NOFOLLOW), 0);
+        const auto result = FileCatalog::scan({{temporary.root()}, {}, false});
+        QVERIFY2(result.errors.isEmpty(), qPrintable(result.errors.join('\n')));
+        QCOMPARE(result.files.size(), 1);
+        QVERIFY(result.files.constFirst().screenshot);
+        QCOMPARE(QFileInfo(result.files.constFirst().path).fileName(), QStringLiteral("renamed-capture.png"));
+        QCOMPARE(::removexattr(name.constData(), "com.apple.metadata:kMDItemIsScreenCapture", XATTR_NOFOLLOW), 0);
+    }
+#endif
 
     void missingRootIsExplicitError()
     {
@@ -604,6 +840,26 @@ private slots:
         QVERIFY(result.files.isEmpty());
         QCOMPARE(result.errors.size(), 1);
         QVERIFY(result.errors[0].contains("Git"));
+    }
+
+    void codeScopeSkipsNestedWorktreeUnlessExplicitlySelected()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString nested = temporary.path("nested-worktree");
+        QVERIFY(writeFile(temporary.path("outer.cpp")));
+        QVERIFY(writeFile(nested + "/inner.cpp"));
+        QVERIFY(writeFile(nested + "/.git", "gitdir: ./missing-repository\n"));
+        const auto ancestor = FileCatalog::scan({{temporary.root()}, {}, false, FolderRules::Scope::Code});
+        QVERIFY2(ancestor.errors.isEmpty(), qPrintable(ancestor.errors.join('\n')));
+        QCOMPARE(fileNames(ancestor), QSet<QString>{"outer.cpp"});
+        QVERIFY(!ancestor.directories.contains(normalizePath(nested)));
+        // The explicit root is examined instead of being silently skipped.
+        // Its broken Git metadata must fail closed rather than leak contents.
+        const auto selected = FileCatalog::scan({{nested}, {}, false, FolderRules::Scope::Code});
+        QVERIFY(selected.files.isEmpty());
+        QCOMPARE(selected.errors.size(), 1);
+        QVERIFY(selected.errors.constFirst().contains("Git"));
     }
 };
 

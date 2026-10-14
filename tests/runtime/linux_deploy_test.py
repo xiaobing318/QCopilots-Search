@@ -1,4 +1,5 @@
 """Exercise Qt deployment after normal, stripped and CPack installation on Linux."""
+import configparser
 import os
 from pathlib import Path
 import re
@@ -52,6 +53,17 @@ def check_linux_deployment(options, source, repo, root):
 
     def verify(stage, label):
         binary = stage / "bin/qcs-deploy-fixture"
+        desktop = stage / "share/applications/com.qcopilots.qcopilots-search.desktop"
+        if not desktop.is_file():
+            raise RuntimeError(f"Missing installed Linux desktop entry: {desktop}")
+        desktop_content = configparser.ConfigParser(interpolation=None)
+        desktop_content.optionxform = str
+        desktop_content.read_string(desktop.read_text(encoding="utf-8"))
+        expected_entry = {"Type": "Application", "Name": "QCopilots Search",
+                          "Exec": "qcs-gui", "Terminal": "false",
+                          "Categories": "Utility;Filesystem;"}
+        if desktop_content.sections() != ["Desktop Entry"] or dict(desktop_content["Desktop Entry"]) != expected_entry:
+            raise RuntimeError(f"Invalid installed Linux desktop entry: {desktop_content.items()}")
         for name in (owner, module, transitive):
             if not (stage / "lib" / name).is_file():
                 raise RuntimeError(f"Missing deployed transitive/owned library: {name}")
@@ -64,8 +76,9 @@ def check_linux_deployment(options, source, repo, root):
         mapped = run([binary, stage / "lib" / module], env=environment).splitlines()
         if len(mapped) != 4 or any(not Path(path).resolve().is_relative_to(stage.resolve()) for path in mapped):
             raise RuntimeError(f"Deployed process escaped its installation: {mapped}")
-        records.append({"case": label, "passed": True, "mappedLibraries": mapped})
-        print(f"PASS {label}: Qt deployment preserves installed RPATH and indirect dependencies", flush=True)
+        records.append({"case": label, "passed": True, "mappedLibraries": mapped,
+                        "desktopEntry": desktop.relative_to(stage).as_posix()})
+        print(f"PASS {label}: desktop entry, installed RPATH and indirect dependencies verified", flush=True)
 
     for label, strip in (("linux-install", False), ("linux-install-strip", True)):
         stage = root / "linux-deploy" / f"{label} 中文 空格"

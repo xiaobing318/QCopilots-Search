@@ -27,15 +27,6 @@ for stream in (sys.stdout, sys.stderr):
 SOURCE = Path(__file__).resolve().parents[2]
 PRODUCT = "qcs"
 sys.dont_write_bytecode = True
-FAST_TESTS = {PRODUCT + "-tests-" + name for name in (
-    "workflow", "macos-signing", "license-materials", "runner", "path-budget", "temp-paths",
-    "core", "file-catalog", "model-files", "backend-layout", "inference-install-layout",
-    "image-sizing", "runtime", "extraction-document", "extraction-image", "extraction-media",
-    "extraction-legacy_doc", "index_repository", "vector_index", "index_repository_regression",
-    "search_cancellation", "recovery_process", "service", "client", "worker", "cli", "gui",
-    "gui-service", "semantic-manifest")}
-SLOW_TESTS = {PRODUCT + "-tests-" + name for name in (
-    "reference-vectors", "semantic", "acceptance-runners", "file-capacity")}
 
 
 def test_profile():
@@ -164,8 +155,8 @@ def find_program(name: str, *, installed: bool) -> Path:
     prefix = ROOT / ("stage" if installed else "release")
     suffix = ".exe" if os.name == "nt" else ""
     candidates = [prefix / "bin" / (name + suffix),
-                  prefix / "bin/qcs.app/Contents/MacOS" / name,
-                  prefix / "qcs.app/Contents/MacOS" / name]
+                  prefix / "bin/qcs-gui.app/Contents/MacOS" / name,
+                  prefix / "qcs-gui.app/Contents/MacOS" / name]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
@@ -186,15 +177,7 @@ def native_environment():
 
 
 def models():
-    MODELS.mkdir(parents=True, exist_ok=True)
-    cli = find_program(PRODUCT + "-cli", installed=True)
-    common = [cli, "--model-dir", MODELS, "--profile-dir", ROOT / "ci-model-profile"]
-    manifest = run([*common, "models", "manifest"], environment=native_environment(), capture=True)
-    (REPORTS / "models-manifest.json").write_text(manifest.stdout, encoding="utf-8")
-    run([*common, "--timeout", "1800000", "--progress", "models", "download"], environment=native_environment())
-    verified = run([*common, "models", "verify"], environment=native_environment(), capture=True)
-    print(verified.stdout)
-    (REPORTS / "models.json").write_text(verified.stdout, encoding="utf-8")
+    dev("models")
 
 
 def capacity():
@@ -213,19 +196,11 @@ def package_for_suffix(suffix: str):
 
 
 def installers():
-    if os.name == "nt":
-        dev("verify-package", "--package-file", str(package_for_suffix(".exe")),
-            "--report-dir", str(REPORTS / "package-nsis"), display=True)
-    elif platform.system() == "Linux":
-        run([sys.executable, SOURCE / ".github/scripts/qcs-deb-ci.py",
-             "--build-root", ROOT, "--package-file", package_for_suffix(".deb"),
-             "--model-dir", MODELS, "--report-dir", REPORTS / "package-deb"])
-    else:
-        raise RuntimeError("There is no additional installer acceptance for this platform")
+    dev("installers", display=True)
 
 
 def test_evidence(*, require_complete=False, profile="full"):
-    inventory_name = "test-selected-inventory.json" if profile == "fast" else "ctest-inventory.json"
+    inventory_name = "ctest-inventory.json"
     command = [sys.executable, SOURCE / ".github/scripts/qcs-ctest-evidence.py",
                "--junit", REPORTS / "tests/ctest.xml", "--platform", platform.system(),
                "--inventory", REPORTS / "tests" / inventory_name, "--test-profile", profile,
@@ -384,7 +359,7 @@ def signature_evidence(stage: Path, *, system: str | None = None):
     if (system or platform.system()) != "Darwin":
         result["reason"] = "Native signing verification is not configured for this platform"
         return result
-    target = stage / "qcs.app"
+    target = stage / "qcs-gui.app"
     result["target"] = str(target)
     if not target.is_dir():
         result["reason"] = "The installed application bundle is absent"
@@ -658,21 +633,13 @@ def fast_selection(root: Path, architecture: str):
     registered = evidence.read_json(directory / "ctest-inventory.json")
     selected = evidence.read_json(directory / "test-selected-inventory.json")
     selection = evidence.read_json(directory / "test-selection.json")
-    def names(document):
-        if document.get("kind") != "ctestInfo" or not isinstance(document.get("tests"), list):
-            raise ValueError("Invalid CTest inventory")
-        values = [test["name"] for test in document["tests"]]
-        if not values or any(not isinstance(name, str) for name in values) or len(set(values)) != len(values):
-            raise ValueError("Empty, invalid or duplicate CTest inventory")
-        return set(values)
-    all_names, selected_names = names(registered), names(selected)
-    slow = set(SLOW_TESTS)
-    if architecture == "x86_64":
-        slow.add("qcs-tests-reference-vectors-baseline")
-    labeled_slow = {test["name"] for test in registered["tests"] if "slow" in next(
-        (prop["value"] for prop in test.get("properties", []) if prop["name"] == "LABELS"), [])}
-    if all_names != FAST_TESTS | slow or labeled_slow != slow or selected_names != FAST_TESTS:
-        raise ValueError("Fast CTest registration, slow labels or selection differ from the required scope")
+    policy = developer_workflow().helper_module("tools/qcs-test-policy.py", "qcs_native_policy")
+    scope = policy.describe_inventory(registered, "fast")
+    all_names, selected_names = set(scope["registeredPrograms"]), set(scope["selectedPrograms"])
+    slow = set(scope["excludedPrograms"])
+    actual_selected = policy.describe_inventory(selected, "full")["selectedPrograms"]
+    if set(actual_selected) != selected_names:
+        raise ValueError("Fast CTest selection differs from the registered slow-label policy")
     if evidence.read_json(directory / "test-inventory.json") != registered:
         raise ValueError("CTest registration changed between native and developer invocations")
     expected = {"profile": "fast", "kind": "ctest-selection", "status": "passed", "passed": True,
@@ -725,20 +692,21 @@ def inspect_fast(root: Path, *, expected_head: str, expected_run: str, expected_
                 or summary.get("wrapperCollectionComplete") is not True):
             errors.append("Fast acceptance identity or scope is invalid")
         system, architecture = evidence.PLATFORMS[platform_id]
-        fast_selection(root, architecture)
+        selection = fast_selection(root, architecture)
         spec = importlib.util.spec_from_file_location("qcs_fast_cases", SOURCE / ".github/scripts/qcs-ctest-evidence.py")
         parser = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(parser)
         cases = parser.inspect_junit(root / "reports/tests/ctest.xml", system,
-                                     root / "reports/tests/test-selected-inventory.json", "fast")
+                                     root / "reports/tests/ctest-inventory.json", "fast")
         errors.extend(cases["errors"])
         if cases.get("testsComplete") is not True or cases.get("releaseComplete") is not False:
             errors.append("Fast selected test cases are incomplete or falsely claim release completion")
         wrappers = evidence.read_json(root / "reports/wrappers/index.json")
         if wrappers.get("collectionComplete") is not True or wrappers.get("errors") or wrappers.get("missingLabels"):
             errors.append("Fast wrapper diagnostics are incomplete")
-        if (len(wrappers.get("files", [])) != len(FAST_TESTS)
-                or {item.get("label") for item in wrappers.get("files", [])} != FAST_TESTS):
+        expected_programs = set(selection["selectedTests"])
+        if (len(wrappers.get("files", [])) != len(expected_programs)
+                or {item.get("label") for item in wrappers.get("files", [])} != expected_programs):
             errors.append("Fast wrapper programs differ from the required selected tests")
         for item in wrappers.get("files", []):
             path = "reports/" + item["path"]
@@ -933,17 +901,7 @@ def main():
             dev("package", "--generator", generator)
         dev("verify-package", "--report-dir", str(REPORTS / "package"), display=True)
     elif action == "sources":
-        run([sys.executable, SOURCE / "tools/qcs-source-bundle.py", "--build-root", ROOT,
-             "--qt-root", QT, "--download"])
-        archives = [ROOT / "deps/sources/llama.cpp-b11461.tar.gz", ROOT / "deps/llama-b11461.tar.gz"]
-        archive = next((path for path in archives if path.is_file()), None)
-        if archive is None:
-            raise RuntimeError("The collected llama source archive is unavailable for rebuild verification")
-        run([sys.executable, SOURCE / "tests/runtime/source_integrity_test.py", "--archive", archive,
-             "--report", REPORTS / "source-integrity.json"])
-        integrity = json.loads((REPORTS / "source-integrity.json").read_text(encoding="utf-8"))
-        if integrity.get("passed") is not True:
-            raise RuntimeError("Required source-integrity cases failed or did not execute")
+        dev("sources")
     elif action == "installers":
         installers()
     elif action == "report":

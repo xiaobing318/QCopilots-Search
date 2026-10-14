@@ -1,5 +1,10 @@
 include_guard(GLOBAL)
 
+function(qcopilots_search_install_linux_desktop)
+  install(FILES "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../resources/com.qcopilots.qcopilots-search.desktop"
+    DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/applications")
+endfunction()
+
 function(qcopilots_search_linux_deploy_arguments output)
   # CMake installs, rewrites the RPATH and optionally strips these targets
   # before Qt deploys dependencies. A second raw copy from the build tree

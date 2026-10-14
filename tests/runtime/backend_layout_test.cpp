@@ -25,7 +25,7 @@ private slots:
         QString error;
         auto temporary = test::temporaryDirectory(&error);
         QVERIFY2(temporary != nullptr, qPrintable(error));
-        const auto contents = temporary->filePath(QStringLiteral("中文 安装/qcs.app/Contents"));
+        const auto contents = temporary->filePath(QStringLiteral("中文 安装/qcs-gui.app/Contents"));
         const auto executable = QDir(contents).filePath(QStringLiteral("MacOS"));
         const auto plugins = QDir(contents).filePath(QStringLiteral("PlugIns/ggml"));
         const auto frameworks = QDir(contents).filePath(QStringLiteral("Frameworks"));

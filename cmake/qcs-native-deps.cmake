@@ -5,6 +5,8 @@ include_guard(GLOBAL)
 # consistent prefix and never silently resolve to an unpinned system package.
 include(FetchContent)
 include(GNUInstallDirs)
+include(qcs-output-paths)
+include("${CMAKE_CURRENT_LIST_DIR}/qcs-write-if-different.cmake")
 
 function(qcopilots_search_fetch name url sha256)
     # Short stable keys keep source caches readable and build trees bounded.
@@ -24,6 +26,8 @@ function(qcopilots_search_fetch name url sha256)
     endif()
     set(QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT "${CMAKE_BINARY_DIR}/nd"
         CACHE PATH "Per-configuration native dependency build directory")
+    qcopilots_search_require_external_path(FETCHCONTENT_BASE_DIR "${FETCHCONTENT_BASE_DIR}")
+    qcopilots_search_require_external_path(QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}")
     file(REAL_PATH "${CMAKE_SOURCE_DIR}" source_root)
     file(REAL_PATH "${FETCHCONTENT_BASE_DIR}" dependency_root)
     cmake_path(IS_PREFIX source_root "${dependency_root}" NORMALIZE inside_source)
@@ -45,6 +49,9 @@ function(qcopilots_search_fetch name url sha256)
     set(source_marker "${cached_source}/.qcs-source-sha256")
     string(TOUPPER "${name}" upper_name)
     set(explicit_source_override "${FETCHCONTENT_SOURCE_DIR_${upper_name}}")
+    if(explicit_source_override)
+        qcopilots_search_require_external_path("FETCHCONTENT_SOURCE_DIR_${upper_name}" "${explicit_source_override}")
+    endif()
     if(NOT explicit_source_override AND EXISTS "${source_marker}")
         file(READ "${source_marker}" cached_hash)
         string(STRIP "${cached_hash}" cached_hash)
@@ -150,7 +157,7 @@ function(qcopilots_search_add_archive_dependency)
         "${qcs_miniz_SOURCE_DIR}/miniz_tinfl.c"
         "${qcs_miniz_SOURCE_DIR}/miniz_tdef.c")
     file(MAKE_DIRECTORY "${qcs_miniz_BINARY_DIR}")
-    file(WRITE "${qcs_miniz_BINARY_DIR}/miniz_export.h"
+    qcopilots_search_write_if_different("${qcs_miniz_BINARY_DIR}/miniz_export.h"
         "#pragma once\n#define MINIZ_EXPORT\n#define MINIZ_NO_EXPORT\n")
     target_include_directories(qcs-native-miniz SYSTEM PUBLIC
         "${qcs_miniz_SOURCE_DIR}" "${qcs_miniz_BINARY_DIR}")

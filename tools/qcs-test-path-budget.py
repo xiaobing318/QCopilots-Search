@@ -63,11 +63,11 @@ class PathBudgetTests(unittest.TestCase):
         (build / "build.ninja").write_text(
             "rule compile\n  command = unused-compiler $in $out\n"
             "rule generate\n  command = unused-generator $out\n"
-            "build CMakeFiles/qcs.dir/file.cpp.obj: compile\n"
-            "build qcs_autogen/mocs_compilation.cpp: generate\n"
+            "build CMakeFiles/qcs-gui.dir/file.cpp.obj: compile\n"
+            "build qcs-gui_autogen/mocs_compilation.cpp: generate\n"
             "build generated$ 文件/qrc_resources.cpp: generate\n"
-            "build qcs.exe: generate CMakeFiles/qcs.dir/file.cpp.obj\n"
-            "build all: phony qcs.exe\n",
+            "build qcs-gui.exe: generate CMakeFiles/qcs-gui.dir/file.cpp.obj\n"
+            "build all: phony qcs-gui.exe\n",
             encoding="utf-8")
         return build
 
@@ -79,15 +79,15 @@ class PathBudgetTests(unittest.TestCase):
 
     def test_classification(self):
         samples = {
-            "CMakeFiles/qcs.dir/file.cpp.obj": "object",
-            "CMakeFiles/qcs.dir/file.cpp.o": "object",
-            "qcs_autogen/CMakeFiles/qcs.dir/qrc_resources.cpp.obj": "object",
-            "qcs_autogen/CMakeFiles/qcs.dir/qrc_resources.cpp.o": "object",
-            "qcs_autogen/mocs_compilation.cpp": "moc",
+            "CMakeFiles/qcs-gui.dir/file.cpp.obj": "object",
+            "CMakeFiles/qcs-gui.dir/file.cpp.o": "object",
+            "qcs-gui_autogen/CMakeFiles/qcs-gui.dir/qrc_resources.cpp.obj": "object",
+            "qcs-gui_autogen/CMakeFiles/qcs-gui.dir/qrc_resources.cpp.o": "object",
+            "qcs-gui_autogen/mocs_compilation.cpp": "moc",
             "generated/qrc_qcs.cpp": "rcc",
-            "CMakeFiles/qcs.rsp": "response",
+            "CMakeFiles/qcs-gui.rsp": "response",
             "sb/tesseract/qcs_tess-populate-stamp/update.txt": "fetchcontent",
-            "qcs.exe": "build",
+            "qcs-gui.exe": "build",
         }
         for path, expected in samples.items():
             with self.subTest(path=path):
@@ -159,11 +159,11 @@ class PathBudgetTests(unittest.TestCase):
 
     def test_unmaterialized_per_header_and_included_moc_outputs_are_checked(self):
         build = self.graph()
-        metadata = build / "CMakeFiles/qcs_autogen.dir/AutogenInfo.json"
+        metadata = build / "CMakeFiles/qcs-gui_autogen.dir/AutogenInfo.json"
         metadata.parent.mkdir(parents=True)
         source = self.root / "tests.cpp"
         source.write_text('#include "tests.moc"\n', encoding="utf-8")
-        autogen = build / "qcs_autogen"
+        autogen = build / "qcs-gui_autogen"
         moc = "/".join(["m" * 65] * 4) + "/moc_header.cpp"
         metadata.write_text(json.dumps({
             "BUILD_DIR": str(autogen), "INCLUDE_DIR": str(autogen / "include"),
@@ -184,7 +184,7 @@ class PathBudgetTests(unittest.TestCase):
         stamp = build / "sb/tess/qcs_tess-populate-prefix/src/qcs_tess-populate-stamp/update-info.txt"
         stamp.parent.mkdir(parents=True)
         stamp.write_text("test stamp", encoding="utf-8")
-        response = build / "CMakeFiles/qcs.rsp"
+        response = build / "CMakeFiles/qcs-gui.rsp"
         response.parent.mkdir(parents=True)
         response.write_text("object list", encoding="utf-8")
         report = budget.inspect_paths(self.args(build=build, ninja=self.ninja()))
@@ -194,9 +194,9 @@ class PathBudgetTests(unittest.TestCase):
         self.assertEqual(report["passed"], not report["offenders"])
         paths = {row["path"]: row for row in report["paths"]}
         self.assertEqual(paths[str(stamp.resolve())]["category"], "fetchcontent")
-        obj = paths[str((build / "CMakeFiles/qcs.dir/file.cpp.obj").resolve())]
+        obj = paths[str((build / "CMakeFiles/qcs-gui.dir/file.cpp.obj").resolve())]
         self.assertEqual(obj["origins"], ["ninja"])
-        self.assertFalse((build / "qcs.exe").exists(), "Inspection must not build the graph")
+        self.assertFalse((build / "qcs-gui.exe").exists(), "Inspection must not build the graph")
         self.assertFalse(any(row["path"].endswith(os.sep + "all") for row in paths.values()))
         self.assertEqual(report["summary"]["byCategory"]["object"], 1)
 

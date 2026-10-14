@@ -6,9 +6,9 @@ QCopilots Search 是使用 C++20、Qt Widgets 和 CMake 开发的本地多模态
 
 ## 应用与数据
 
-GUI 为 `qcs`，本地服务为 `qcs-service`，提取和推理工作进程为 `qcs-worker`，命令行入口为 `qcs-cli`。所有组件使用相同的运行目录配置，服务统一管理索引写入和查询。
+GUI 为 `qcs-gui`，Windows 对应 `qcs-gui.exe`，macOS 应用包为 `qcs-gui.app`。本地服务为 `qcs-service`，提取和推理工作进程为 `qcs-worker`，命令行入口为 `qcs-cli`。所有组件使用相同的运行目录配置，服务统一管理索引写入和查询。
 
-程序、开发脚本和新生成产物采用短名称，不提供旧命令别名。产品显示名称仍为 QCopilots Search，C++ 命名空间为 `qcopilots_search`，配置变量使用 `QCOPILOTS_SEARCH_*`。首次切换使用新的 profile 和构建目录，不把旧构建缓存改名后继续使用，也不自动迁移旧配置或索引。
+程序、开发脚本和新生成产物采用 `qcs` 前缀，不提供旧 GUI 命令别名。仓库规范名称为 `QCopilots-Search`，产品显示名称仍为 QCopilots Search，C++ 命名空间为 `qcopilots_search`，配置变量使用 `QCOPILOTS_SEARCH_*`。本轮仓库和 GUI 改名保持现有 `qcs` profile、配置和索引路径不变。源码位置或构建目标变更后重新配置外置构建目录，不把旧构建缓存改名后继续使用。
 
 搜索只处理用户选择的目录。模型保存在本地，下载模型和检查更新需要网络，文件提取与搜索在本机执行。没有模型时仍可使用文件名和已提取文本的关键词搜索。删除索引配置不应删除源文件。
 
@@ -25,8 +25,8 @@ Qt 固定为 6.12.0，Qt PDF 为与该 Qt 版本配套的独立 6.140.0 模块�
 Windows PowerShell 示例，路径可以替换为其他盘符或包含中文、空格的目录：
 
 ```powershell
-git clone https://github.com/xiaobing318/QCopilots-search.git
-Set-Location QCopilots-search
+git clone https://github.com/xiaobing318/QCopilots-Search.git
+Set-Location QCopilots-Search
 $buildRoot = Join-Path (Split-Path $PWD.Path -Parent) 'qcs-build'
 $qtRoot = Join-Path (Split-Path $PWD.Path -Parent) 'Qt-SDK'
 ./qcs-dev.ps1 bootstrap --build-root $buildRoot --qt-root $qtRoot
@@ -39,8 +39,8 @@ $qtRoot = Join-Path (Split-Path $PWD.Path -Parent) 'Qt-SDK'
 macOS / Linux 的入口参数相同：
 
 ```bash
-git clone https://github.com/xiaobing318/QCopilots-search.git
-cd QCopilots-search
+git clone https://github.com/xiaobing318/QCopilots-Search.git
+cd QCopilots-Search
 build_root="$(dirname "$PWD")/qcs-build"
 qt_root="$(dirname "$PWD")/Qt-SDK"
 bash ./qcs-dev.sh bootstrap --build-root "$build_root" --qt-root "$qt_root"
@@ -76,6 +76,7 @@ $modelDir = Join-Path $buildRoot 'models'
 ## 文档
 
 - [开发指南](docs/development.md)
+- [脚本审查与维护清单](docs/script-audit.md)
 - [架构与进程契约](docs/architecture.md)
 - [依赖、模型与格式边界](docs/dependencies.md)
 - [测试指南](docs/testing.md) 和 [需求与测试矩阵](docs/requirements-test-matrix.md)

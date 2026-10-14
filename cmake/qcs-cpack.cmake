@@ -2,6 +2,15 @@
 # would include EXCLUDE_FROM_ALL developer exports and could sign the macOS
 # bundle before a later component writes runtime resources into it.
 set(CPACK_MONOLITHIC_INSTALL ON)
+if(DEFINED CPACK_QCS_SOURCE_DIR)
+  set(Python3_EXECUTABLE "${CPACK_QCS_PYTHON_EXECUTABLE}")
+  include("${CMAKE_CURRENT_LIST_DIR}/qcs-output-paths.cmake")
+  foreach(_root CPACK_PACKAGE_DIRECTORY CPACK_TOPLEVEL_DIRECTORY)
+    if(DEFINED ${_root} AND NOT "${${_root}}" STREQUAL "")
+      qcopilots_search_require_external_path("${_root}" "${${_root}}" "${CPACK_QCS_SOURCE_DIR}")
+    endif()
+  endforeach()
+endif()
 
 if(CPACK_GENERATOR MATCHES "^NSIS")
   # CMake 3.28's built-in template unconditionally asks for administrator

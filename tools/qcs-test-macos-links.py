@@ -37,9 +37,9 @@ class LinkTests(unittest.TestCase):
             Path(root).mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix="qcs-links-", dir=root)
         self.addCleanup(self.temporary.cleanup)
-        self.app = Path(self.temporary.name) / "中文 空格" / "qcs.app"
+        self.app = Path(self.temporary.name) / "中文 空格" / "qcs-gui.app"
         self.outputs, self.calls = {}, []
-        self.main = self.bundle(self.app, "qcs")
+        self.main = self.bundle(self.app, "qcs-gui")
         self.library = self.image("Contents/Frameworks/libnative.1.dylib")
 
     def bundle(self, root, name):
@@ -198,4 +198,4 @@ class LinkTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

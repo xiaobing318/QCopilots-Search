@@ -88,7 +88,7 @@ PR 的候选提交使用事件中的 `pull_request.head.sha`，其他事件使�
 ```powershell
 $tool = Join-Path $source 'tools/qcs-release-evidence.py'
 & $python $tool record-build --source $source --output-root $evidenceRoot `
-  --program "qcs=$buildRoot/release/bin/qcs.exe" `
+  --program "qcs-gui=$buildRoot/release/bin/qcs-gui.exe" `
   --program "qcs-service=$buildRoot/release/bin/qcs-service.exe" `
   --program "qcs-worker=$buildRoot/release/bin/qcs-worker.exe" `
   --program "qcs-cli=$buildRoot/release/bin/qcs-cli.exe" `
@@ -150,6 +150,6 @@ $millionPreflight = Join-Path $source 'tools/acceptance/qcs-physical-preflight.p
 
 macOS 部署默认使用 ad-hoc 签名。Qt 先通过 `-no-codesign` 完成依赖复制、路径修改和 strip，然后项目签名工具扫描整个 APP 中的实际 Mach-O 文件，包括无链接引用的完整版本 dylib、动态加载模块和 universal binary。独立代码文件和嵌套 framework、APP 从内到外签名，最外层 APP 最后签。工具逐个验证代码文件和 bundle，再执行 `codesign --verify --deep --strict`。签名不使用 `--deep`，也不允许签名后再次修改 APP 内容。签名清单和命令记录写到 APP 外部的 `reports/qcs-macos-signing-<配置>.json`。
 
-`QCOPILOTS_SEARCH_MACOS_CODESIGN_IDENTITY` 默认为 `-`，可以显式指定受控钥匙串中的证书身份。指定证书但不可用时构建失败，不回退到 ad-hoc。证书模式启用 secure timestamp，并为 executable 启用 Hardened Runtime。可选 `QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP` 指向 JSON 文件，键为 APP 内 executable 的相对路径，例如 `Contents/MacOS/qcs`，值为相对于该 JSON 文件的 entitlement plist 路径。只有映射中明确列出的 executable 会附加这些权限，库和 framework 不接受 entitlement 映射。未配置时不自动继承第三方代码的旧 entitlements，已有权限需求必须在该映射中明确列出。私钥和签名凭据不能写入仓库、日志或普通测试产物。
+`QCOPILOTS_SEARCH_MACOS_CODESIGN_IDENTITY` 默认为 `-`，可以显式指定受控钥匙串中的证书身份。指定证书但不可用时构建失败，不回退到 ad-hoc。证书模式启用 secure timestamp，并为 executable 启用 Hardened Runtime。可选 `QCOPILOTS_SEARCH_MACOS_ENTITLEMENTS_MAP` 指向 JSON 文件，键为 APP 内 executable 的相对路径，例如 `Contents/MacOS/qcs-gui`，值为相对于该 JSON 文件的 entitlement plist 路径。只有映射中明确列出的 executable 会附加这些权限，库和 framework 不接受 entitlement 映射。未配置时不自动继承第三方代码的旧 entitlements，已有权限需求必须在该映射中明确列出。私钥和签名凭据不能写入仓库、日志或普通测试产物。
 
 验收报告以实际 `codesign` 命令及退出码为依据。ad-hoc 不等于 Developer ID 分发签名，签名验证也不证明已公证。报告中的签名范围是 staging APP，未生成 APP、命令不可用或身份无法识别时记为未知，其他平台尚未配置签名验证时同样记为未知。当前仓库默认验收的是 ad-hoc 包，配置证书的分发与公证仍须在受控发布环境单独验证。签名后重新计算包校验和，并验证签名后的最终包。维护者确认全部验收和许可材料后再决定公开发布。

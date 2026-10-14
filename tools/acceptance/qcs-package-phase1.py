@@ -22,7 +22,7 @@ sys.dont_write_bytecode = True
 for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="backslashreplace")
-APPLICATIONS = {"qcs", "qcs-service", "qcs-worker", "qcs-cli"}
+APPLICATIONS = {"qcs-gui", "qcs-service", "qcs-worker", "qcs-cli"}
 SOURCE = Path(__file__).resolve().parents[2]
 
 
@@ -311,7 +311,7 @@ def main(argv=None):
         summary["candidateRecord"] = str(candidate_path)
         cu_root = run / "cu 解包"
         verifier.unpack(Path(distributions["ZIP"]["path"]), cu_root)
-        matches = list(cu_root.rglob("qcs.exe"))
+        matches = list(cu_root.rglob("qcs-gui.exe"))
         if len(matches) != 1:
             raise RuntimeError("Expected exactly one retained GUI executable")
         for name, expected in before.items():

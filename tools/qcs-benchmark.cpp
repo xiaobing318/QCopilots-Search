@@ -359,6 +359,9 @@ double percentile(std::vector<double> values, double quantile)
 SearchOptions benchmarkSearchOptions(const RuntimePaths &paths, bool enforceFolderRules)
 {
     SearchOptions options;
+    // Synthetic vectors measure ANN/capacity, not model relevance. This
+    // process-local mode is deliberately unavailable through service IPC.
+    options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
     options.enforceFolderRules = enforceFolderRules;
     options.cancelled = std::make_shared<std::atomic_bool>(false);
     options.allowedRoots = QStringList{paths.profileDir};
@@ -1170,6 +1173,7 @@ int main(int argc, char **argv)
         report.insert(QStringLiteral("seed"), QString::number(seed));
         report.insert(QStringLiteral("generatorVersion"), QStringLiteral("splitmix64-v1-cluster64-noise008-uniform10percent"));
         report.insert(QStringLiteral("semanticQualityEvaluated"), false);
+        report.insert(QStringLiteral("semanticCandidateMode"), QStringLiteral("raw-candidates"));
         report.insert(QStringLiteral("physicalFileTraversalEvaluated"), false);
         report.insert(QStringLiteral("enforceFolderRules"), enforceFolderRules);
         report.insert(QStringLiteral("cancellationTokenEnabled"), true);

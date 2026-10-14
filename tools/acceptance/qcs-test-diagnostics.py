@@ -90,7 +90,7 @@ if entry == "aggregate":
     fixtures = {"qcs-test-portability-runners.py": portability, "qcs-test-token-context.py": token_tests}
     aggregate.load_script = lambda name: fixtures[name] if name in fixtures else original_load(name)
     aggregate.RecorderIntegration = type("EmptyFixtureIntegration", (unittest.TestCase,), {})
-    raise SystemExit(aggregate.main())
+    raise SystemExit(aggregate.main([]))
 elif entry == "standalone":
     original_main = unittest.main
     def fixture_main(*arguments, **keywords):
@@ -142,7 +142,7 @@ class DiagnosticOutputContracts(unittest.TestCase):
             encoding="utf-8", errors="strict", timeout=30)
 
     def inspect(self, output):
-        return EVIDENCE.inspect_signing_unittest(output, "Windows", EVIDENCE.ACCEPTANCE_TEST)
+        return EVIDENCE.inspect_signing_unittest(output, "Windows", EVIDENCE.ACCEPTANCE_NATIVE_TEST)
 
     def assert_diagnostics(self, output, conclusion):
         lines = output.splitlines()

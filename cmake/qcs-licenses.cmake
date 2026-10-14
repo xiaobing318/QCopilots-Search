@@ -4,6 +4,7 @@ find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 
 set(QCOPILOTS_SEARCH_LICENSE_SOURCE_CACHE "${QCOPILOTS_SEARCH_DEPENDENCY_ROOT}/licenses"
   CACHE PATH "External cache for pinned Qt license source archives")
+qcopilots_search_require_external_path(QCOPILOTS_SEARCH_LICENSE_SOURCE_CACHE "${QCOPILOTS_SEARCH_LICENSE_SOURCE_CACHE}")
 option(QCOPILOTS_SEARCH_DOWNLOAD_LICENSE_SOURCES "Download missing hash-locked Qt license source archives" ON)
 get_filename_component(_qcopilots_license_qt_prefix "${Qt6Core_DIR}/../../.." ABSOLUTE)
 FetchContent_GetProperties(qcs_llama SOURCE_DIR _qcopilots_license_llama_source)

@@ -22,7 +22,7 @@ HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("qcs_capacity_preflight", HERE / "qcs-physical-preflight.py")
 PREFLIGHT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PREFLIGHT)
-PROGRAMS = ("qcs", "qcs-cli", "qcs-service", "qcs-worker", "qcs-benchmark", "qcs-tests-file-capacity")
+PROGRAMS = ("qcs-gui", "qcs-cli", "qcs-service", "qcs-worker", "qcs-benchmark", "qcs-tests-file-capacity")
 WINDOWS = os.name == "nt"
 POWERSHELL = os.environ.get("QCOPILOTS_SEARCH_POWERSHELL") or shutil.which("pwsh")
 CAPABILITIES = {

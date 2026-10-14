@@ -15,12 +15,14 @@
 
 Qt 6.12.0 和独立 Qt PDF 6.140.0 由 bootstrap 安装。官方 SDK 包按下载校验值锁定。其他依赖通过 CMake 下载到外置依赖目录，不修改系统包的源码，也不在仓库中展开第三方源码。
 
+NSIS 在 Windows `package` 需要该生成器时才准备，日常 Qt bootstrap 和 fast 检查不下载安装器工具。Linux 完整流程的 DEB 安装验收需要可运行的 Docker。
+
 Linux 主机还需要 Qt 使用的图形、字体、XCB、DBus 和多媒体运行依赖。Qt 的 XCB 平台插件需要 `libxcb-shape0` 提供的 `libxcb-shape.so.0`。Qt Multimedia 的 PulseAudio 客户端动态库由 `libpulse0` 提供，构建和运行都需要该库，不要求安装开发头文件或启动音频服务。无显示服务器的 CI 在 Xvfb 中执行 GUI 用例。平台依赖安装命令以 `.github/workflows/qcs-native.yml` 为可执行参考，`doctor` 输出用于检查当前主机。
 
 ## 目录布局
 
 ```text
-QCopilots-search/                 源码，可以位于任意可读目录
+QCopilots-Search/                 源码，可以位于任意可读目录
   src/                           C++ 模块
   tests/                         QtTest、进程与模型测试及只读夹具
   tools/                         开发与验收工具
@@ -44,7 +46,7 @@ QCopilots-search/                 源码，可以位于任意可读目录
   gen/licenses/                  生成许可证材料
 ```
 
-本机选用 `C:\Dev\github-repos-compilations\qcs` 作为外置根。其他电脑通过 `--build-root` 或 `QCOPILOTS_SEARCH_BUILD_ROOT` 指定位置，脚本的默认短根也位于源码树外。`qcs` 是程序、脚本、真实 CMake target、安装资源和新产物的名称前缀。产品显示名称仍为 QCopilots Search，命名空间 `qcopilots_search` 和 `QCOPILOTS_SEARCH_*` 配置接口不变，不提供旧长命令别名。
+本机选用 `C:\Dev\github-repos-compilations\qcs` 作为外置根。其他电脑通过 `--build-root` 或 `QCOPILOTS_SEARCH_BUILD_ROOT` 指定位置，脚本的默认短根也位于源码树外。`qcs` 是程序、脚本、真实 CMake target、安装资源和新产物的名称前缀。GUI 目标和可执行文件为 `qcs-gui`，Windows 带 `.exe` 后缀，macOS 应用包为 `qcs-gui.app`。产品显示名称仍为 QCopilots Search，命名空间 `qcopilots_search`、`QCOPILOTS_SEARCH_*` 配置接口和现有 `qcs` profile 路径不变，不提供旧 GUI 命令别名。
 
 `stage` 供部署和打包使用。程序的真实用户数据通过平台标准应用目录解析，开发构建目录不会成为默认用户数据目录。使用 `--profile-dir` 可以让 GUI、服务和 CLI 连接独立实例，`--model-dir` 可以选择模型目录。
 
@@ -54,6 +56,8 @@ Windows 的数据库打开使用扩展 NT 路径和 SQLite `win32-longpath` VFS�
 
 Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。二者接受相同的动作与参数。
 
+自有脚本的职责、调用关系和清理决定见 [脚本审查清单](script-audit.md)。平台入口保留环境初始化，公共开发流程集中在 `tools/qcs-dev.py`。
+
 | 动作 | 用途 |
 | --- | --- |
 | `bootstrap` | 获取并校验锁定 Qt SDK，准备外置依赖环境 |
@@ -61,10 +65,16 @@ Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。二者�
 | `configure` | 生成外置 CMake 构建树 |
 | `build` | 编译程序、工具和启用的测试 |
 | `test` | 默认运行快速 CTest 范围，显式 `--test-profile full` 运行全套，并保存报告 |
+| `check` | 按 fast/full 顺序执行完整本地流程，保存每阶段日志与统一报告 |
 | `run` | 从构建结果启动应用 |
+| `models` | 使用构建目录中的 CLI 下载或复用锁定模型，并验证大小与 SHA-256 |
 | `install` | 使用 CMake install 生成 staging 布局 |
 | `package` | 从安装布局生成选定平台包 |
 | `verify-package` | 检查部署文件、许可材料及包内真实多模态推理 |
+| `installers` | 验证已生成的 Windows NSIS 或 Linux DEB，macOS 通过 DMG 包验证完成 |
+| `sources` | 生成对应源码材料，并验证锁定 llama.cpp 归档与补丁完整性 |
+| `release-prepare` | 校验完整候选证据并冻结上传材料，不重新构建 |
+| `release-upload-draft` | 显式创建或续传 GitHub 草稿，不公开发布 |
 | `clean` | 默认仅清理指定构建配置，显式生成物清理须验证归属和路径边界 |
 
 共同参数：
@@ -76,11 +86,11 @@ Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。二者�
 | `--config Release\|Debug` | 构建配置，默认 Release |
 | `--jobs N` | 并行编译任务数 |
 | `--model-dir PATH` | 实际模型目录 |
-| `--test-profile fast\|full` | 测试范围，默认 `fast` 排除 `slow` 标签，`full` 不排除 |
+| `--test-profile fast\|full` | `test` 的测试范围与 `check` 的流程范围，默认 `fast` |
 | `--test-label LABEL` | 在所选测试范围内继续按 CTest 标签筛选 |
 | `--generator NAME` | CPack 生成器，如 ZIP、NSIS、TGZ、DEB、DragNDrop |
 | `--cmake-arg=-DNAME=VALUE` | 向 configure 传递额外的 CMake 配置 |
-| `--report-dir PATH` | 当前测试或包验证的独立外置报告目录 |
+| `--report-dir PATH` | 本次独立报告目录，`check` 要求位于当前外置构建根内且为空 |
 | `--keep-failed-tests` | 保留失败用例的产物 |
 | `--scope generated` | `clean` 的显式生成物清理范围，排除模型、SDK、源码和正式用户配置 |
 | `--dry-run` | `clean` 只列出处理范围，不删除文件 |
@@ -89,25 +99,24 @@ Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。二者�
 
 ## 日常修改与完整验收
 
-日常修改后先运行 `build` 和默认 `test`。`fast` 仍包含 GUI、真实服务、进程、存储、路径和提取回归，但不执行真实模型推理、语义质量、物理容量及完整验收运行器测试。只运行某类测试时可加 `--test-label`，筛选与 `fast` 的排除条件取交集。例如真实模型用例必须同时指定 `--test-profile full --test-label real-model`，空选择会明确失败。
+日常使用 `check`，默认按 `doctor → configure → build → test` 执行 fast 流程。它保留 GUI、真实服务、进程、存储、路径、提取与验收运行器 pure 合约回归，不执行真实模型、slow、安装或打包。已经配置好的构建树也可单独执行 `build` 和 `test`。
 
-下面的完整验收示例显式选择 `full`。日常快速通过不能替代发行所需的完整本地、四组合原生 CI、Computer Use 及容量证据。
+`check --test-profile full` 依次执行环境检查、配置、构建、模型准备、全部 CTest、安装、平台打包、包验证、Windows/Linux 安装器验证和对应源码材料。Windows 生成 ZIP/NSIS，Linux 生成 TGZ/DEB，macOS 生成 DMG。它不接受 `--test-label`、`--keyword-only`、`--generator` 或 `--package-file` 缩减范围，局部排查使用独立动作。
 
 ```powershell
 $buildRoot = 'D:\Builds\qcs 示例'
 $qtRoot = 'D:\SDKs\Qt'
 $modelDir = Join-Path $buildRoot 'models'
 ./qcs-dev.ps1 bootstrap --build-root $buildRoot --qt-root $qtRoot
-./qcs-dev.ps1 doctor --build-root $buildRoot --qt-root $qtRoot
-./qcs-dev.ps1 configure --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
-./qcs-dev.ps1 build --build-root $buildRoot --qt-root $qtRoot --jobs 4
-./qcs-dev.ps1 test --build-root $buildRoot --qt-root $qtRoot --test-profile full --model-dir $modelDir
-./qcs-dev.ps1 install --build-root $buildRoot --qt-root $qtRoot
-./qcs-dev.ps1 package --build-root $buildRoot --qt-root $qtRoot --generator ZIP
-./qcs-dev.ps1 verify-package --build-root $buildRoot --qt-root $qtRoot --model-dir $modelDir
+./qcs-dev.ps1 check --build-root $buildRoot --qt-root $qtRoot --jobs 4
+./qcs-dev.ps1 check --build-root $buildRoot --qt-root $qtRoot --test-profile full --model-dir $modelDir --jobs 4
 ```
 
 以上路径是可替换的命令示例。代码、CI 与测试不会依赖这些盘符。模型准备方式及完整测试的门槛见 [测试指南](testing.md)。
+
+`check-report.json` 记录每阶段的命令输出、退出状态、耗时、候选身份和产物哈希，`<build-root>/reports/latest-check.json` 指向最近一次报告。某阶段失败后保留后续阶段为未运行。本地 full 成功仍保持 `releaseComplete: false`，四组合原生 CI、十万文件、百万向量和最终包 Computer Use 需要各自完成。
+
+只筛选测试时使用 `test --test-label`，它与当前 profile 取交集。真实模型用例需要同时指定 `--test-profile full --test-label real-model`，空选择会失败。发布阶段使用 `release-prepare` 的 `--candidate-commit`、`--native-artifacts-dir`、`--local-evidence-dir`、`--local-full-report`、`--output-dir`，上传草稿使用 `release-upload-draft --manifest ... --tag ...`，完整示例与前置条件见 [发布命令](release-command.md)。
 
 `verify-package` 默认执行发布验收，需要通过 `--model-dir` 或 `QCOPILOTS_SEARCH_MODEL_DIR` 提供两份完整、校验通过的锁定模型。验收使用最终包内的 worker 执行文字、图片和音频黄金向量，并通过安装后的服务执行语义检索。它保留原始 worker 回复、实际加载库的来源与哈希，以及对应许可材料。仅做开发阶段关键词检查时可显式使用 `--keyword-only`，该报告的 `releaseComplete` 为 false，不能用于发布门禁。
 

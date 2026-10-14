@@ -55,6 +55,12 @@ private:
     void applyLanguage();
     void createTray();
     void sendSearch(bool popup = false);
+    void loadMoreFiles(bool popup = false);
+    void updateBrowseControls(bool popup = false);
+    void markFilesStale(bool popup = false);
+    void refreshRoots();
+    QJsonObject searchContext(bool popup) const;
+    void openHit(const SearchHit &hit);
     QString send(const QString &method, const QJsonObject &params = {}, int timeoutMs = 30000);
     void handleResponse(const QString &id, const QJsonObject &data);
     void handleFailure(const QString &id, const QString &code, const QString &message);
@@ -72,7 +78,7 @@ private:
     AppSettings settings_;
     PlatformIntegration *platform_;
     QString language_;
-    bool useTray_, onboarding_, shownOnboarding_ = false, quitting_ = false, connected_ = false, modelAvailable_ = false;
+    bool useTray_, onboarding_, shownOnboarding_ = false, quitting_ = false, connected_ = false, modelAvailable_ = false, settingsLoaded_ = false;
     SearchEdit *query_;
     QComboBox *kind_, *root_;
     QCheckBox *code_;
@@ -80,6 +86,7 @@ private:
     PreviewPanel *preview_;
     QLabel *heading_, *subtitle_, *summary_, *error_, *progressText_, *capability_;
     QPushButton *settingsButton_, *modelButton_, *indexButton_, *pauseButton_, *retryButton_, *quickButton_, *updateButton_;
+    QPushButton *loadMore_, *refreshFiles_, *retryShortcut_;
     QProgressBar *progress_;
     QSystemTrayIcon *tray_ = nullptr;
     QAction *traySearch_ = nullptr, *trayQuick_ = nullptr, *trayPause_ = nullptr, *trayQuit_ = nullptr;
@@ -87,10 +94,22 @@ private:
     SearchEdit *popupQuery_ = nullptr;
     QListWidget *popupResults_ = nullptr;
     QLabel *popupStatus_ = nullptr;
+    QPushButton *popupFullSearch_ = nullptr;
+    QPushButton *popupRefreshFiles_ = nullptr;
     QTimer debounce_, popupDebounce_, refresh_;
     QString currentSearch_, popupSearch_, indexState_;
-    QJsonObject requestedSearchContext_, displayedSearchContext_;
-    QString popupRequestedQuery_, popupResultQuery_;
+    struct ResultRequest {
+        bool popup = false, browse = false, append = false;
+        QJsonObject context;
+    };
+    struct BrowseState {
+        QString cursor, generation, visibilityEpoch, failure;
+        bool stale = false, pending = false, loading = false;
+    };
+    QHash<QString, ResultRequest> resultRequests_;
+    QJsonObject displayedSearchContext_, popupDisplayedContext_;
+    BrowseState browse_, popupBrowse_;
+    QString popupResultQuery_;
     QString lastSearchWarning_;
     QString documentRequest_, documentPath_;
     int documentStart_ = 0;

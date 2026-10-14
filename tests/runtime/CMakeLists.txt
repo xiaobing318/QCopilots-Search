@@ -9,7 +9,16 @@ qcopilots_search_add_test(NAME qcs-tests-backend-layout
   COMMAND "$<TARGET_FILE:qcs-tests-backend-layout>" -o "-,txt")
 set_tests_properties(qcs-tests-backend-layout PROPERTIES LABELS "unit;runtime;package" TIMEOUT 60)
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
-qcopilots_search_add_test(NAME qcs-tests-inference-install-layout
+qcopilots_search_add_test(NAME qcs-tests-output-paths
+  COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/output_paths_test.py"
+    --cmake "${CMAKE_COMMAND}")
+set_tests_properties(qcs-tests-output-paths PROPERTIES LABELS "unit;portability;workflow" TIMEOUT 120)
+FetchContent_GetProperties(qcs_libgit2 SOURCE_DIR _qcopilots_git_source)
+qcopilots_search_add_test(NAME qcs-tests-configure-idempotency
+  COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/configure_idempotency_test.py"
+    --cmake "${CMAKE_COMMAND}" --libgit-source "${_qcopilots_git_source}")
+set_tests_properties(qcs-tests-configure-idempotency PROPERTIES LABELS "unit;workflow;native" TIMEOUT 120)
+qcopilots_search_add_test(NAME qcs-tests-inference-install-layout EVIDENCE_KIND program
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/install_layout_test.py"
     --cmake "${CMAKE_COMMAND}" --generator "${CMAKE_GENERATOR}" --compiler "${CMAKE_C_COMPILER}"
     --qt-cmake-dir "${Qt6_DIR}")

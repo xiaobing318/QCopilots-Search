@@ -1,5 +1,6 @@
 #include "app_backend.h"
 #include "main_window.h"
+#include "login_startup.h"
 #include "core/runtime_paths.h"
 #include <QApplication>
 #include <QCommandLineParser>
@@ -36,11 +37,13 @@ void writeCommandLineOutput(const QString &text, bool error = false) {
 }
 
 int main(int argc, char **argv) {
+    qcopilots_search::prepareLoginStartupDetection();
     QApplication application(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("qcs"));
+    QCoreApplication::setApplicationName(QStringLiteral("qcs-gui"));
     QCoreApplication::setOrganizationName(QStringLiteral("QCopilots"));
     QCoreApplication::setApplicationVersion(QStringLiteral(QCOPILOTS_SEARCH_VERSION));
     QApplication::setApplicationDisplayName(QStringLiteral("QCopilots Search"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("com.qcopilots.qcopilots-search"));
     QApplication::setWindowIcon(qcopilots_search::MainWindow::applicationIcon());
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("QCopilots Search — local multimodal file search"));
@@ -77,7 +80,19 @@ int main(int argc, char **argv) {
     qcopilots_search::ServiceBackend backend(paths);
     qcopilots_search::MainWindow window(paths, &backend, !parser.isSet("no-tray"), !parser.isSet("no-onboarding"));
     application.setQuitOnLastWindowClosed(false);
-    if (!parser.isSet("background") || parser.isSet("no-tray") || !QSystemTrayIcon::isSystemTrayAvailable()) window.show();
-    QTimer::singleShot(0, &window, &qcopilots_search::MainWindow::start);
+    const bool explicitBackground = parser.isSet("background");
+    const bool disableTray = parser.isSet("no-tray");
+    auto *startup = new QTimer(&window);
+    startup->setInterval(10);
+    QObject::connect(startup, &QTimer::timeout, &window, [&window, startup, explicitBackground, disableTray] {
+        const bool background = explicitBackground || qcopilots_search::isLoginStartupLaunch();
+        const bool showForeground = !background || disableTray || !QSystemTrayIcon::isSystemTrayAvailable();
+        if (!qcopilots_search::completeLoginStartupDetection(showForeground)) return;
+        startup->stop();
+        startup->deleteLater();
+        if (showForeground) window.show();
+        window.start();
+    });
+    startup->start();
     return application.exec();
 }

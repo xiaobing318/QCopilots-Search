@@ -388,34 +388,35 @@ class TokenContextContracts(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     context.validate_child_change(first, second, parent)
 
-    def test_opened_thread_owner_is_verified_before_resume_in_both_job_implementations(self):
+    def test_opened_thread_owner_is_verified_before_resume_in_shared_job_implementation(self):
         class Thread(ctypes.Structure):
             _fields_ = [("size", wintypes.DWORD), ("tid", wintypes.DWORD), ("owner", wintypes.DWORD)]
 
-        for module_name in ("qcs_owned_processes", "qcs-two-checkout-portability"):
-            for actual_owner in (0, 456, 123):
-                with self.subTest(module=module_name, actualOwner=actual_owner):
-                    module = load(module_name)
-                    jobs = module.WindowsProcesses.__new__(module.WindowsProcesses)
-                    jobs.Thread = Thread
-                    def first(snapshot, pointer):
-                        row = ctypes.cast(pointer, ctypes.POINTER(Thread)).contents
-                        row.tid, row.owner = 789, 123
-                        return True
-                    jobs.k = SimpleNamespace(
-                        CreateToolhelp32Snapshot=mock.Mock(return_value=333),
-                        Thread32First=mock.Mock(side_effect=first), Thread32Next=mock.Mock(return_value=False),
-                        CloseHandle=mock.Mock(return_value=True), OpenThread=mock.Mock(return_value=444),
-                        GetProcessIdOfThread=mock.Mock(return_value=actual_owner), ResumeThread=mock.Mock(return_value=1))
-                    if actual_owner == 123:
+        module = load("qcs_owned_processes")
+        portability = load("qcs-two-checkout-portability")
+        self.assertIs(portability.WindowsProcesses, module.WindowsProcesses)
+        for actual_owner in (0, 456, 123):
+            with self.subTest(actualOwner=actual_owner):
+                jobs = module.WindowsProcesses.__new__(module.WindowsProcesses)
+                jobs.Thread = Thread
+                def first(snapshot, pointer):
+                    row = ctypes.cast(pointer, ctypes.POINTER(Thread)).contents
+                    row.tid, row.owner = 789, 123
+                    return True
+                jobs.k = SimpleNamespace(
+                    CreateToolhelp32Snapshot=mock.Mock(return_value=333),
+                    Thread32First=mock.Mock(side_effect=first), Thread32Next=mock.Mock(return_value=False),
+                    CloseHandle=mock.Mock(return_value=True), OpenThread=mock.Mock(return_value=444),
+                    GetProcessIdOfThread=mock.Mock(return_value=actual_owner), ResumeThread=mock.Mock(return_value=1))
+                if actual_owner == 123:
+                    jobs.resume(SimpleNamespace(pid=123))
+                    jobs.k.ResumeThread.assert_called_once_with(444)
+                else:
+                    with self.assertRaises(RuntimeError):
                         jobs.resume(SimpleNamespace(pid=123))
-                        jobs.k.ResumeThread.assert_called_once_with(444)
-                    else:
-                        with self.assertRaises(RuntimeError):
-                            jobs.resume(SimpleNamespace(pid=123))
-                        jobs.k.ResumeThread.assert_not_called()
-                    jobs.k.OpenThread.assert_called_once_with(0x0802, False, 789)
-                    self.assertEqual(jobs.k.CloseHandle.call_args_list, [mock.call(333), mock.call(444)])
+                    jobs.k.ResumeThread.assert_not_called()
+                jobs.k.OpenThread.assert_called_once_with(0x0802, False, 789)
+                self.assertEqual(jobs.k.CloseHandle.call_args_list, [mock.call(333), mock.call(444)])
 
     def test_live_descendants_are_stopped_before_job_close(self):
         boundary = FakeBoundary(descendants=1)

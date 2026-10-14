@@ -27,6 +27,7 @@ import zipfile
 
 sys.dont_write_bytecode = True
 PRODUCT = "qcs"
+GUI_EXECUTABLE = "qcs-gui"
 WINDOWS_PRODUCT_KEY = r"Software\QCopilots\qcopilots-search"
 WINDOWS_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\qcopilots-search"
 SOURCE = Path(__file__).resolve().parent.parent
@@ -630,7 +631,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         suffix=".exe" if os.name=="nt" else ""
         candidates = [candidate for candidate in (
             application/"bin"/(PRODUCT+"-cli"+suffix),
-            application/"qcs.app/Contents/MacOS"/(PRODUCT+"-cli"+suffix),
+            application/f"{GUI_EXECUTABLE}.app/Contents/MacOS"/(PRODUCT+"-cli"+suffix),
             application/"Contents/MacOS"/(PRODUCT+"-cli"+suffix)) if candidate.is_file()]
         if not candidates and not installed_root:
             candidates=list(application.rglob(PRODUCT+"-cli"+suffix))
@@ -650,7 +651,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
                 raise RuntimeError(f"OCR language is missing from distribution: {language}")
         if not list(data_root.rglob("jieba.dict.utf8")):
             raise RuntimeError("Chinese tokenizer dictionary is missing from distribution")
-        for name in (PRODUCT, PRODUCT+"-service", PRODUCT+"-worker", PRODUCT+"-cli"):
+        for name in (GUI_EXECUTABLE, PRODUCT+"-service", PRODUCT+"-worker", PRODUCT+"-cli"):
             completed=subprocess.run([str(binary/(name+suffix)),"--version"],cwd=work,env=environment,capture_output=True,text=True,timeout=30)
             if completed.returncode:
                 raise RuntimeError(f"Packaged program failed to load: {name}: {completed.stderr}")
@@ -711,7 +712,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
             raise RuntimeError("The explicitly started package-test service exited unexpectedly")
         report["serviceLibraries"]=verify_library_origins(service,application,installed_files)
         gui_log=(report_dir/"gui.log").open("w",encoding="utf-8"); logs.append(gui_log)
-        gui=subprocess.Popen([str(binary/(PRODUCT+suffix)),"--profile-dir",str(profile),*model_arguments,
+        gui=subprocess.Popen([str(binary/(GUI_EXECUTABLE+suffix)),"--profile-dir",str(profile),*model_arguments,
                               "--no-onboarding","--no-tray"],cwd=work,env=environment,stdout=gui_log,stderr=gui_log)
         time.sleep(3)
         if gui.poll() is not None:

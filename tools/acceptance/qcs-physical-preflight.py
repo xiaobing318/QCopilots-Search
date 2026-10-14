@@ -58,7 +58,7 @@ def run_preflight(args):
             errors.append("Current source tree, locks or working-tree state differ from the build receipt")
         if identity.get("checkoutCommit") != expected or identity.get("candidateHead") != expected:
             errors.append("Current clean source identity does not match ExpectedCommit")
-        required = {"qcs", "qcs-service", "qcs-worker",
+        required = {"qcs-gui", "qcs-service", "qcs-worker",
                     "qcs-cli", "qcs-benchmark", "qcs-tests-file-capacity"}
         programs = build.get("programs", {})
         if set(programs) != required:

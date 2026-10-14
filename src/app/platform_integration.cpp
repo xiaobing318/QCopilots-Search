@@ -1,10 +1,15 @@
 #include "platform_integration.h"
+#include "platform_external_open.h"
+#include "core/runtime_paths.h"
+#ifdef Q_OS_LINUX
+#include "linux_global_shortcut.h"
+#endif
 #include <QCoreApplication>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFileInfo>
 #include <QProcess>
-#include <QSettings>
+#include <QGuiApplication>
 #include <QStandardPaths>
 #include <QUrl>
 #ifdef Q_OS_WIN
@@ -31,7 +36,7 @@ bool failure(QString *error, const QString &message) { if (error) *error = messa
 }
 PlatformIntegration::PlatformIntegration(QObject *parent) : QObject(parent) {}
 PlatformIntegration::~PlatformIntegration() {
-    QCoreApplication::instance()->removeNativeEventFilter(this);
+    if (QCoreApplication::instance()) QCoreApplication::instance()->removeNativeEventFilter(this);
 #ifdef Q_OS_WIN
     if (registered_) UnregisterHotKey(nullptr, hotkeyId);
 #elif defined(Q_OS_MACOS)
@@ -40,12 +45,15 @@ PlatformIntegration::~PlatformIntegration() {
 #endif
 }
 bool PlatformIntegration::registerGlobalShortcut() {
-    if (registered_) return true;
+    if (registered_ || shortcutInfo_.state == GlobalShortcutState::Pending) return registered_;
 #ifdef Q_OS_WIN
+    shortcutInfo_.backend = QStringLiteral("win32");
     registered_ = RegisterHotKey(nullptr, hotkeyId, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_SPACE);
     if (registered_) QCoreApplication::instance()->installNativeEventFilter(this);
     status_ = registered_ ? QStringLiteral("Ctrl+Shift+Space") : QStringLiteral("Global shortcut is already in use. Use the tray or main window.");
 #elif defined(Q_OS_MACOS)
+    shortcutInfo_.backend = QStringLiteral("carbon");
+    if (handler_) { RemoveEventHandler(static_cast<EventHandlerRef>(handler_)); handler_ = nullptr; }
     EventTypeSpec type{kEventClassKeyboard, kEventHotKeyPressed};
     EventHandlerRef handler = nullptr;
     EventHotKeyRef key = nullptr;
@@ -55,12 +63,52 @@ bool PlatformIntegration::registerGlobalShortcut() {
     hotkey_ = key;
     handler_ = handler;
     status_ = registered_ ? QStringLiteral("Ctrl+Shift+Space") : QStringLiteral("Global shortcut unavailable. Use the tray or main window.");
+#elif defined(Q_OS_LINUX)
+    if (!linuxShortcut_) {
+        linuxShortcut_ = new LinuxGlobalShortcut(this);
+        connect(linuxShortcut_, &LinuxGlobalShortcut::statusChanged, this,
+                [this](LinuxShortcutState state, const QString &binding, const QString &message) {
+            switch (state) {
+            case LinuxShortcutState::Unavailable: shortcutInfo_.state = GlobalShortcutState::Unavailable; break;
+            case LinuxShortcutState::Pending: shortcutInfo_.state = GlobalShortcutState::Pending; break;
+            case LinuxShortcutState::Active: shortcutInfo_.state = GlobalShortcutState::Active; break;
+            case LinuxShortcutState::Denied: shortcutInfo_.state = GlobalShortcutState::Denied; break;
+            case LinuxShortcutState::Failed: shortcutInfo_.state = GlobalShortcutState::Failed; break;
+            }
+            shortcutInfo_.backend = linuxShortcut_->backend();
+            shortcutInfo_.binding = binding;
+            shortcutInfo_.message = message;
+            registered_ = state == LinuxShortcutState::Active;
+            status_ = message.isEmpty() ? binding : message;
+            emit shortcutStatusChanged();
+        });
+        connect(linuxShortcut_, &LinuxGlobalShortcut::activated, this, [this](const QString &token) {
+            // Keep the compositor token scoped to this user-triggered activation.
+            // Forward the standard token to the platform during activation.
+            // Compositor focus still requires native Qt/Wayland acceptance tests.
+            const bool hadToken = qEnvironmentVariableIsSet("XDG_ACTIVATION_TOKEN");
+            const QByteArray previous = qgetenv("XDG_ACTIVATION_TOKEN");
+            if (!token.isEmpty()) qputenv("XDG_ACTIVATION_TOKEN", token.toUtf8());
+            emit activated();
+            if (!token.isEmpty()) {
+                if (hadToken) qputenv("XDG_ACTIVATION_TOKEN", previous);
+                else qunsetenv("XDG_ACTIVATION_TOKEN");
+            }
+        });
+    }
+    linuxShortcut_->start();
+    return registered_; // Portal permission and binding complete asynchronously.
 #else
     status_ = QStringLiteral("Global shortcut is unavailable on this desktop. Use the tray or main window.");
 #endif
+    shortcutInfo_.state = registered_ ? GlobalShortcutState::Active : GlobalShortcutState::Unavailable;
+    shortcutInfo_.binding = registered_ ? QStringLiteral("Ctrl+Shift+Space") : QString();
+    shortcutInfo_.message = status_;
+    emit shortcutStatusChanged();
     return registered_;
 }
 QString PlatformIntegration::shortcutStatus() const { return status_; }
+GlobalShortcutInfo PlatformIntegration::shortcutInfo() const { return shortcutInfo_; }
 bool PlatformIntegration::nativeEventFilter(const QByteArray &, void *message, qintptr *result) {
 #ifdef Q_OS_WIN
     const auto *msg = static_cast<MSG *>(message);
@@ -72,29 +120,14 @@ bool PlatformIntegration::nativeEventFilter(const QByteArray &, void *message, q
     return false;
 }
 bool PlatformIntegration::openHit(const SearchHit &hit, const QString &editorCommand, QString *error) {
-    if (!QFileInfo::exists(hit.path)) return failure(error, QStringLiteral("The source file no longer exists."));
-    if (hit.lineStart > 0 && !editorCommand.trimmed().isEmpty()) {
-        QStringList command = QProcess::splitCommand(editorCommand);
-        if (command.isEmpty()) return failure(error, QStringLiteral("The editor command is empty."));
-        QString program = command.takeFirst();
-        bool substituted = false;
-        for (auto &argument : command) {
-            substituted |= argument.contains(QStringLiteral("{file}"));
-            argument.replace(QStringLiteral("{file}"), hit.path);
-            argument.replace(QStringLiteral("{line}"), QString::number(hit.lineStart));
-            argument.replace(QStringLiteral("{cell}"), QString::number(hit.cell));
-        }
-        if (!substituted) {
-            const QString executable = QFileInfo(program).completeBaseName().toLower();
-            if (executable == "code" || executable == "code-insiders" || executable == "codium") command << "--goto" << hit.path + ':' + QString::number(hit.lineStart);
-            else if (executable == "subl" || executable == "sublime_text") command << hit.path + ':' + QString::number(hit.lineStart);
-            else command << hit.path;
-        }
-        if (!QProcess::startDetached(program, command)) return failure(error, QStringLiteral("Could not start the configured editor."));
-        return true;
-    }
-    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(hit.path))) return failure(error, QStringLiteral("No application could open this file."));
-    return true;
+    AppSettings settings;
+    settings.editorCommand = editorCommand;
+    return openHit(hit, settings, error);
+}
+bool PlatformIntegration::openHit(const SearchHit &hit, const AppSettings &settings, QString *error) {
+    if (!QFileInfo(hit.path).isFile()) return failure(error, QStringLiteral("The source file no longer exists."));
+    const auto command = buildOpenCommand(hit, settings, error);
+    return command && executeOpenCommand(hit, *command, error);
 }
 bool PlatformIntegration::revealFile(const QString &path, QString *error) {
     if (!QFileInfo::exists(path)) return failure(error, QStringLiteral("The source file no longer exists."));
@@ -108,24 +141,40 @@ bool PlatformIntegration::revealFile(const QString &path, QString *error) {
     return failure(error, QStringLiteral("Could not reveal the file in the file manager."));
 }
 bool PlatformIntegration::supportsStartAtLogin() {
-#ifdef Q_OS_WIN
-    return true;
-#else
-    return false;
-#endif
+    return loginStartupSupported();
 }
 bool PlatformIntegration::setStartAtLogin(bool enabled, QString *error) {
-#ifdef Q_OS_WIN
-    QSettings registry(QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"), QSettings::NativeFormat);
-    const QString name = QStringLiteral("qcopilots-search");
-    if (enabled) registry.setValue(name, '"' + QDir::toNativeSeparators(QCoreApplication::applicationFilePath()) + QStringLiteral("\" --background"));
-    else registry.remove(name);
-    registry.sync();
-    if (registry.status() != QSettings::NoError) return failure(error, QStringLiteral("Could not change the Windows sign-in setting."));
-    return true;
-#else
-    if (!enabled) return true;
-    return failure(error, QStringLiteral("Automatic sign-in launch is unavailable on this platform. Use the system startup application settings."));
-#endif
+    for (const QString &argument : QCoreApplication::arguments()) {
+        if (argument == QStringLiteral("--profile-dir") || argument.startsWith(QStringLiteral("--profile-dir="))
+            || argument == QStringLiteral("--model-dir") || argument.startsWith(QStringLiteral("--model-dir=")))
+            return failure(error, QStringLiteral("Login startup can only be changed from the default profile and model directory."));
+    }
+    const auto paths = RuntimePaths::resolve();
+    return setStartAtLogin(enabled, paths.profileDir, paths.modelDir, error);
 }
+bool PlatformIntegration::canSetStartAtLogin(const QString &profileDirectory, const QString &modelsDirectory) {
+    if (QStandardPaths::isTestModeEnabled()
+        || qEnvironmentVariableIsSet("QCOPILOTS_SEARCH_PROFILE_DIR")
+        || qEnvironmentVariableIsSet("QCOPILOTS_SEARCH_MODEL_DIR")
+        || profileDirectory.isEmpty() || modelsDirectory.isEmpty()) return false;
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    if (base.isEmpty()) return false;
+    const QString defaultProfile = QDir(base).filePath(QStringLiteral("qcs"));
+    const auto defaults = RuntimePaths::resolve(defaultProfile, QDir(defaultProfile).filePath(QStringLiteral("models")));
+    const auto actual = RuntimePaths::resolve(profileDirectory, modelsDirectory);
+#ifdef Q_OS_WIN
+    constexpr Qt::CaseSensitivity pathCase = Qt::CaseInsensitive;
+#else
+    constexpr Qt::CaseSensitivity pathCase = Qt::CaseSensitive;
+#endif
+    return actual.profileDir.compare(defaults.profileDir, pathCase) == 0
+        && actual.modelDir.compare(defaults.modelDir, pathCase) == 0;
+}
+bool PlatformIntegration::setStartAtLogin(bool enabled, const QString &profileDirectory,
+                                         const QString &modelsDirectory, QString *error) {
+    if (!canSetStartAtLogin(profileDirectory, modelsDirectory))
+        return failure(error, QStringLiteral("Login startup can only be changed from the default profile and model directory."));
+    return loginStartupSetEnabled(enabled, error);
+}
+LoginStartupState PlatformIntegration::startAtLoginState() { return loginStartupState(); }
 }

@@ -1,7 +1,10 @@
 #include "core/runtime_paths.h"
+#include "core/relevance_policy.h"
+#include "core/embedding_math.h"
 #include "extraction/extractor.h"
 #include "runtime/EmbeddingRuntime.h"
 #include "storage/index_repository.h"
+#include "storage/vector_index.h"
 #include "support/test_environment.h"
 #include <QCommandLineParser>
 #include <QCryptographicHash>
@@ -33,6 +36,7 @@ constexpr double pi = 3.14159265358979323846;
 struct Query {
     QString text, language, modality, file;
     bool code = false;
+    QString topic, partition;
 };
 struct Input {
     QString file, modality;
@@ -46,6 +50,8 @@ struct Vector {
     QString file;
     bool code;
     QVector<float> value;
+    QString modality;
+    qint64 segmentId = 0;
 };
 void require(bool value, const QString &error) {
     if (!value)
@@ -62,6 +68,55 @@ void write(const QString &path, const QByteArray &bytes) {
     require(f.write(bytes) == bytes.size() && f.commit(), "Cannot commit fixture: " + path);
 }
 QString fixtureRoot() { return QStringLiteral(QCOPILOTS_SEARCH_SEMANTIC_FIXTURES); }
+QJsonObject relevanceManifest() {
+    QJsonParseError parseError;
+    const auto document = QJsonDocument::fromJson(read(fixtureRoot() + "/relevance_queries.json"), &parseError);
+    require(parseError.error == QJsonParseError::NoError && document.isObject(),
+            "Invalid relevance query manifest: " + parseError.errorString());
+    const auto manifest = document.object();
+    require(manifest.value("schema").toInt() == 1, "Invalid relevance query schema");
+    QHash<QString, QString> partitions;
+    auto registerTopic = [&](const QString &topic, const QString &split) {
+        require(!topic.isEmpty() && (split == "calibration" || split == "holdout" || split == "background"),
+                "Invalid relevance topic partition: " + topic);
+        require(!partitions.contains(topic) || partitions.value(topic) == split,
+                "Topic leaks across calibration and holdout: " + topic);
+        partitions.insert(topic, split);
+    };
+    const auto topicSplits = manifest.value("topic_splits").toObject();
+    require(topicSplits.size() == 80, "All 80 existing topics require a frozen partition");
+    for (auto i = topicSplits.begin(); i != topicSplits.end(); ++i)
+        registerTopic(i.key(), i.value().toString());
+    for (const auto &entry : manifest.value("additional_topic_splits").toArray()) {
+        const auto item = entry.toObject();
+        registerTopic(item.value("topic_id").toString(), item.value("split").toString());
+    }
+    for (const auto &entry : manifest.value("code_fixtures").toArray()) {
+        const auto item = entry.toObject();
+        registerTopic(item.value("topic_id").toString(), item.value("split").toString());
+        require(!item.value("source").toString().trimmed().isEmpty()
+                    && !item.value("query_en").toString().trimmed().isEmpty()
+                    && !item.value("query_zh").toString().trimmed().isEmpty(),
+                "Added code fixture is missing source or labels");
+    }
+    QSet<QString> ids;
+    for (const auto &entry : manifest.value("no_answers").toArray()) {
+        const auto item = entry.toObject();
+        const auto id = item.value("id").toString();
+        const auto topic = item.value("topic_id").toString();
+        const auto split = item.value("split").toString();
+        require(!id.isEmpty() && !ids.contains(id) && !topic.isEmpty()
+                    && (split == "calibration" || split == "holdout")
+                    && !item.value("query").toString().trimmed().isEmpty()
+                    && !item.value("absent_requirement").toString().trimmed().isEmpty(),
+                "Invalid or duplicate labelled no-answer query: " + id);
+        require(partitions.contains(topic), "No-answer query refers to an unknown topic: " + topic);
+        registerTopic(topic, split);
+        ids.insert(id);
+    }
+    require(ids.size() >= 80, "Relevance corpus needs at least 80 fixed no-answer queries");
+    return manifest;
+}
 void validateAssets() {
     const auto manifest = QJsonDocument::fromJson(read(fixtureRoot() + "/assets.json")).object();
     require(manifest.value("schema").toInt() == 1, "Invalid semantic fixture schema");
@@ -475,6 +530,43 @@ Prepared prepare(const QString &root, bool includeBackground) {
             out.files.append({file, "background", false});
         }
     require(out.queries.size() >= 200, "Semantic corpus needs at least 200 positive queries");
+    const auto relevance = relevanceManifest();
+    const auto topicSplits = relevance.value("topic_splits").toObject();
+    QHash<int, QJsonObject> additional;
+    for (const auto &entry : relevance.value("additional_topic_splits").toArray()) {
+        const auto item = entry.toObject();
+        additional.insert(item.value("fixture_ordinal").toInt(), item);
+    }
+    for (auto &query : out.queries) {
+        bool valid = false;
+        const int ordinal = QFileInfo(query.file).completeBaseName().toInt(&valid, 16);
+        require(valid, "Invalid opaque fixture ordinal");
+        if (ordinal <= 80) {
+            query.topic = QString::number(ordinal).rightJustified(3, '0');
+            query.partition = topicSplits.value(query.topic).toString();
+        } else {
+            query.topic = additional.value(ordinal).value("topic_id").toString();
+            query.partition = additional.value(ordinal).value("split").toString();
+        }
+        require(!query.topic.isEmpty() && (query.partition == "calibration" || query.partition == "holdout"),
+                "Missing frozen topic partition: " + query.file);
+    }
+    // Append after the original corpus so its immutable ordinal mapping never
+    // changes. Smoke still validates all labels without indexing these files.
+    for (const auto &entry : relevance.value("code_fixtures").toArray()) {
+        const auto item = entry.toObject();
+        require(item.value("extension").toString() == "py", "Unsupported relevance code fixture extension");
+        const auto file = opaque(root, number++, "py");
+        write(file, item.value("source").toString().toUtf8());
+        add(out, file, "code", item.value("query_en").toString(), item.value("query_zh").toString(), true);
+        for (int i = out.queries.size() - 2; i < out.queries.size(); ++i) {
+            out.queries[i].topic = item.value("topic_id").toString();
+            out.queries[i].partition = item.value("split").toString();
+            require(!out.queries[i].topic.isEmpty()
+                        && (out.queries[i].partition == "calibration" || out.queries[i].partition == "holdout"),
+                    "Invalid added code topic partition");
+        }
+    }
     return out;
 }
 double cosine(const QVector<float> &a, const QVector<float> &b) {
@@ -504,6 +596,49 @@ QJsonArray ranking(const QVector<Vector> &vectors, const QVector<float> &query, 
             QJsonObject{{"file", QFileInfo(ordered[i].first).fileName()}, {"cosine", ordered[i].second}});
     return out;
 }
+QJsonArray rawCandidates(const QVector<Vector> &vectors, const QVector<float> &query, bool code) {
+    struct Candidate { QString file, modality; double score; qint64 id; };
+    // Use the same arithmetic as the production gate. Float normalization
+    // roundoff matters at a calibrated threshold boundary.
+    const auto normalizedQuery = embedding_math::normalized(query);
+    QHash<QString, Candidate> best;
+    for (const auto &v : vectors) {
+        if (v.code != code)
+            continue;
+        const auto modality = semanticPolicyModality(v.modality, code);
+        const auto key = v.file + QChar(0) + modality;
+        require(v.value.size() == normalizedQuery.size(), "Invalid persisted calibration vector dimension");
+        const auto score = embedding_math::cosine(normalizedQuery, v.value);
+        const auto existing = best.constFind(key);
+        if (existing == best.cend() || score > existing->score
+            || (score == existing->score && v.segmentId < existing->id))
+            best.insert(key, {QFileInfo(v.file).fileName(), modality, score, v.segmentId});
+    }
+    auto ordered = best.values();
+    std::sort(ordered.begin(), ordered.end(), [](const Candidate &a, const Candidate &b) {
+        return a.score == b.score ? a.id < b.id : a.score > b.score;
+    });
+    QJsonArray out;
+    for (const auto &candidate : ordered)
+        out.append(QJsonObject{{"file", candidate.file}, {"policyModality", candidate.modality},
+                               {"cosine", candidate.score}, {"segmentId", candidate.id}});
+    return out;
+}
+QJsonArray keywordCandidates(IndexRepository &index, const Query &query) {
+    SearchOptions options;
+    options.query = query.text;
+    options.code = query.code;
+    // Calibration needs the same bounded keyword candidate pool before RRF,
+    // not just the final ten hits. A top-ten production query uses 256 slots.
+    options.limit = 256;
+    QString error;
+    const auto hits = index.search(options, &error);
+    require(error.isEmpty(), error);
+    QJsonArray out;
+    for (const auto &hit : hits)
+        out.append(QJsonObject{{"file", QFileInfo(hit.path).fileName()}, {"rank", out.size() + 1}});
+    return out;
+}
 struct Count {
     int queries = 0, hits = 0, semanticHits = 0;
 };
@@ -523,6 +658,7 @@ int main(int argc, char **argv) {
                                            QStringLiteral(QCOPILOTS_SEARCH_SEMANTIC_TESSDATA))});
     parser.addOption({"report", "Write JSON report to this explicit location.", "path"});
     parser.addOption({"preserve", "Retain isolated corpus and index for diagnosis."});
+    parser.addOption({"calibration-export", "Export raw exact candidates for fixed calibration/holdout topics. Never qualifies as release acceptance."});
     parser.addOption(
         {"smoke", "Run a small executable pipeline probe. Never qualifies as release acceptance."});
     // QCommandLineParser::process may use a native message box for --help when
@@ -538,9 +674,11 @@ int main(int argc, char **argv) {
     }
     QJsonObject report{
         {"schema", 1},
+        {"semanticCandidateMode", parser.isSet("calibration-export") ? "raw-candidates" : "matches-only"},
         {"passed", false},
         {"startedAt", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
-        {"mode", parser.isSet("smoke") ? "smoke" : "release"},
+        {"mode", parser.isSet("smoke") ? "smoke" :
+                     (parser.isSet("calibration-export") ? "calibration-export" : "release")},
         {"annotationProtocol",
          "Target notes and bilingual relevance labels were authored together before observing model results. "
          "This is a controlled implementation acceptance set, not an independently human-annotated blind "
@@ -555,6 +693,9 @@ int main(int argc, char **argv) {
     try {
         validateAssets();
         topics();
+        const auto relevance = relevanceManifest();
+        require(!(parser.isSet("smoke") && parser.isSet("calibration-export")),
+                "--smoke and --calibration-export are mutually exclusive");
         env = std::make_unique<test::TestEnvironment>("semantic 中文 space");
         require(env->isValid(), env->error());
         auto corpus = env->path("corpus");
@@ -572,6 +713,15 @@ int main(int argc, char **argv) {
             QString::fromLatin1(QCryptographicHash::hash(read(fixtureRoot() + "/semantic_acceptance.cpp"),
                                                          QCryptographicHash::Sha256)
                                     .toHex());
+        report["relevanceManifestSha256"] = QString::fromLatin1(
+            QCryptographicHash::hash(read(fixtureRoot() + "/relevance_queries.json"),
+                                     QCryptographicHash::Sha256).toHex());
+        report["corpusIdentity"] = QJsonObject{
+            {"fixtureManifestSha256", report.value("fixtureManifestSha256")},
+            {"topicManifestSha256", report.value("topicManifestSha256")},
+            {"generatorSha256", report.value("generatorSha256")},
+            {"relevanceManifestSha256", report.value("relevanceManifestSha256")}};
+        report["relevancePolicy"] = semanticRelevancePolicy();
         if (parser.isSet("validate-only")) {
             report["status"] = "manifest-passed";
             result = 0;
@@ -628,7 +778,6 @@ int main(int argc, char **argv) {
                         segment.embedding =
                             runtime.embedText(segment.text, PromptKind::Document, segment.title, &error);
                     require(segment.embedding.size() == 768, "Embedding failed: " + error);
-                    vectors.append({input.file, input.code, segment.embedding});
                     segments.append(segment);
                     ++extracted;
                 }
@@ -636,6 +785,16 @@ int main(int argc, char **argv) {
                     index.replaceFiles({IndexedFile{input.file, text.sourceVersion, input.code, segments}},
                                        &error, true),
                     error);
+                // Read the authoritative persisted FP16 vectors and actual
+                // segment IDs. Calibration must use the production cosine
+                // inputs and tie ordering, not pre-quantization floats.
+                const auto stored = index.fileSegments(input.file, input.code, &error);
+                require(error.isEmpty() && stored.size() == segments.size(),
+                        "Cannot read persisted calibration segments: " + error);
+                for (const auto &segment : stored)
+                    if (!segment.embedding.isEmpty())
+                        vectors.append({input.file, input.code, segment.embedding,
+                                        segment.modality, segment.id});
                 files.append(QJsonObject{
                     {"file", QFileInfo(input.file).fileName()},
                     {"modality", input.modality},
@@ -681,6 +840,8 @@ int main(int argc, char **argv) {
                 options.queryEmbedding = embedding;
                 options.code = query.code;
                 options.limit = 10;
+                if (parser.isSet("calibration-export"))
+                    options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
                 timer.restart();
                 auto hits = index.search(options, &error);
                 require(error.isEmpty(), error);
@@ -711,11 +872,16 @@ int main(int argc, char **argv) {
                 results.append(QJsonObject{{"query", query.text},
                                            {"language", query.language},
                                            {"modality", query.modality},
+                                           {"code", query.code},
+                                           {"topic", query.topic},
+                                           {"partition", query.partition},
                                            {"expectedFile", QFileInfo(query.file).fileName()},
                                            {"rank", rank},
                                            {"encodingMilliseconds", encodingMs},
                                            {"retrievalMilliseconds", retrievalMs},
-                                           {"productionTop10", returned},
+                                           {parser.isSet("calibration-export") ? "rawUnfilteredTop10" : "productionTop10", returned},
+                                           {"rawCandidates", rawCandidates(vectors, embedding, query.code)},
+                                           {"keywordCandidates", keywordCandidates(index, query)},
                                            {"exactSemanticTop10", semantic}});
                 QTextStream(stdout) << "Query " << queryNumber << "/" << prepared.queries.size()
                                     << " rank=" << rank << " " << query.language << " " << query.modality
@@ -737,42 +903,35 @@ int main(int argc, char **argv) {
             }
             report["metrics"] = metrics;
             report["queries"] = results;
-            const QStringList negatives = {"Telemetry logs from a fusion reactor on Europa",
-                                           "A dragon's medical insurance policy number",
-                                           "2029 Martian embassy visa appointment password",
-                                           "量子传送门的校准许可证编号",
-                                           "海王星地下列车的真实时刻表",
-                                           "An underwater volcano's encrypted bank account",
-                                           "A recipe for transparent anti-gravity concrete",
-                                           "会说话的石头购买宇宙飞船的合同",
-                                           "A satellite photograph of the city on Pluto",
-                                           "永动机工厂的秘密生产配方",
-                                           "Minutes of the invisible parliament on Jupiter",
-                                           "The checksum of a message sent from a parallel universe",
-                                           "半人马座外星船长的家庭住址",
-                                           "Teleportation portal maintenance invoice",
-                                           "A notarised marriage certificate for a phoenix",
-                                           "梦境转换成钻石机器的维修手册",
-                                           "A dinosaur's biometric passport issued tomorrow",
-                                           "The snow dragon's interstellar tax declaration",
-                                           "火星精灵的水下城堡产权证书",
-                                           "A shopping receipt from the centre of a black hole"};
             QJsonArray noAnswers;
             QJsonObject noAnswerSummary;
-            for (int i = 0; i < negatives.size() && !parser.isSet("smoke"); ++i) {
-                auto emb = runtime.embedText(negatives[i], PromptKind::Query, {}, &error);
+            for (const auto &entry : relevance.value("no_answers").toArray()) {
+                if (parser.isSet("smoke"))
+                    break;
+                const auto labelled = entry.toObject();
+                Query negative;
+                negative.text = labelled.value("query").toString();
+                negative.code = labelled.value("code").toBool();
+                negative.language = labelled.value("language").toString();
+                negative.modality = labelled.value("modality").toString();
+                negative.topic = labelled.value("topic_id").toString();
+                negative.partition = labelled.value("split").toString();
+                auto emb = runtime.embedText(negative.text,
+                    negative.code ? PromptKind::CodeQuery : PromptKind::Query, {}, &error);
                 require(emb.size() == 768, error);
                 SearchOptions opts;
-                opts.query = negatives[i];
+                opts.query = negative.text;
+                opts.code = negative.code;
                 opts.queryEmbedding = emb;
                 opts.limit = 10;
+                if (parser.isSet("calibration-export"))
+                    opts.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
                 auto hits = index.search(opts, &error);
                 require(error.isEmpty(), error);
-                const QString partition = i < 10 ? "calibration" : "holdout";
-                const auto exact = ranking(vectors, emb, false);
+                const auto exact = ranking(vectors, emb, negative.code);
                 const double topCosine = exact.isEmpty() ? 0.0 :
                     exact.first().toObject().value("cosine").toDouble();
-                auto summary = noAnswerSummary.value(partition).toObject();
+                auto summary = noAnswerSummary.value(negative.partition).toObject();
                 const int priorCount = summary.value("queries").toInt();
                 summary["queries"] = priorCount + 1;
                 summary["queriesReturningCandidates"] =
@@ -783,23 +942,48 @@ int main(int argc, char **argv) {
                     qMax(summary.value("maximumTopCosine").toDouble(), topCosine);
                 summary["meanTopCosine"] =
                     (summary.value("meanTopCosine").toDouble() * priorCount + topCosine) / (priorCount + 1);
-                noAnswerSummary[partition] = summary;
-                noAnswers.append(QJsonObject{{"query", negatives[i]},
-                                             {"partition", partition},
+                noAnswerSummary[negative.partition] = summary;
+                QJsonArray returned;
+                for (const auto &hit : hits)
+                    returned.append(QJsonObject{{"file", QFileInfo(hit.path).fileName()},
+                                                {"score", hit.score}, {"source", hit.matchSource}});
+                noAnswers.append(QJsonObject{{"query", negative.text},
+                                             {"id", labelled.value("id")},
+                                             {"topic", negative.topic},
+                                             {"partition", negative.partition},
+                                             {"language", negative.language},
+                                             {"modality", negative.modality},
+                                             {"code", negative.code},
+                                             {"absentRequirement", labelled.value("absent_requirement")},
                                              {"returnedCount", hits.size()},
+                                             {parser.isSet("calibration-export") ? "rawUnfilteredTop10" : "productionTop10", returned},
+                                             {"rawCandidates", rawCandidates(vectors, emb, negative.code)},
+                                             {"keywordCandidates", keywordCandidates(index, negative)},
                                              {"exactSemanticTop10", exact}});
+                QTextStream(stdout) << "No-answer " << noAnswers.size() << " "
+                                    << negative.partition << " returned=" << hits.size() << '\n';
+            }
+            for (const auto &partition : {QStringLiteral("calibration"), QStringLiteral("holdout")}) {
+                auto summary = noAnswerSummary.value(partition).toObject();
+                const auto count = summary.value("queries").toInt();
+                const double rate = count ? double(summary.value("queriesReturningCandidates").toInt()) / count : 1.0;
+                summary["falseReturnRate"] = rate;
+                summary["maximumFalseReturnRate"] = .10;
+                summary["passed"] = count > 0 && rate <= .10;
+                noAnswerSummary[partition] = summary;
+                passed = passed && count > 0 && rate <= .10;
             }
             report["noAnswerQueries"] = noAnswers;
             report["noAnswerSummary"] = noAnswerSummary;
-            report["noAnswerInterpretation"] =
-                "Independent labelled absent subjects. Search returns ranked candidates and has no "
-                "calibrated rejection promise. Raw exact cosine and returned counts are reported separately, "
-                "with calibration and untouched holdout groups. No threshold was fitted to positive "
-                "acceptance queries.";
+            report["noAnswerInterpretation"] = relevance.value("split_policy").toObject().value("limitation");
+            // Raw sampling is deliberately not an acceptance result. A generated
+            // policy must subsequently pass the ordinary production search run.
+            passed = passed && semanticRelevancePolicy().value("calibrated").toBool()
+                     && !parser.isSet("calibration-export");
             report["status"] =
-                parser.isSet("smoke") ? "smoke-passed" : (passed ? "passed" : "quality-gate-failed");
+                parser.isSet("smoke") ? "smoke-passed" : (parser.isSet("calibration-export") ? "calibration-exported" : (passed ? "passed" : "quality-gate-failed"));
             report["passed"] = passed;
-            result = parser.isSet("smoke") || passed ? 0 : 1;
+            result = parser.isSet("smoke") || parser.isSet("calibration-export") || passed ? 0 : 1;
         }
     } catch (const std::exception &exception) {
         report["status"] = "failed";

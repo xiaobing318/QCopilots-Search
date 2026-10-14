@@ -97,7 +97,7 @@ Outcome call(ServiceClient &client, const QString &method, const QJsonObject &pa
 Outcome checkUpdate(int timeout)
 {
     QNetworkAccessManager network;
-    QNetworkRequest request(QUrl(QStringLiteral("https://api.github.com/repos/xiaobing318/QCopilots-search/releases/latest")));
+    QNetworkRequest request(QUrl(QStringLiteral("https://api.github.com/repos/xiaobing318/QCopilots-Search/releases/latest")));
     request.setRawHeader("Accept", "application/vnd.github+json");
     request.setRawHeader("User-Agent", "qcopilots-search-cli");
     request.setTransferTimeout(timeout);
@@ -274,7 +274,7 @@ int main(int argc, char **argv)
         {{QStringLiteral("kind")}, QStringLiteral("Search file kind filter"), QStringLiteral("kind")},
         {{QStringLiteral("root")}, QStringLiteral("Search root filter, or source root when indexing/configuring. Repeatable."), QStringLiteral("path")},
         {{QStringLiteral("exclude")}, QStringLiteral("Excluded directory when indexing/configuring. Repeatable."), QStringLiteral("path")},
-        {{QStringLiteral("code")}, QStringLiteral("Search code, or enable code indexing when configuring")},
+        {{QStringLiteral("code")}, QStringLiteral("Use the independent code space for search, roots and excludes")},
         {{QStringLiteral("keyword-only")}, QStringLiteral("Do not use the semantic query encoder")},
         {{QStringLiteral("limit")}, QStringLiteral("Maximum search results (1..1000)"), QStringLiteral("count"), QStringLiteral("100")},
         {{QStringLiteral("wait")}, QStringLiteral("Wait for indexing completion, bounded by --timeout")},
@@ -389,18 +389,19 @@ int main(int argc, char **argv)
     }
 
     if (command == QStringLiteral("index") || method == QStringLiteral("settings.set")) {
+        const bool codeSpace = parser.isSet(QStringLiteral("code"));
         QStringList roots = parser.values(QStringLiteral("root"));
         if (command == QStringLiteral("index")) roots.append(arguments);
         if (!roots.isEmpty()) {
             for (auto &root : roots) root = QFileInfo(root).absoluteFilePath();
-            params.insert(QStringLiteral("roots"), QJsonArray::fromStringList(roots));
+            params.insert(codeSpace ? QStringLiteral("codeRoots") : QStringLiteral("roots"), QJsonArray::fromStringList(roots));
         }
         if (parser.isSet(QStringLiteral("exclude"))) {
             auto excludes = parser.values(QStringLiteral("exclude"));
             for (auto &exclude : excludes) exclude = QFileInfo(exclude).absoluteFilePath();
-            params.insert(QStringLiteral("excludes"), QJsonArray::fromStringList(excludes));
+            params.insert(codeSpace ? QStringLiteral("codeExcludes") : QStringLiteral("excludes"), QJsonArray::fromStringList(excludes));
         }
-        if (parser.isSet(QStringLiteral("code"))) params.insert(QStringLiteral("includeCode"), true);
+        if (codeSpace) params.insert(QStringLiteral("includeCode"), true);
         if (method == QStringLiteral("settings.set") && params.isEmpty())
             return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("config set requires settings JSON or --root/--exclude/--code")), pretty);
     }

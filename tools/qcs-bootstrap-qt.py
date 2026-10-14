@@ -53,7 +53,7 @@ def download(entry: dict, cache: Path, reserve: int) -> Path:
     for attempt in range(3):
         try:
             print(f"Downloading {entry['module']}", flush=True)
-            request = urllib.request.Request(entry["url"], headers={"User-Agent": "QCopilots-search-bootstrap/1"})
+            request = urllib.request.Request(entry["url"], headers={"User-Agent": "QCopilots-Search-bootstrap/1"})
             with urllib.request.urlopen(request, timeout=120) as response, partial.open("wb") as stream:
                 length = int(response.headers.get("Content-Length", "0"))
                 if shutil.disk_usage(cache).free < reserve + length:

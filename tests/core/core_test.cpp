@@ -66,8 +66,13 @@ private slots:
     void legacyProfileRejected_data();
     void legacyProfileRejected();
     void settingsRoundTrip();
+    void settingsV1Migration_data();
+    void settingsV1Migration();
     void settingsRejectCorruption();
     void settingsRejectUnsupportedTypes();
+    void settingsRejectInvalidOpeners_data();
+    void settingsRejectInvalidOpeners();
+    void settingsOpenerPresets();
     void settingsAtomicFailure();
     void settingsFingerprint();
     void segmentSerialization();
@@ -613,15 +618,83 @@ void CoreTest::settingsRoundTrip()
     QVERIFY(first.roots.isEmpty());
     first.roots = {env.path(QStringLiteral("未挂载 目录"))};
     first.excludes = {env.path(QStringLiteral("未挂载 目录/排除"))};
+    first.codeRoots = {env.path(QStringLiteral("独立 代码"))};
+    first.codeExcludes = {env.path(QStringLiteral("独立 代码/build"))};
     first.language = QStringLiteral("zh_CN");
     first.includeCode = true;
     first.indexingPaused = true;
     first.editorCommand = QStringLiteral("editor --line {line} {path}");
+    first.pdfOpener.preset = QStringLiteral("custom");
+    first.pdfOpener.program = env.path(QStringLiteral("PDF 阅读器/viewer"));
+    first.pdfOpener.arguments = {QStringLiteral("--page"), QStringLiteral("{page}"),
+                                 QStringLiteral("{path}"), QString{}};
+    first.mediaOpener.preset = QStringLiteral("mpv");
+    first.mediaOpener.program = env.path(QStringLiteral("播放器/mpv"));
+    first.mediaOpener.arguments = {QStringLiteral("--start={seconds}"), QStringLiteral("{path}")};
+    QCOMPARE(first.toJson().value(QStringLiteral("version")).toInt(), 2);
     QVERIFY2(first.save(paths.configFile, &error), qPrintable(error));
     AppSettings second;
     QVERIFY2(second.load(paths.configFile, &error), qPrintable(error));
     QCOMPARE(second.toJson(), first.toJson());
+    QCOMPARE(second.codeRoots, first.codeRoots);
+    QCOMPARE(second.codeExcludes, first.codeExcludes);
+    QVERIFY(second.codeRoots != second.roots);
+    QCOMPARE(second.pdfOpener.arguments.last(), QString{});
+    QVERIFY(!second.needsMigration());
     QVERIFY(!QFileInfo::exists(env.path("registry")));
+}
+
+void CoreTest::settingsV1Migration_data()
+{
+    QTest::addColumn<bool>("includeCode");
+    QTest::newRow("code-enabled") << true;
+    QTest::newRow("code-disabled") << false;
+}
+
+void CoreTest::settingsV1Migration()
+{
+    QFETCH(bool, includeCode);
+    TestEnvironment env(QStringLiteral("settings-v1"));
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    AppSettings original;
+    original.roots = {env.path(QStringLiteral("原始 资料"))};
+    original.excludes = {env.path(QStringLiteral("原始 资料/排除"))};
+    original.includeCode = includeCode;
+    original.language = QStringLiteral("zh_CN");
+    auto legacy = original.toJson();
+    legacy[QStringLiteral("version")] = 1;
+    legacy.remove(QStringLiteral("codeRoots"));
+    legacy.remove(QStringLiteral("codeExcludes"));
+    legacy.remove(QStringLiteral("pdfOpener"));
+    legacy.remove(QStringLiteral("mediaOpener"));
+    const QByteArray legacyBytes = QJsonDocument(legacy).toJson(QJsonDocument::Indented);
+    QVERIFY(env.writeFile(QStringLiteral("settings.json"), legacyBytes));
+
+    AppSettings migrated;
+    QString error;
+    QVERIFY2(migrated.load(env.path(QStringLiteral("settings.json")), &error), qPrintable(error));
+    QVERIFY(migrated.needsMigration());
+    QCOMPARE(migrated.roots, original.roots);
+    QCOMPARE(migrated.excludes, original.excludes);
+    QCOMPARE(migrated.language, original.language);
+    QCOMPARE(migrated.codeRoots, includeCode ? original.roots : QStringList{});
+    QCOMPARE(migrated.codeExcludes, includeCode ? original.excludes : QStringList{});
+    QCOMPARE(migrated.pdfOpener.preset, QStringLiteral("system"));
+    QCOMPARE(migrated.mediaOpener.preset, QStringLiteral("system"));
+
+    QFile file(env.path(QStringLiteral("settings.json")));
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), legacyBytes); // Loading must not write before the profile lock is held.
+    file.close();
+    QVERIFY2(migrated.save(file.fileName(), &error), qPrintable(error));
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const auto saved = QJsonDocument::fromJson(file.readAll()).object();
+    file.close();
+    QCOMPARE(saved.value(QStringLiteral("version")).toInt(), 2);
+    AppSettings reloaded;
+    QVERIFY2(reloaded.load(file.fileName(), &error), qPrintable(error));
+    QVERIFY(!reloaded.needsMigration());
+    QCOMPARE(reloaded.toJson(), migrated.toJson());
 }
 
 void CoreTest::settingsRejectCorruption()
@@ -644,20 +717,113 @@ void CoreTest::settingsRejectUnsupportedTypes()
 {
     AppSettings original;
     AppSettings parsed;
+    parsed.language = QStringLiteral("zh_CN");
+    const auto before = parsed.toJson();
     QString error;
     auto json = original.toJson();
-    json["version"] = 2;
+    json["version"] = 3;
     QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
+    QCOMPARE(parsed.toJson(), before);
     json = original.toJson();
     json["includeCode"] = "true";
     QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
     json = original.toJson();
     json["roots"] = QJsonArray{"relative/directory"};
     QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
+    for (const auto &key : {QStringLiteral("codeRoots"), QStringLiteral("codeExcludes")}) {
+        json = original.toJson();
+        json[key] = QJsonArray{"relative/directory"};
+        QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
+        QCOMPARE(parsed.toJson(), before);
+        json[key] = true;
+        QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
+        QCOMPARE(parsed.toJson(), before);
+    }
     json = original.toJson();
     json["language"] = "unknown";
     QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
+    json = original.toJson();
+    json["editorCommand"] = QStringLiteral("editor") + QChar::Null + QStringLiteral("{path}");
+    QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
+    QCOMPARE(parsed.toJson(), before);
     QVERIFY(!AppSettings::fromJson(original.toJson(), nullptr, &error));
+}
+
+void CoreTest::settingsRejectInvalidOpeners_data()
+{
+    QTest::addColumn<QString>("opener");
+    QTest::addColumn<QJsonValue>("value");
+    const QString nul = QStringLiteral("prefix") + QChar::Null + QStringLiteral("suffix");
+    for (const QString &opener : {QStringLiteral("pdfOpener"), QStringLiteral("mediaOpener")}) {
+        const QByteArray prefix = opener.toLatin1();
+        QTest::newRow((prefix + "-not-object").constData()) << opener << QJsonValue(true);
+        QTest::newRow((prefix + "-unknown-preset").constData())
+            << opener << QJsonValue(QJsonObject{{"preset", "unknown"}});
+        QTest::newRow((prefix + "-preset-type").constData())
+            << opener << QJsonValue(QJsonObject{{"preset", true}});
+        QTest::newRow((prefix + "-program-type").constData())
+            << opener << QJsonValue(QJsonObject{{"program", 42}});
+        QTest::newRow((prefix + "-program-nul").constData())
+            << opener << QJsonValue(QJsonObject{{"program", nul}});
+        QTest::newRow((prefix + "-custom-without-program").constData())
+            << opener << QJsonValue(QJsonObject{{"preset", "custom"}});
+        QTest::newRow((prefix + "-custom-blank-program").constData())
+            << opener << QJsonValue(QJsonObject{{"preset", "custom"}, {"program", " \t "}});
+        QTest::newRow((prefix + "-arguments-type").constData())
+            << opener << QJsonValue(QJsonObject{{"arguments", "--page {page}"}});
+        QTest::newRow((prefix + "-argument-type").constData())
+            << opener << QJsonValue(QJsonObject{{"arguments", QJsonArray{"{path}", 42}}});
+        QTest::newRow((prefix + "-argument-nul").constData())
+            << opener << QJsonValue(QJsonObject{{"arguments", QJsonArray{nul}}});
+    }
+    QTest::newRow("pdf-rejects-media-preset")
+        << QStringLiteral("pdfOpener") << QJsonValue(QJsonObject{{"preset", "mpv"}});
+    QTest::newRow("media-rejects-pdf-preset")
+        << QStringLiteral("mediaOpener") << QJsonValue(QJsonObject{{"preset", "sumatra"}});
+}
+
+void CoreTest::settingsRejectInvalidOpeners()
+{
+    QFETCH(QString, opener);
+    QFETCH(QJsonValue, value);
+    AppSettings parsed;
+    parsed.language = QStringLiteral("zh_CN");
+    parsed.pdfOpener.preset = QStringLiteral("sumatra");
+    parsed.mediaOpener.preset = QStringLiteral("mpv");
+    auto legacy = parsed.toJson();
+    legacy[QStringLiteral("version")] = 1;
+    QString error;
+    QVERIFY2(AppSettings::fromJson(legacy, &parsed, &error), qPrintable(error));
+    QVERIFY(parsed.needsMigration());
+    const auto before = parsed.toJson();
+    auto invalid = AppSettings{}.toJson();
+    invalid[opener] = value;
+    QVERIFY(!AppSettings::fromJson(invalid, &parsed, &error));
+    QVERIFY(!error.isEmpty());
+    QCOMPARE(parsed.toJson(), before);
+    QVERIFY(parsed.needsMigration());
+}
+
+void CoreTest::settingsOpenerPresets()
+{
+    for (const QString &pdf : {QStringLiteral("system"), QStringLiteral("sumatra"),
+                               QStringLiteral("okular"), QStringLiteral("skim"),
+                               QStringLiteral("custom")}) {
+        for (const QString &media : {QStringLiteral("system"), QStringLiteral("mpv"),
+                                     QStringLiteral("custom")}) {
+            AppSettings source;
+            source.pdfOpener.preset = pdf;
+            source.pdfOpener.program = QStringLiteral("pdf-viewer");
+            source.pdfOpener.arguments = {QString{}, QStringLiteral("{path}")};
+            source.mediaOpener.preset = media;
+            source.mediaOpener.program = QStringLiteral("media-viewer");
+            source.mediaOpener.arguments = {QStringLiteral("{path}"), QString{}};
+            AppSettings parsed;
+            QString error;
+            QVERIFY2(AppSettings::fromJson(source.toJson(), &parsed, &error), qPrintable(error));
+            QCOMPARE(parsed.toJson(), source.toJson());
+        }
+    }
 }
 
 void CoreTest::settingsAtomicFailure()
@@ -685,6 +851,20 @@ void CoreTest::settingsFingerprint()
     const QString original = settings.fingerprint();
     settings.language = "zh_CN";
     settings.minimizeToTray = false;
+    settings.pdfOpener.preset = QStringLiteral("sumatra");
+    settings.pdfOpener.program = QStringLiteral("pdf-viewer");
+    settings.pdfOpener.arguments = {QStringLiteral("{path}")};
+    settings.mediaOpener.preset = QStringLiteral("mpv");
+    settings.mediaOpener.program = QStringLiteral("media-viewer");
+    settings.mediaOpener.arguments = {QStringLiteral("{path}")};
+    QCOMPARE(settings.fingerprint(), original);
+    settings.codeRoots = {QDir::rootPath()};
+    const QString withCodeRoots = settings.fingerprint();
+    QVERIFY(withCodeRoots != original);
+    settings.codeExcludes = {QDir::rootPath()};
+    QVERIFY(settings.fingerprint() != withCodeRoots);
+    settings.codeRoots.clear();
+    settings.codeExcludes.clear();
     QCOMPARE(settings.fingerprint(), original);
     settings.includeCode = true;
     QVERIFY(settings.fingerprint() != original);

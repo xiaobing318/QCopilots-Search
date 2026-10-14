@@ -1,7 +1,8 @@
 """Explicitly scheduled, real packaged CLI -> IPC -> service -> query-worker timing.
 
-This portable evidence runner does not alter application source. Without
---execute it only emits or verifies a read-only plan. Schedule after final
+Read-only input verification is portable. Execution requires Windows owned-process
+jobs. This runner does not alter application source. Without --execute it only
+emits or verifies a read-only plan. Schedule after final
 package Computer Use, before million-vector acceptance, with exclusive resources.
 """
 import argparse
@@ -23,10 +24,13 @@ import time
 import zipfile
 
 sys.dont_write_bytecode = True
+# Contract harnesses load this file by path from an unrelated working directory.
+# Resolve its shared process helper from the script directory in that case too.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qcs_owned_processes import WindowsProcesses
 
 
-APPLICATIONS = {"qcs", "qcs-service", "qcs-worker", "qcs-cli"}
+APPLICATIONS = {"qcs-gui", "qcs-service", "qcs-worker", "qcs-cli"}
 CREATE_SUSPENDED = 0x00000004  # Windows flag, not exported by every Python subprocess build.
 
 

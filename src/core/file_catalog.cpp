@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QRegularExpression>
 #include <QSet>
 #include <algorithm>
 #include <git2.h>
@@ -25,6 +26,9 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#ifdef Q_OS_MACOS
+#include <sys/xattr.h>
+#endif
 #endif
 
 namespace qcopilots_search {
@@ -89,7 +93,49 @@ bool secretName(const QString &name)
     static const QStringList prefixes = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".env", "secret",
         "credential", ".netrc", ".npmrc", ".pypirc", "htpasswd", ".htpasswd"};
     const QString lower = name.toLower();
+    static const QSet<QString> secretExtensions = {"pem", "key", "p12", "pfx", "keystore", "jks", "ppk",
+        "kdbx", "gpg", "asc", "crt", "cer", "der", "p8", "mobileprovision"};
+    if (secretExtensions.contains(QFileInfo(name).suffix().toLower())) return true;
     return std::any_of(prefixes.cbegin(), prefixes.cend(), [&lower](const auto &prefix) { return lower.startsWith(prefix); });
+}
+
+// This check precedes even transport-stream sniffing. Reading a placeholder can
+// ask its provider to download it, so metadata is inspected without file data.
+bool unavailablePlaceholder(const QFileInfo &info)
+{
+#ifdef Q_OS_WIN
+    QString native = QDir::toNativeSeparators(info.absoluteFilePath());
+    if (!native.startsWith(QStringLiteral("\\\\?\\")))
+        native = native.startsWith(QStringLiteral("\\\\"))
+            ? QStringLiteral("\\\\?\\UNC\\") + native.mid(2) : QStringLiteral("\\\\?\\") + native;
+    const DWORD attributes = GetFileAttributesW(reinterpret_cast<LPCWSTR>(native.utf16()));
+    // FILE_ATTRIBUTE_RECALL_ON_OPEN / RECALL_ON_DATA_ACCESS are available on
+    // modern Windows SDKs. Use their ABI values for older build SDK headers.
+    constexpr DWORD recallOnOpen = 0x00040000, recallOnDataAccess = 0x00400000;
+    return attributes != INVALID_FILE_ATTRIBUTES
+        && (attributes & (FILE_ATTRIBUTE_OFFLINE | recallOnOpen | recallOnDataAccess));
+#elif defined(Q_OS_MACOS)
+    struct stat state{};
+    constexpr uint32_t dataless = 0x40000000; // SF_DATALESS, iCloud and File Provider.
+    return (::lstat(QFile::encodeName(info.absoluteFilePath()).constData(), &state) == 0
+            && (state.st_flags & dataless)) || info.fileName().endsWith(QStringLiteral(".icloud"));
+#else
+    Q_UNUSED(info);
+    return false;
+#endif
+}
+
+bool isScreenshot(const QFileInfo &info)
+{
+#ifdef Q_OS_MACOS
+    if (::getxattr(QFile::encodeName(info.absoluteFilePath()).constData(),
+                  "com.apple.metadata:kMDItemIsScreenCapture", nullptr, 0, 0, XATTR_NOFOLLOW) > 0)
+        return true;
+#endif
+    const auto name = info.fileName();
+    for (const auto &prefix : {"Screenshot", "Screen Shot", "CleanShot", "SCR-"})
+        if (name.startsWith(QLatin1StringView(prefix), Qt::CaseInsensitive)) return true;
+    return false;
 }
 
 bool transportStream(const QString &path)
@@ -103,7 +149,7 @@ bool transportStream(const QString &path)
             || (bytes[4] == 0x47 && bytes[196] == 0x47 && bytes[388] == 0x47));
 }
 
-QString classify(const QFileInfo &info, bool includeCode)
+QString classify(const QFileInfo &info, bool includeCode, bool codeOnly = false)
 {
     const QString extension = info.suffix().toLower();
     const QString name = info.fileName();
@@ -119,16 +165,23 @@ QString classify(const QFileInfo &info, bool includeCode)
         return {};
     if (extension == "ts" || extension == "mts" || extension == "m2ts") {
         if (transportStream(info.absoluteFilePath()))
-            return "video";
+            return codeOnly ? QString{} : QStringLiteral("video");
         if (extension == "m2ts")
             return {};
     }
-    if (includeCode && (sourceExtensions().contains(extension) || sourceNames.contains(name) || name.startsWith("Dockerfile."))) {
+    const bool codeText = extension == "md" || extension == "markdown" || extension == "txt"
+        || extension == "html" || extension == "htm";
+    if (includeCode && (sourceExtensions().contains(extension) || sourceNames.contains(name)
+        || name.startsWith("Dockerfile.") || (codeOnly && codeText))) {
         if (name.endsWith(".min.js", Qt::CaseInsensitive) || name.endsWith(".min.mjs", Qt::CaseInsensitive)
             || name.endsWith(".min.css", Qt::CaseInsensitive))
             return {};
+        const auto lower = name.toLower();
+        if (codeOnly && (lower.startsWith("license") || lower.startsWith("licence")
+            || lower.startsWith("copying") || lower.startsWith("notice"))) return {};
         return "code";
     }
+    if (codeOnly) return {};
     if (texts.contains(extension)) return "text";
     if (extension == "pdf") return "pdf";
     if (images.contains(extension)) return "image";
@@ -137,14 +190,42 @@ QString classify(const QFileInfo &info, bool includeCode)
     return {};
 }
 
-bool skipDirectory(const QString &name, bool includeCode)
+bool skipDirectory(const QFileInfo &info, bool includeCode)
 {
+    const auto name = info.fileName();
     static const QSet<QString> common = {".git", ".svn", ".hg", "node_modules", "bower_components", "venv", ".venv",
         "site-packages", "__pycache__", "DerivedData", "Pods", "Carthage"};
     static const QSet<QString> code = {"vendor", "Vendor", "vendored", "third_party", "third-party", "thirdparty",
         "3rdparty", "external", "extern", "deps", "build", "Build", "dist", "out", "target", "obj", "coverage",
         "htmlcov", "generated", "__generated__", "wandb", "mlruns", "lightning_logs"};
-    return common.contains(name) || name.endsWith(".noindex") || (includeCode && code.contains(name));
+    static const QSet<QString> bundles = {"app", "bundle", "framework", "plugin", "kext", "prefpane",
+        "appex", "xcodeproj", "xcworkspace", "pkg", "photoslibrary"};
+    return info.isHidden() || name.startsWith(u'.') || common.contains(name) || name.endsWith(".noindex")
+        || bundles.contains(info.suffix().toLower()) || (includeCode && code.contains(name))
+#ifdef Q_OS_MACOS
+        || info.absoluteFilePath() == QDir::homePath() + QStringLiteral("/Library")
+#endif
+        ;
+}
+
+bool projectDirectory(const QFileInfoList &entries)
+{
+    static const QSet<QString> markers = {".git", "package.json", "Package.swift", "pyproject.toml", "setup.py",
+        "requirements.txt", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile",
+        "composer.json", "CMakeLists.txt"};
+    return std::any_of(entries.cbegin(), entries.cend(), [](const auto &entry) {
+        return markers.contains(entry.fileName()) || entry.suffix() == "xcodeproj" || entry.suffix() == "xcworkspace";
+    });
+}
+
+bool machineNamed(const QString &stem)
+{
+    const auto lower = stem.toLower();
+    for (const auto &prefix : {"img", "dsc", "pxl", "mvimg", "vid", "gopr", "dji", "photo", "whatsapp", "screenshot"})
+        if (lower.startsWith(QLatin1StringView(prefix))) return false;
+    static const QRegularExpression hex(QStringLiteral("^[0-9a-f]{8,}([-_][0-9a-f]{4,})*$"));
+    static const QRegularExpression numbered(QStringLiteral("^[a-z]{0,16}[-_. ]?[0-9]{3,}([-_.][0-9]+)*$"));
+    return hex.match(lower).hasMatch() || numbered.match(lower).hasMatch();
 }
 
 bool describeFile(const QFileInfo &info, FileRecord &record, QString &error)
@@ -184,7 +265,9 @@ bool describeFile(const QFileInfo &info, FileRecord &record, QString &error)
     }
     if (!resolved && ok) failure = GetLastError();
     CloseHandle(handle);
-    if (!ok || !resolved || (metadata.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+    constexpr DWORD unavailableAttributes = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+        | FILE_ATTRIBUTE_OFFLINE | 0x00040000 | 0x00400000;
+    if (!ok || !resolved || (metadata.dwFileAttributes & unavailableAttributes)) {
         error = QStringLiteral("File changed or identity is unavailable: %1 (Windows error %2)").arg(record.path).arg(failure);
         return false;
     }
@@ -196,8 +279,17 @@ bool describeFile(const QFileInfo &info, FileRecord &record, QString &error)
     changeTime = QByteArray::number(ticks) + ':' + QByteArray::number(basic.ChangeTime.QuadPart);
 #else
     struct stat metadata{};
-    const int descriptor = ::open(QFile::encodeName(record.path).constData(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
-    const bool valid = descriptor >= 0 && ::fstat(descriptor, &metadata) == 0 && S_ISREG(metadata.st_mode);
+    const int descriptor = ::open(QFile::encodeName(record.path).constData(),
+#ifdef Q_OS_MACOS
+        O_EVTONLY | O_NOFOLLOW | O_CLOEXEC);
+#else
+        O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+#endif
+    const bool valid = descriptor >= 0 && ::fstat(descriptor, &metadata) == 0 && S_ISREG(metadata.st_mode)
+#ifdef Q_OS_MACOS
+        && !(metadata.st_flags & 0x40000000)
+#endif
+        ;
     if (!valid) {
         const int failure = errno;
         if (descriptor >= 0) ::close(descriptor);
@@ -400,7 +492,12 @@ bool FileCatalog::describe(const QString &path, FileRecord *record, QString *err
         return false;
     }
     FileRecord described;
+    if (unavailablePlaceholder(info)) {
+        if (error) *error = QStringLiteral("File is in the cloud and has not been downloaded: %1").arg(path);
+        return false;
+    }
     described.kind = classify(info, true);
+    described.screenshot = described.kind == QStringLiteral("image") && isScreenshot(info);
     if (described.kind.isEmpty()) {
         if (error) *error = QStringLiteral("Unsupported file type: %1").arg(path);
         return false;
@@ -419,8 +516,10 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
                              const std::function<void(qsizetype)> &onDiscovered)
 {
     ScanResult result;
-    GitLibrary git(rules.includeCode);
-    if (rules.includeCode && !git.initialized) {
+    const bool codeOnly = rules.scope == FolderRules::Scope::Code;
+    const bool includeCode = rules.includeCode || codeOnly;
+    GitLibrary git(includeCode);
+    if (includeCode && !git.initialized) {
         result.errors.append(QStringLiteral("Cannot initialize bundled libgit2: %1").arg(gitError()));
         return result;
     }
@@ -431,6 +530,15 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
     QSet<QString> seenDirectories;
     QHash<QString, QString> repositoryCache;
     QHash<QString, QList<FileRecord>> repositoryFiles;
+    QSet<QString> explicitRoots;
+    for (const auto &root : rules.roots) {
+        const QFileInfo info(root);
+        if (!info.isSymLink()
+#ifdef Q_OS_WIN
+            && !info.isJunction()
+#endif
+        ) explicitRoots.insert(pathKey(normalizePath(root)));
+    }
     for (const auto &rawRoot : rules.roots) {
         if (isCancelled(cancel)) { result.cancelled = true; break; }
         const QFileInfo rawInfo(rawRoot);
@@ -452,10 +560,12 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
         QStringList activeExcludes;
         for (const auto &exclude : excludes)
             if (containsNormalized(exclude, root) && exclude.compare(root, pathCase) != 0) activeExcludes.append(exclude);
-        QStringList pending{root};
+        struct PendingDirectory { QString path; bool inProject; };
+        QList<PendingDirectory> pending{{root, false}};
         while (!pending.isEmpty()) {
             if (isCancelled(cancel)) { result.cancelled = true; break; }
-            const QString directory = pending.takeLast();
+            const auto next = pending.takeLast();
+            const QString directory = next.path;
             const QFileInfo current(directory);
             if (current.isSymLink()
 #ifdef Q_OS_WIN
@@ -472,32 +582,41 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
                     return containsNormalized(actualDirectory, exclude);
                 })) continue;
             const auto entries = QDir(directory).entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDir::NoSort);
+            const bool inProject = next.inProject || (!includeCode && projectDirectory(entries));
             if (!seenDirectories.contains(pathKey(actualDirectory))) {
                 seenDirectories.insert(pathKey(actualDirectory));
                 result.directories.append(actualDirectory);
             }
+            QList<FileRecord> directoryFiles;
             for (const auto &info : entries) {
                 if (isCancelled(cancel)) { result.cancelled = true; break; }
                 // Symlinks and Windows junctions are never followed, including file links.
-                if (info.isSymLink()
+                if (info.isSymLink() || info.isHidden() || info.fileName().startsWith(u'.')
 #ifdef Q_OS_WIN
                     || info.isJunction()
 #endif
                 ) continue;
+                if (unavailablePlaceholder(info)) continue;
                 const QString path = normalizePath(info.absoluteFilePath());
                 if (!containsNormalized(path, root)) continue;
                 if (std::any_of(activeExcludes.cbegin(), activeExcludes.cend(), [&path](const auto &exclude) {
                         return containsNormalized(path, exclude);
                     })) continue;
                 if (info.isDir()) {
-                    if (!skipDirectory(info.fileName(), rules.includeCode)) pending.append(path);
+                    const QFileInfo gitMarker(QDir(path).filePath(QStringLiteral(".git")));
+                    // A selected worktree root is valid, but nested worktrees
+                    // and submodules are excluded from a code walk.
+                    if (!skipDirectory(info, includeCode) && !(codeOnly && gitMarker.isFile()))
+                        pending.append({path, inProject});
                     continue;
                 }
                 if (!info.isFile() || seenFiles.contains(pathKey(path))) continue;
-                const QString kind = classify(info, rules.includeCode);
+                const QString kind = classify(info, includeCode, codeOnly);
                 if (kind.isEmpty()) continue;
                 FileRecord record;
                 record.kind = kind;
+                record.screenshot = kind == QStringLiteral("image") && isScreenshot(info);
+                if (inProject && !record.screenshot) continue;
                 QString error;
                 if (!describeFile(info, record, error)) { result.errors.append(error); continue; }
                 // Validate the actual handle-resolved path after any ancestor changes.
@@ -505,8 +624,31 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
                     || std::any_of(activeExcludes.cbegin(), activeExcludes.cend(), [&record](const auto &exclude) {
                         return containsNormalized(record.path, exclude);
                     })) continue;
+                directoryFiles.append(record);
+            }
+            // DigUp excludes a whole folder's media when one media kind has
+            // >=300 entries and >=70% machine names. Explicit roots opt in.
+            bool dataset = false;
+            if (!includeCode && !explicitRoots.contains(pathKey(actualDirectory))) {
+                QHash<QString, QPair<qsizetype, qsizetype>> counts;
+                for (const auto &record : directoryFiles) {
+                    if (record.screenshot || (record.kind != "image" && record.kind != "audio" && record.kind != "video"))
+                        continue;
+                    auto &count = counts[record.kind];
+                    ++count.first;
+                    if (machineNamed(QFileInfo(record.path).completeBaseName())) ++count.second;
+                }
+                for (const auto &count : counts) {
+                    if (count.first >= 300 && count.second * 10 >= count.first * 7) { dataset = true; break; }
+                }
+            }
+            for (const auto &record : directoryFiles) {
+                if (isCancelled(cancel)) { result.cancelled = true; break; }
+                if (dataset && !record.screenshot && (record.kind == "image" || record.kind == "audio" || record.kind == "video"))
+                    continue;
+                if (seenFiles.contains(pathKey(record.path))) continue;
                 seenFiles.insert(pathKey(record.path));
-                const QString repository = rules.includeCode ? findRepository(info.absolutePath(), repositoryCache) : QString{};
+                const QString repository = includeCode ? findRepository(QFileInfo(record.path).absolutePath(), repositoryCache) : QString{};
                 if (repository.isEmpty()) {
                     result.files.append(record);
                     if (onDiscovered) onDiscovered(result.files.size());

@@ -44,15 +44,19 @@ if(MSVC)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+include(qcs-output-paths)
 include(qcs-msvc-rsp)
 include(GNUInstallDirs)
 if(APPLE)
   # A user drags one .app out of the DMG. All helpers, libraries and data must
   # travel with that bundle, rather than rely on adjacent staging directories.
-  set(CMAKE_INSTALL_BINDIR "qcs.app/Contents/MacOS")
-  set(CMAKE_INSTALL_LIBDIR "qcs.app/Contents/Frameworks")
-  set(CMAKE_INSTALL_DATADIR "qcs.app/Contents/Resources")
+  set(CMAKE_INSTALL_BINDIR "qcs-gui.app/Contents/MacOS")
+  set(CMAKE_INSTALL_LIBDIR "qcs-gui.app/Contents/Frameworks")
+  set(CMAKE_INSTALL_DATADIR "qcs-gui.app/Contents/Resources")
 endif()
+# --prefix and DESTDIR may change after configure. Check their effective path
+# before any subdirectory installation can copy files into the source tree.
+qcopilots_search_install_output_guard("${CMAKE_SOURCE_DIR}")
 include(CTest)
 # CTest defaults to only 1 KiB for passing tests, which removes QtTest's case
 # totals and can hide internal skips from the release evidence.
@@ -65,6 +69,18 @@ set(QCOPILOTS_SEARCH_DEPENDENCY_ROOT "${CMAKE_BINARY_DIR}/../deps" CACHE PATH "E
 set(QCOPILOTS_SEARCH_TEST_ROOT "${CMAKE_BINARY_DIR}/../runs" CACHE PATH "External root for isolated test runs")
 set(QCOPILOTS_SEARCH_MODEL_DIR "" CACHE PATH "Optional read-only model cache for real model tests")
 set(FETCHCONTENT_BASE_DIR "${QCOPILOTS_SEARCH_DEPENDENCY_ROOT}" CACHE PATH "Dependency working directory")
+foreach(_root QCOPILOTS_SEARCH_DEPENDENCY_ROOT QCOPILOTS_SEARCH_TEST_ROOT FETCHCONTENT_BASE_DIR)
+  qcopilots_search_require_external_path("${_root}" "${${_root}}")
+endforeach()
+get_cmake_property(_qcopilots_variables VARIABLES)
+foreach(_variable IN LISTS _qcopilots_variables)
+  if(_variable MATCHES "^CMAKE_(RUNTIME|LIBRARY|ARCHIVE|PDB|COMPILE_PDB)_OUTPUT_DIRECTORY(_[A-Za-z0-9_]+)?$"
+      OR _variable MATCHES "^FETCHCONTENT_SOURCE_DIR_")
+    if(NOT "${${_variable}}" STREQUAL "")
+      qcopilots_search_require_external_path("${_variable}" "${${_variable}}")
+    endif()
+  endif()
+endforeach()
 file(MAKE_DIRECTORY "${QCOPILOTS_SEARCH_TEST_ROOT}")
 
 find_package(Qt6 6.12 REQUIRED COMPONENTS Core Gui Widgets Network Sql Concurrent Test Xml Svg Core5Compat Multimedia MultimediaWidgets Pdf PdfWidgets)
@@ -107,6 +123,11 @@ if(QCOPILOTS_SEARCH_BUILD_TESTS)
     "${PROJECT_SOURCE_DIR}/tools/qcs-test-macos-signing.py")
   set_tests_properties(qcs-tests-macos-signing PROPERTIES
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" LABELS "unit;portability;package"
+    ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+  qcopilots_search_add_test(NAME qcs-tests-release-tool COMMAND "${Python3_EXECUTABLE}" -B
+    "${PROJECT_SOURCE_DIR}/tools/qcs-test-release.py")
+  set_tests_properties(qcs-tests-release-tool PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" LABELS "unit;tooling;package" TIMEOUT 120
     ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 endif()
 include(qcs-dev-deploy)

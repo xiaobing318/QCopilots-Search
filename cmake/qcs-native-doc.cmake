@@ -1,4 +1,5 @@
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/qcs-write-if-different.cmake")
 
 # Calligra's maintained wv2 parser can run independently of its KDE application.
 # Only POLE is needed from libmso. Building all of libmso would introduce the ODF
@@ -26,7 +27,7 @@ function(qcopilots_search_add_doc_dependency)
     endif()
     string(REPLACE "#include <fstream>" "#include <fstream>\n#include <filesystem>" pole_content "${pole_content}")
     string(REPLACE "file.open(filename.c_str()," "file.open(std::filesystem::u8path(filename)," pole_content "${pole_content}")
-    file(WRITE "${wv2_binary}/pole.cpp" "${pole_content}")
+    qcopilots_search_write_if_different("${wv2_binary}/pole.cpp" "${pole_content}")
 
     file(READ "${wv2_source}/parserfactory.cpp" parser_content)
     string(FIND "${parser_content}" "FILE *file = fopen(fileName.c_str(), \"r\");" parser_anchor)
@@ -40,7 +41,7 @@ function(qcopilots_search_add_doc_dependency)
     string(REPLACE "unsigned char buffer[4];\n        fread(buffer, 1, 4, file);\n        diagnose(buffer);\n        fclose(file);"
         "unsigned char buffer[4] = {};\n        if (file.read(reinterpret_cast<char *>(buffer), 4) == 4)\n            diagnose(buffer);"
         parser_content "${parser_content}")
-    file(WRITE "${wv2_binary}/parserfactory.cpp" "${parser_content}")
+    qcopilots_search_write_if_different("${wv2_binary}/parserfactory.cpp" "${parser_content}")
 
     # wv2's sole iconv consumer converts legacy code pages to UCS-2. A private
     # adapter uses Qt's strict stateless decoder with Core5Compat fallback for

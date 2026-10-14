@@ -1,11 +1,15 @@
 #include "index_repository.h"
 #include "core/file_catalog.h"
+#include "core/embedding_math.h"
+#include "core/relevance_policy.h"
 #include "text_index.h"
 #include "vector_index.h"
 #include <QDir>
 #include <QFileInfo>
 #include <QHash>
+#include <QCryptographicHash>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QStorageInfo>
 #include <QUuid>
 #include <algorithm>
@@ -18,7 +22,7 @@
 
 namespace qcopilots_search {
 namespace {
-constexpr int schemaVersion = 2;
+constexpr int schemaVersion = 3;
 constexpr int shardCount = 16;
 constexpr qint64 exactSubsetLimit = 20000;
 constexpr qint64 deltaLimit = 2048;
@@ -101,6 +105,10 @@ struct Statement {
     if (result != SQLITE_OK)
       fail(db, "Bind vector");
   }
+  void bindNull(int pos) {
+    if (sqlite3_bind_null(stmt, pos) != SQLITE_OK)
+      fail(db, "Bind null");
+  }
   bool next() {
     const int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW)
@@ -118,6 +126,7 @@ struct Statement {
     sqlite3_clear_bindings(stmt);
   }
   qint64 integer(int col) const { return sqlite3_column_int64(stmt, col); }
+  bool isNull(int col) const { return sqlite3_column_type(stmt, col) == SQLITE_NULL; }
   double number(int col) const { return sqlite3_column_double(stmt, col); }
   QString string(int col) const {
     const auto *p = sqlite3_column_text(stmt, col);
@@ -161,6 +170,10 @@ void putMeta(sqlite3 *db, const QString &key, const QString &value) {
   q.bind(2, value);
   q.run();
 }
+void advanceBrowseGeneration(sqlite3 *db) {
+  putMeta(db, QStringLiteral("browse_generation"),
+          QString::number(meta(db, QStringLiteral("browse_generation")).toLongLong() + 1));
+}
 QString keyForPath(const QString &path) {
   auto result = normalizePath(path);
 #ifdef Q_OS_WIN
@@ -169,31 +182,10 @@ QString keyForPath(const QString &path) {
   return result;
 }
 QVector<float> normalized(const QVector<float> &values) {
-  if (values.size() != embeddingDimensions)
-    throw std::runtime_error("Embedding must contain exactly 768 values");
-  double squared = 0;
-  for (float value : values) {
-    if (!std::isfinite(value))
-      throw std::runtime_error("Embedding contains a non-finite value");
-    squared += double(value) * value;
-  }
-  if (!(squared > 1.e-20))
-    throw std::runtime_error("Embedding has zero norm");
-  auto result = values;
-  const double scale = 1. / std::sqrt(squared);
-  for (auto &value : result)
-    value = float(value * scale);
-  return result;
+  return embedding_math::normalized(values);
 }
 double cosine(const QVector<float> &a, const QVector<float> &b) {
-  if (a.size() != b.size() || a.isEmpty())
-    return -1;
-  double dot = 0, norm = 0;
-  for (qsizetype i = 0; i < a.size(); ++i) {
-    dot += double(a[i]) * b[i];
-    norm += double(b[i]) * b[i];
-  }
-  return norm > 0 ? dot / std::sqrt(norm) : -1;
+  return embedding_math::cosine(a, b);
 }
 const QString hitColumns =
     QStringLiteral("s.id,f.path,s.title,s.kind,s.text,s.page,s.line_start,s."
@@ -232,10 +224,10 @@ struct Filter {
                           "(f.path_key>=? COLLATE BINARY AND "
                           "f.path_key<? COLLATE BINARY))");
   }
-  explicit Filter(const SearchOptions &options)
+  explicit Filter(const SearchOptions &options, bool filesOnly = false)
       : kind(options.kind), code(options.code) {
     if (!kind.isEmpty())
-      sql += QStringLiteral(" AND s.kind=?");
+      sql += filesOnly ? QStringLiteral(" AND f.kind=?") : QStringLiteral(" AND s.kind=?");
     if (!options.root.isEmpty())
       sql += QStringLiteral(" AND ") + within(keyForPath(options.root));
     if (options.enforceFolderRules) {
@@ -449,7 +441,7 @@ bool IndexRepository::open(const RuntimePaths &paths, QString *error) {
     execute(db, R"SQL(
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 INSERT OR IGNORE INTO meta VALUES('generation','0');
-CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY,path TEXT NOT NULL,path_key TEXT NOT NULL,version TEXT NOT NULL,source_version TEXT NOT NULL,code INTEGER NOT NULL,UNIQUE(path_key,code));
+CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY,path TEXT NOT NULL,path_key TEXT NOT NULL,version TEXT NOT NULL,source_version TEXT NOT NULL,code INTEGER NOT NULL,modified_ms INTEGER,kind TEXT NOT NULL DEFAULT '',UNIQUE(path_key,code));
 CREATE TABLE IF NOT EXISTS segments(id INTEGER PRIMARY KEY AUTOINCREMENT,file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,generation INTEGER NOT NULL,shard INTEGER NOT NULL DEFAULT 0,title TEXT NOT NULL,kind TEXT NOT NULL,modality TEXT NOT NULL,text TEXT NOT NULL,media_path TEXT NOT NULL,page INTEGER NOT NULL,line_start INTEGER NOT NULL,line_end INTEGER NOT NULL,cell INTEGER NOT NULL,start_ms INTEGER NOT NULL,end_ms INTEGER NOT NULL,embedding BLOB,terms TEXT NOT NULL,han TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS segments_file ON segments(file_id);
 CREATE INDEX IF NOT EXISTS segments_generation ON segments(shard,generation) WHERE embedding IS NOT NULL;
@@ -461,12 +453,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS segment_fts USING fts5(terms,han,content='seg
 CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON segments BEGIN INSERT INTO segment_fts(rowid,terms,han) VALUES(new.id,new.terms,new.han); END;
 CREATE TRIGGER IF NOT EXISTS segments_ad AFTER DELETE ON segments BEGIN INSERT INTO segment_fts(segment_fts,rowid,terms,han) VALUES('delete',old.id,old.terms,old.han); END;
 CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE OF terms,han ON segments BEGIN INSERT INTO segment_fts(segment_fts,rowid,terms,han) VALUES('delete',old.id,old.terms,old.han); INSERT INTO segment_fts(rowid,terms,han) VALUES(new.id,new.terms,new.han); END;
-PRAGMA user_version=2;
 )SQL");
     if (version == 1) {
       execute(db, "ALTER TABLE files ADD COLUMN source_version TEXT NOT NULL "
                   "DEFAULT '';UPDATE files SET source_version=version");
     }
+    if (version > 0 && version < 3) {
+      execute(db, "ALTER TABLE files ADD COLUMN modified_ms INTEGER;"
+                  "ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT ''");
+    }
+    execute(db, "CREATE INDEX IF NOT EXISTS files_browse ON files(code,modified_ms DESC,id DESC);"
+                "CREATE INDEX IF NOT EXISTS files_browse_kind ON files(code,kind,modified_ms DESC,id DESC);"
+                "CREATE INDEX IF NOT EXISTS files_pending_metadata ON files(code) WHERE modified_ms IS NULL OR kind='';"
+                "INSERT OR IGNORE INTO meta VALUES('browse_generation','0');"
+                "PRAGMA user_version=3");
     if (meta(db, QStringLiteral("index_uuid")).isEmpty())
       putMeta(db, QStringLiteral("index_uuid"),
               QUuid::createUuid().toString(QUuid::WithoutBraces));
@@ -516,10 +516,12 @@ PRAGMA user_version=2;
 bool IndexRepository::replaceFile(const QString &path, const QString &version,
                                   const QVector<Segment> &segments, bool code,
                                   QString *error,
-                                  const PublicationGate &publicationGate) {
+                                  const PublicationGate &publicationGate,
+                                  std::optional<qint64> modifiedMs,
+                                  const QString &kind) {
   if (error)
     error->clear();
-  return replaceFiles({IndexedFile{path, version, code, segments}}, error,
+  return replaceFiles({IndexedFile{path, version, code, segments, modifiedMs, kind}}, error,
                       false, publicationGate);
 }
 
@@ -569,18 +571,15 @@ bool IndexRepository::replaceFiles(const QVector<IndexedFile> &files,
       auto *db = d->writer.db;
       Transaction transaction(db, true);
       const auto generation = d->generation() + 1;
+      bool browsingChanged = false;
+      Statement currentFile(db, "SELECT path,modified_ms,kind FROM files WHERE path_key=? AND code=?");
       Statement insertFile(
-          db, "INSERT INTO files(path,path_key,version,source_version,code) "
-              "VALUES(?,?,?,?,?) "
+          db, "INSERT INTO files(path,path_key,version,source_version,code,modified_ms,kind) "
+              "VALUES(?,?,?,?,?,?,?) "
               "ON CONFLICT(path_key,code) DO UPDATE SET "
               "path=excluded.path,version=excluded.version,source_version="
-              "excluded.source_version RETURNING id");
-      Statement oppositeEvents(
-          db, "INSERT INTO ann_events SELECT ?,s.shard,s.id,'delete' FROM "
-              "segments s JOIN files f ON f.id=s.file_id WHERE f.path_key=? "
-              "AND f.code<>? AND s.embedding IS NOT NULL");
-      Statement removeOpposite(
-          db, "DELETE FROM files WHERE path_key=? AND code<>?");
+              "excluded.source_version,modified_ms=COALESCE(excluded.modified_ms,files.modified_ms),"
+              "kind=CASE WHEN excluded.kind='' THEN files.kind ELSE excluded.kind END RETURNING id");
       Statement eventDelete(
           db, "INSERT INTO ann_events SELECT ?,shard,id,'delete' FROM segments "
               "WHERE file_id=? AND embedding IS NOT NULL");
@@ -595,20 +594,22 @@ bool IndexRepository::replaceFiles(const QVector<IndexedFile> &files,
                             "INSERT INTO ann_events VALUES(?,?,?,'upsert')");
       for (const auto &prepared : batch) {
         const auto &file = *prepared.file;
-        oppositeEvents.bind(1, generation);
-        oppositeEvents.bind(2, prepared.key);
-        oppositeEvents.bind(3, qint64(file.code));
-        oppositeEvents.run();
-        oppositeEvents.reset();
-        removeOpposite.bind(1, prepared.key);
-        removeOpposite.bind(2, qint64(file.code));
-        removeOpposite.run();
-        removeOpposite.reset();
+        currentFile.bind(1, prepared.key);
+        currentFile.bind(2, qint64(file.code));
+        const bool existed = currentFile.next();
+        browsingChanged = browsingChanged || !existed
+            || currentFile.string(0) != prepared.path
+            || (file.modifiedMs && (currentFile.isNull(1) || currentFile.integer(1) != *file.modifiedMs))
+            || (!file.kind.isEmpty() && currentFile.string(2) != file.kind);
+        currentFile.reset();
         insertFile.bind(1, prepared.path);
         insertFile.bind(2, prepared.key);
         insertFile.bind(3, file.version);
         insertFile.bind(4, file.version);
         insertFile.bind(5, qint64(file.code));
+        if (file.modifiedMs) insertFile.bind(6, *file.modifiedMs);
+        else insertFile.bindNull(6);
+        insertFile.bind(7, file.kind);
         if (!insertFile.next())
           throw std::runtime_error("Missing inserted file id");
         const qint64 fileId = insertFile.integer(0);
@@ -660,6 +661,7 @@ bool IndexRepository::replaceFiles(const QVector<IndexedFile> &files,
         putMeta(db, QStringLiteral("deferred_maintenance"),
                 QStringLiteral("1"));
       putMeta(db, QStringLiteral("generation"), QString::number(generation));
+      if (browsingChanged) advanceBrowseGeneration(db);
       transaction.commit();
     }
     if (!deferMaintenance) {
@@ -701,6 +703,10 @@ bool IndexRepository::replaceFiles(const QVector<IndexedFile> &files,
 }
 
 bool IndexRepository::removeFile(const QString &path, QString *error) {
+  return removeFile(path, false, error);
+}
+
+bool IndexRepository::removeFile(const QString &path, bool code, QString *error) {
   if (error)
     error->clear();
   try {
@@ -712,14 +718,19 @@ bool IndexRepository::removeFile(const QString &path, QString *error) {
     Statement events(db,
                      "INSERT INTO ann_events SELECT ?,s.shard,s.id,'delete' "
                      "FROM segments s JOIN files f ON f.id=s.file_id WHERE "
-                     "f.path_key=? AND s.embedding IS NOT NULL");
+                     "f.path_key=? AND f.code=? AND s.embedding IS NOT NULL");
     events.bind(1, gen);
     events.bind(2, keyForPath(path));
+    events.bind(3, qint64(code));
     events.run();
-    Statement remove(db, "DELETE FROM files WHERE path_key=?");
+    Statement remove(db, "DELETE FROM files WHERE path_key=? AND code=?");
     remove.bind(1, keyForPath(path));
+    remove.bind(2, qint64(code));
     remove.run();
-    putMeta(db, "generation", QString::number(gen));
+    if (sqlite3_changes(db) > 0) {
+      putMeta(db, "generation", QString::number(gen));
+      advanceBrowseGeneration(db);
+    }
     transaction.commit();
     return true;
   } catch (const std::exception &e) {
@@ -730,6 +741,12 @@ bool IndexRepository::removeFile(const QString &path, QString *error) {
 
 bool IndexRepository::prune(const QString &root,
                             const QSet<QString> &presentPaths, QString *error) {
+  return prune(root, presentPaths, false, error);
+}
+
+bool IndexRepository::prune(const QString &root,
+                            const QSet<QString> &presentPaths, bool code,
+                            QString *error) {
   if (error)
     error->clear();
   try {
@@ -743,7 +760,8 @@ bool IndexRepository::prune(const QString &root,
     auto *db = d->writer.db;
     Transaction transaction(db, true);
     const auto gen = d->generation() + 1;
-    Statement all(db, "SELECT id,path,path_key FROM files");
+    Statement all(db, "SELECT id,path,path_key FROM files WHERE code=?");
+    all.bind(1, qint64(code));
     QVector<qint64> removed;
     while (all.next())
       if (isPathWithin(all.string(1), root) && !present.contains(all.string(2)))
@@ -761,13 +779,218 @@ bool IndexRepository::prune(const QString &root,
       remove.run();
       remove.reset();
     }
-    if (!removed.isEmpty())
+    if (!removed.isEmpty()) {
       putMeta(db, "generation", QString::number(gen));
+      advanceBrowseGeneration(db);
+    }
     transaction.commit();
     return true;
   } catch (const std::exception &e) {
     report(error, e);
     return false;
+  }
+}
+
+bool IndexRepository::updateFileMetadata(const QVector<FileMetadata> &files,
+                                         QString *error,
+                                         const PublicationGate &publicationGate) {
+  if (error) error->clear();
+  try {
+    if (files.isEmpty()) return true;
+    std::lock_guard lock(d->publication);
+    const auto lease = publicationGate ? publicationGate() : std::shared_ptr<void>();
+    if (publicationGate && !lease)
+      throw std::runtime_error("Discarded obsolete file metadata before publication");
+    d->requireOpen();
+    d->diskGuard(qint64(files.size()) * 1024);
+    d->checkpoint();
+    auto *db = d->writer.db;
+    Transaction transaction(db, true);
+    Statement current(db, "SELECT id,modified_ms,kind,source_version,version FROM files WHERE path_key=? AND code=?");
+    Statement update(db, "UPDATE files SET modified_ms=?,kind=? WHERE id=?");
+    bool changed = false;
+    for (const auto &file : files) {
+      if (file.path.isEmpty() || file.kind.isEmpty())
+        throw std::runtime_error("File metadata requires a nonempty path and kind");
+      current.bind(1, keyForPath(file.path));
+      current.bind(2, qint64(file.code));
+      if (current.next()
+          && (!file.expectedIndexedVersion.isEmpty()
+              ? current.string(4) == file.expectedIndexedVersion
+              : file.sourceFingerprint.isEmpty()
+                  || current.string(3).startsWith(file.sourceFingerprint + u'|'))
+          && (current.isNull(1) || current.integer(1) != file.modifiedMs || current.string(2) != file.kind)) {
+        const qint64 id = current.integer(0);
+        update.bind(1, file.modifiedMs);
+        update.bind(2, file.kind);
+        update.bind(3, id);
+        update.run();
+        update.reset();
+        changed = true;
+      }
+      current.reset();
+    }
+    if (changed) advanceBrowseGeneration(db);
+    transaction.commit();
+    return true;
+  } catch (const std::exception &e) {
+    report(error, e);
+    return false;
+  }
+}
+
+qint64 IndexRepository::browseGeneration(QString *error) const {
+  if (error) error->clear();
+  try {
+    std::lock_guard lock(d->publication);
+    d->requireOpen();
+    return meta(d->writer.db, QStringLiteral("browse_generation")).toLongLong();
+  } catch (const std::exception &e) {
+    report(error, e);
+    return -1;
+  }
+}
+
+FileListPage IndexRepository::listFiles(const FileListOptions &options) const {
+  FileListPage page;
+  auto reject = [&](const QString &code, const QString &message) {
+    page.errorCode = code;
+    page.error = message;
+    return page;
+  };
+  try {
+    if (options.limit < 1 || options.limit > 100)
+      return reject(QStringLiteral("invalid_request"), QStringLiteral("File browsing requires a page size from 1 to 100"));
+    auto checkCancelled = [&] {
+      if (options.cancelled && options.cancelled->load(std::memory_order_relaxed))
+        throw std::runtime_error("File browsing cancelled");
+    };
+    checkCancelled();
+    SearchOptions filters;
+    filters.kind = options.kind;
+    filters.root = options.root;
+    filters.allowedRoots = options.allowedRoots;
+    filters.excludedRoots = options.excludedRoots;
+    filters.enforceFolderRules = options.enforceFolderRules;
+    filters.code = options.code;
+    const Filter filter(filters, true);
+    auto normalizedPaths = [](const QStringList &paths) {
+      QStringList normalized;
+      for (const auto &path : paths) if (!path.isEmpty()) normalized.append(keyForPath(path));
+      normalized.removeDuplicates();
+      normalized.sort();
+      return QJsonArray::fromStringList(normalized);
+    };
+    const QJsonObject context{{"code", options.code}, {"kind", options.kind},
+      {"root", keyForPath(options.root)}, {"roots", normalizedPaths(options.allowedRoots)},
+      {"excludes", normalizedPaths(options.excludedRoots)}, {"enforce", options.enforceFolderRules},
+      {"configuration", options.configurationToken}};
+    const QString contextHash = QString::fromLatin1(QCryptographicHash::hash(
+        QJsonDocument(context).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256).toHex());
+    QJsonObject cursor;
+    qint64 lastMtime = 0, lastId = 0, cursorGeneration = 0;
+    if (!options.cursor.isEmpty()) {
+      if (options.cursor.size() > 2048)
+        return reject(QStringLiteral("invalid_cursor"), QStringLiteral("File cursor exceeds the size limit"));
+      const auto encoded = options.cursor.toLatin1();
+      if (QString::fromLatin1(encoded) != options.cursor
+          || std::any_of(encoded.begin(), encoded.end(), [](char c) {
+               return !(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z')
+                   && !(c >= '0' && c <= '9') && c != '_' && c != '-';
+             }))
+        return reject(QStringLiteral("invalid_cursor"), QStringLiteral("File cursor encoding is invalid"));
+      QJsonParseError parseError;
+      const auto document = QJsonDocument::fromJson(QByteArray::fromBase64(
+          encoded, QByteArray::Base64UrlEncoding | QByteArray::AbortOnBase64DecodingErrors), &parseError);
+      cursor = document.object();
+      auto integer = [&](const char *name, qint64 &target) {
+        const auto value = cursor.value(QLatin1String(name));
+        if (!value.isString()) return false;
+        bool ok = false;
+        target = value.toString().toLongLong(&ok);
+        return ok && QString::number(target) == value.toString();
+      };
+      if (parseError.error != QJsonParseError::NoError || !document.isObject()
+          || cursor.size() != 6 || cursor.value("v").toInt() != 1
+          || !cursor.value("index").isString() || !cursor.value("context").isString()
+          || !integer("generation", cursorGeneration) || cursorGeneration < 0
+          || !integer("mtime", lastMtime) || !integer("id", lastId) || lastId < 1)
+        return reject(QStringLiteral("invalid_cursor"), QStringLiteral("File cursor fields are invalid"));
+    }
+    Connection reader;
+    std::unique_ptr<Transaction> transaction;
+    QString indexUuid;
+    {
+      std::lock_guard lock(d->publication);
+      d->requireOpen();
+      reader.open(d->paths.databaseFile(), false);
+      transaction = std::make_unique<Transaction>(reader.db);
+      page.browseGeneration = meta(reader.db, QStringLiteral("browse_generation")).toLongLong();
+      indexUuid = meta(reader.db, QStringLiteral("index_uuid"));
+    }
+    auto *db = reader.db;
+    if (!cursor.isEmpty() && (cursorGeneration != page.browseGeneration
+        || cursor.value("index").toString() != indexUuid
+        || cursor.value("context").toString() != contextHash))
+      return reject(QStringLiteral("cursor_stale"), QStringLiteral("The file list changed. Refresh to browse its current contents."));
+    if (options.cancelled)
+      sqlite3_progress_handler(db, 1000, [](void *state) noexcept {
+        return static_cast<const std::atomic_bool *>(state)->load(std::memory_order_relaxed) ? 1 : 0;
+      }, options.cancelled.get());
+    auto metadataFilters = filters;
+    metadataFilters.kind.clear();
+    const Filter metadataFilter(metadataFilters, true);
+    Statement pending(db, QStringLiteral("SELECT EXISTS(SELECT 1 FROM files f WHERE ")
+        + metadataFilter.sql + QStringLiteral(" AND (modified_ms IS NULL OR kind=''))"));
+    metadataFilter.bind(pending);
+    pending.next();
+    if (pending.integer(0)) {
+      page.metadataPending = true;
+      return reject(QStringLiteral("metadata_pending"), QStringLiteral("Indexed file metadata is being refreshed. Retry after reconciliation completes."));
+    }
+    QString sql = QStringLiteral("SELECT f.id,f.path,f.kind,f.modified_ms,f.source_version,f.code FROM files f WHERE ") + filter.sql;
+    if (!cursor.isEmpty())
+      sql += QStringLiteral(" AND (f.modified_ms<? OR (f.modified_ms=? AND f.id<?))");
+    sql += QStringLiteral(" ORDER BY f.modified_ms DESC,f.id DESC LIMIT ?");
+    Statement query(db, sql);
+    int bind = filter.bind(query);
+    if (!cursor.isEmpty()) {
+      query.bind(bind++, lastMtime);
+      query.bind(bind++, lastMtime);
+      query.bind(bind++, lastId);
+    }
+    query.bind(bind, qint64(options.limit + 1));
+    while (query.next()) {
+      checkCancelled();
+      if (page.files.size() == options.limit) { page.hasMore = true; break; }
+      FileListEntry file;
+      file.fileId = query.integer(0);
+      file.path = query.string(1);
+      file.title = QFileInfo(file.path).fileName();
+      file.kind = query.string(2);
+      file.modifiedMs = query.integer(3);
+      file.sourceVersion = query.string(4);
+      file.code = query.integer(5) != 0;
+      page.files.append(std::move(file));
+    }
+    if (page.hasMore) {
+      const auto &last = page.files.last();
+      const QJsonObject next{{"v", 1}, {"index", indexUuid}, {"context", contextHash},
+          {"generation", QString::number(page.browseGeneration)},
+          {"mtime", QString::number(last.modifiedMs)}, {"id", QString::number(last.fileId)}};
+      page.nextCursor = QString::fromLatin1(QJsonDocument(next).toJson(QJsonDocument::Compact)
+          .toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+    }
+    checkCancelled();
+    transaction->commit();
+    return page;
+  } catch (const std::exception &e) {
+    page.files.clear();
+    page.hasMore = false;
+    page.nextCursor.clear();
+    return reject(options.cancelled && options.cancelled->load(std::memory_order_relaxed)
+                    ? QStringLiteral("cancelled") : QStringLiteral("storage_error"),
+                  QString::fromUtf8(e.what()));
   }
 }
 
@@ -1059,7 +1282,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
                   return a.second == b.second ? a.first < b.first
                                               : a.second > b.second;
                 });
-      Statement get(db, QStringLiteral("SELECT ") + hitColumns +
+      Statement get(db, QStringLiteral("SELECT ") + hitColumns + QStringLiteral(",s.modality") +
                             QStringLiteral(" FROM segments s JOIN files f ON "
                                            "f.id=s.file_id WHERE s.id=?"));
       QSet<QString> paths;
@@ -1067,6 +1290,11 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
         get.bind(1, value.first);
         if (get.next()) {
           auto hit = readHit(get);
+          if (options.semanticCandidateMode == SemanticCandidateMode::MatchesOnly
+              && !acceptsSemanticCandidate(get.string(12), options.code, value.second)) {
+            get.reset();
+            continue;
+          }
           if (!paths.contains(hit.path)) {
             paths.insert(hit.path);
             hit.score = value.second;
@@ -1078,7 +1306,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
           break;
       }
     }
-    if (expression.isEmpty() && options.queryEmbedding.isEmpty()) {
+    if (options.query.trimmed().isEmpty() && options.queryEmbedding.isEmpty()) {
       Statement q(
           db,
           QStringLiteral("SELECT ") + hitColumns +
@@ -1146,6 +1374,8 @@ QJsonObject IndexRepository::status(QString *error) const {
          scalar(db,
                 "SELECT count(*) FROM segments WHERE embedding IS NOT NULL")},
         {"generation", d->generation()},
+        {"browseGeneration", meta(db, "browse_generation")},
+        {"metadataPendingFiles", scalar(db, "SELECT count(*) FROM files WHERE modified_ms IS NULL OR kind=''")},
         {"annVectors", qint64(d->published->size())},
         {"annGeneration", qint64(d->published->generation())},
         {"annEfSearch", VectorIndex::searchEf},

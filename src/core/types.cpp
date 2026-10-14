@@ -90,6 +90,35 @@ SearchHit SearchHit::fromJson(const QJsonObject &value)
     return hit;
 }
 
+QJsonObject FileListEntry::toJson() const
+{
+    return {{"fileId", QString::number(fileId)}, {"path", path}, {"title", title},
+            {"kind", kind}, {"modifiedMs", QString::number(modifiedMs)},
+            {"sourceVersion", sourceVersion}, {"code", code}};
+}
+
+FileListEntry FileListEntry::fromJson(const QJsonObject &value)
+{
+    FileListEntry entry;
+    entry.fileId = value.value("fileId").toString().toLongLong();
+    entry.path = value.value("path").toString();
+    entry.title = value.value("title").toString();
+    entry.kind = value.value("kind").toString();
+    entry.modifiedMs = value.value("modifiedMs").toString().toLongLong();
+    entry.sourceVersion = value.value("sourceVersion").toString();
+    entry.code = value.value("code").toBool();
+    return entry;
+}
+
+QJsonObject FileListPage::toJson() const
+{
+    QJsonArray values;
+    for (const auto &file : files) values.append(file.toJson());
+    return {{"files", values}, {"nextCursor", nextCursor}, {"hasMore", hasMore},
+            {"browseGeneration", QString::number(browseGeneration)},
+            {"metadataPending", metadataPending}};
+}
+
 QJsonObject IndexProgress::toJson() const
 {
     return {{QStringLiteral("state"), state}, {QStringLiteral("currentPath"), currentPath},

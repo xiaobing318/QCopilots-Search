@@ -1,4 +1,4 @@
-"""Owned process jobs reused from the reviewed two-checkout evidence runner."""
+"""Shared Windows process jobs for owned acceptance-runner child processes."""
 import ctypes
 from ctypes import wintypes
 import time

@@ -29,13 +29,15 @@
     {"name": "qcs-debug", "configurePreset": "qcs-debug"}
   ],
   "testPresets": [
-    {"name": "qcs-release", "configurePreset": "qcs-release", "filter": {"exclude": {"label": "^slow$"}}, "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
-    {"name": "qcs-debug", "configurePreset": "qcs-debug", "filter": {"exclude": {"label": "^slow$"}}, "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
-    {"name": "qcs-release-full", "configurePreset": "qcs-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
-    {"name": "qcs-debug-full", "configurePreset": "qcs-debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
+    {"name": "qcs-release", "displayName": "Release fast tests", "description": "Exclude slow tests. No model download, application installation or packaging.", "configurePreset": "qcs-release", "filter": {"exclude": {"label": "^slow$"}}, "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "qcs-debug", "displayName": "Debug fast tests", "description": "Exclude slow tests. No model download, application installation or packaging.", "configurePreset": "qcs-debug", "filter": {"exclude": {"label": "^slow$"}}, "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "qcs-release-full", "displayName": "Release full tests", "description": "All registered tests, including slow tests. Prepare models first, or use qcs-dev check --test-profile full for the complete flow.", "configurePreset": "qcs-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "qcs-debug-full", "displayName": "Debug full tests", "description": "All registered tests, including slow tests. Prepare models first, or use qcs-dev check --test-profile full for the complete flow.", "configurePreset": "qcs-debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
   ],
   "workflowPresets": [
     {"name": "qcs-release", "steps": [{"type": "configure", "name": "qcs-release"}, {"type": "build", "name": "qcs-release"}, {"type": "test", "name": "qcs-release"}]},
-    {"name": "qcs-release-full", "steps": [{"type": "configure", "name": "qcs-release"}, {"type": "build", "name": "qcs-release"}, {"type": "test", "name": "qcs-release-full"}]}
+    {"name": "qcs-release-full", "steps": [{"type": "configure", "name": "qcs-release"}, {"type": "build", "name": "qcs-release"}, {"type": "test", "name": "qcs-release-full"}]},
+    {"name": "qcs-debug", "steps": [{"type": "configure", "name": "qcs-debug"}, {"type": "build", "name": "qcs-debug"}, {"type": "test", "name": "qcs-debug"}]},
+    {"name": "qcs-debug-full", "steps": [{"type": "configure", "name": "qcs-debug"}, {"type": "build", "name": "qcs-debug"}, {"type": "test", "name": "qcs-debug-full"}]}
   ]
 }

@@ -74,15 +74,15 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
     popupDebounce_.setInterval(180);
     connect(&debounce_, &QTimer::timeout, this, [this] { sendSearch(); });
     connect(&popupDebounce_, &QTimer::timeout, this, [this] { sendSearch(true); });
-    connect(query_, &QLineEdit::textChanged, this, [this] { if (!query_->isComposing()) debounce_.start(); });
+    connect(query_, &QLineEdit::textChanged, this, [this] { updateBrowseControls(); if (!query_->isComposing()) debounce_.start(); });
     connect(query_, &SearchEdit::compositionFinished, &debounce_, qOverload<>(&QTimer::start));
     connect(query_, &QLineEdit::returnPressed, this, [this] { if (!query_->isComposing()) { debounce_.stop(); sendSearch(); } });
-    connect(kind_, &QComboBox::currentIndexChanged, this, [this] { debounce_.start(); });
-    connect(root_, &QComboBox::currentIndexChanged, this, [this] { debounce_.start(); });
-    connect(code_, &QCheckBox::toggled, this, [this](bool code) { kind_->setEnabled(!code); debounce_.start(); });
+    connect(kind_, &QComboBox::currentIndexChanged, this, [this] { updateBrowseControls(); debounce_.start(); });
+    connect(root_, &QComboBox::currentIndexChanged, this, [this] { updateBrowseControls(); debounce_.start(); });
+    connect(code_, &QCheckBox::toggled, this, [this](bool code) { kind_->setEnabled(!code); refreshRoots(); debounce_.start(); });
     connect(results_, &QListWidget::currentRowChanged, this, &MainWindow::selectResult);
     connect(results_, &QListWidget::itemActivated, this, [this] { openCurrent(); });
-    connect(preview_, &PreviewPanel::openRequested, this, [this](const SearchHit &hit) { QString error; if (!PlatformIntegration::openHit(hit, settings_.editorCommand, &error)) showError(error); });
+    connect(preview_, &PreviewPanel::openRequested, this, &MainWindow::openHit);
     connect(preview_, &PreviewPanel::revealRequested, this, [this](const QString &path) { QString error; if (!PlatformIntegration::revealFile(path, &error)) showError(error); });
     connect(preview_, &PreviewPanel::documentRequested, this, [this](const QString &path, bool code, int start) {
         if (!documentRequest_.isEmpty()) { backend_->cancel(documentRequest_); pending_.remove(documentRequest_); }
@@ -115,7 +115,24 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
     connect(backend_, &AppBackend::eventReceived, this, [this](const QString &event, const QJsonObject &data) {
         if (event == "progress") updateProgress(data);
         else if (event == "settings") applySettings(data);
-        else if (event == "indexChanged") debounce_.start();
+        else if (event == "indexChanged") {
+            const QString generation = data.value("browseGeneration").toString();
+            const QString visibilityEpoch = data.value("visibilityEpoch").toString();
+            const auto changed = [&](const BrowseState &state) {
+                return (!generation.isEmpty() && generation != state.generation)
+                    || (!visibilityEpoch.isEmpty() && visibilityEpoch != state.visibilityEpoch);
+            };
+            if (query_->text().trimmed().isEmpty() && !browse_.generation.isEmpty() && !browse_.pending) {
+                if (changed(browse_)) markFilesStale();
+            }
+            else debounce_.start();
+            if (popup_ && popup_->isVisible()) {
+                if (popupQuery_->text().trimmed().isEmpty() && !popupBrowse_.generation.isEmpty() && !popupBrowse_.pending) {
+                    if (changed(popupBrowse_)) markFilesStale(true);
+                }
+                else popupDebounce_.start();
+            }
+        }
     });
     refresh_.setInterval(2500);
     connect(&refresh_, &QTimer::timeout, this, [this] { if (connected_ && !pending_.values().contains("status")) send("status"); });
@@ -128,6 +145,7 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
     results_->installEventFilter(this);
     if (useTray_) {
         createTray();
+        connect(platform_, &PlatformIntegration::shortcutStatusChanged, this, &MainWindow::applyLanguage);
         platform_->registerGlobalShortcut();
         connect(platform_, &PlatformIntegration::activated, this, &MainWindow::showQuickSearch);
     }
@@ -194,10 +212,11 @@ void MainWindow::buildUi() {
     splitter->setChildrenCollapsible(false);
     results_ = new QListWidget(splitter);
     results_->setObjectName("searchResults");
-    results_->setWordWrap(true);
-    results_->setSpacing(5);
+    results_->setWordWrap(false);
+    results_->setTextElideMode(Qt::ElideMiddle);
+    results_->setSpacing(2);
     results_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    results_->setStyleSheet("QListWidget{border:1px solid #cbd1de;border-radius:7px} QListWidget::item{padding:12px;border-radius:5px} QListWidget::item:selected{background:#e4ecff;color:#102957}");
+    results_->setStyleSheet("QListWidget{border:1px solid #cbd1de;border-radius:7px} QListWidget::item{padding:8px;border-radius:5px} QListWidget::item:selected{background:#e4ecff;color:#102957}");
     results_->setMinimumWidth(240);
     preview_ = new PreviewPanel(splitter);
     preview_->setMinimumWidth(310);
@@ -206,6 +225,17 @@ void MainWindow::buildUi() {
     splitter->setStretchFactor(0, 4);
     splitter->setStretchFactor(1, 6);
     layout->addWidget(splitter, 1);
+    auto *browseActions = new QHBoxLayout;
+    refreshFiles_ = new QPushButton(central);
+    refreshFiles_->setObjectName("refreshFilesButton");
+    loadMore_ = new QPushButton(central);
+    loadMore_->setObjectName("loadMoreFilesButton");
+    browseActions->addWidget(refreshFiles_);
+    browseActions->addWidget(loadMore_);
+    browseActions->addStretch();
+    layout->addLayout(browseActions);
+    connect(refreshFiles_, &QPushButton::clicked, this, [this] { debounce_.stop(); sendSearch(); });
+    connect(loadMore_, &QPushButton::clicked, this, [this] { loadMoreFiles(); });
     auto *indexRow = new QHBoxLayout;
     progressText_ = new QLabel(central);
     progressText_->setObjectName("indexProgressText");
@@ -231,10 +261,14 @@ void MainWindow::buildUi() {
     capability_ = new QLabel(central);
     capability_->setWordWrap(true);
     capability_->setObjectName("shortcutCapability");
+    retryShortcut_ = new QPushButton(central);
+    retryShortcut_->setObjectName("retryShortcutButton");
+    connect(retryShortcut_, &QPushButton::clicked, platform_, &PlatformIntegration::registerGlobalShortcut);
     updateButton_ = new QPushButton(central);
     updateButton_->setFlat(true);
     updateButton_->setObjectName("updatesButton");
     footer->addWidget(capability_, 1);
+    footer->addWidget(retryShortcut_);
     footer->addWidget(updateButton_);
     layout->addLayout(footer);
     setCentralWidget(central);
@@ -259,6 +293,11 @@ void MainWindow::applyLanguage() {
     code_->setText(label("Code search", "代码搜索"));
     code_->setToolTip(label("Enable code indexing in Settings before searching source code and notebook cells.", "请先在设置中启用代码索引，再搜索源代码与 Notebook 单元格。"));
     quickButton_->setText(label("Quick search", "快速搜索"));
+    if (popupQuery_) popupQuery_->setPlaceholderText(label("Describe what you want to find…", "描述您想查找的内容…"));
+    if (popupFullSearch_) popupFullSearch_->setText(label("Open full search", "打开完整搜索"));
+    refreshFiles_->setText(label("Refresh files", "刷新文件列表"));
+    loadMore_->setText(label("Load more files", "加载更多文件"));
+    if (popupRefreshFiles_) popupRefreshFiles_->setText(refreshFiles_->text());
     modelButton_->setText(modelAvailable_ ? label("Model ready", "模型已就绪") : label("Add model", "添加模型"));
     settingsButton_->setText(label("Settings", "设置"));
     indexButton_->setText(label("Rescan", "重新扫描"));
@@ -269,10 +308,15 @@ void MainWindow::applyLanguage() {
     if (summary_->text().isEmpty()) summary_->setText(label("Start with a question or keyword", "输入问题或关键词开始搜索"));
     if (progressText_->text().isEmpty()) progressText_->setText(label("Connecting to local service…", "正在连接本地服务…"));
     preview_->setLanguage(language_);
+    retryShortcut_->setText(label("Retry shortcut", "重试快捷键"));
+    retryShortcut_->setVisible(useTray_);
     if (useTray_) {
-        const QString shortcut = platform_->shortcutStatus();
-        if (shortcut == "Ctrl+Shift+Space") capability_->setText(label("Quick search: Ctrl+Shift+Space · Search: Ctrl+F", "快速搜索：Ctrl+Shift+Space · 搜索：Ctrl+F"));
-        else if (!shortcut.isEmpty()) capability_->setText(label("Global shortcut unavailable. Use Quick search, the tray or Ctrl+F.", "全局快捷键暂不可用，请使用快速搜索、托盘或 Ctrl+F。"));
+        const auto shortcut = platform_->shortcutInfo();
+        if (shortcut.state == GlobalShortcutState::Active) capability_->setText(label("Quick search: ", "快速搜索：") + shortcut.binding + label(" · Search: Ctrl+F", " · 搜索：Ctrl+F"));
+        else if (shortcut.state == GlobalShortcutState::Pending) capability_->setText(label("Waiting for the desktop shortcut permission…", "正在等待系统快捷键授权…"));
+        else capability_->setText(label("Global shortcut unavailable. Use Quick search, the tray or Ctrl+F.", "全局快捷键暂不可用，请使用快速搜索、托盘或 Ctrl+F。"));
+        capability_->setToolTip(shortcut.message);
+        retryShortcut_->setEnabled(shortcut.state != GlobalShortcutState::Active && shortcut.state != GlobalShortcutState::Pending);
     } else capability_->setText(label("Search: Ctrl+F", "搜索：Ctrl+F"));
     if (useTray_ && !tray_) capability_->setText(capability_->text() + label(" · Tray unavailable, closing the window exits the app.", " · 系统托盘不可用，关闭窗口将退出应用。"));
     if (tray_) {
@@ -281,6 +325,8 @@ void MainWindow::applyLanguage() {
         trayPause_->setText(indexState_ == "paused" ? label("Resume indexing", "继续索引") : label("Pause indexing", "暂停索引"));
         trayQuit_->setText(label("Quit QCopilots Search", "退出 QCopilots Search"));
     }
+    updateBrowseControls();
+    if (popup_) updateBrowseControls(true);
 }
 void MainWindow::createTray() {
     if (!QSystemTrayIcon::isSystemTrayAvailable()) return;
@@ -302,47 +348,123 @@ QString MainWindow::send(const QString &method, const QJsonObject &params, int t
     pending_.insert(id, method);
     return id;
 }
+QJsonObject MainWindow::searchContext(bool popup) const {
+    const bool code = !popup && code_->isChecked();
+    return {{"query", (popup ? popupQuery_ : query_)->text().trimmed()},
+        {"code", code}, {"kind", popup || code ? "" : kind_->currentData().toString()},
+        {"root", popup ? "" : root_->currentData().toString()},
+        {"configuredRoots", QJsonArray::fromStringList(code ? settings_.codeRoots : settings_.roots)},
+        {"configuredExcludes", QJsonArray::fromStringList(code ? settings_.codeExcludes : settings_.excludes)}};
+}
 void MainWindow::sendSearch(bool popup) {
     if (!connected_) return;
     SearchEdit *input = popup ? popupQuery_ : query_;
     if (!input || input->isComposing()) return;
     QString &previous = popup ? popupSearch_ : currentSearch_;
-    if (!previous.isEmpty()) { backend_->cancel(previous); pending_.remove(previous); }
-    QJsonObject parameters{{"query", input->text().trimmed()}, {"limit", popup ? 12 : 100}, {"semantic", true}, {"code", popup ? false : code_->isChecked()}};
-    if (!popup) { parameters.insert("kind", code_->isChecked() ? "" : kind_->currentData().toString()); parameters.insert("root", root_->currentData().toString()); }
-    if (!popup) {
-        requestedSearchContext_ = parameters;
-        requestedSearchContext_.insert("configuredRoots", QJsonArray::fromStringList(settings_.roots));
-        requestedSearchContext_.insert("configuredExcludes", QJsonArray::fromStringList(settings_.excludes));
+    if (!previous.isEmpty()) { backend_->cancel(previous); pending_.remove(previous); resultRequests_.remove(previous); }
+    const auto context = searchContext(popup);
+    const bool browse = context.value("query").toString().isEmpty();
+    auto parameters = context;
+    parameters.remove("configuredRoots"); parameters.remove("configuredExcludes");
+    parameters.insert("limit", popup ? 12 : 100);
+    if (browse) parameters.remove("query"); else parameters.insert("semantic", true);
+    auto &state = popup ? popupBrowse_ : browse_;
+    if (context != (popup ? popupDisplayedContext_ : displayedSearchContext_)) state = {};
+    state.loading = browse;
+    state.pending = false;
+    state.failure.clear();
+    previous = send(browse ? "files.list" : "search", parameters, 120000);
+    resultRequests_.insert(previous, {popup, browse, false, context});
+    (popup ? popupStatus_ : summary_)->setText(browse ? label("Loading files…", "正在加载文件…") : label("Searching…", "正在搜索…"));
+    updateBrowseControls(popup);
+}
+void MainWindow::loadMoreFiles(bool popup) {
+    auto &state = popup ? popupBrowse_ : browse_;
+    const auto context = searchContext(popup);
+    if (!connected_ || !context.value("query").toString().isEmpty() || state.loading || state.stale || state.cursor.isEmpty()
+        || context != (popup ? popupDisplayedContext_ : displayedSearchContext_)) return;
+    auto parameters = context;
+    parameters.remove("query"); parameters.remove("configuredRoots"); parameters.remove("configuredExcludes");
+    parameters.insert("limit", popup ? 12 : 100);
+    parameters.insert("cursor", state.cursor);
+    QString &request = popup ? popupSearch_ : currentSearch_;
+    request = send("files.list", parameters, 120000);
+    resultRequests_.insert(request, {popup, true, true, context});
+    state.loading = true;
+    state.failure.clear();
+    updateBrowseControls(popup);
+}
+void MainWindow::updateBrowseControls(bool popup) {
+    if (popup && !popupQuery_) return;
+    const auto context = searchContext(popup);
+    const bool browse = context.value("query").toString().isEmpty();
+    const auto &state = popup ? popupBrowse_ : browse_;
+    auto *more = popup ? nullptr : loadMore_;
+    auto *refresh = popup ? popupRefreshFiles_ : refreshFiles_;
+    if (!refresh) return;
+    refresh->setVisible(browse);
+    if (more) {
+        more->setVisible(browse);
+        more->setEnabled(browse && connected_ && !state.loading && !state.stale && !state.pending && !state.cursor.isEmpty()
+            && context == (popup ? popupDisplayedContext_ : displayedSearchContext_));
     }
-    previous = send("search", parameters, 120000);
-    if (popup) popupRequestedQuery_ = input->text().trimmed();
-    if (popup) popupStatus_->setText(label("Searching…", "正在搜索…")); else summary_->setText(label("Searching…", "正在搜索…"));
+    refresh->setEnabled(browse && connected_ && !state.loading);
+    if (!browse) return;
+    QString message;
+    if (state.loading) message = label("Loading files…", "正在加载文件…");
+    else if (state.pending) message = label("Checking folders. Refresh after indexing finishes.", "正在核对文件目录，完成后请刷新。");
+    else if (state.stale) message = label("Files changed. Refresh to continue browsing.", "文件列表已变化，请刷新后继续浏览。");
+    else if (!state.failure.isEmpty()) message = state.failure;
+    else if (context == (popup ? popupDisplayedContext_ : displayedSearchContext_))
+        message = label("Files: ", "文件：") + QString::number((popup ? popupHits_ : hits_).size())
+            + (state.cursor.isEmpty() ? label(" · all loaded", " · 已全部加载")
+                : popup ? label(" · open full search for more", " · 打开完整搜索查看更多") : label(" · more available", " · 还有更多"));
+    if (!message.isEmpty()) (popup ? popupStatus_ : summary_)->setText(message);
+}
+void MainWindow::markFilesStale(bool popup) {
+    auto &state = popup ? popupBrowse_ : browse_;
+    state.stale = true;
+    state.loading = false;
+    QString &request = popup ? popupSearch_ : currentSearch_;
+    if (!request.isEmpty()) { backend_->cancel(request); pending_.remove(request); resultRequests_.remove(request); request.clear(); }
+    updateBrowseControls(popup);
 }
 void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
     const QString method = pending_.take(id);
-    if (method == "search") {
-        const bool popup = id == popupSearch_;
-        if (!popup && id != currentSearch_) return;
-        if (popup) popupResultQuery_ = popupRequestedQuery_;
+    if (method == "search" || method == "files.list") {
+        if (!resultRequests_.contains(id)) return;
+        const auto request = resultRequests_.take(id);
+        const bool popup = request.popup;
+        if (id != (popup ? popupSearch_ : currentSearch_) || request.context != searchContext(popup)) return;
+        (popup ? popupSearch_ : currentSearch_).clear();
+        auto &state = popup ? popupBrowse_ : browse_;
+        state.loading = false;
+        if (popup) popupResultQuery_ = request.context.value("query").toString();
         QList<SearchHit> &hits = popup ? popupHits_ : hits_;
         QListWidget *list = popup ? popupResults_ : results_;
         QLabel *summary = popup ? popupStatus_ : summary_;
-        const SearchHit previous = preview_->currentHit();
-        // Retain a preview during an index refresh, but a new question or
-        // filter must start with its highest-ranked result.
-        const bool sameContext = !popup && requestedSearchContext_ == displayedSearchContext_;
-        if (!popup) displayedSearchContext_ = requestedSearchContext_;
+        const int previousRow = list->currentRow();
+        const int scroll = list->verticalScrollBar()->value();
+        const SearchHit previous = previousRow >= 0 && previousRow < hits.size() ? hits.at(previousRow) : SearchHit{};
+        auto &displayedContext = popup ? popupDisplayedContext_ : displayedSearchContext_;
+        const bool sameContext = request.context == displayedContext;
+        displayedContext = request.context;
         const QSignalBlocker resultBlocker(list);
-        hits.clear();
-        list->clear();
-        for (const auto &value : data.value("hits").toArray()) {
-            const auto hit = SearchHit::fromJson(value.toObject());
+        if (!request.append) { hits.clear(); list->clear(); }
+        for (const auto &value : data.value(request.browse ? "files" : "hits").toArray()) {
+            SearchHit hit;
+            if (request.browse) {
+                const auto file = FileListEntry::fromJson(value.toObject());
+                hit.path = file.path; hit.title = file.title; hit.kind = file.code ? "code" : file.kind; hit.sourceVersion = file.sourceVersion;
+            } else hit = SearchHit::fromJson(value.toObject());
             hits.append(hit);
-            QString excerpt = hit.text.simplified().left(popup ? 110 : 180);
-            QString description = hit.title.isEmpty() ? QFileInfo(hit.path).fileName() : hit.title;
-            description += '\n' + excerpt;
-            description += '\n' + QFileInfo(hit.path).absolutePath();
+            QString description = (hit.title.isEmpty() ? QFileInfo(hit.path).fileName() : hit.title).simplified();
+            description += '\n' + QFileInfo(hit.path).absolutePath().simplified();
+            if (!hit.kind.isEmpty()) description += " · " + hit.kind;
+            if (hit.page > 0) description += label(" · Page ", " · 页码 ") + QString::number(hit.page);
+            if (hit.lineStart > 0) description += label(" · Line ", " · 行号 ") + QString::number(hit.lineStart);
+            if (hit.cell > 0) description += label(" · Cell ", " · 单元格 ") + QString::number(hit.cell);
+            if (hit.startMs > 0) description += QStringLiteral(" · %1 s").arg(hit.startMs / 1000.0, 0, 'f', 1);
             if (!popup && !hit.matchSource.isEmpty()) {
                 const QString source = hit.matchSource == "semantic" ? label("Semantic", "语义匹配")
                     : hit.matchSource == "hybrid" ? label("Semantic + keywords", "语义与关键词")
@@ -352,14 +474,23 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
             auto *item = new QListWidgetItem(description, list);
             item->setToolTip(hit.path);
             item->setData(Qt::UserRole, hit.path);
+            if (request.browse) item->setData(Qt::UserRole + 1, value.toObject().value("fileId").toString());
         }
-        summary->setText(hits.isEmpty() ? label("No matching files", "没有匹配的文件") : label("Results: ", "结果：") + QString::number(hits.size()) + (data.value("semantic").toBool() ? label(" · semantic + keywords", " · 语义与关键词") : label(" · keywords", " · 关键词")));
+        if (request.browse) {
+            state.cursor = data.value("hasMore").toBool() ? data.value("nextCursor").toString() : QString();
+            state.generation = data.value("browseGeneration").toString();
+            state.visibilityEpoch = data.value("visibilityEpoch").toString();
+            state.stale = false;
+            state.pending = data.value("metadataPending").toBool();
+            state.failure.clear();
+        } else summary->setText(hits.isEmpty() ? label("No matching files", "没有匹配的文件") : label("Results: ", "结果：") + QString::number(hits.size()) + (data.value("semantic").toBool() ? label(" · semantic + keywords", " · 语义与关键词") : label(" · keywords", " · 关键词")));
         int selection = hits.isEmpty() ? -1 : 0;
         bool sameHit = false;
         if (sameContext) {
             for (int row = 0; row < hits.size(); ++row) {
                 const auto &hit = hits.at(row);
-                if (hit.path == previous.path && hit.segmentId == previous.segmentId && hit.text == previous.text && hit.page == previous.page && hit.startMs == previous.startMs) {
+                if (hit.path == previous.path && hit.kind == previous.kind && hit.sourceVersion == previous.sourceVersion
+                    && hit.segmentId == previous.segmentId && hit.text == previous.text && hit.page == previous.page && hit.startMs == previous.startMs) {
                     selection = row;
                     sameHit = true;
                     break;
@@ -367,8 +498,9 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
             }
         }
         list->setCurrentRow(selection);
-        if (!sameContext) list->scrollToTop();
+        if (sameContext) list->verticalScrollBar()->setValue(scroll); else list->scrollToTop();
         if (!popup && !sameHit) selectResult(selection);
+        updateBrowseControls(popup);
         const QString warning = data.value("warning").toString(data.value("error").toString());
         if (popup) {
             if (!warning.isEmpty()) popupStatus_->setText(popupStatus_->text() + '\n' + warning);
@@ -408,13 +540,41 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
 }
 void MainWindow::handleFailure(const QString &id, const QString &code, const QString &message) {
     const QString method = pending_.take(id);
+    if (method.isEmpty()) return;
+    if (method == "search" || method == "files.list") {
+        if (!resultRequests_.contains(id)) return;
+        const auto request = resultRequests_.take(id);
+        if (id != (request.popup ? popupSearch_ : currentSearch_) || request.context != searchContext(request.popup)) return;
+        (request.popup ? popupSearch_ : currentSearch_).clear();
+        auto &state = request.popup ? popupBrowse_ : browse_;
+        state.loading = false;
+        if (code == "cursor_stale" || code == "invalid_cursor") {
+            markFilesStale(request.popup);
+            return;
+        }
+        if (code == "metadata_pending") {
+            state.pending = true;
+            (request.popup ? popupStatus_ : summary_)->setText(label("Checking folders. Results will refresh when indexing finishes.", "正在核对文件目录，完成后将刷新结果。"));
+            updateBrowseControls(request.popup);
+            return;
+        }
+        if (code != "cancelled" && code != "canceled") {
+            state.failure = request.browse && code == "unknown_method"
+                ? label("The application and local service use incompatible versions. Restart QCopilots Search and update both components if this continues.", "应用与本地服务版本不兼容，请重新启动 QCopilots Search，如仍有问题请同步更新应用和服务。")
+                : message.isEmpty() ? code : message;
+            if (request.popup) popupStatus_->setText(state.failure);
+            else { showError(state.failure); summary_->setText(label("Could not load results", "无法加载结果")); }
+        }
+        // A failed append retains its cursor, rows, selection and preview for retry.
+        updateBrowseControls(request.popup);
+        return;
+    }
     if (code.compare("cancelled", Qt::CaseInsensitive) == 0 || code.compare("canceled", Qt::CaseInsensitive) == 0) return;
     if (method == "models.reload" && code == "busy" && modelReloadAttempts_++ < 20 && !quitting_) {
         statusBar()->showMessage(label("Waiting for the current index update before loading the model…", "正在等待当前索引更新完成，然后加载模型…"), 5000);
         QTimer::singleShot(500, this, [this] { if (!quitting_) send("models.reload", {}, 120000); });
         return;
     }
-    if (method == "search" && id != currentSearch_ && id != popupSearch_) return;
     if (method == "document.preview") {
         if (id == documentRequest_ && preview_->currentHit().path == documentPath_) { preview_->documentPreviewFailed(message); documentRequest_.clear(); }
         return;
@@ -428,18 +588,29 @@ void MainWindow::applySettings(const QJsonObject &json) {
     AppSettings parsed;
     QString error;
     if (!AppSettings::fromJson(json, &parsed, &error)) { showError(error); return; }
+    const auto previousContext = searchContext(false);
+    const auto previousPopupContext = popup_ ? searchContext(true) : QJsonObject{};
     settings_ = parsed;
     language_ = settings_.language == "system" ? QLocale::system().name() : settings_.language;
+    code_->setEnabled(settings_.includeCode);
+    if (!settings_.includeCode) code_->setChecked(false);
+    refreshRoots();
+    applyLanguage();
+    if (!settingsLoaded_ || previousContext != searchContext(false)) debounce_.start();
+    if (popup_ && popup_->isVisible() && (!settingsLoaded_ || previousPopupContext != searchContext(true))) popupDebounce_.start();
+    settingsLoaded_ = true;
+}
+void MainWindow::refreshRoots() {
     const QSignalBlocker rootBlocker(root_);
+    const auto &paths = code_->isChecked() ? settings_.codeRoots : settings_.roots;
+    bool unchanged = root_->count() == paths.size() + 1;
+    for (int row = 0; unchanged && row < paths.size(); ++row) unchanged = root_->itemData(row + 1).toString() == paths.at(row);
+    if (unchanged) { root_->setItemText(0, label("All folders", "所有文件夹")); return; }
     const QString previousRoot = root_->currentData().toString();
     root_->clear();
     root_->addItem(label("All folders", "所有文件夹"), "");
-    for (const auto &path : settings_.roots) root_->addItem(path, path);
+    for (const auto &path : paths) root_->addItem(path, path);
     root_->setCurrentIndex(qMax(0, root_->findData(previousRoot)));
-    code_->setEnabled(settings_.includeCode);
-    if (!settings_.includeCode) code_->setChecked(false);
-    applyLanguage();
-    debounce_.start();
 }
 void MainWindow::updateProgress(const QJsonObject &value) {
     indexState_ = value.value("state").toString("idle");
@@ -464,17 +635,14 @@ void MainWindow::updateProgress(const QJsonObject &value) {
 }
 void MainWindow::showSettings(bool firstRun) {
     if (auto *existing = findChild<SettingsDialog *>()) { existing->raise(); existing->activateWindow(); return; }
-    const QString platformDefault = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)).filePath(QStringLiteral("qcs"));
-    const bool defaultProfile = !QStandardPaths::isTestModeEnabled()
-        && !qEnvironmentVariableIsSet("QCOPILOTS_SEARCH_PROFILE_DIR")
-        && paths_.profileDir == RuntimePaths::resolve(platformDefault).profileDir;
+    const bool defaultProfile = PlatformIntegration::canSetStartAtLogin(paths_.profileDir, paths_.modelDir);
     auto *dialog = new SettingsDialog(settings_, firstRun, defaultProfile, this);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &QDialog::accepted, this, [this, dialog, defaultProfile] {
         const auto settings = dialog->settings();
-        if (defaultProfile && settings.startAtLogin != settings_.startAtLogin) {
+        if (defaultProfile && dialog->startupChangeRequested()) {
             QString error;
-            if (!PlatformIntegration::setStartAtLogin(settings.startAtLogin, &error)) { showError(error); return; }
+            if (!PlatformIntegration::setStartAtLogin(settings.startAtLogin, paths_.profileDir, paths_.modelDir, &error)) { showError(error); return; }
         }
         auto changes = settings.toJson();
         // Pausing belongs to the service's live task state. A preferences dialog
@@ -495,12 +663,19 @@ void MainWindow::showError(const QString &message) { error_->setText(message); e
 void MainWindow::openCurrent() {
     const int row = results_->currentRow();
     if (row < 0 || row >= hits_.size()) return;
+    openHit(hits_.at(row));
+}
+void MainWindow::openHit(const SearchHit &hit) {
     QString error;
-    if (!PlatformIntegration::openHit(hits_.at(row), settings_.editorCommand, &error)) showError(error);
+    if (!PlatformIntegration::openHit(hit, settings_, &error)) showError(error);
+    else if (!error.isEmpty()) statusBar()->showMessage(error, 15000);
 }
 void MainWindow::selectResult(int row) {
     if (!documentRequest_.isEmpty()) { backend_->cancel(documentRequest_); pending_.remove(documentRequest_); documentRequest_.clear(); }
-    if (row >= 0 && row < hits_.size()) preview_->showHit(hits_.at(row)); else preview_->clear();
+    if (row >= 0 && row < hits_.size()) {
+        preview_->showHit(hits_.at(row));
+        if (displayedSearchContext_.value("query").toString().isEmpty()) preview_->loadDocumentText();
+    } else preview_->clear();
 }
 void MainWindow::showSearch() { showNormal(); raise(); activateWindow(); query_->setFocus(); query_->selectAll(); }
 void MainWindow::showQuickSearch() {
@@ -516,21 +691,32 @@ void MainWindow::showQuickSearch() {
         popupQuery_->setClearButtonEnabled(true);
         popupResults_ = new QListWidget(popup_);
         popupResults_->setObjectName("quickSearchResults");
-        popupResults_->setWordWrap(true);
+        popupResults_->setWordWrap(false);
+        popupResults_->setTextElideMode(Qt::ElideMiddle);
+        popupResults_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         popupStatus_ = new QLabel(popup_);
+        popupStatus_->setObjectName("quickSearchStatus");
         popupStatus_->setWordWrap(true);
         layout->addWidget(popupQuery_);
         layout->addWidget(popupResults_, 1);
         layout->addWidget(popupStatus_);
-        auto *full = new QPushButton(label("Open full search", "打开完整搜索"), popup_);
-        full->setObjectName("openFullSearchButton");
-        layout->addWidget(full);
-        connect(full, &QPushButton::clicked, this, [this] { query_->setText(popupQuery_->text()); popup_->hide(); showSearch(); });
+        auto *browseActions = new QHBoxLayout;
+        popupRefreshFiles_ = new QPushButton(popup_);
+        popupRefreshFiles_->setObjectName("quickRefreshFilesButton");
+        browseActions->addWidget(popupRefreshFiles_);
+        browseActions->addStretch();
+        layout->addLayout(browseActions);
+        connect(popupRefreshFiles_, &QPushButton::clicked, this, [this] { popupDebounce_.stop(); sendSearch(true); });
+        popupFullSearch_ = new QPushButton(label("Open full search", "打开完整搜索"), popup_);
+        popupFullSearch_->setObjectName("openFullSearchButton");
+        layout->addWidget(popupFullSearch_);
+        connect(popupFullSearch_, &QPushButton::clicked, this, [this] { query_->setText(popupQuery_->text()); popup_->hide(); showSearch(); });
         connect(popupQuery_, &QLineEdit::textChanged, this, [this] {
             if (!popupQuery_->isComposing()) {
                 popupHits_.clear();
                 popupResults_->clear();
                 popupResultQuery_.clear();
+                updateBrowseControls(true);
                 popupDebounce_.start();
             }
         });
@@ -540,14 +726,16 @@ void MainWindow::showQuickSearch() {
             const int row = popupResults_->currentRow();
             if (row < 0 || row >= popupHits_.size()) { sendSearch(true); return; }
             QString error;
-            if (PlatformIntegration::openHit(popupHits_.at(row), settings_.editorCommand, &error)) popup_->hide(); else popupStatus_->setText(error);
+            if (PlatformIntegration::openHit(popupHits_.at(row), settings_, &error)) {
+                if (error.isEmpty()) popup_->hide(); else popupStatus_->setText(error);
+            } else popupStatus_->setText(error);
         };
         connect(popupQuery_, &QLineEdit::returnPressed, this, [this, open] { if (!popupQuery_->isComposing()) open(); });
         connect(popupResults_, &QListWidget::itemActivated, this, open);
         popupQuery_->installEventFilter(this);
         popupResults_->installEventFilter(this);
     }
-    popupQuery_->setPlaceholderText(label("Describe what you want to find…", "描述您想查找的内容…"));
+    applyLanguage();
     popup_->move(screen()->availableGeometry().center() - QPoint(popup_->width() / 2, popup_->height() / 2));
     popup_->show();
     popup_->raise();
@@ -573,7 +761,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
     return QMainWindow::eventFilter(watched, event);
 }
 void MainWindow::checkForUpdates(bool manual) {
-    QNetworkRequest request(QUrl("https://api.github.com/repos/xiaobing318/QCopilots-search/releases/latest"));
+    QNetworkRequest request(QUrl("https://api.github.com/repos/xiaobing318/QCopilots-Search/releases/latest"));
     request.setRawHeader("User-Agent", "qcopilots-search/" + QCoreApplication::applicationVersion().toUtf8());
     request.setRawHeader("Accept", "application/vnd.github+json");
     request.setTransferTimeout(15000);
@@ -602,7 +790,7 @@ void MainWindow::checkForUpdates(bool manual) {
             return;
         }
         const QUrl url(release.value("html_url").toString());
-        if (url.scheme() != "https" || url.host() != "github.com" || !url.path().startsWith("/xiaobing318/QCopilots-search/releases/")) { if (manual) showError(label("The update response contains an unexpected download address.", "更新响应中的下载地址不符合预期。")); return; }
+        if (url.scheme() != "https" || url.host() != "github.com" || !url.path().startsWith("/xiaobing318/QCopilots-Search/releases/")) { if (manual) showError(label("The update response contains an unexpected download address.", "更新响应中的下载地址不符合预期。")); return; }
         QMessageBox prompt(QMessageBox::Information, label("Update available", "有可用更新"), label("Version ", "版本 ") + version + label(" is available. Open the release page to download it?", " 已发布，是否打开发布页面下载？"), QMessageBox::Open | QMessageBox::Cancel, this);
         prompt.button(QMessageBox::Open)->setText(label("Open", "打开"));
         prompt.button(QMessageBox::Cancel)->setText(label("Cancel", "取消"));

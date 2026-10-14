@@ -3,6 +3,7 @@
 #include "storage/index_repository.h"
 #include <QObject>
 #include <QLocalServer>
+#include <QProcess>
 #include <functional>
 #include <memory>
 
@@ -16,6 +17,13 @@ struct ServiceDependencies {
     // Empty uses QLocalServer::listen. Construction-only injection lets tests
     // deliver a real connection before the listen operation returns.
     std::function<bool(QLocalServer &, const QString &)> listen;
+    // Construction-only seams for deterministic lifecycle tests. Production
+    // callers use these defaults and the installed worker executable.
+    std::function<void(QProcess &, bool query)> configureWorker;
+    int indexIdleMs = 60000;
+    int queryIdleMs = 600000;
+    int workerShutdownGraceMs = 1500;
+    int reconcileMs = 30000;
 };
 
 class ServiceServer final : public QObject {

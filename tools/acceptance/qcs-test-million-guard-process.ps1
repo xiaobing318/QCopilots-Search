@@ -41,7 +41,7 @@ function ProcessFixture([string] $Name, [int] $Identifier, $CpuSeconds) {
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
-$blockingNames = @('cmake', 'ctest', 'ninja', 'cl', 'link', 'qcs',
+$blockingNames = @('cmake', 'ctest', 'ninja', 'cl', 'link', 'qcs-gui',
     'qcs-service', 'qcs-worker', 'qcs-cli',
     'qcs-benchmark', 'qcs-tests-file-capacity',
     'qcs-tests-reference-vectors', 'qcs-tests-semantic',

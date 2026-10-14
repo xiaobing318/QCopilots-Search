@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Portable signing-contract tests. Real Apple codesign is exercised by native CI.
 
-The runner below records commands without invoking a signing tool. Real symbolic
-link cases explicitly report unavailable Windows privileges as skipped coverage.
+The runner below records commands without invoking a signing tool. Real POSIX
+bundle symbolic-link cases are registered only on macOS and Linux. Windows still
+executes the portable resolution contracts without requiring symlink privileges.
 """
 from __future__ import annotations
 
@@ -90,8 +91,8 @@ class SigningTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="qcs-signing-", dir=configured)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.app = self.root / "应用 空格" / "qcs.app"
-        self.create_bundle(self.app, "qcs")
+        self.app = self.root / "应用 空格" / "qcs-gui.app"
+        self.create_bundle(self.app, "qcs-gui")
 
     def write(self, relative, content):
         path = self.app / relative
@@ -120,12 +121,7 @@ class SigningTests(unittest.TestCase):
 
     def symlink(self, link, target, *, directory=False):
         link.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            link.symlink_to(target, target_is_directory=directory)
-        except OSError as error:
-            if os.name == "nt" and error.winerror == 1314:
-                self.skipTest("Windows lacks symbolic-link creation privilege (WinError 1314). Native CI must run this case.")
-            raise
+        link.symlink_to(target, target_is_directory=directory)
 
     def inventory_fixture(self):
         self.write("Contents/Frameworks/libtesseract.5.5.3.dylib", thin(DYLIB))
@@ -180,7 +176,7 @@ class SigningTests(unittest.TestCase):
         self.assertNotIn(path.relative_to(self.app).as_posix(), inventory["machOFiles"])
 
     def test_inventory_architectures_come_from_thin_headers_and_fat_tables(self):
-        expected = {"Contents/MacOS/qcs": ["x86_64"]}
+        expected = {"Contents/MacOS/qcs-gui": ["x86_64"]}
         for endian, suffix in (("<", "le"), (">", "be")):
             # Misleading names establish that CPU types come from bytes.
             intel = f"Contents/Frameworks/pretends-arm64-{suffix}.dylib"
@@ -259,7 +255,7 @@ class SigningTests(unittest.TestCase):
         plan = signing.plan_bundle(self.app)
         self.assertEqual(Path(plan["bundle"]), self.app)
         expected = {
-            "Contents/MacOS/qcs",
+            "Contents/MacOS/qcs-gui",
             "Contents/MacOS/qcs-worker",
             "Contents/Frameworks/libtesseract.5.5.3.dylib",
             "Contents/Frameworks/libtesseract.5.5.dylib",
@@ -311,7 +307,7 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(paths[-1], ".")
 
     def test_missing_bundle_executable_fails_before_signing(self):
-        (self.app / "Contents/MacOS/qcs").unlink()
+        (self.app / "Contents/MacOS/qcs-gui").unlink()
         runner = RecordingRunner()
         with self.assertRaises(EXPECTED_ERROR + (OSError,)):
             signing.sign_bundle(self.app, runner=runner)
@@ -358,7 +354,7 @@ class SigningTests(unittest.TestCase):
 
     def test_symlink_escape_resolution_contract_without_platform_privileges(self):
         # Model the filesystem answers for one link. Real symlink tests above
-        # separately exercise the operating system where privileges permit.
+        # separately exercise the macOS/Linux bundle filesystem contract.
         alias = self.write("Contents/Frameworks/escaped.dylib", thin(DYLIB))
         outside = self.root / "outside.dylib"
         outside.write_bytes(thin(DYLIB))
@@ -530,13 +526,32 @@ class SigningTests(unittest.TestCase):
 def load_tests(loader, suite, pattern):
     # Keep the final-bundle link and signing contracts in the existing CTest
     # entry while reporting every portable unittest separately at verbosity 2.
+    posix_only = {
+        "test_internal_library_symlink_is_not_signed_twice",
+        "test_directory_symlink_is_not_recursed",
+        "test_external_file_symlink_is_rejected",
+        "test_external_directory_symlink_is_rejected",
+    }
+    selected, excluded = [], []
+    for case in loader.loadTestsFromTestCase(SigningTests):
+        if os.name == "nt" and case._testMethodName in posix_only:
+            excluded.append({
+                "case": case.id(),
+                "reason": "POSIX macOS bundle symbolic-link contract is covered on macOS/Linux. Portable resolution contracts run on Windows.",
+            })
+        else:
+            selected.append(case)
     path = Path(__file__).with_name("qcs-test-macos-links.py")
     spec = importlib.util.spec_from_file_location("qcopilots_search_test_macos_links", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    suite.addTests(loader.loadTestsFromModule(module))
-    return suite
+    selected.extend(loader.loadTestsFromTestCase(module.LinkTests))
+    print("QCS_CASE_REGISTRATION " + json.dumps({
+        "suite": "pure", "selected": [case.id() for case in selected],
+        "notApplicable": excluded,
+    }, ensure_ascii=False), flush=True)
+    return unittest.TestSuite(selected)
 
 
 if __name__ == "__main__":

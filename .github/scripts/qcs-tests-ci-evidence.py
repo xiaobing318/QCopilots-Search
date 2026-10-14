@@ -26,6 +26,24 @@ deb_spec = importlib.util.spec_from_file_location(
 deb = importlib.util.module_from_spec(deb_spec)
 deb_spec.loader.exec_module(deb)
 
+# Synthetic fixture metadata. Production classification comes only from CTest labels.
+FIXTURE_PYTHON_TESTS = {
+    "qcs-tests-macos-signing", "qcs-tests-workflow", "qcs-tests-license-materials",
+    "qcs-tests-acceptance-runners", "qcs-tests-acceptance-native", "qcs-tests-runner",
+    "qcs-tests-path-budget", "qcs-tests-temp-paths", "qcs-tests-ci-evidence",
+    "qcs-tests-release-evidence", "qcs-tests-test-policy",
+}
+FIXTURE_NON_QT_TESTS = FIXTURE_PYTHON_TESTS | {
+    "qcs-tests-semantic-manifest", "qcs-tests-semantic", "qcs-tests-inference-install-layout",
+}
+
+
+def fixture_test(name, extra_labels=()):
+    kind = "python-unittest" if name in FIXTURE_PYTHON_TESTS else (
+        "program" if name in FIXTURE_NON_QT_TESTS else "qttest")
+    return {"name": name, "properties": [{"name": "LABELS", "value": [kind, *extra_labels]}]}
+
+
 SIGNING_PROGRAM = "qcs-tests-macos-signing"
 SIGNING_SKIP_REASON = ("Windows lacks symbolic-link creation privilege (WinError 1314). "
                        "Native CI must run this case.")
@@ -98,8 +116,9 @@ def workflow_verbose(rows=None):
 class EvidenceTests(unittest.TestCase):
     def inspect(self, output="Totals: 3 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n",
                 *, name="qcs-tests-core", system="Windows", failure=None, raw=False,
-                expected=None, include_inventory=True, duplicate=False, test_profile="full", status=None):
-        if not raw and name not in evidence.NON_QT_TESTS:
+                expected=None, include_inventory=True, duplicate=False, test_profile="full", status=None,
+                inventory_entries=None):
+        if not raw and name not in FIXTURE_NON_QT_TESTS:
             output = ("********* Start testing of EvidenceTests *********\n"
                       "PASS   : EvidenceTests::initTestCase()\n"
                       "PASS   : EvidenceTests::runsCase()\n"
@@ -122,7 +141,8 @@ class EvidenceTests(unittest.TestCase):
             ET.ElementTree(root).write(path, encoding="utf-8")
             inventory = Path(temporary) / "ctest-inventory.json"
             inventory.write_text(json.dumps({"kind": "ctestInfo",
-                "tests": [{"name": value} for value in (expected if expected is not None else [name])]}),
+                "tests": inventory_entries if inventory_entries is not None else
+                    [fixture_test(value) for value in (expected if expected is not None else [name])]}),
                 encoding="utf-8")
             return evidence.inspect_junit(path, system, inventory if include_inventory else None,
                                           test_profile)
@@ -134,6 +154,39 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result["testProfile"], "full")
         self.assertEqual(result["qtTestTotals"]["passed"], 3)
         self.assertTrue(result["inventoryVerified"])
+
+    def test_new_python_program_uses_inventory_kind_without_a_name_registry(self):
+        name = "qcs-tests-new-tool-without-parser-change"
+        output = "test_new (__main__.NewTool.test_new) ... ok\nRan 1 test in 0.001s\n\nOK\n"
+        entry = {"name": name, "properties": [{"name": "LABELS", "value": ["python-unittest"]}]}
+        result = self.inspect(output, name=name, raw=True, inventory_entries=[entry])
+        self.assertTrue(result["testsComplete"], result["errors"])
+        self.assertEqual(result["pythonTestTotals"]["passed"], 1)
+
+    def test_new_python_program_cannot_pass_with_summary_only(self):
+        name = "qcs-tests-new-tool-without-parser-change"
+        entry = {"name": name, "properties": [{"name": "LABELS", "value": ["python-unittest"]}]}
+        result = self.inspect("Ran 2 tests in 0.001s\n\nOK\n", name=name, raw=True, inventory_entries=[entry])
+        self.assertFalse(result["testsComplete"])
+
+    def test_missing_or_conflicting_evidence_kind_cannot_pass(self):
+        for labels in ([], ["unit"], ["qttest", "python-unittest"]):
+            entry = {"name": "qcs-tests-core", "properties": [{"name": "LABELS", "value": labels}]}
+            self.assertFalse(self.inspect(inventory_entries=[entry])["testsComplete"])
+
+    def test_fast_uses_full_inventory_to_record_excluded_slow_tests(self):
+        entries = [fixture_test("qcs-tests-core"), fixture_test("qcs-tests-slow-fixture", ["slow"])]
+        result = self.inspect(test_profile="fast", inventory_entries=entries)
+        self.assertTrue(result["testsComplete"], result["errors"])
+        self.assertFalse(result["releaseComplete"])
+        self.assertEqual(result["registeredPrograms"], ["qcs-tests-core", "qcs-tests-slow-fixture"])
+        self.assertEqual(result["excludedPrograms"], ["qcs-tests-slow-fixture"])
+        self.assertFalse(self.inspect(test_profile="full", inventory_entries=entries)["testsComplete"])
+
+    def test_disabled_slow_registration_is_not_hidden_by_fast_selection(self):
+        entries = [fixture_test("qcs-tests-core"), fixture_test("qcs-tests-slow-fixture", ["slow"])]
+        entries[1]["properties"].append({"name": "DISABLED", "value": True})
+        self.assertFalse(self.inspect(test_profile="fast", inventory_entries=entries)["testsComplete"])
 
     def test_subset_report_cannot_claim_full_completion(self):
         self.assertFalse(self.inspect(expected=["qcs-tests-core",
@@ -206,8 +259,8 @@ class EvidenceTests(unittest.TestCase):
                          ["releaseComplete"])
 
     def test_non_qt_programs_do_not_require_qt_totals(self):
-        for name in evidence.NON_QT_TESTS:
-            if name in evidence.PYTHON_CASE_TESTS:
+        for name in FIXTURE_NON_QT_TESTS:
+            if name in FIXTURE_PYTHON_TESTS:
                 continue
             self.assertTrue(self.inspect("success\n", name=name)["releaseComplete"])
 
@@ -324,7 +377,7 @@ class TestProfileEvidenceTests(unittest.TestCase):
                 ET.SubElement(case, "failure").text = "Manifest mismatch"
             ET.ElementTree(root).write(junit, encoding="utf-8")
             inventory.write_text(json.dumps({"kind": "ctestInfo", "tests": [
-                {"name": "qcs-tests-semantic-manifest"}]}), encoding="utf-8")
+                fixture_test("qcs-tests-semantic-manifest")]}), encoding="utf-8")
             argv = [str(Path(evidence.__file__)), "--junit", str(junit), "--inventory", str(inventory),
                     "--platform", "Windows", "--output", str(output), *options]
             with mock.patch.object(sys, "argv", argv), mock.patch("sys.stdout", new_callable=io.StringIO):
@@ -370,6 +423,44 @@ class PythonSigningEvidenceTests(unittest.TestCase):
     def skipped_rows(self, *, reason=SIGNING_SKIP_REASON):
         return [(name, "skipped " + repr(reason) if name in SIGNING_SYMLINK_CASES else "ok")
                 for name in SIGNING_CASES]
+
+    def test_python_310_and_311_verbose_ids_have_identical_normalized_cases(self):
+        modern = signing_verbose()
+        legacy = modern
+        for name in SIGNING_CASES:
+            legacy = legacy.replace(f"(__main__.SigningTests.{name})", "(__main__.SigningTests)")
+        modern_result, legacy_result = self.inspect(modern), self.inspect(legacy)
+        self.assertTrue(modern_result["releaseComplete"], modern_result["errors"])
+        self.assertTrue(legacy_result["releaseComplete"], legacy_result["errors"])
+        self.assertEqual(modern_result["ctestPrograms"][0]["cases"],
+                         legacy_result["ctestPrograms"][0]["cases"])
+        self.assertEqual(modern_result["pythonTestTotals"], legacy_result["pythonTestTotals"])
+
+    def test_mismatched_explicit_method_cannot_be_treated_as_legacy_class(self):
+        original = signing_verbose()
+        output = original.replace(f"(__main__.SigningTests.{SIGNING_CASES[0]})",
+                                  "(__main__.SigningTests.test_forged_identity)", 1)
+        result = self.inspect(output)
+        self.assertFalse(result["releaseComplete"])
+        self.assertTrue(any("method and case identity disagree" in error for error in result["errors"]))
+
+    def test_mixed_legacy_and_modern_duplicate_ids_remain_duplicates(self):
+        rows = [(name, "ok") for name in SIGNING_CASES]
+        rows[-1] = rows[0]
+        output = signing_verbose(rows).replace(
+            f"(__main__.SigningTests.{rows[0][0]})", "(__main__.SigningTests)", 1)
+        result = self.inspect(output)
+        self.assertFalse(result["releaseComplete"])
+        self.assertTrue(any("duplicate case records" in error for error in result["errors"]))
+
+    def test_legacy_ids_still_apply_exact_skip_identity_and_reason(self):
+        output = signing_verbose(self.skipped_rows())
+        for name in SIGNING_CASES:
+            output = output.replace(f"(__main__.SigningTests.{name})", "(__main__.SigningTests)")
+        result = self.inspect(output)
+        self.assertTrue(result["releaseComplete"], result["errors"])
+        self.assertEqual(result["pythonTestTotals"]["notApplicable"], 4)
+        self.assertEqual(result["pythonTestTotals"]["passed"], 8)
 
     def test_complete_verbose_pass_records_have_independent_python_totals(self):
         expected = {"run": 12, "passed": 12, "failed": 0, "skipped": 0, "notApplicable": 0}
@@ -844,22 +935,22 @@ class WrapperDiagnosticsTests(unittest.TestCase):
 
 
 class PackageModelFlowTests(unittest.TestCase):
-    def test_native_deb_installer_keeps_model_path_as_one_argument(self):
+    def test_native_installers_share_the_local_runner_and_its_model_arguments(self):
         root = Path("synthetic build 中文 空格")
         models = root / "shared models 中文"
-        package = root / "pkg/qcs package.deb"
         with mock.patch.object(native, "ROOT", root, create=True), \
                 mock.patch.object(native, "REPORTS", root / "reports", create=True), \
                 mock.patch.object(native, "MODELS", models, create=True), \
+                mock.patch.object(native, "QT", root / "sdk", create=True), \
                 mock.patch.object(native.os, "name", "posix"), \
                 mock.patch.object(native.platform, "system", return_value="Linux"), \
-                mock.patch.object(native, "package_for_suffix", return_value=package), \
                 mock.patch.object(native, "run") as run:
             native.installers()
         command = run.call_args.args[0]
+        self.assertIn("installers", command)
         self.assertEqual(command.count("--model-dir"), 1)
         self.assertEqual(command[command.index("--model-dir") + 1], models)
-        self.assertEqual(command[command.index("--package-file") + 1], package)
+        self.assertTrue(run.call_args.kwargs["display"])
 
     def test_common_and_nsis_verification_keep_shared_model_argument(self):
         root = Path("synthetic build 中文 空格")
@@ -943,7 +1034,7 @@ class PackageModelFlowTests(unittest.TestCase):
             (root / "incoming/qcs.deb").write_bytes(b"synthetic DEB fixture")
             (root / "etc/os-release").write_text("synthetic container", encoding="utf-8")
             (root / "reports/smoke/report.json").write_text(json.dumps(smoke), encoding="utf-8")
-            payload = root / "usr/bin/qcs"
+            payload = root / "usr/bin/qcs-gui"
             payload.write_bytes(b"synthetic payload")
             commands = []
             installed_queries = 0
@@ -964,7 +1055,7 @@ class PackageModelFlowTests(unittest.TestCase):
                     result.returncode = 1 if installed_queries == 1 else 0
                     result.stdout = "" if installed_queries == 1 else "ii "
                 elif parts[:2] == ["dpkg-query", "--listfiles"]:
-                    result.stdout = "/usr/bin/qcs\n"
+                    result.stdout = "/usr/bin/qcs-gui\n"
                 elif parts[:2] == ["dpkg", "--remove"]:
                     payload.unlink()
                 return result
@@ -1479,7 +1570,7 @@ class SignatureEvidenceTests(unittest.TestCase):
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
             stage = Path(temporary)
             if exists:
-                (stage / "qcs.app").mkdir()
+                (stage / "qcs-gui.app").mkdir()
             outcomes = [native.subprocess.CompletedProcess([], verify_code, "", verify_error),
                         native.subprocess.CompletedProcess([], display_code, "", details)]
             with mock.patch.object(native.subprocess, "run", side_effect=error or outcomes) as run:
@@ -1560,7 +1651,7 @@ class PythonLicenseEvidenceTests(unittest.TestCase):
 
 
 class PythonAcceptanceRunnerEvidenceTests(PythonLicenseEvidenceTests):
-    program = "qcs-tests-acceptance-runners"
+    program = "qcs-tests-acceptance-native"
 
     def test_verbose_license_cases_are_counted_without_qt_totals(self):
         rows = [f"{identifier.rsplit('.', 1)[-1]} ({identifier}) ... ok"
@@ -1584,7 +1675,7 @@ class AcceptanceNativePortabilityEvidenceTests(unittest.TestCase):
     reason = "Windows native PowerShell and NTFS ACL contract"
 
     def inspect(self, *, system="Linux", omitted=(), changed=None,
-                program="qcs-tests-acceptance-runners"):
+                program="qcs-tests-acceptance-native"):
         rows = [(evidence.ACCEPTANCE_WINDOWS_TOKEN_CASE, "ok")]
         for method in self.methods:
             if method in omitted:
@@ -1687,7 +1778,7 @@ class AcceptanceTokenContextEvidenceTests(unittest.TestCase):
     reason = "Windows native process token and Job Object contract"
 
     def inspect(self, *, system="Linux", identifier=None, status=None, omitted=False,
-                duplicate=False, program="qcs-tests-acceptance-runners"):
+                duplicate=False, program="qcs-tests-acceptance-native"):
         rows = [(case, "ok") for case in sorted(evidence.ACCEPTANCE_WINDOWS_CASES - {self.case})]
         if not omitted:
             case_status = status if status is not None else (
@@ -1710,7 +1801,7 @@ class AcceptanceTokenContextEvidenceTests(unittest.TestCase):
                 self.assertEqual(result["pythonTestTotals"],
                     {"run": 4, "passed": 3, "failed": 0, "skipped": 1, "notApplicable": 1})
                 self.assertEqual(result["pythonTestSkips"], [{
-                    "program": "qcs-tests-acceptance-runners", "case": self.case,
+                    "program": "qcs-tests-acceptance-native", "case": self.case,
                     "reason": self.reason, "classification": "notApplicable",
                     "requiredNativePlatforms": ["Windows"]}])
                 self.assertEqual(result["ctestPrograms"][0]["cases"][-1]["status"],
@@ -1840,7 +1931,7 @@ class RunnerHandlePlatformEvidenceTests(unittest.TestCase):
                     self.assertEqual(result["pythonTestSkips"][0]["classification"], "requiredNotRun")
 
     def test_exception_cannot_apply_to_other_programs(self):
-        for program in ("qcs-tests-acceptance-runners", "qcs-tests-path-budget", "qcs-tests-license-materials"):
+        for program in ("qcs-tests-acceptance-native", "qcs-tests-path-budget", "qcs-tests-license-materials"):
             for system in ("Linux", "Darwin"):
                 result = self.inspect(system=system, program=program)
                 self.assertFalse(result["releaseComplete"])
@@ -1856,6 +1947,8 @@ class PythonTempPathsEvidenceTests(PythonLicenseEvidenceTests):
 
 
 class FastNativeTests(unittest.TestCase):
+    FAST_FIXTURES = {"qcs-tests-core", "qcs-tests-gui"}
+
     def temporary(self):
         return tempfile.TemporaryDirectory(prefix="qcs-fast-中文 ",
             dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
@@ -1863,14 +1956,13 @@ class FastNativeTests(unittest.TestCase):
     def selection(self, root, architecture="x86_64"):
         directory = root / "reports/tests"
         directory.mkdir(parents=True)
-        slow = set(native.SLOW_TESTS)
+        slow = {"qcs-tests-semantic", "qcs-tests-reference-vectors"}
         if architecture == "x86_64":
             slow.add("qcs-tests-reference-vectors-baseline")
-        full = {"kind": "ctestInfo", "tests": [{"name": name, "properties": [
-            {"name": "LABELS", "value": ["slow"] if name in slow else ["unit"]}]}
-            for name in sorted(native.FAST_TESTS | slow)]}
+        full = {"kind": "ctestInfo", "tests": [fixture_test(name, ["slow"] if name in slow else ["unit"])
+            for name in sorted(self.FAST_FIXTURES | slow)]}
         chosen = {"kind": "ctestInfo", "tests": [entry for entry in full["tests"]
-                                               if entry["name"] in native.FAST_TESTS]}
+                                               if entry["name"] in self.FAST_FIXTURES]}
         selection = {"profile": "fast", "kind": "ctest-selection", "status": "passed", "passed": True,
                      "fullSuitePassed": False, "releaseComplete": False, "exitCode": 0,
                      "filters": ["-LE", "^slow$"], "labelFilter": None,
@@ -1900,7 +1992,7 @@ class FastNativeTests(unittest.TestCase):
             release.write_json(root / "reports" / name, document)
         suite = ET.Element("testsuite")
         files = []
-        for name in sorted(native.FAST_TESTS):
+        for name in sorted(self.FAST_FIXTURES):
             case = ET.SubElement(suite, "testcase", name=name)
             ET.SubElement(case, "system-out").text = (
                 "********* Start testing of SyntheticTests *********\n"
@@ -1981,7 +2073,7 @@ class FastNativeTests(unittest.TestCase):
                     command = [str(value) for value in run.call_args.args[0]]
                     self.assertEqual(command[command.index("--test-profile") + 1], profile)
                     self.assertIn("--require-selected-tests" if profile == "fast" else "--require-complete", command)
-                    expected = "test-selected-inventory.json" if profile == "fast" else "ctest-inventory.json"
+                    expected = "ctest-inventory.json"
                     self.assertEqual(Path(command[command.index("--inventory") + 1]).name, expected)
 
     def test_test_evidence_parser_failure_propagates_to_job(self):
@@ -1991,15 +2083,13 @@ class FastNativeTests(unittest.TestCase):
                 native.test_evidence(require_complete=True, profile="fast")
 
     def test_selection_has_exact_fast_and_slow_sets_on_both_architectures(self):
-        self.assertEqual(len(native.FAST_TESTS), 29)
-        self.assertEqual(len(native.SLOW_TESTS), 4)
         for architecture in ("x86_64", "arm64"):
             with self.subTest(architecture=architecture), self.temporary() as temporary:
                 root = Path(temporary)
                 self.selection(root, architecture)
                 selection = native.fast_selection(root, architecture)
-                self.assertEqual(selection["counts"]["selected"], 29)
-                self.assertEqual(selection["counts"]["excluded"], 5 if architecture == "x86_64" else 4)
+                self.assertEqual(selection["counts"]["selected"], len(self.FAST_FIXTURES))
+                self.assertEqual(selection["counts"]["excluded"], 3 if architecture == "x86_64" else 2)
 
     def test_selection_rejects_missing_registration_extra_slow_or_missing_fast(self):
         mutations = ("registration", "extra slow", "missing slow", "missing selected", "duplicate selected")
@@ -2036,7 +2126,7 @@ class FastNativeTests(unittest.TestCase):
                     native.fast_selection(root, "x86_64")
 
     def test_fast_manifest_can_pass_selected_scope_but_never_full_native_gate(self):
-        with self.temporary() as temporary, mock.patch.object(native, "FAST_TESTS", {"qcs-tests-core", "qcs-tests-gui"}):
+        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core", "qcs-tests-gui"}):
             root = Path(temporary)
             self.fixture(root)
             result = self.inspect(root)
@@ -2049,7 +2139,7 @@ class FastNativeTests(unittest.TestCase):
             self.assertFalse(native.release_evidence().inspect_native(root, expected_head="a" * 40)["passed"])
 
     def test_fast_gate_rejects_mixed_candidate_run_attempt_and_changed_raw_output(self):
-        with self.temporary() as temporary, mock.patch.object(native, "FAST_TESTS", {"qcs-tests-core"}):
+        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
             root = Path(temporary)
             self.fixture(root)
             for mismatch in ({"head": "b" * 40}, {"run": "124"}, {"attempt": "2"}):
@@ -2060,7 +2150,7 @@ class FastNativeTests(unittest.TestCase):
             self.assertFalse(self.inspect(root)["passed"])
 
     def test_fast_gate_rechecks_actual_case_failures_instead_of_summary_flags(self):
-        with self.temporary() as temporary, mock.patch.object(native, "FAST_TESTS", {"qcs-tests-core"}):
+        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
             root = Path(temporary)
             identity = self.fixture(root)
             junit = root / "reports/tests/ctest.xml"
@@ -2074,7 +2164,7 @@ class FastNativeTests(unittest.TestCase):
         for key, value in (("testCasesComplete", False), ("testEvidenceErrors", ["required case absent"]),
                            ("wrapperCollectionComplete", False)):
             with self.subTest(key=key), self.temporary() as temporary, \
-                    mock.patch.object(native, "FAST_TESTS", {"qcs-tests-core"}):
+                    mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
                 root = Path(temporary)
                 identity = self.fixture(root)
                 target = root / "reports/fast-acceptance.json"
@@ -2087,7 +2177,7 @@ class FastNativeTests(unittest.TestCase):
     def test_fast_gate_rejects_duplicate_wrapper_and_false_or_changed_exit(self):
         for mutate in ("duplicate", "bool", "exit", "raw"):
             with self.subTest(mutate=mutate), self.temporary() as temporary, \
-                    mock.patch.object(native, "FAST_TESTS", {"qcs-tests-core"}):
+                    mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
                 root = Path(temporary)
                 identity = self.fixture(root)
                 index = root / "reports/wrappers/index.json"
@@ -2107,7 +2197,7 @@ class FastNativeTests(unittest.TestCase):
     def test_fast_gate_rejects_missing_bound_reports_and_incomplete_wrappers(self):
         for mutate in ("unbound", "wrappers", "build", "release"):
             with self.subTest(mutate=mutate), self.temporary() as temporary, \
-                    mock.patch.object(native, "FAST_TESTS", {"qcs-tests-core"}):
+                    mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}):
                 root = Path(temporary)
                 identity = self.fixture(root)
                 if mutate == "unbound":
@@ -2128,7 +2218,7 @@ class FastNativeTests(unittest.TestCase):
     def test_fast_aggregate_requires_four_platforms_and_one_source_run_identity(self):
         for mutate in (None, "missing", "duplicate", "tree", "attempt"):
             with self.subTest(mutate=mutate), self.temporary() as temporary, \
-                    mock.patch.object(native, "FAST_TESTS", {"qcs-tests-core"}), \
+                    mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}), \
                     mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
                         "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}):
                 root = Path(temporary)
@@ -2162,7 +2252,12 @@ class FastNativeTests(unittest.TestCase):
         workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
         self.assertIn("default: fast", workflow)
         self.assertIn("options: [fast, full]", workflow)
-        self.assertIn("github.event_name == 'push' && 'full' || inputs.test_profile || 'fast'", workflow)
+        self.assertIn("types: [opened, synchronize, reopened, labeled, unlabeled]", workflow)
+        profile_expression = "(github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full'))) && 'full' || inputs.test_profile || 'fast'"
+        self.assertEqual(workflow.count(profile_expression), 2,
+                         "Both profile selection and concurrency must distinguish full PR runs")
+        self.assertLess(workflow.index("qcs-native-ci.py models\n"), workflow.index("qcs-native-ci.py test\n"))
+        self.assertLess(workflow.index("qcs-native-ci.py test\n"), workflow.index("qcs-native-ci.py install\n"))
         self.assertIn("name: qcs-fast-${{ matrix.id }}", workflow)
         self.assertIn("name: qcs-native-${{ matrix.id }}", workflow)
         for action in ("install", "models", "capacity", "package", "installers", "sources"):

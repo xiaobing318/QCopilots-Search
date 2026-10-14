@@ -6,12 +6,16 @@
 #include "core/types.h"
 #include "core/app_settings.h"
 #include "core/file_catalog.h"
+#include "core/pipeline_manifest.h"
 #include "storage/index_repository.h"
 #include "support/test_environment.h"
+#include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QLocalSocket>
 #include <QProcess>
@@ -19,6 +23,7 @@
 #include <QScopeGuard>
 #include <QStorageInfo>
 #include <QTest>
+#include <QThread>
 #include <QTimer>
 #include <QUuid>
 #include <QtEndian>
@@ -29,11 +34,131 @@
 #include <condition_variable>
 #include <mutex>
 #include <stdexcept>
+#include <iostream>
 
 using namespace qcopilots_search;
 using namespace qcopilots_search::test;
 
 namespace {
+// This executable doubles as a protocol peer for lifecycle and scheduling
+// tests. The seam is C++ construction-only and never affects installed workers.
+int controlledWorker(const QStringList &arguments) {
+    if (arguments.size() != 6) return 2;
+    const QString logPath = arguments.at(2);
+    const QString mode = arguments.at(3);
+    const QString gates = arguments.at(4);
+    const int delayMs = arguments.at(5).toInt();
+    const auto record = [&](QJsonObject event) {
+        event.insert("pid", QString::number(QCoreApplication::applicationPid()));
+        QFile log(logPath);
+        if (!log.open(QIODevice::WriteOnly | QIODevice::Append)) return false;
+        const auto bytes = QJsonDocument(event).toJson(QJsonDocument::Compact) + '\n';
+        return log.write(bytes) == bytes.size() && log.flush();
+    };
+    const auto waitForGate = [&](const QString &name) {
+        QElapsedTimer elapsed; elapsed.start();
+        while (QFileInfo::exists(QDir(gates).filePath(mode + u'-' + name))) {
+            if (elapsed.elapsed() > 15000) return false;
+            QThread::msleep(5);
+        }
+        return true;
+    };
+    if (!record({{"event", "started"}})) return 3;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        const auto request = QJsonDocument::fromJson(QByteArray::fromStdString(line)).object();
+        const QString operation = request.value("operation").toString();
+        if (operation == "shutdown") {
+            if (!record({{"event", "shutdown"}}) || !waitForGate("shutdown")) return 4;
+            return record({{"event", "exited"}}) ? 0 : 3;
+        }
+        if (operation == "cancel") continue;
+        QJsonObject result;
+        if (operation == "extract") {
+            const QString path = request.value("path").toString();
+            const int offset = request.value("offset").toInt();
+            if (!record({{"event", operation}, {"path", path}, {"offset", offset},
+                         {"code", request.value("code")}})) return 3;
+            if (!waitForGate(QFileInfo(path).fileName() + u'-' + QString::number(offset))) return 4;
+            QFile source(path);
+            if (!source.open(QIODevice::ReadOnly)) return 5;
+            const auto fixture = QJsonDocument::fromJson(source.readAll()).object();
+            const int count = fixture.value("segments").toInt(1);
+            const int next = qMin(count, offset + request.value("maxSegments").toInt(40));
+            QJsonArray segments;
+            for (int i = offset; i < next; ++i) {
+                Segment segment;
+                segment.path = path; segment.title = QFileInfo(path).fileName();
+                segment.kind = request.value("code").toBool() ? "code" : "text";
+                segment.modality = "text";
+                segment.text = fixture.value("token").toString("controlledkeyword") + u' ' + QString::number(i);
+                segment.lineStart = i + 1; segment.lineEnd = i + 1;
+                if (request.value("embed").toBool()) {
+                    segment.embedding.fill(0.0f, embeddingDimensions);
+                    segment.embedding[0] = 1.0f;
+                }
+                segments.append(segment.toJson());
+            }
+            const bool complete = next == count;
+            result = {{"segments", segments}, {"state", complete ? "complete" : "partial"},
+                {"complete", complete}, {"next", next}, {"sourceVersion", request.value("expectedVersion")},
+                {"extractionFingerprint", extractionPipelineFingerprint()},
+                {"modelFingerprint", embeddingPipelineFingerprint()}};
+        } else if (operation == "query") {
+            if (!record({{"event", operation}}) || !waitForGate("query")) return 4;
+            QJsonArray embedding;
+            for (int i = 0; i < embeddingDimensions; ++i) embedding.append(i == 0 ? 1.0 : 0.0);
+            result = {{"embedding", embedding}, {"modelFingerprint", embeddingPipelineFingerprint()}};
+        } else return 6;
+        if (delayMs > 0) QThread::msleep(static_cast<unsigned long>(delayMs));
+        const auto response = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"ok", true}, {"result", result}})
+            .toJson(QJsonDocument::Compact);
+        std::cout << response.constData() << '\n' << std::flush;
+    }
+    return record({{"event", "eof"}}) ? 0 : 3;
+}
+
+struct ControlledWorkers {
+    explicit ControlledWorkers(const TestEnvironment &environment) : root(environment.path("worker-control")) {
+        valid = QDir().mkpath(root);
+    }
+    QString root;
+    bool valid = false;
+    QString logPath(bool query) const { return QDir(root).filePath(query ? "query.jsonl" : "index.jsonl"); }
+    QString gatePath(bool query, const QString &name) const {
+        return QDir(root).filePath((query ? QStringLiteral("query-") : QStringLiteral("index-")) + name);
+    }
+    bool block(bool query, const QString &name) const {
+        QFile gate(gatePath(query, name)); return gate.open(QIODevice::WriteOnly);
+    }
+    bool release(bool query, const QString &name) const { return QFile::remove(gatePath(query, name)); }
+    QList<QJsonObject> events(bool query, const QString &type = {}) const {
+        QList<QJsonObject> result;
+        QFile file(logPath(query));
+        if (!file.open(QIODevice::ReadOnly)) return result;
+        while (!file.atEnd()) {
+            const auto line = file.readLine();
+            if (!line.endsWith('\n')) break;
+            const auto event = QJsonDocument::fromJson(line).object();
+            if (!event.isEmpty() && (type.isEmpty() || event.value("event").toString() == type)) result.append(event);
+        }
+        return result;
+    }
+    ServiceDependencies dependencies(bool models = false, int delayMs = 0) const {
+        ServiceDependencies result;
+        result.verifyModels = [models](QString *) { return models; };
+        result.configureWorker = [*this, delayMs](QProcess &worker, bool query) {
+            worker.setProgram(QCoreApplication::applicationFilePath());
+            worker.setArguments({"--qcs-test-worker", logPath(query), query ? "query" : "index", root, QString::number(delayMs)});
+        };
+        return result;
+    }
+};
+
+QByteArray controlledDocument(const QString &token, int segments = 1) {
+    return QJsonDocument(QJsonObject{{"token", token}, {"segments", segments}}).toJson(QJsonDocument::Compact);
+}
+
 QJsonObject localCall(ServiceClient &client, const QString &method, const QJsonObject &params = {}, int timeout = 9000) {
     QJsonObject reply;
     QEventLoop loop;
@@ -436,6 +561,7 @@ private slots:
         QVERIFY2(service.start(&error), qPrintable(error));
         ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
         QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("catalogReady").toBool(), 5000);
         const auto initial = localCall(client, "status").value("result").toObject();
         const auto oldPipeline = initial.value("pipelineFingerprint").toString();
         QVERIFY(!oldPipeline.isEmpty());
@@ -483,21 +609,29 @@ private slots:
             }
         }
         ServiceProcess service(paths); QVERIFY2(service.start(), qPrintable(service.error));
-        auto limited = [&] { return service.call("search", {{"query", "needle"}, {"semantic", false}, {"limit", 1}}).value("result").toObject().value("hits").toArray(); };
+        auto ready = [&] { return service.call("status").value("result").toObject().value("catalogReady").toBool(); };
+        QTRY_VERIFY_WITH_TIMEOUT(ready(), 5000);
+        auto limited = [&](const QString &root = {}) {
+            return service.call("search", {{"query", "needle"}, {"semantic", false}, {"limit", 1}, {"root", root}})
+                .value("result").toObject().value("hits").toArray();
+        };
         QCOMPARE(limited().size(), 1);
         QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("first/needle.txt"));
-        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("second")}}}).value("ok").toBool());
-        QCOMPARE(limited().size(), 1);
-        QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("second/document.txt"));
-        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("first"), environment.path("second")}},
-            {"excludes", QJsonArray{environment.path("first")}}}).value("ok").toBool());
+        // A query root filters before limit without deleting either fixture row.
+        const auto second = limited(environment.path("second"));
+        QCOMPARE(second.size(), 1);
+        QCOMPARE(second.first().toObject().value("path").toString(), environment.path("second/document.txt"));
+        QVERIFY(service.call("settings.set", {{"excludes", QJsonArray{environment.path("first")}}}).value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(ready(), 5000);
         // An explicitly selected root overrides an equal exclusion, as in FileCatalog.
         QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("first/needle.txt"));
         QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.root()}},
             {"excludes", QJsonArray{environment.path("first")}}}).value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(ready(), 5000);
         QCOMPARE(limited().size(), 1);
         QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("second/document.txt"));
-        QCOMPARE(service.call("status").value("result").toObject().value("repository").toObject().value("files").toInt(), 2);
+        // Pausing stops extraction. Successful metadata reconciliation still prunes exclusions.
+        QCOMPARE(service.call("status").value("result").toObject().value("repository").toObject().value("files").toInt(), 1);
     }
 
     void singletonAndExplicitProfile_data() {
@@ -644,6 +778,7 @@ private slots:
         QVERIFY2(service.start(&error), qPrintable(error));
         ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
         QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("catalogReady").toBool(), 5000);
         armed.store(true);
         QVERIFY(localCall(client, "index.resume").value("ok").toBool());
 
@@ -716,6 +851,7 @@ private slots:
         QVERIFY2(service.start(&error), qPrintable(error));
         ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
         QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("catalogReady").toBool(), 5000);
         {
             const std::lock_guard guard(mutationMutex);
             keepChanging = true;
@@ -911,6 +1047,9 @@ private slots:
             QObject::disconnect(ready);
             return replies.value(id).value(0);
         };
+        int catalogRequest = 0;
+        QTRY_VERIFY_WITH_TIMEOUT(call(QStringLiteral("catalog-ready-%1").arg(++catalogRequest), "status")
+            .value("result").toObject().value("catalogReady").toBool(), 5000);
         const QJsonObject searchParams{{"query", "boundedcancel"}, {"semantic", false}};
         socket.write(frame("pending-search", "search", searchParams)); socket.flush();
         QTRY_VERIFY_WITH_TIMEOUT(entered.load() >= 1, 5000);
@@ -1032,6 +1171,7 @@ private slots:
         ServiceProcess service(environment.runtimePaths());
         QVERIFY2(service.start(), qPrintable(service.error));
         QVERIFY(service.call("settings.set", {{"includeCode", true}}).value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(service.call("status").value("result").toObject().value("catalogReady").toBool(), 5000);
         QLocalSocket socket;
         socket.connectToServer(service.paths.ipcName);
         QVERIFY(socket.waitForConnected(3000));
@@ -1126,11 +1266,14 @@ private slots:
         QVERIFY(environment.writeFile(relativeRoot + "/untracked.cpp", "int untrackedcodetoken = 1;\n"));
         QVERIFY(environment.writeFile(relativeRoot + "/.gitignore", "ignored.cpp\n"));
         QVERIFY(environment.writeFile(relativeRoot + "/ignored.cpp", "int ignoredcodetoken = 1;\n"));
+        QVERIFY(environment.writeFile("ordinary/README.md", "classificationtoggleword ordinary documentation"));
         const QString path = repository + "/README.md";
+        const QString ordinaryPath = environment.path("ordinary/README.md");
         ServiceProcess service(environment.runtimePaths());
         QVERIFY2(service.start(), qPrintable(service.error));
-        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{repository}}, {"includeCode", false}}).value("ok").toBool());
-        QVERIFY2(service.waitForHit("classificationtoggleword", path), qPrintable(serviceDiagnostics(service.paths, service.call("status"))));
+        QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.path("ordinary")}},
+            {"codeRoots", QJsonArray{repository}}, {"includeCode", false}}).value("ok").toBool());
+        QVERIFY2(service.waitForHit("classificationtoggleword", ordinaryPath), qPrintable(serviceDiagnostics(service.paths, service.call("status"))));
         QVERIFY(service.call("settings.set", {{"includeCode", true}}).value("ok").toBool());
         auto codeHits = [&] {
             return service.call("search", {{"query", "classificationtoggleword"}, {"code", true}, {"semantic", false}})
@@ -1138,7 +1281,10 @@ private slots:
         };
         QTRY_VERIFY2_WITH_TIMEOUT(codeHits().size() == 1,
             qPrintable(serviceDiagnostics(service.paths, service.call("status"))), 30000);
-        QCOMPARE(service.search("classificationtoggleword").size(), 0);
+        QCOMPARE(codeHits().first().toObject().value("path").toString(), path);
+        const auto ordinary = service.search("classificationtoggleword");
+        QCOMPARE(ordinary.size(), 1);
+        QCOMPARE(ordinary.first().value("path").toString(), ordinaryPath);
         auto sourceHits = [&] (const QString &query) {
             return service.call("search", {{"query", query}, {"code", true}, {"semantic", false}})
                 .value("result").toObject().value("hits").toArray();
@@ -1147,13 +1293,502 @@ private slots:
             qPrintable(serviceDiagnostics(service.paths, service.call("status"))), 30000);
         QVERIFY(sourceHits("ignoredcodetoken").isEmpty());
         QVERIFY(service.call("settings.set", {{"includeCode", false}}).value("ok").toBool());
-        QVERIFY2(service.waitForHit("classificationtoggleword", path), qPrintable(serviceDiagnostics(service.paths, service.call("status"))));
+        QVERIFY2(service.waitForHit("classificationtoggleword", ordinaryPath), qPrintable(serviceDiagnostics(service.paths, service.call("status"))));
+        const auto retained = service.call("settings.get").value("result").toObject();
+        QCOMPARE(retained.value("codeRoots").toArray(), QJsonArray{repository});
         const auto disabled = service.call("search", {{"query", "classificationtoggleword"}, {"code", true}});
         QCOMPARE(disabled.value("error").toObject().value("code").toString(), QStringLiteral("code_search_disabled"));
         QFile configFile(repository + "/.git/config");
         QVERIFY(configFile.open(QIODevice::ReadOnly));
         QCOMPARE(configFile.readAll(), config);
         QVERIFY(!QFileInfo::exists(repository + "/.git/index"));
+    }
+
+    void unavailableRootPreservesItsIndexWithoutBlockingHealthyRoot() {
+        TestEnvironment environment("service-partial-catalog");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QStringList relativePaths{"healthy/live.txt", "healthy/deleted.txt", "unavailable/retained.txt"};
+        for (const auto &path : relativePaths) QVERIFY(environment.writeFile(path, "partialcatalogkeyword"));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("healthy"), environment.path("unavailable")};
+        settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            for (const auto &relative : relativePaths) {
+                FileRecord file;
+                QVERIFY(FileCatalog::describe(environment.path(relative), &file));
+                Segment segment;
+                segment.path = file.path; segment.title = QFileInfo(file.path).fileName();
+                segment.kind = "text"; segment.modality = "text"; segment.text = "partialcatalogkeyword";
+                QVERIFY2(repository.replaceFile(file.path, file.fingerprint + "|legacy", {segment}, false, &error), qPrintable(error));
+            }
+        }
+        // Only the two named fixture files and the now-empty fixture directory
+        // are removed. The unavailable root's database row must remain intact.
+        QVERIFY(QFile::remove(environment.path("healthy/deleted.txt")));
+        QVERIFY(QFile::remove(environment.path("unavailable/retained.txt")));
+        QVERIFY(QDir().rmdir(environment.path("unavailable")));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        ServiceServer service(paths, workers.dependencies());
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("catalogReady").toBool(), 5000);
+        const auto search = localCall(client, "search", {{"query", "partialcatalogkeyword"}, {"semantic", false}});
+        QVERIFY2(search.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(search).toJson())));
+        const auto hits = search.value("result").toObject().value("hits").toArray();
+        QCOMPARE(hits.size(), 1);
+        QCOMPARE(hits.first().toObject().value("path").toString(), environment.path("healthy/live.txt"));
+        const auto listing = localCall(client, "files.list");
+        QVERIFY2(listing.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(listing).toJson())));
+        const auto files = listing.value("result").toObject().value("files").toArray();
+        QCOMPARE(files.size(), 1);
+        QCOMPARE(files.first().toObject().value("path").toString(), environment.path("healthy/live.txt"));
+        QCOMPARE(files.first().toObject().value("modifiedMs").toString().toLongLong(),
+            QFileInfo(environment.path("healthy/live.txt")).lastModified().toMSecsSinceEpoch());
+        const auto status = localCall(client, "status").value("result").toObject();
+        QCOMPARE(status.value("repository").toObject().value("files").toInt(), 2);
+        QVERIFY(status.value("progress").toObject().value("error").toString().contains(environment.path("unavailable")));
+        QVERIFY(workers.events(false, "started").isEmpty());
+        client.disconnectFromService(); service.stop();
+        IndexRepository repository;
+        QVERIFY2(repository.open(paths, &error), qPrintable(error));
+        QVERIFY(repository.fileVersion(environment.path("healthy/deleted.txt")).isEmpty());
+        QVERIFY(!repository.fileVersion(environment.path("unavailable/retained.txt")).isEmpty());
+    }
+
+    void pausedLegacyMetadataRepairHidesChangedSourceWithoutBlockingHealthyFile() {
+        TestEnvironment environment("service-stale-legacy-metadata");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/healthy.txt", "legacymetadatakeyword healthy source"));
+        QVERIFY(environment.writeFile("selected/changed.txt", "legacymetadatakeyword original source"));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("selected")}; settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        QString originalChangedVersion;
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            for (const QString &relative : {QStringLiteral("selected/healthy.txt"), QStringLiteral("selected/changed.txt")}) {
+                FileRecord file;
+                QVERIFY(FileCatalog::describe(environment.path(relative), &file));
+                Segment segment;
+                segment.path = file.path; segment.title = QFileInfo(file.path).fileName();
+                segment.kind = "text"; segment.modality = "text"; segment.text = "legacymetadatakeyword";
+                const QString version = file.fingerprint + "|legacy";
+                QVERIFY2(repository.replaceFile(file.path, version, {segment}, false, &error), qPrintable(error));
+                if (relative.endsWith("changed.txt")) originalChangedVersion = version;
+            }
+        }
+        QVERIFY(environment.writeFile("selected/changed.txt", "A changed source whose old body must stay hidden while extraction is paused."));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        ServiceServer service(paths, workers.dependencies());
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("catalogReady").toBool(), 5000);
+        const auto listing = localCall(client, "files.list");
+        QVERIFY2(listing.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(listing).toJson())));
+        const auto files = listing.value("result").toObject().value("files").toArray();
+        QCOMPARE(files.size(), 1);
+        QCOMPARE(files.first().toObject().value("path").toString(), environment.path("selected/healthy.txt"));
+        QVERIFY(!listing.value("result").toObject().value("metadataPending").toBool());
+        const auto search = localCall(client, "search", {{"query", "legacymetadatakeyword"}, {"semantic", false}});
+        QVERIFY(search.value("ok").toBool());
+        const auto hits = search.value("result").toObject().value("hits").toArray();
+        QCOMPARE(hits.size(), 1);
+        QCOMPARE(hits.first().toObject().value("path").toString(), environment.path("selected/healthy.txt"));
+        const auto status = localCall(client, "status").value("result").toObject();
+        QCOMPARE(status.value("repository").toObject().value("files").toInt(), 2);
+        QCOMPARE(status.value("repository").toObject().value("metadataPendingFiles").toInteger(), 0);
+        QCOMPARE(status.value("progress").toObject().value("state").toString(), QStringLiteral("paused"));
+        QVERIFY(workers.events(false, "started").isEmpty());
+        client.disconnectFromService(); service.stop();
+        IndexRepository repository;
+        QVERIFY2(repository.open(paths, &error), qPrintable(error));
+        // Metadata refresh must never relabel old indexed content as the new source.
+        QCOMPARE(repository.fileVersion(environment.path("selected/changed.txt")), originalChangedVersion);
+    }
+
+    void independentSpacesRepairMetadataAndBrowseWithoutContent() {
+        TestEnvironment environment("service-browse-spaces");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QStringList relativePaths{"ordinary/a.txt", "ordinary/b.txt", "shared/note.txt", "code/source.cpp"};
+        for (const auto &path : relativePaths)
+            QVERIFY(environment.writeFile(path, controlledDocument("browsingkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("ordinary"), environment.path("shared")};
+        settings.codeRoots = {environment.path("code"), environment.path("shared")};
+        settings.includeCode = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            for (const auto &relative : relativePaths) {
+                FileRecord file;
+                QVERIFY(FileCatalog::describe(environment.path(relative), &file));
+                const QList<bool> spaces = relative.startsWith("shared/") ? QList<bool>{false, true}
+                    : QList<bool>{relative.startsWith("code/")};
+                for (const bool code : spaces) {
+                    Segment segment;
+                    segment.path = file.path; segment.title = QFileInfo(file.path).fileName();
+                    segment.kind = code ? "code" : "text"; segment.modality = "text";
+                    segment.text = "legacybodymustnotappearinfilelist";
+                    // Omit mtime deliberately, as in a database from before file browsing.
+                    QVERIFY2(repository.replaceFile(file.path, file.fingerprint + "|legacy", {segment}, code, &error), qPrintable(error));
+                }
+            }
+        }
+        ControlledWorkers workers(environment);
+        QVERIFY(workers.valid);
+        for (const auto &relative : relativePaths)
+            QVERIFY(workers.block(false, QFileInfo(relative).fileName() + "-0"));
+        ServiceServer service(paths, workers.dependencies());
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QJsonObject firstPage;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            firstPage = localCall(client, "files.list", {{"limit", 1}});
+            return firstPage.value("ok").toBool()
+                && !firstPage.value("result").toObject().value("metadataPending").toBool()
+                && firstPage.value("result").toObject().value("files").toArray().size() == 1;
+        })(), 5000);
+        QVERIFY(firstPage.value("result").toObject().value("hasMore").toBool());
+        const QString oldCursor = firstPage.value("result").toObject().value("nextCursor").toString();
+        QVERIFY(!oldCursor.isEmpty());
+        for (const bool code : {false, true}) {
+            QSet<QString> actual;
+            QString cursor;
+            bool more = true;
+            for (int page = 0; more && page < 8; ++page) {
+                const auto response = localCall(client, "files.list", {{"code", code}, {"limit", 1}, {"cursor", cursor}});
+                QVERIFY2(response.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(response).toJson())));
+                const auto result = response.value("result").toObject();
+                const auto entries = result.value("files").toArray();
+                QCOMPARE(entries.size(), 1);
+                const auto entry = entries.first().toObject();
+                const QString path = entry.value("path").toString();
+                QVERIFY(!actual.contains(path)); actual.insert(path);
+                QCOMPARE(entry.value("code").toBool(), code);
+                QVERIFY(!entry.value("fileId").toString().isEmpty());
+                QCOMPARE(entry.value("modifiedMs").toString().toLongLong(), QFileInfo(path).lastModified().toMSecsSinceEpoch());
+                QVERIFY(!entry.value("sourceVersion").toString().isEmpty());
+                QVERIFY(!entry.contains("text")); QVERIFY(!entry.contains("embedding"));
+                more = result.value("hasMore").toBool();
+                cursor = result.value("nextCursor").toString();
+                QCOMPARE(cursor.isEmpty(), !more);
+            }
+            QVERIFY(!more);
+            const QSet<QString> expected = code
+                ? QSet<QString>{environment.path("code/source.cpp"), environment.path("shared/note.txt")}
+                : QSet<QString>{environment.path("ordinary/a.txt"), environment.path("ordinary/b.txt"), environment.path("shared/note.txt")};
+            QCOMPARE(actual, expected);
+        }
+        // Removing code roots invalidates old cursors and prunes only that space.
+        QVERIFY(localCall(client, "settings.set", {{"codeRoots", QJsonArray{}}}).value("ok").toBool());
+        const auto stale = localCall(client, "files.list", {{"limit", 1}, {"cursor", oldCursor}});
+        QCOMPARE(stale.value("error").toObject().value("code").toString(), QStringLiteral("cursor_stale"));
+        QJsonObject ordinary;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            ordinary = localCall(client, "files.list", {{"limit", 100}});
+            return ordinary.value("ok").toBool()
+                && ordinary.value("result").toObject().value("files").toArray().size() == 3;
+        })(), 5000);
+        const auto code = localCall(client, "files.list", {{"code", true}});
+        QVERIFY(code.value("ok").toBool());
+        QVERIFY(code.value("result").toObject().value("files").toArray().isEmpty());
+        client.disconnectFromService(); service.stop();
+    }
+
+    void idleWorkersReleaseAndRestartDespiteFrequentReconciliation() {
+        TestEnvironment environment("service-idle-workers");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/first.txt", controlledDocument("idlefirstkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        auto dependencies = workers.dependencies(true);
+        dependencies.indexIdleMs = 150; dependencies.queryIdleMs = 150;
+        dependencies.reconcileMs = 25; dependencies.workerShutdownGraceMs = 1000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "exited").size(), 1, 5000);
+        const auto firstQuery = localCall(client, "search", {{"query", "idlefirstkeyword"}, {"semantic", true}});
+        QVERIFY(firstQuery.value("ok").toBool());
+        QVERIFY(firstQuery.value("result").toObject().value("semantic").toBool());
+        QVERIFY(firstQuery.value("result").toObject().value("warning").toString().isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(true, "exited").size(), 1, 5000);
+        QVERIFY(environment.writeFile("selected/second.txt", controlledDocument("idlesecondkeyword")));
+        QVERIFY(localCall(client, "index.start").value("ok").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "exited").size(), 2, 5000);
+        const auto secondQuery = localCall(client, "search", {{"query", "idlesecondkeyword"}, {"semantic", true}});
+        QVERIFY(secondQuery.value("ok").toBool());
+        const auto result = secondQuery.value("result").toObject();
+        QVERIFY(result.value("semantic").toBool());
+        QVERIFY(result.value("warning").toString().isEmpty());
+        bool foundSecond = false;
+        for (const auto &hit : result.value("hits").toArray())
+            if (hit.toObject().value("path").toString() == environment.path("selected/second.txt")) foundSecond = true;
+        QVERIFY(foundSecond);
+        QCOMPARE(workers.events(false, "started").size(), 2);
+        QCOMPARE(workers.events(true, "started").size(), 2);
+        const auto progress = localCall(client, "status").value("result").toObject().value("progress").toObject();
+        QCOMPARE(progress.value("failed").toInteger(), 0);
+        QVERIFY(progress.value("error").toString().isEmpty());
+        client.disconnectFromService(); service.stop();
+    }
+
+    void workArrivingWhileWorkerCloses_data() {
+        QTest::addColumn<bool>("queryWorker");
+        QTest::newRow("index") << false;
+        QTest::newRow("query") << true;
+    }
+
+    void workArrivingWhileWorkerCloses() {
+        QFETCH(bool, queryWorker);
+        TestEnvironment environment("service-closing-worker");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/first.txt", controlledDocument("closingfirstkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.block(queryWorker, "shutdown"));
+        auto dependencies = workers.dependencies(queryWorker);
+        dependencies.indexIdleMs = queryWorker ? 60000 : 100;
+        dependencies.queryIdleMs = 100;
+        dependencies.workerShutdownGraceMs = 3000;
+        dependencies.reconcileMs = 25;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "search", {{"query", "closingfirstkeyword"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().size() == 1, 5000);
+        if (queryWorker) {
+            const auto initial = localCall(client, "search", {{"query", "closingfirstkeyword"}, {"semantic", true}});
+            QVERIFY(initial.value("result").toObject().value("semantic").toBool());
+        }
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(queryWorker, "shutdown").size(), 1, 5000);
+        QVERIFY(workers.events(queryWorker, "exited").isEmpty());
+        const QString firstPid = workers.events(queryWorker, "started").first().value("pid").toString();
+        if (queryWorker) {
+            bool released = false;
+            QTimer::singleShot(150, &client, [&] { released = workers.release(true, "shutdown"); });
+            const auto response = localCall(client, "search", {{"query", "closingfirstkeyword"}, {"semantic", true}});
+            QVERIFY(released);
+            QVERIFY(response.value("ok").toBool());
+            QVERIFY(response.value("result").toObject().value("semantic").toBool());
+            QVERIFY(response.value("result").toObject().value("warning").toString().isEmpty());
+            QCOMPARE(response.value("result").toObject().value("hits").toArray().size(), 1);
+        } else {
+            QVERIFY(environment.writeFile("selected/second.txt", controlledDocument("closingsecondkeyword")));
+            QVERIFY(localCall(client, "index.start").value("ok").toBool());
+            QTest::qWait(100);
+            QCOMPARE(workers.events(false, "extract").size(), 1);
+            QVERIFY(workers.release(false, "shutdown"));
+            QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "search", {{"query", "closingsecondkeyword"}, {"semantic", false}})
+                .value("result").toObject().value("hits").toArray().size() == 1, 5000);
+        }
+        QCOMPARE(workers.events(queryWorker, "started").size(), 2);
+        const QString secondPid = workers.events(queryWorker, "started").last().value("pid").toString();
+        QVERIFY(secondPid != firstPid);
+        const auto operations = workers.events(queryWorker, queryWorker ? "query" : "extract");
+        QCOMPARE(operations.size(), 2);
+        QCOMPARE(operations.last().value("pid").toString(), secondPid);
+        const auto progress = localCall(client, "status").value("result").toObject().value("progress").toObject();
+        QCOMPARE(progress.value("failed").toInteger(), 0);
+        QVERIFY(progress.value("error").toString().isEmpty());
+        client.disconnectFromService(); service.stop();
+    }
+
+    void scansMergeNewFilesBetweenLongDocumentBatches() {
+        TestEnvironment environment("service-fair-batches");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/a-long.txt", controlledDocument("fairlongkeyword", 240)));
+        QVERIFY(environment.writeFile("selected/z-existing.txt", controlledDocument("fairexistingkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.block(false, "a-long.txt-0"));
+        auto dependencies = workers.dependencies(false, 20);
+        dependencies.reconcileMs = 25;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        const auto longPath = environment.path("selected/a-long.txt");
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            for (const auto &event : workers.events(false, "extract"))
+                if (event.value("path").toString() == longPath) return true;
+            return false;
+        })(), 5000);
+        QVERIFY(environment.writeFile("selected/b-arriving.txt", controlledDocument("fairarrivingkeyword")));
+        // The in-flight batch remains blocked while a new scan observes this file.
+        QVERIFY(localCall(client, "index.start").value("ok").toBool());
+        QTest::qWait(150);
+        QVERIFY(localCall(client, "status").value("ok").toBool());
+        QVERIFY(workers.release(false, "a-long.txt-0"));
+        QTRY_VERIFY_WITH_TIMEOUT(workers.events(false, "extract").size() >= 8, 10000);
+        const auto operations = workers.events(false, "extract");
+        QList<int> longOffsets;
+        int existingIndex = -1, arrivingIndex = -1, lastLongIndex = -1;
+        for (qsizetype i = 0; i < operations.size(); ++i) {
+            const auto &operation = operations.at(i);
+            const QString path = operation.value("path").toString();
+            if (path == longPath) {
+                longOffsets.append(operation.value("offset").toInt()); lastLongIndex = int(i);
+            }
+            if (path == environment.path("selected/z-existing.txt")) existingIndex = int(i);
+            if (path == environment.path("selected/b-arriving.txt")) arrivingIndex = int(i);
+        }
+        QCOMPARE(longOffsets, QList<int>({0, 40, 80, 120, 160, 200}));
+        QVERIFY(existingIndex >= 0 && existingIndex < lastLongIndex);
+        QVERIFY(arrivingIndex >= 0 && arrivingIndex < lastLongIndex);
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "search", {{"query", "fairlongkeyword 239"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().size() == 1, 5000);
+        const auto progress = localCall(client, "status").value("result").toObject().value("progress").toObject();
+        QCOMPARE(progress.value("failed").toInteger(), 0);
+        client.disconnectFromService(); service.stop();
+    }
+
+    void changedQueuedFileIsPrioritizedAheadOfBulkBacklog() {
+        TestEnvironment environment("service-recent-queued-change");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        // The first-created tail is oldest, and its name sorts last if the
+        // filesystem gives several fixture writes the same timestamp.
+        const QString tailRelative = QStringLiteral("selected/z-tail.txt");
+        QVERIFY(environment.writeFile(tailRelative, controlledDocument("queuedoldversionkeyword")));
+        constexpr int bulkCount = 52;
+        for (int i = 0; i < bulkCount; ++i)
+            QVERIFY(environment.writeFile(QStringLiteral("selected/bulk-%1.txt").arg(i, 2, 10, QLatin1Char('0')),
+                controlledDocument("bulkbacklogkeyword")));
+        QVERIFY(environment.writeFile("selected/a-block.txt", controlledDocument("recentblockkeyword")));
+        const auto paths = environment.runtimePaths();
+        const QString tailPath = environment.path(tailRelative);
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.block(false, "a-block.txt-0"));
+        ServiceServer service(paths, workers.dependencies());
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "extract").size(), 1, 5000);
+        QCOMPARE(workers.events(false, "extract").first().value("path").toString(), environment.path("selected/a-block.txt"));
+        QCOMPARE(localCall(client, "status").value("result").toObject().value("queuedFiles").toInt(), bulkCount + 2);
+        QSignalSpy events(&client, &ServiceClient::eventReceived);
+        QVERIFY(localCall(client, "index.pause").value("ok").toBool());
+        QVERIFY(environment.writeFile(tailRelative, controlledDocument("queuednewversionkeyword with a different source length")));
+        QVERIFY(localCall(client, "index.reconcile").value("ok").toBool());
+        QVERIFY(workers.release(false, "a-block.txt-0"));
+        // Pause holds later extraction until the metadata merge confirms the
+        // changed source, rather than relying on a fixed scan duration.
+        const auto catalogMerged = [&] {
+            for (const auto &event : events)
+                if (event.at(0).toString() == "indexChanged"
+                    && event.at(1).value<QJsonObject>().value("path").toString().isEmpty()) return true;
+            return false;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(catalogMerged(), 5000);
+        QCOMPARE(workers.events(false, "extract").size(), 1);
+        QVERIFY(localCall(client, "index.resume").value("ok").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+            .value("progress").toObject().value("state").toString(), QStringLiteral("idle"), 10000);
+        const auto operations = workers.events(false, "extract");
+        QCOMPARE(operations.size(), bulkCount + 2);
+        int tailIndex = -1, tailAttempts = 0;
+        QSet<QString> pathsSeen;
+        for (qsizetype i = 0; i < operations.size(); ++i) {
+            const QString path = operations.at(i).value("path").toString();
+            QVERIFY(!pathsSeen.contains(path)); pathsSeen.insert(path);
+            if (path == tailPath) { tailIndex = int(i); ++tailAttempts; }
+        }
+        QCOMPARE(tailAttempts, 1);
+        // The updated source must reach the user near the front, before most
+        // of the unchanged backlog, without prescribing the internal lanes.
+        QVERIFY2(tailIndex > 0 && tailIndex < 6, qPrintable(QStringLiteral("Changed file remained at extraction position %1 of %2")
+            .arg(tailIndex).arg(operations.size())));
+        const auto current = localCall(client, "search", {{"query", "queuednewversionkeyword"}, {"semantic", false}});
+        QVERIFY(current.value("ok").toBool());
+        const auto hits = current.value("result").toObject().value("hits").toArray();
+        QCOMPARE(hits.size(), 1);
+        QCOMPARE(hits.first().toObject().value("path").toString(), tailPath);
+        const auto obsolete = localCall(client, "search", {{"query", "queuedoldversionkeyword"}, {"semantic", false}});
+        QVERIFY(obsolete.value("ok").toBool());
+        QVERIFY(obsolete.value("result").toObject().value("hits").toArray().isEmpty());
+        client.disconnectFromService(); service.stop();
+    }
+
+    void newProjectMarkerWithdrawsQueuedOrdinaryFile() {
+        TestEnvironment environment("service-queued-exclusion");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/z-project/queued.txt", controlledDocument("excludedqueuedkeyword")));
+        QVERIFY(environment.writeFile("selected/a-block.txt", controlledDocument("retainedblockkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.block(false, "a-block.txt-0"));
+        ServiceServer service(paths, workers.dependencies());
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "extract").size(), 1, 5000);
+        QCOMPARE(workers.events(false, "extract").first().value("path").toString(), environment.path("selected/a-block.txt"));
+        QCOMPARE(localCall(client, "status").value("result").toObject().value("queuedFiles").toInt(), 2);
+        QVERIFY(localCall(client, "index.pause").value("ok").toBool());
+        QVERIFY(environment.writeFile("selected/z-project/CMakeLists.txt", "project(ExcludedFixture)\n"));
+        QVERIFY(localCall(client, "index.reconcile").value("ok").toBool());
+        QVERIFY(workers.release(false, "a-block.txt-0"));
+        // The in-flight batch may finish, while pause holds every later batch.
+        // A completed reconciliation must withdraw the now-ineligible job.
+        QJsonObject settled;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            settled = localCall(client, "status").value("result").toObject();
+            return settled.value("catalogReady").toBool()
+                && settled.value("queuedFiles").toInt() == 0
+                && settled.value("progress").toObject().value("state").toString() == "paused";
+        })(), 5000);
+        QVERIFY(localCall(client, "index.resume").value("ok").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+            .value("progress").toObject().value("state").toString(), QStringLiteral("idle"), 5000);
+        QCOMPARE(workers.events(false, "extract").size(), 1);
+        const auto excluded = localCall(client, "search", {{"query", "excludedqueuedkeyword"}, {"semantic", false}});
+        QVERIFY(excluded.value("ok").toBool());
+        QVERIFY(excluded.value("result").toObject().value("hits").toArray().isEmpty());
+        const auto listing = localCall(client, "files.list");
+        QVERIFY(listing.value("ok").toBool());
+        const auto files = listing.value("result").toObject().value("files").toArray();
+        QCOMPARE(files.size(), 1);
+        QCOMPARE(files.first().toObject().value("path").toString(), environment.path("selected/a-block.txt"));
+        client.disconnectFromService(); service.stop();
     }
 
     void continuationSurvivesMissingJournal() {
@@ -1206,5 +1841,11 @@ private slots:
     }
 };
 
-QTEST_GUILESS_MAIN(ServiceTests)
+int main(int argc, char **argv) {
+    QCoreApplication application(argc, argv);
+    if (application.arguments().value(1) == "--qcs-test-worker")
+        return controlledWorker(application.arguments());
+    ServiceTests tests;
+    return QTest::qExec(&tests, argc, argv);
+}
 #include "test_service.moc"

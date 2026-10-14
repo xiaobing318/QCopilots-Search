@@ -30,7 +30,7 @@ GOLDENS = {"query", "query-bn", "query-ar", "document", "document-long",
            "screen-280", "photo-140", "frame-70", "speech"}
 REFERENCE = "qcs-tests-reference-vectors"
 SEMANTIC = "qcs-tests-semantic"
-PRODUCERS = {"qcs", "qcs-service", "qcs-worker",
+PRODUCERS = {"qcs-gui", "qcs-service", "qcs-worker",
              "qcs-cli", "qcs-benchmark", "qcs-tests-file-capacity"}
 
 

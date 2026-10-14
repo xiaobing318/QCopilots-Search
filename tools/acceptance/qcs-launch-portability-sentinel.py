@@ -100,7 +100,7 @@ def main():
             'Requested candidate does not match the clean build receipt')
     require(source == Path(receipt['sourceDirectory']).resolve(), 'Source checkout does not match build receipt')
     programs = {name: app / (name + '.exe') for name in
-                ('qcs', 'qcs-service', 'qcs-worker', 'qcs-cli')}
+                ('qcs-gui', 'qcs-service', 'qcs-worker', 'qcs-cli')}
     hashes = {name: digest(path) for name, path in programs.items()}
     require(all(hashes[name] == receipt['programs'][name]['sha256'] for name in programs),
             'Selected ordinary application binaries differ from the frozen build receipt')
@@ -193,7 +193,7 @@ def main():
         cli('configure-owned-profile', ['config', 'set', '--file', str(settings_file)])
         cli('index-owned-fixture', ['index', '--wait'], 120000)
         cli('pause-owned-index', ['pause'])
-        gui = start('qcs', ['--no-tray', '--no-onboarding'], True)
+        gui = start('qcs-gui', ['--no-tray', '--no-onboarding'], True)
         rows = None
         for attempt in range(15):
             require(gui.poll() is None and service.poll() is None, 'Owned GUI/service exited during launch')

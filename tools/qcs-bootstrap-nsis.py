@@ -54,7 +54,7 @@ def download(lock: dict, cache: Path, reserve: int) -> Path:
     for attempt in range(3):
         try:
             print(f"Downloading NSIS {lock['version']}", flush=True)
-            request = urllib.request.Request(lock["url"], headers={"User-Agent": "QCopilots-search-bootstrap/1"})
+            request = urllib.request.Request(lock["url"], headers={"User-Agent": "QCopilots-Search-bootstrap/1"})
             with urllib.request.urlopen(request, timeout=120) as response, partial.open("wb") as output:
                 shutil.copyfileobj(response, output, 1024 * 1024)
             if partial.stat().st_size != lock["size"] or digest(partial) != lock["sha256"]:

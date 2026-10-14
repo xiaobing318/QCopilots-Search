@@ -31,7 +31,7 @@ def command(*arguments):
 
 def build_symbols(manifest_path, output):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    expected = {"qcs", "qcs-service", "qcs-worker", "qcs-cli"}
+    expected = {"qcs-gui", "qcs-service", "qcs-worker", "qcs-cli"}
     if {entry["name"] for entry in manifest["programs"]} != expected or len(manifest["programs"]) != 4:
         raise RuntimeError("Debug symbols require all four application executables")
     for field in ("version", "platform", "architecture"):

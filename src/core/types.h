@@ -50,6 +50,8 @@ struct SearchHit {
     static SearchHit fromJson(const QJsonObject &value);
 };
 
+enum class SemanticCandidateMode { MatchesOnly, RawCandidates };
+
 struct SearchOptions {
     QString query;
     QString kind;
@@ -63,6 +65,46 @@ struct SearchOptions {
     // Process-local cancellation shared by service, SQLite and ANN search.
     // The pointer is never serialized or sent over IPC.
     std::shared_ptr<std::atomic_bool> cancelled;
+    // Raw candidates are for process-local calibration and ANN measurements.
+    SemanticCandidateMode semanticCandidateMode = SemanticCandidateMode::MatchesOnly;
+};
+
+// Browsing operates on indexed files, independently of segment search/ranking.
+struct FileListEntry {
+    qint64 fileId = 0;
+    QString path;
+    QString title;
+    QString kind;
+    qint64 modifiedMs = 0;
+    QString sourceVersion;
+    bool code = false;
+    QJsonObject toJson() const;
+    static FileListEntry fromJson(const QJsonObject &value);
+};
+
+struct FileListOptions {
+    QString kind;
+    QString root;
+    QStringList allowedRoots;
+    QStringList excludedRoots;
+    bool enforceFolderRules = false;
+    bool code = false;
+    int limit = 100;
+    QString cursor;
+    // Service-owned visibility epoch. Never populated from a client cursor.
+    QString configurationToken;
+    std::shared_ptr<std::atomic_bool> cancelled;
+};
+
+struct FileListPage {
+    QList<FileListEntry> files;
+    QString nextCursor;
+    bool hasMore = false;
+    qint64 browseGeneration = 0;
+    bool metadataPending = false;
+    QString errorCode;
+    QString error;
+    QJsonObject toJson() const;
 };
 
 struct IndexProgress {

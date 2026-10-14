@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QScopeGuard>
 #include <QtTest>
 #include <sqlite3.h>
@@ -53,6 +54,14 @@ QSet<QString> hitPaths(const QList<SearchHit> &hits)
     QSet<QString> result;
     for (const SearchHit &hit : hits)
         result.insert(hit.path);
+    return result;
+}
+
+QJsonArray segmentSnapshots(const QVector<Segment> &segments)
+{
+    QJsonArray result;
+    for (const auto &segment : segments)
+        result.append(segment.toJson());
     return result;
 }
 
@@ -217,6 +226,7 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(1);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         QVERIFY(repository.search(semantic, &error).isEmpty());
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QVERIFY(repository.fileVersion(path, false, &error).isEmpty());
@@ -300,6 +310,7 @@ private slots:
         }, &error), qPrintable(error));
         SearchOptions options;
         options.queryEmbedding = basis(0);
+        options.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         options.limit = 1;
         const auto all = repository.search(options, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
@@ -343,6 +354,7 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         QVERIFY(repository.search(semantic, &error).isEmpty());
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
@@ -379,6 +391,7 @@ private slots:
         QCOMPARE(after.value(QStringLiteral("pendingShards")), before.value(QStringLiteral("pendingShards")));
         auto search = query(QStringLiteral("survivorword"));
         search.queryEmbedding = basis(0);
+        search.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = repository.search(search, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(1));
@@ -480,6 +493,7 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = reopened.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(1));
@@ -513,6 +527,7 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = reopened.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(1));
@@ -614,6 +629,7 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(1);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         semantic.limit = 1;
         const auto hits = repository.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
@@ -635,6 +651,7 @@ private slots:
         const QString path = environment.path(QStringLiteral("imported.txt"));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         QString error;
         {
             IndexRepository repository;
@@ -752,9 +769,9 @@ private slots:
         QVERIFY2(reopened.checkIntegrity(&error), qPrintable(error));
     }
 
-    void reclassificationRetiresOppositeClassKeywordsAndVectors()
+    void samePathSpacesKeepIndependentKeywordsAndVectors()
     {
-        TestEnvironment environment(QStringLiteral("storage-reclassify"));
+        TestEnvironment environment(QStringLiteral("storage-space-isolation"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
         const QString path = environment.path(QStringLiteral("repository/README.md"));
         struct Phase {
@@ -771,57 +788,137 @@ private slots:
         IndexRepository repository;
         QString error;
         QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        QHash<bool, Phase> currentBySpace;
         for (qsizetype i = 0; i < phases.size(); ++i) {
             const auto &phase = phases.at(i);
             QVERIFY2(repository.replaceFile(path, phase.version,
                         {segment(phase.text, phase.code ? QStringLiteral("code") : QStringLiteral("document"),
                                  phase.embedding)}, phase.code, &error), qPrintable(error));
+            currentBySpace.insert(phase.code, phase);
             // Exercise the live delta/tombstone path and then the persisted ANN.
             for (int publication = 0; publication < 2; ++publication) {
                 const auto status = repository.status(&error);
                 QVERIFY2(error.isEmpty(), qPrintable(error));
-                QCOMPARE(status.value(QStringLiteral("files")).toInteger(), qint64(1));
-                QCOMPARE(status.value(QStringLiteral("segments")).toInteger(), qint64(1));
-                QCOMPARE(status.value(QStringLiteral("vectors")).toInteger(), qint64(1));
-                QCOMPARE(repository.fileVersion(path, phase.code, &error), phase.version);
-                QVERIFY(repository.fileVersion(path, !phase.code, &error).isEmpty());
-                QVERIFY2(error.isEmpty(), qPrintable(error));
-                QVERIFY(repository.fileSegments(path, !phase.code, &error).isEmpty());
-                QVERIFY2(error.isEmpty(), qPrintable(error));
-
-                auto keyword = query(phase.text);
-                keyword.code = phase.code;
-                const auto current = repository.search(keyword, &error);
-                QVERIFY2(error.isEmpty(), qPrintable(error));
-                QCOMPARE(current.size(), qsizetype(1));
-                QCOMPARE(current.first().text, phase.text);
-                keyword.code = !phase.code;
-                QVERIFY(repository.search(keyword, &error).isEmpty());
-                QVERIFY2(error.isEmpty(), qPrintable(error));
-
-                SearchOptions semantic;
-                semantic.code = phase.code;
-                semantic.queryEmbedding = phase.embedding;
-                const auto semanticHits = repository.search(semantic, &error);
-                QVERIFY2(error.isEmpty(), qPrintable(error));
-                QCOMPARE(semanticHits.size(), qsizetype(1));
-                QCOMPARE(semanticHits.first().text, phase.text);
-                semantic.code = !phase.code;
-                QVERIFY(repository.search(semantic, &error).isEmpty());
-                QVERIFY2(error.isEmpty(), qPrintable(error));
-
-                for (qsizetype old = 0; old < i; ++old) {
-                    for (bool code : {false, true}) {
-                        auto retired = query(phases.at(old).text);
-                        retired.code = code;
-                        QVERIFY(repository.search(retired, &error).isEmpty());
+                QCOMPARE(status.value(QStringLiteral("files")).toInteger(), qint64(currentBySpace.size()));
+                QCOMPARE(status.value(QStringLiteral("segments")).toInteger(), qint64(currentBySpace.size()));
+                QCOMPARE(status.value(QStringLiteral("vectors")).toInteger(), qint64(currentBySpace.size()));
+                for (bool code : {false, true}) {
+                    if (!currentBySpace.contains(code)) {
+                        QVERIFY(repository.fileVersion(path, code, &error).isEmpty());
+                        QVERIFY(repository.fileSegments(path, code, &error).isEmpty());
                         QVERIFY2(error.isEmpty(), qPrintable(error));
+                        continue;
                     }
+                    const auto &current = currentBySpace[code];
+                    QCOMPARE(repository.fileVersion(path, code, &error), current.version);
+                    const auto stored = repository.fileSegments(path, code, &error);
+                    QVERIFY2(error.isEmpty(), qPrintable(error));
+                    QCOMPARE(stored.size(), qsizetype(1));
+                    QCOMPARE(stored.first().text, current.text);
+
+                    auto keyword = query(current.text);
+                    keyword.code = code;
+                    const auto currentHits = repository.search(keyword, &error);
+                    QVERIFY2(error.isEmpty(), qPrintable(error));
+                    QCOMPARE(currentHits.size(), qsizetype(1));
+                    QCOMPARE(currentHits.first().text, current.text);
+                    keyword.code = !code;
+                    QVERIFY(repository.search(keyword, &error).isEmpty());
+                    QVERIFY2(error.isEmpty(), qPrintable(error));
+
+                    SearchOptions semantic;
+                    semantic.code = code;
+                    semantic.queryEmbedding = current.embedding;
+                    semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
+                    const auto semanticHits = repository.search(semantic, &error);
+                    QVERIFY2(error.isEmpty(), qPrintable(error));
+                    QCOMPARE(semanticHits.size(), qsizetype(1));
+                    QCOMPARE(semanticHits.first().text, current.text);
+                }
+                for (qsizetype old = 0; old < i; ++old) {
+                    const auto &prior = phases.at(old);
+                    if (currentBySpace[prior.code].version == prior.version)
+                        continue;
+                    auto retired = query(prior.text);
+                    retired.code = prior.code;
+                    QVERIFY(repository.search(retired, &error).isEmpty());
+                    QVERIFY2(error.isEmpty(), qPrintable(error));
                 }
                 if (publication == 0)
                     QVERIFY2(repository.flush(&error), qPrintable(error));
             }
         }
+
+        // The compatibility overload targets ordinary files only.
+        QVERIFY2(repository.removeFile(path, &error), qPrintable(error));
+        QVERIFY(repository.fileVersion(path, false, &error).isEmpty());
+        QCOMPARE(repository.fileVersion(path, true, &error), QStringLiteral("code-v3"));
+        QVERIFY2(repository.flush(&error), qPrintable(error));
+        SearchOptions codeSearch = query(QStringLiteral("codefinalword"));
+        codeSearch.code = true;
+        QCOMPARE(repository.search(codeSearch, &error).size(), qsizetype(1));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        SearchOptions semantic;
+        semantic.code = true;
+        semantic.queryEmbedding = basis(2);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
+        const auto remainingCode = repository.search(semantic, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(remainingCode.size(), qsizetype(1));
+        QCOMPARE(remainingCode.first().text, QStringLiteral("codefinalword"));
+        QVERIFY2(repository.replaceFile(path, QStringLiteral("main-v4"),
+                    {segment(QStringLiteral("mainremainingword"), QStringLiteral("document"), basis(1))},
+                    false, &error), qPrintable(error));
+        QVERIFY2(repository.removeFile(path, true, &error), qPrintable(error));
+        QVERIFY(repository.fileVersion(path, true, &error).isEmpty());
+        QCOMPARE(repository.fileVersion(path, false, &error), QStringLiteral("main-v4"));
+        QVERIFY(repository.search(codeSearch, &error).isEmpty());
+        QCOMPARE(repository.search(query(QStringLiteral("mainremainingword")), &error).size(), qsizetype(1));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(repository.flush(&error), qPrintable(error));
+        QVERIFY(repository.search(semantic, &error).isEmpty());
+        semantic.code = false;
+        semantic.queryEmbedding = basis(1);
+        const auto remainingOrdinary = repository.search(semantic, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(remainingOrdinary.size(), qsizetype(1));
+        QCOMPARE(remainingOrdinary.first().text, QStringLiteral("mainremainingword"));
+        QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
+    }
+
+    void pruningIsIndependentForOrdinaryAndCodeSpaces()
+    {
+        TestEnvironment environment(QStringLiteral("storage-space-pruning"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QString root = environment.path(QStringLiteral("root"));
+        const QString shared = QDir(root).filePath(QStringLiteral("shared.md"));
+        const QString ordinaryOnly = QDir(root).filePath(QStringLiteral("ordinary.txt"));
+        const QString codeOnly = QDir(root).filePath(QStringLiteral("source.cpp"));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        QVERIFY2(repository.replaceFiles({
+            {shared, QStringLiteral("main-v1"), false, {segment(QStringLiteral("ordinarytoken"))}},
+            {ordinaryOnly, QStringLiteral("main-v1"), false, {segment(QStringLiteral("ordinarytoken"))}},
+            {shared, QStringLiteral("code-v1"), true, {segment(QStringLiteral("codetoken"))}},
+            {codeOnly, QStringLiteral("code-v1"), true, {segment(QStringLiteral("codetoken"))}}
+        }, &error), qPrintable(error));
+        auto codeSearch = query(QStringLiteral("codetoken"));
+        codeSearch.code = true;
+        QVERIFY2(repository.prune(root, {shared}, &error), qPrintable(error));
+        QCOMPARE(hitPaths(repository.search(query(QStringLiteral("ordinarytoken")), &error)),
+                 (QSet<QString>{shared}));
+        QCOMPARE(hitPaths(repository.search(codeSearch, &error)), (QSet<QString>{shared, codeOnly}));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(repository.prune(root, {codeOnly}, true, &error), qPrintable(error));
+        QCOMPARE(hitPaths(repository.search(codeSearch, &error)), (QSet<QString>{codeOnly}));
+        QCOMPARE(repository.fileVersion(shared, false, &error), QStringLiteral("main-v1"));
+        QVERIFY(repository.fileVersion(shared, true, &error).isEmpty());
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(repository.prune(root, {}, false, &error), qPrintable(error));
+        QVERIFY(repository.search(query(QStringLiteral("ordinarytoken")), &error).isEmpty());
+        QCOMPARE(hitPaths(repository.search(codeSearch, &error)), (QSet<QString>{codeOnly}));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
     }
 
@@ -966,9 +1063,11 @@ private slots:
         keyword.cancelled = cancelled;
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         semantic.cancelled = cancelled;
         auto hybrid = keyword;
         hybrid.queryEmbedding = basis(0);
+        hybrid.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         for (const auto &options : {keyword, semantic, hybrid}) {
             cancelled->store(true, std::memory_order_relaxed);
             QVERIFY(repository.search(options, &error).isEmpty());
@@ -1016,11 +1115,221 @@ private slots:
         QCOMPARE(repository.status(&error).value(QStringLiteral("annVectors")).toInteger(), qint64(files.size() - 1));
         SearchOptions semantic;
         semantic.queryEmbedding = basis(0);
+        semantic.semanticCandidateMode = SemanticCandidateMode::RawCandidates;
         const auto hits = repository.search(semantic, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(hits.size(), qsizetype(files.size() - 1));
         QVERIFY(!hitPaths(hits).contains(removed));
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
+    }
+
+    void fileMetadataBackfillPreservesIndexedContentAndVersion()
+    {
+        TestEnvironment environment(QStringLiteral("storage-metadata-backfill"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QString path = environment.path(QString::fromUtf8("资料/报告.pdf"));
+        const QString version = QStringLiteral("source-v1|partial:2");
+        Segment first = segment(QStringLiteral("first searchable passage"), QStringLiteral("pdf"), basis(0));
+        first.page = 3;
+        Segment second = segment(QStringLiteral("second searchable passage"), QStringLiteral("pdf"));
+        second.page = 4;
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        QVERIFY2(repository.replaceFile(path, version, {first, second}, false, &error), qPrintable(error));
+        QVERIFY2(repository.replaceFile(path, QStringLiteral("code-v1"),
+                    {segment(QStringLiteral("separate code passage"), QStringLiteral("code"))},
+                    true, &error, {}, 800, QStringLiteral("code")), qPrintable(error));
+        const auto before = segmentSnapshots(repository.fileSegments(path, false, &error));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        const auto pending = repository.listFiles({});
+        QVERIFY(pending.metadataPending);
+        QCOMPARE(pending.errorCode, QStringLiteral("metadata_pending"));
+        QVERIFY(pending.files.isEmpty());
+
+        // Metadata repair must not re-extract, change source versions or create
+        // records for files that have not been indexed yet.
+        QVERIFY2(repository.updateFileMetadata({
+            {path, false, 1700, QStringLiteral("pdf"), QStringLiteral("source-v1")},
+            {environment.path(QStringLiteral("missing.txt")), false, 1900, QStringLiteral("text"), {}}
+        }, &error), qPrintable(error));
+        const auto page = repository.listFiles({});
+        QVERIFY2(page.error.isEmpty(), qPrintable(page.error));
+        QVERIFY(!page.metadataPending);
+        QCOMPARE(page.files.size(), qsizetype(1));
+        const auto entry = page.files.first();
+        QCOMPARE(entry.path, path);
+        QCOMPARE(entry.title, QFileInfo(path).fileName());
+        QCOMPARE(entry.kind, QStringLiteral("pdf"));
+        QCOMPARE(entry.modifiedMs, qint64(1700));
+        QCOMPARE(entry.sourceVersion, version);
+        QCOMPARE(repository.fileVersion(path, false, &error), version);
+        QCOMPARE(segmentSnapshots(repository.fileSegments(path, false, &error)), before);
+        QCOMPARE(repository.status(&error).value(QStringLiteral("files")).toInteger(), qint64(2));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        FileListOptions codeOptions;
+        codeOptions.code = true;
+        const auto codePage = repository.listFiles(codeOptions);
+        QVERIFY2(codePage.error.isEmpty(), qPrintable(codePage.error));
+        QCOMPARE(codePage.files.size(), qsizetype(1));
+        QCOMPARE(codePage.files.first().modifiedMs, qint64(800));
+        QCOMPARE(codePage.files.first().kind, QStringLiteral("code"));
+        QCOMPARE(codePage.files.first().sourceVersion, QStringLiteral("code-v1"));
+
+        // Unchanged repair scans and stale fingerprints must leave cursor
+        // generations alone, even if the stale scan proposes other metadata.
+        QVERIFY2(repository.updateFileMetadata({
+            {path, false, 1700, QStringLiteral("pdf"), QStringLiteral("source-v1")}
+        }, &error), qPrintable(error));
+        QCOMPARE(repository.listFiles({}).browseGeneration, page.browseGeneration);
+        QVERIFY2(repository.updateFileMetadata({
+            {path, false, 9999, QStringLiteral("image"), QStringLiteral("source-v2")},
+            {path, false, 9999, QStringLiteral("image"), QStringLiteral("source")}
+        }, &error), qPrintable(error));
+        const auto unchanged = repository.listFiles({});
+        QVERIFY2(unchanged.error.isEmpty(), qPrintable(unchanged.error));
+        QCOMPARE(unchanged.browseGeneration, page.browseGeneration);
+        QCOMPARE(unchanged.files.first().modifiedMs, qint64(1700));
+        QCOMPARE(unchanged.files.first().kind, QStringLiteral("pdf"));
+        QCOMPARE(segmentSnapshots(repository.fileSegments(path, false, &error)), before);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+
+        QVERIFY(!repository.updateFileMetadata({
+            {path, false, 1800, QStringLiteral("pdf"), QStringLiteral("source-v1")}
+        }, &error, [] { return std::shared_ptr<void>{}; }));
+        QVERIFY(!error.isEmpty());
+        const auto rejected = repository.listFiles({});
+        QVERIFY2(rejected.error.isEmpty(), qPrintable(rejected.error));
+        QCOMPARE(rejected.browseGeneration, page.browseGeneration);
+        QCOMPARE(rejected.files.first().modifiedMs, qint64(1700));
+        QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
+    }
+
+    void metadataSnapshotCanRepairChangedSourcesWithoutReextracting()
+    {
+        TestEnvironment environment(QStringLiteral("storage-metadata-snapshot"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        IndexRepository repository;
+        QString error;
+        QVERIFY2(repository.open(environment.runtimePaths(), &error), qPrintable(error));
+        const QString changed = environment.path(QStringLiteral("changed.txt"));
+        const QString healthy = environment.path(QStringLiteral("healthy.txt"));
+        const QString oldVersion = QStringLiteral("old-source|pipeline");
+        const QString healthyVersion = QStringLiteral("healthy-source|pipeline");
+        QVERIFY2(repository.replaceFile(changed, oldVersion,
+            {segment(QStringLiteral("old indexed content"))}, false, &error), qPrintable(error));
+        QVERIFY2(repository.replaceFile(healthy, healthyVersion,
+            {segment(QStringLiteral("healthy content"))}, false, &error), qPrintable(error));
+        const auto before = segmentSnapshots(repository.fileSegments(changed, false, &error));
+        QCOMPARE(repository.listFiles({}).errorCode, QStringLiteral("metadata_pending"));
+        // A paused service can repair both metadata rows. It later hides the
+        // changed source by checking its retained sourceVersion against disk.
+        QVERIFY2(repository.updateFileMetadata({
+            {changed, false, 2000, QStringLiteral("text"), QStringLiteral("new-source"), oldVersion},
+            {healthy, false, 1000, QStringLiteral("text"), QStringLiteral("healthy-source"), healthyVersion}
+        }, &error), qPrintable(error));
+        const auto page = repository.listFiles({});
+        QVERIFY2(page.error.isEmpty(), qPrintable(page.error));
+        QCOMPARE(page.files.size(), qsizetype(2));
+        QCOMPARE(page.files.first().path, changed);
+        QCOMPARE(page.files.first().sourceVersion, oldVersion);
+        QCOMPARE(segmentSnapshots(repository.fileSegments(changed, false, &error)), before);
+        QCOMPARE(repository.fileVersion(changed, false, &error), oldVersion);
+
+        const QString publishedVersion = QStringLiteral("published-source|pipeline");
+        QVERIFY2(repository.replaceFile(changed, publishedVersion,
+            {segment(QStringLiteral("newly indexed content"))}, false, &error, {},
+            3000, QStringLiteral("text")), qPrintable(error));
+        const auto publishedGeneration = repository.browseGeneration(&error);
+        QVERIFY2(repository.updateFileMetadata({
+            {changed, false, 5, QStringLiteral("pdf"), QStringLiteral("published-source"), oldVersion}
+        }, &error), qPrintable(error));
+        const auto stillCurrent = repository.listFiles({});
+        QVERIFY2(stillCurrent.error.isEmpty(), qPrintable(stillCurrent.error));
+        QCOMPARE(stillCurrent.files.first().modifiedMs, qint64(3000));
+        QCOMPARE(stillCurrent.files.first().kind, QStringLiteral("text"));
+        QCOMPARE(stillCurrent.files.first().sourceVersion, publishedVersion);
+        QCOMPARE(stillCurrent.browseGeneration, publishedGeneration);
+        QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
+    }
+
+    void schemaTwoMigrationRequiresMetadataWithoutReextractingFiles()
+    {
+        TestEnvironment environment(QStringLiteral("storage-schema-two-browse-migration"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto paths = environment.runtimePaths();
+        const QString path = environment.path(QStringLiteral("old/report.pdf"));
+        const QString version = QStringLiteral("legacy-source|partial:2");
+        QJsonArray originalSegments;
+        QString error;
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            Segment first = segment(QStringLiteral("legacy searchable passage"), QStringLiteral("pdf"), basis(0));
+            first.page = 7;
+            Segment second = segment(QStringLiteral("legacy second passage"), QStringLiteral("pdf"));
+            second.page = 8;
+            QVERIFY2(repository.replaceFile(path, version, {first, second}, false, &error,
+                        {}, 600, QStringLiteral("pdf")), qPrintable(error));
+            originalSegments = segmentSnapshots(repository.fileSegments(path, false, &error));
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY2(repository.flush(&error), qPrintable(error));
+        }
+        // Materialize the preceding schema, including its already indexed
+        // segments. Closing the repository first also exercises real reopening.
+        QVERIFY2(executeSql(paths.databaseFile(),
+            "DROP INDEX files_browse;"
+            "DROP INDEX files_browse_kind;"
+            "DROP INDEX files_pending_metadata;"
+            "ALTER TABLE files DROP COLUMN modified_ms;"
+            "ALTER TABLE files DROP COLUMN kind;"
+            "DELETE FROM meta WHERE key='browse_generation';"
+            "PRAGMA user_version=2;", &error), qPrintable(error));
+        {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            const auto status = repository.status(&error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(status.value(QStringLiteral("schemaVersion")).toInt(), 3);
+            QCOMPARE(status.value(QStringLiteral("metadataPendingFiles")).toInteger(), qint64(1));
+            const auto pending = repository.listFiles({});
+            QVERIFY(pending.metadataPending);
+            QCOMPARE(pending.errorCode, QStringLiteral("metadata_pending"));
+            QVERIFY(pending.files.isEmpty());
+            QVERIFY(pending.nextCursor.isEmpty());
+            QVERIFY(!pending.hasMore);
+            QCOMPARE(repository.fileVersion(path, false, &error), version);
+            QCOMPARE(segmentSnapshots(repository.fileSegments(path, false, &error)), originalSegments);
+            const auto hits = repository.search(query(QStringLiteral("searchable")), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(hits.size(), qsizetype(1));
+            QCOMPARE(hits.first().sourceVersion, version);
+
+            // An unchanged source version still needs this metadata update.
+            QVERIFY2(repository.updateFileMetadata({
+                {path, false, 900, QStringLiteral("pdf"), QStringLiteral("legacy-source")}
+            }, &error), qPrintable(error));
+            const auto completed = repository.listFiles({});
+            QVERIFY2(completed.error.isEmpty(), qPrintable(completed.error));
+            QVERIFY(!completed.metadataPending);
+            QCOMPARE(completed.files.size(), qsizetype(1));
+            QCOMPARE(completed.files.first().modifiedMs, qint64(900));
+            QCOMPARE(completed.files.first().sourceVersion, version);
+            QCOMPARE(segmentSnapshots(repository.fileSegments(path, false, &error)), originalSegments);
+            QCOMPARE(repository.fileVersion(path, false, &error), version);
+            QCOMPARE(repository.status(&error).value(QStringLiteral("metadataPendingFiles")).toInteger(), qint64(0));
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
+        }
+        IndexRepository reopened;
+        QVERIFY2(reopened.open(paths, &error), qPrintable(error));
+        const auto page = reopened.listFiles({});
+        QVERIFY2(page.error.isEmpty(), qPrintable(page.error));
+        QCOMPARE(page.files.size(), qsizetype(1));
+        QCOMPARE(page.files.first().modifiedMs, qint64(900));
+        QCOMPARE(page.files.first().sourceVersion, version);
+        QCOMPARE(segmentSnapshots(reopened.fileSegments(path, false, &error)), originalSegments);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
     }
 
     void pageLayoutIsSelectedOnlyForNewDatabases()

@@ -21,22 +21,30 @@
 | 生成物清理保留用户资源 | clean 范围及归属检查 | dry-run 无修改，generated 清理排除模型、SDK、源码和正式配置，归属不符拒绝 | 必需回归，以本轮工具测试报告为准 |
 | 实际生成路径预算 | `tools/qcs-path-budget.py` 与 CMake | `qcs-tests-path-budget`，Windows UTF-16 长度、对象 200 字符、其他受控路径 240 字符，超长根诊断及动态长路径压力用例 | 已建立回归，以本轮路径报告为准 |
 | 配置读取与原子保存 | `core/app_settings.*` | settingsRoundTrip、settingsRejectCorruption、settingsAtomicFailure | 已建立用例 |
+| 配置 v2 与普通/代码目录分离 | `core/app_settings.*`、`app/settings_dialog.*` | `qcs-tests-core` 的 `settingsV1Migration`、`settingsFingerprint`，`qcs-tests-gui` 的 `independentFoldersAndExternalApplicationArgumentsRoundTrip` | 已建立迁移与界面回归，关闭代码索引必须保留代码目录 |
+| 同路径两个空间的数据隔离 | `storage/index_repository.*`、服务配置与扫描 | `samePathSpacesKeepIndependentKeywordsAndVectors`、`pruningIsIndependentForOrdinaryAndCodeSpaces`、服务 `independentSpacesRepairMetadataAndBrowseWithoutContent` | 已建立回归，分别验证关键词、向量、清理及目录资格 |
+| schema 3 元数据补齐与来源核对 | SQLite 迁移、文件扫描、元数据快照 | `schemaTwoMigrationRequiresMetadataWithoutReextractingFiles`、`fileMetadataBackfillPreservesIndexedContentAndVersion`、`metadataSnapshotCanRepairChangedSourcesWithoutReextracting`、服务 `pausedLegacyMetadataRepairHidesChangedSourceWithoutBlockingHealthyFile` | 已建立迁移回归，未知时间不可伪造，等待核对必须显式报告 |
 | 旧持久布局拒绝且不修改 | RuntimePaths、ServiceClient | legacyProfileRejected、legacyProfileIsRejectedBeforeConnectingToExistingEndpoint | 已建立回归，以本轮进程报告为准 |
 | 模型固定版本与校验 | `core/model_files.*` | pinnedManifest、corruptedModelCannotPublish、CLI models verify | 已建立用例 |
 | 下载续传、取消和重试 | 模型下载器 | resumesRanges、cancelKeepsPartialAndUnlocks、invalidCompletePartialRestarts | 已建立用例 |
 | 文本、HTML、RTF、Office | `extraction/document_extractor.*` | extraction-document 全套 | 已建立用例 |
 | HTML 外部资源禁止加载 | 文档提取 | htmlNeverReadsLocalResources | 已建立用例 |
 | 长文件续读 | 提取游标、worker | longDocumentResumesWithoutLosingTail、persistentCursorAndIsolatedProfiles | 已建立用例 |
+| 近期变动、批量首读和续读公平调度 | `service/service_server.cpp` 三队列与队列令牌 | `qcs-tests-service` 的 `scansMergeNewFilesBetweenLongDocumentBatches`、`changedQueuedFileIsPrioritizedAheadOfBulkBacklog`、`changingSourceDoesNotStarveStableQueuedFile`、`continuationSurvivesMissingJournal` | 实现为批次 4:1:1，已建立时序回归，不代表固定响应时间保证 |
+| worker 空闲退出和需求恢复 | 服务 index/query idle 定时器与退出原因状态 | `idleWorkersReleaseAndRestartDespiteFrequentReconciliation`、`workArrivingWhileWorkerCloses` | 索引默认 60 秒、查询默认 600 秒，测试缩短等待验证状态机，真实资源与恢复延迟另记 |
 | 旧 DOC | legacy_doc_extractor | extraction-legacy_doc | 已建立入口，格式结果待报告 |
 | 图片、PDF、OCR | image_extractor | pdfPaginationAndPosition、scannedPdfRendersImage、realOcrWithUnicodeDataDirectory | 已建立用例 |
 | HEIC、RAW 格式范围 | libheif、LibRaw | 真实格式探针与包级运行 | 待明确夹具与执行证据 |
 | 音频窗口、环境声、视频时间 | media_extractor、runtime | extraction-media、reference-vectors、独立语义集 | 数值和窗口用例已建立，真实语义待报告 |
 | 可选代码、Git ignore、未跟踪源码 | file_catalog、document_extractor | gitIgnoreKeepsTrackedAndUntrackedSource、codeLocationsAndNotebookSources | 已建立用例 |
+| 普通与代码扫描的独立资格 | `core/file_catalog.*`、服务扫描合并 | `independentScopesAllowSharedTextAndRejectCodeData`、`codeScanningWorksWithoutGitExecutable`、`codeScopeSkipsNestedWorktreeUnlessExplicitlySelected`、服务 `newProjectMarkerWithdrawsQueuedOrdinaryFile` | 已建立回归，目录资格变动需同步撤销过时排队任务 |
 | 九条黄金向量 cosine ≥ 0.999 | runtime | tests-reference-vectors | 已建立用例，四组合结果待 CI |
 | 中文、截断、损坏媒体 | runtime | chineseInputsAreNormalizedAndDistinct、truncationPreservesThePrefix、malformedAndMismatchedMediaAreRejected | 已建立用例 |
 | 中文关键词与定位 | storage/text_index | tests-index_repository 的 keywordSearch、locationAndFileAggregation | 已建立用例 |
 | 无模型关键词搜索 | worker、storage | unicodePathsAndKeywordOnlyWithoutModels | 已建立用例 |
 | 文件增删改与模型版本 | IndexRepository | replacementAndRemovalRetireOldSegments、pipelineChangeInvalidatesVectorsButPreservesKeywordSearch | 已建立用例 |
+| 空查询文件浏览与 keyset 分页 | `IndexRepository::listFiles`、服务 `files.list` | `fileListPagesEveryFileOnceWithStableModificationTies`、`fileListPageDoesNotPinReadTransactionBetweenRequests` | 已建立回归，按修改时间与 ID 排序，每页 1 至 100 项且页面间不持有读事务 |
+| 浏览游标与真实可见版本 | `browseGeneration`、服务 `visibilityEpoch`、游标配置摘要 | `fileListCursorRejectsChangedVisibilityContext`、`fileListCursorBecomesStaleAfterMembershipOrMetadataChanges`、`fileListCursorSurvivesSegmentContinuationAndAnnPublication` | 已建立回归，无变化扫描、续读和 ANN 发布不可误使页面失效 |
 | 过滤参与召回 | IndexRepository、VectorIndex | semanticSearchAppliesFiltersBeforeLimit、allowedIdsRestrictCandidates | 已建立用例 |
 | 过滤分片策略与取消恢复 | VectorIndex | `qcs-tests-vector_index`，真实允许集合的选择边界、缺失 ID 与墓碑、混合分片、实际打分途中取消、异常、旧快照及全局 k 并列排序 | 已建立回归，正确性与性能结果待新冻结候选报告 |
 | 并发发布时的 SQL/ANN 配对快照 | IndexRepository | `qcs-tests-index_repository_regression` 的 `annFileAggregationAndPendingTombstones`，待发布增删改、目录规则变化、旧读者与单分片发布交错 | 已建立回归，原生执行结果待新冻结候选报告 |
@@ -47,12 +55,20 @@
 | Worker 崩溃及迟到结果 | 服务任务调度 | 进程故障注入与版本检查 | 待集成测试证据 |
 | 首次引导、设置与模型界面 | Qt Widgets app | GUI QtTest、CU-01 至 CU-03 | 待 GUI 与 Computer Use 结果 |
 | 搜索、过滤、导航和预览 | Qt Widgets app | GUI QtTest、CU-04 至 CU-08 | 待 GUI 与 Computer Use 结果 |
+| 两行元信息列表与按选择读取正文 | `app/main_window.*`、`app/preview_panel.*` | `emptyQueryBrowsesFilesAndLoadsOnlySelectedBody`、`keywordSearchAndTextPreview`、`browsingDocumentLoadsOneBatchWithoutInventingSearchLocation` | 已建立回归，列表不得显示正文或内容缩略图，最终包仍需目视确认 |
+| 主窗口分页与快速窗口上限 | GUI `files.list` 请求和浏览控件 | `browsingAppendAndStaleCursorPreserveSelectionAndPreview`、`quickBrowserUsesTwelveAndRefreshesLanguage` | 主窗口每页 100，快速最多 12 且不分页，已建立状态回归 |
+| 过期页、迟到响应与核对等待 | GUI 请求上下文和浏览状态 | `lateBrowseResponseCannotReplaceTypedSearchBeforeDebounce`、`metadataPendingSearchShowsProgressAndRetriesAfterIndexChange`、`quickBrowseFailureRemainsVisibleAcrossStatusRefresh` | 已建立回归，旧页保留并提示刷新，版本不兼容不能静默回退 |
 | 状态与语言刷新保留正在操作的预览控件 | `app/main_window.*`、`app/preview_panel.*` | `qcs-tests-gui` 的 `playingMediaButtonSurvivesStatusAndLanguageRefresh`、`mediaClockTracksDurationBeforePlaybackAndClears`、`statusRefreshPreservesUncommittedKindNavigation`、`statusRefreshPreservesIntermediatePdfPageEdit`，验证实际播放状态、播放前时长、未提交分类导航与 PDF 页码输入 | 已建立独立回归，旧代码失败与修复后结果分别记录，最终包仍需 Computer Use 复验 |
 | 暂停、恢复与文件变化 | service、app | CU-09、服务变化对账测试 | 待集成与用户操作结果 |
 | 托盘、全局快捷键与重启 | 平台适配 | CU-10 和平台能力报告 | 待各平台执行结果 |
+| Linux portal 与 X11 全局快捷键 | `app/linux_global_shortcut.*`、`app/platform_integration.*` | Linux 专用 `qcs-tests-linux-shortcut`，另需真实 X11/Wayland 桌面验证授权、绑定、触发、关闭与重试 | 协议状态用例不能替代实际 compositor 运行结果，拒绝授权不得绕过 |
+| 登录启动与隔离配置限制 | `app/login_startup.*`、`PlatformIntegration::canSetStartAtLogin`、设置页显式变更意图 | `qcs-tests-login-startup` 的 desktop-entry 编码、禁用覆盖、测试隔离用例，`qcs-tests-platform` 的 `isolatedProfilesCannotChangeLoginStartup` | 测试不写真实系统启动项，Windows/macOS/Linux 实际登录行为需原生验收 |
+| 指定外部 PDF 与媒体应用定位 | `app/platform_external_open.*`、外部应用设置 | `platformPdfPresetUsesPhysicalPage`、`mediaStartUsesExactMilliseconds`、`actualProcessReceivesLiteralFileAndLocationArguments`、`missingApplicationNeverSilentlyFallsBack` | 参数构造和进程传参已有回归，实际查看器/播放器定位需安装相应应用验证 |
+| 系统默认打开的定位边界 | `PlatformIntegration::openHit` 与 GUI 通知 | `ordinaryOpenExplicitlyReportsLocationLimit`、外部打开 Computer Use 场景 | 不保证默认应用页码或时间定位，指定应用失败不得伪装成默认打开成功 |
 | 十万个物理文件 | file_catalog 容量入口 | tests-file-capacity，独立全规模运行 | 已建立入口，规模结果待报告 |
 | 百万 768 维向量 | qcs-benchmark | 写入、ANN、重开、精确 top-20 对照及 500 次计时 | 已建立入口，本机实测待报告 |
-| 真实语义质量 | 独立语义数据集与评估器 | ≥ 1,000 真实片段、≥ 200 中英查询和无答案集 | 待数据集与执行报告 |
+| 真实语义质量与相关性校准 | `core/relevance_policy.*`、`tests/semantic` 真实模型采样与校准器 | `qcs-tests-relevance-calibration`、`qcs-tests-semantic-manifest`、完整 `qcs-tests-semantic`，calibration 与 holdout 分离并绑定模型和语料身份 | v1 留出集未通过，当前策略仍未校准，v2 独立样本扩充与续验不能写作通过 |
+| 保持相关性门槛与生产重验 | 校准策略生成和生产候选过滤 | 总体 Recall@10 ≥ 0.90、语言及模态分组 ≥ 0.80、无答案误返回率 ≤ 0.10，生成策略后重新编译并运行生产检索 | 门槛不降低，原始候选导出或模拟拟合通过不能替代生产质量验收 |
 | 磁盘不足、提交中断与失效版本零返回 | storage、service | 故障注入及恢复检查 | 部分存储用例已建立，全流程待报告 |
 | 安装布局与依赖部署 | install、CPack、verify-package | 原生 CI 与重定位包级启动 | 已建立流程，包级结果待报告 |
 | 包报告绑定实际源码 checkout | `tools/qcs-verify-package.py` | `qcs-tests-workflow`，真实 Git HEAD、linked worktree、候选声明失配、dirty 状态、无 Git 归档与错误提前失败 | 已建立回归，真实包级结果待新冻结候选报告 |
@@ -67,3 +83,5 @@
 | Windows Computer Use 门槛 | 最终 Windows 包、@oai/sky | CU-01 至 CU-10，真实枚举与窗口操作，包及程序哈希、截图和结果 | 同一最终包的独立门槛 |
 
 完整验收需要本地自动化、四组合原生 CI、当前 Windows Computer Use 和必需容量测试分别完成。源码中存在入口、触发 Actions 或执行相近用例均不能替代实际证据，失败、未运行和平台不适用必须分别记录。所有报告绑定执行时的同一候选，不复用旧长命名候选的报告。
+
+相关性质量门禁与构建、单元测试和容量门禁独立。当前策略头文件的 `calibrated=false` 会关闭语义候选接受，关键词分支继续工作。v1 留出失败后的 v2 扩充需保留新的样本来源、固定分组和语料哈希，不能继续把已经观察过结果的 v1 留出集称为未触碰的独立留出集。尚未取得同一候选的完整模型质量证据时，不能宣布多模态检索质量或发布就绪已经通过。

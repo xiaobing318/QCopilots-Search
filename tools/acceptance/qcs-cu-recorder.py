@@ -23,7 +23,8 @@ import zipfile
 
 sys.dont_write_bytecode = True
 PRODUCT = "qcs"
-NAMES = (PRODUCT, PRODUCT + "-service", PRODUCT + "-worker", PRODUCT + "-cli")
+GUI_EXECUTABLE = PRODUCT + "-gui"
+NAMES = (GUI_EXECUTABLE, PRODUCT + "-service", PRODUCT + "-worker", PRODUCT + "-cli")
 CASES = tuple(f"CU-{n:02d}" for n in range(1, 11))
 LOCKS = ("dependencies.lock.json", "tools/qt-packages.lock.json", "tools/nsis-package.lock.json",
          "tools/qcs-source-packages.lock.json", "cmake/qcs-native-deps.cmake")

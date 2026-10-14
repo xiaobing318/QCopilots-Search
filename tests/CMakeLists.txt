@@ -3,7 +3,7 @@
 # concurrent invocations and must never hold writable test state.
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 function(qcopilots_search_add_test)
-  cmake_parse_arguments(PARSE_ARGV 0 _test "COMMAND_EXPAND_LISTS;KEEP_SUCCESS_ARTIFACTS" "NAME;WORKING_DIRECTORY" "COMMAND;CONFIGURATIONS")
+  cmake_parse_arguments(PARSE_ARGV 0 _test "COMMAND_EXPAND_LISTS;KEEP_SUCCESS_ARTIFACTS" "NAME;WORKING_DIRECTORY;EVIDENCE_KIND" "COMMAND;CONFIGURATIONS")
   if(NOT _test_NAME MATCHES "^qcs-tests-" OR NOT _test_COMMAND)
     message(FATAL_ERROR "Owned tests require a qcs-tests- name and an explicit command")
   endif()
@@ -23,6 +23,21 @@ function(qcopilots_search_add_test)
     --label "${_test_NAME}" --root "${QCOPILOTS_SEARCH_TEST_ROOT}" ${_runner_options}
     -- ${_test_COMMAND} ${_extra})
   set_tests_properties("${_test_NAME}" PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  if(NOT _test_EVIDENCE_KIND)
+    list(GET _test_COMMAND 0 _program)
+    if(_program STREQUAL "${Python3_EXECUTABLE}")
+      set(_test_EVIDENCE_KIND python-unittest)
+    elseif(_program MATCHES "^\\$<TARGET_FILE:")
+      set(_test_EVIDENCE_KIND qttest)
+    else()
+      message(FATAL_ERROR "Test ${_test_NAME} requires an explicit EVIDENCE_KIND")
+    endif()
+  endif()
+  if(NOT _test_EVIDENCE_KIND MATCHES "^(qttest|python-unittest|program)$")
+    message(FATAL_ERROR "Invalid test evidence kind: ${_test_EVIDENCE_KIND}")
+  endif()
+  # Keep metadata separate until all callers have assigned their LABELS.
+  set_property(TEST "${_test_NAME}" PROPERTY _QCS_EVIDENCE_KIND "${_test_EVIDENCE_KIND}")
 endfunction()
 
 if(NOT TARGET qcs-test-support)
@@ -41,6 +56,11 @@ function(qcopilots_search_configure_test_directory directory)
     if(NOT _test MATCHES "^qcs-tests-")
       message(FATAL_ERROR "Owned test must use qcs-tests- prefix: ${_test}")
     endif()
+    get_property(_evidence_kind TEST "${_test}" DIRECTORY "${directory}" PROPERTY _QCS_EVIDENCE_KIND)
+    if(NOT _evidence_kind)
+      message(FATAL_ERROR "Test has no evidence policy: ${_test}")
+    endif()
+    set_property(TEST "${_test}" DIRECTORY "${directory}" APPEND PROPERTY LABELS "${_evidence_kind}")
     if(NOT _test MATCHES "^qcs-tests-semantic")
       # Qt 6.12's plain Windows logger otherwise chooses OutputDebugStringA
       # even for a console executable whose stdout is captured by CTest.
@@ -56,12 +76,29 @@ function(qcopilots_search_configure_test_directory directory)
     qcopilots_search_configure_test_directory("${_child}")
   endforeach()
 endfunction()
-qcopilots_search_configure_test_directory("${CMAKE_CURRENT_SOURCE_DIR}")
+# Some top-level tooling tests are declared after add_subdirectory(tests).
+# Finalize all labels only after every registration has completed.
+cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL
+  qcopilots_search_configure_test_directory "${PROJECT_SOURCE_DIR}")
 
 qcopilots_search_add_test(NAME qcs-tests-acceptance-runners
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py")
-# Includes native ACL restoration and failure recovery in isolated source trees.
-set_tests_properties(qcs-tests-acceptance-runners PROPERTIES LABELS "unit;tooling;acceptance;slow" TIMEOUT 240)
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py" --suite pure)
+set_tests_properties(qcs-tests-acceptance-runners PROPERTIES LABELS "unit;tooling;acceptance" TIMEOUT 240)
+qcopilots_search_add_test(NAME qcs-tests-acceptance-native
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py" --suite native)
+# Real ACL restoration, process token recovery and owned timeout cleanup.
+set_tests_properties(qcs-tests-acceptance-native PROPERTIES LABELS "tooling;acceptance;native;slow" TIMEOUT 240)
+
+qcopilots_search_add_test(NAME qcs-tests-ci-evidence
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-ci-evidence.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-release-evidence
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-release-evidence.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-test-policy
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-policy-tests.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-check
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-check.py" -v)
+set_tests_properties(qcs-tests-ci-evidence qcs-tests-release-evidence qcs-tests-test-policy qcs-tests-check
+  PROPERTIES LABELS "unit;tooling;evidence" TIMEOUT 240)
 
 qcopilots_search_add_test(NAME qcs-tests-runner
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-runner-tests.py")

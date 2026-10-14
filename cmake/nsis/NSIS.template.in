@@ -80,13 +80,13 @@ Section "QCopilots Search"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "@CPACK_PACKAGE_VERSION@"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "QCopilots"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\bin\qcs.exe"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\bin\qcs-gui.exe"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
   WriteRegStr HKCU "${UNINSTALL_KEY}" "QuietUninstallString" '$\"$INSTDIR\Uninstall.exe$\" /S'
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
   CreateDirectory "$SMPROGRAMS\QCopilots Search"
-  CreateShortCut "$SMPROGRAMS\QCopilots Search\QCopilots Search.lnk" "$INSTDIR\bin\qcs.exe"
+  CreateShortCut "$SMPROGRAMS\QCopilots Search\QCopilots Search.lnk" "$INSTDIR\bin\qcs-gui.exe"
   CreateShortCut "$SMPROGRAMS\QCopilots Search\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
 SectionEnd
 

@@ -85,10 +85,10 @@ class SentinelObserver:
         require(self.profile.is_relative_to(self.launch_record.parent) and self.profile != self.launch_record.parent,
                 "Dedicated sentinel profile must be contained by the directory holding its launch record")
         require(self.profile.is_dir() and self.model_dir.is_dir(), "Prepared sentinel paths do not exist")
-        self.programs = {"gui": self.app_dir / "qcs.exe", "service": self.app_dir / "qcs-service.exe",
+        self.programs = {"gui": self.app_dir / "qcs-gui.exe", "service": self.app_dir / "qcs-service.exe",
                          "cli": self.app_dir / "qcs-cli.exe"}
         self.binary_hashes = {name: digest(path) for name, path in self.programs.items()}
-        for name, product in (("gui", "qcs"), ("service", "qcs-service"), ("cli", "qcs-cli")):
+        for name, product in (("gui", "qcs-gui"), ("service", "qcs-service"), ("cli", "qcs-cli")):
             require(self.binary_hashes[name] == producer_hashes[product], "Sentinel executable differs from the frozen producer: " + name)
         self.ids = {name: int(spec["processes"][name]["pid"]) for name in ("gui", "service")}
         require(min(self.ids.values()) > 0 and len(set(self.ids.values())) == 2, "Expected two distinct already running sentinel processes")

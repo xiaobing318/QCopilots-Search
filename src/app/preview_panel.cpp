@@ -130,16 +130,18 @@ PreviewPanel::PreviewPanel(QWidget *parent) : QWidget(parent) {
     layout->addLayout(actions);
     connect(open_, &QPushButton::clicked, this, [this] { emit openRequested(hit_); });
     connect(reveal_, &QPushButton::clicked, this, [this] { emit revealRequested(hit_.path); });
-    connect(document_, &QPushButton::clicked, this, [this] {
-        documentAutoLocate_ = !documentHitLocated_;
-        documentBatches_ = 0;
-        documentState_ = 1;
-        document_->setEnabled(false);
-        updateDocumentButton();
-        emit documentRequested(hit_.path, hit_.kind == "code" || hit_.lineStart > 0, documentNext_);
-    });
+    connect(document_, &QPushButton::clicked, this, &PreviewPanel::loadDocumentText);
     setLanguage("en");
     clear();
+}
+void PreviewPanel::loadDocumentText() {
+    if (document_->isHidden() || !document_->isEnabled() || hit_.path.isEmpty()) return;
+    documentAutoLocate_ = !documentHitLocated_ && (!hit_.text.isEmpty() || hit_.lineStart > 0 || hit_.cell > 0);
+    documentBatches_ = 0;
+    documentState_ = 1;
+    document_->setEnabled(false);
+    updateDocumentButton();
+    emit documentRequested(hit_.path, hit_.kind == "code" || hit_.lineStart > 0, documentNext_);
 }
 PreviewPanel::~PreviewPanel() {
     if (imageCancelled_) imageCancelled_->store(true);
