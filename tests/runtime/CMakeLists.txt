@@ -49,5 +49,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     COMMAND "$<TARGET_FILE:qcs-tests-reference-vectors>" vectorsMatchReference -o "-,txt")
   set_tests_properties(qcs-tests-reference-vectors-baseline PROPERTIES
     LABELS "real-model;runtime;cpu-baseline;slow" TIMEOUT 1800 RUN_SERIAL TRUE
-    ENVIRONMENT "QCOPILOTS_SEARCH_CPU_BASELINE=1;QCOPILOTS_SEARCH_MODEL_DIR=${QCOPILOTS_SEARCH_MODEL_DIR}")
+    ENVIRONMENT "QCOPILOTS_SEARCH_CPU_BASELINE=1")
+  if(QCOPILOTS_SEARCH_MODEL_DIR)
+    set_property(TEST qcs-tests-reference-vectors-baseline APPEND PROPERTY ENVIRONMENT
+      "QCOPILOTS_SEARCH_MODEL_DIR=${QCOPILOTS_SEARCH_MODEL_DIR}")
+  endif()
 endif()
