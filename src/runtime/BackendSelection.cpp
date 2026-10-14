@@ -26,8 +26,10 @@ QString backendModeName(BackendMode mode)
 QString canonicalBackendName(const QString& registryName)
 {
     const auto name = registryName.trimmed().toLower();
-    // The HIP implementation shares CUDA source but registers as "ROCm".
-    return name == QStringLiteral("rocm") ? QStringLiteral("hip") : name;
+    // HIP and Metal registry names differ from their packaged backend names.
+    if (name == QStringLiteral("rocm")) return QStringLiteral("hip");
+    if (name == QStringLiteral("mtl")) return QStringLiteral("metal");
+    return name;
 }
 
 BackendSelection selectBackend(BackendMode mode, const QString& packagedBackend,

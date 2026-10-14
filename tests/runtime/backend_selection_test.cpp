@@ -35,6 +35,14 @@ private slots:
         QTest::newRow("hip") << QStringLiteral("hip") << QStringLiteral("ROCm");
         QTest::newRow("vulkan") << QStringLiteral("vulkan") << QStringLiteral("Vulkan");
         QTest::newRow("metal") << QStringLiteral("metal") << QStringLiteral("Metal");
+        QTest::newRow("metal-registry") << QStringLiteral("metal") << QStringLiteral("MTL");
+        QTest::newRow("metal-registry-case") << QStringLiteral("metal") << QStringLiteral(" mTl ");
+    }
+
+    void metalRegistryNameMatchesPackagedBackend() {
+        QCOMPARE(canonicalBackendName(QStringLiteral("MTL")), QStringLiteral("metal"));
+        QCOMPARE(canonicalBackendName(QStringLiteral(" mTl ")), QStringLiteral("metal"));
+        QCOMPARE(canonicalBackendName(QStringLiteral("MTL0")), QStringLiteral("mtl0"));
     }
 
     void packagedBackendChoosesOnlyItsOwnGpu() {
@@ -83,6 +91,25 @@ private slots:
         QCOMPARE(automatic.fallbackReason, failure);
         const auto strict = selectBackend(BackendMode::Gpu, QStringLiteral("cuda"), devices, failure);
         QCOMPARE(strict.deviceIndex, -1);
+        QVERIFY(strict.error.contains(failure));
+    }
+
+    void metalRegistryDoesNotBypassCpuOrFailurePolicy() {
+        const QVector<BackendDevice> devices{cpu(), gpu(QStringLiteral("MTL"))};
+        const auto forcedCpu = selectBackend(BackendMode::Cpu, QStringLiteral("metal"), devices);
+        QCOMPARE(forcedCpu.deviceIndex, 0);
+        QVERIFY(!forcedCpu.gpu);
+        const auto missing = selectBackend(BackendMode::Auto, QStringLiteral("metal"), {cpu()});
+        QCOMPARE(missing.deviceIndex, 0);
+        QVERIFY(missing.fallbackReason.contains(QStringLiteral("metal")));
+        const QString failure = QStringLiteral("Metal initialization failed");
+        const auto automatic = selectBackend(BackendMode::Auto, QStringLiteral("metal"), devices, failure);
+        QCOMPARE(automatic.deviceIndex, 0);
+        QVERIFY(!automatic.gpu);
+        QCOMPARE(automatic.fallbackReason, failure);
+        const auto strict = selectBackend(BackendMode::Gpu, QStringLiteral("metal"), devices, failure);
+        QCOMPARE(strict.deviceIndex, -1);
+        QVERIFY(!strict.gpu);
         QVERIFY(strict.error.contains(failure));
     }
 
