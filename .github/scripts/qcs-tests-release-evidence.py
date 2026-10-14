@@ -1470,35 +1470,260 @@ class ComputerUseEvidenceTests(unittest.TestCase):
                 self.assertTrue(self.inspect())
 
 
+class NativeSelectionBindingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="qcs-selection-binding-",
+            dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.candidate = "1" * 40
+        self.selection = {"kind": "ci-artifact-selection", "schemaVersion": 1,
+            "candidateHead": self.candidate, "testProfile": "full", "runId": "123456",
+            "aggregateAttempt": 3, "selected": {name: {} for name in evidence.PLATFORMS}}
+
+    def selection_file(self, relative="selection.json"):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.selection), encoding="utf-8")
+        return path
+
+    def load(self):
+        selector = mock.Mock()
+        selector.load_selection.return_value = deepcopy(self.selection)
+        spec = mock.Mock()
+        with mock.patch.object(evidence.importlib.util, "spec_from_file_location", return_value=spec), \
+             mock.patch.object(evidence.importlib.util, "module_from_spec", return_value=selector):
+            result = evidence.load_native_selection(self.root, self.candidate, expected_run="123456")
+        selector.load_selection.assert_called_once_with(evidence.native_selection_path(self.root),
+            expected_head=self.candidate, expected_profile="full", expected_run="123456")
+        return result
+
+    def test_normalized_bundle_loads_with_explicit_candidate_profile_and_run(self):
+        self.selection_file()
+        self.assertEqual(self.load(), self.selection)
+
+    def test_downloaded_aggregate_directory_preserves_exact_candidate_and_attempt(self):
+        relative = f"qcs-native-aggregate-{self.candidate}-attempt3/selection.json"
+        path = self.selection_file(relative)
+        self.assertEqual(evidence.native_selection_path(self.root), path)
+        self.assertEqual(self.load(), self.selection)
+
+    def test_normalized_selection_takes_precedence_over_downloaded_copy(self):
+        selected = self.selection_file()
+        self.selection_file(f"qcs-native-aggregate-{self.candidate}-attempt3/selection.json")
+        self.assertEqual(evidence.native_selection_path(self.root), selected)
+
+    def test_missing_or_multiple_downloaded_aggregates_are_not_guessed(self):
+        with self.assertRaises(ValueError):
+            evidence.native_selection_path(self.root)
+        for attempt in (2, 3):
+            self.selection_file(f"qcs-native-aggregate-{self.candidate}-attempt{attempt}/selection.json")
+        with self.assertRaises(ValueError):
+            evidence.native_selection_path(self.root)
+
+    def test_downloaded_aggregate_cannot_claim_another_attempt_or_head(self):
+        path = self.selection_file(f"qcs-native-aggregate-{self.candidate}-attempt2/selection.json")
+        with self.assertRaises(ValueError):
+            self.load()
+        path.parent.rename(self.root / ("qcs-native-aggregate-" + "2" * 40 + "-attempt3"))
+        with self.assertRaises(ValueError):
+            self.load()
+
+    def test_selection_requires_all_four_exact_platforms(self):
+        self.selection_file()
+        del self.selection["selected"]["macos-x64"]
+        with self.assertRaises(ValueError):
+            self.load()
+
+    def test_api_selection_failure_is_not_replaced_by_native_success(self):
+        self.selection_file()
+        selector = mock.Mock()
+        selector.load_selection.side_effect = ValueError("Latest attempt failed")
+        with mock.patch.object(evidence.importlib.util, "spec_from_file_location", return_value=mock.Mock()), \
+             mock.patch.object(evidence.importlib.util, "module_from_spec", return_value=selector):
+            with self.assertRaisesRegex(ValueError, "Latest attempt failed"):
+                evidence.load_native_selection(self.root, self.candidate)
+
+    def real_snapshot_fixture(self):
+        spec = importlib.util.spec_from_file_location("qcs_selection_contract_fixture",
+            Path(__file__).resolve().with_name("qcs-tests-artifact-selection.py"))
+        fixtures = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixtures)
+        case = fixtures.ArtifactSelectionTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.artifacts = [fixtures.artifact(source, index + 1001, "full")
+                          for index, source in enumerate(case.jobs)]
+        retried = case.partial_retry()
+        case.artifacts[-1] = fixtures.artifact(retried, 2001, "full")
+        path = case.write_snapshot(self.root, attempt=2, profile="full")
+        return fixtures.HEAD, fixtures.RUN, path
+
+    def test_real_api_snapshot_recomputation_accepts_mixed_original_execution_attempts(self):
+        candidate, run, _ = self.real_snapshot_fixture()
+        selected = evidence.load_native_selection(self.root, candidate, expected_run=run)
+        self.assertEqual(selected["selected"]["windows-x64"]["sourceAttempt"], 2)
+        self.assertEqual(selected["selected"]["linux-x64"]["sourceAttempt"], 1)
+        self.assertEqual(selected["aggregateAttempt"], 2)
+
+    def test_real_api_snapshot_bytes_and_selected_ids_are_revalidated_offline(self):
+        candidate, run, path = self.real_snapshot_fixture()
+        original = path.read_bytes()
+        document = json.loads(original)
+        document["selected"]["linux-x64"]["artifactId"] += 99
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            evidence.load_native_selection(self.root, candidate, expected_run=run)
+        path.write_bytes(original)
+        raw = self.root / document["files"][0]["path"]
+        raw.write_bytes(raw.read_bytes() + b"\n")
+        with self.assertRaises(ValueError):
+            evidence.load_native_selection(self.root, candidate, expected_run=run)
+
+    def bound_runner(self, value=None):
+        runner = value if value is not None else {"schemaVersion": 1, "candidateHead": self.candidate,
+            "platformId": "linux-x64", "runId": "123456", "runAttempt": "1", "testProfile": "full"}
+        path = self.root / "reports/runner-identity.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(runner), encoding="utf-8")
+        return runner, {"files": [evidence.file_record(self.root, path)]}, path
+
+    def test_runner_identity_is_read_only_when_its_exact_bytes_are_manifest_bound(self):
+        runner, manifest, _ = self.bound_runner()
+        self.assertEqual(evidence.native_runner_identity(self.root, manifest), runner)
+        self.assertIsNone(evidence.native_runner_identity(self.root, {"files": []}))
+
+    def test_changed_missing_or_repeated_runner_evidence_is_rejected(self):
+        _, manifest, path = self.bound_runner()
+        altered = deepcopy(manifest)
+        altered["files"].append(deepcopy(altered["files"][0]))
+        with self.assertRaises(ValueError):
+            evidence.native_runner_identity(self.root, altered)
+        path.write_text("{}", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            evidence.native_runner_identity(self.root, manifest)
+        path.unlink()
+        with self.assertRaises(ValueError):
+            evidence.native_runner_identity(self.root, manifest)
+
+    def test_runner_identity_must_be_an_object(self):
+        _, manifest, _ = self.bound_runner([])
+        with self.assertRaises(ValueError):
+            evidence.native_runner_identity(self.root, manifest)
+
+    def test_preflight_forwards_exact_selection_and_expected_run(self):
+        path = self.selection_file()
+        aggregate = {"passed": False, "errors": ["Missing native units"], "gates": {}}
+        with mock.patch.object(evidence, "aggregate_native", return_value=aggregate) as validate:
+            result = evidence.preflight({}, self.root / "missing-local", self.candidate,
+                selection_path=path, expected_run="123456")
+        validate.assert_called_once_with({}, self.candidate, selection_path=path, expected_run="123456")
+        self.assertFalse(result["passed"])
+
+    def test_aggregate_cli_forwards_current_ci_run_and_attempt(self):
+        roots = {"linux-x64": self.root / "synthetic-native"}
+        output = self.root / "aggregate.json"
+        with mock.patch.object(evidence, "discover_native", return_value=roots), \
+             mock.patch.object(evidence, "aggregate_native", return_value={"passed": True}) as validate, \
+             mock.patch("builtins.print"):
+            code = evidence.main(["aggregate-native", "--candidate-commit", self.candidate,
+                "--native-artifacts-dir", str(self.root), "--output", str(output),
+                "--run-id", "123456", "--run-attempt", "3"])
+        self.assertEqual(code, 0)
+        validate.assert_called_once_with(roots, self.candidate, expected_run="123456", expected_attempt=3)
+
+
 class NativeAggregateEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.candidate = "1" * 40
         self.identity = {"candidateHead": self.candidate, "checkoutCommit": "2" * 40,
                          "sourceTree": "3" * 40, "workingTreeModified": False,
                          "lockHashes": {name: "4" * 64 for name in evidence.LOCKS}}
-        # No filesystem access is needed to exercise aggregation of already inspected units.
-        self.roots = {name: Path(name) for name in evidence.PLATFORMS}
+        # Selection API parsing and content binding have separate tests. Here
+        # use four already inspected units to exercise aggregate identity joins.
+        self.parent = Path("native-selection-fixture").resolve()
+        self.selection_path = self.parent / "selection.json"
+        self.selection = {"kind": "ci-artifact-selection", "schemaVersion": 1,
+            "candidateHead": self.candidate, "testProfile": "full", "runId": "123456",
+            "aggregateAttempt": 3, "selected": {name: {
+                "sourceAttempt": 1 if name == "linux-x64" else 3,
+                "artifactName": f"qcs-native-{name}-{self.candidate}-attempt{1 if name == 'linux-x64' else 3}"}
+                for name in evidence.PLATFORMS}}
+        self.roots = {name: self.parent / item["artifactName"] for name, item in self.selection["selected"].items()}
+        self.actual_platforms = {path.name: name for name, path in self.roots.items()}
         self.gates = {name: {"passed": True, "errors": [], "platformId": name,
                              "identity": deepcopy(self.identity), "modelFingerprint": "model-fingerprint",
-                             "extractionFingerprint": "extraction-fingerprint"}
+                             "extractionFingerprint": "extraction-fingerprint", "runnerIdentity": {
+                                 "schemaVersion": 1, "platformId": name, "candidateHead": self.candidate,
+                                 "testProfile": "full", "runId": "123456",
+                                 "runAttempt": str(self.selection["selected"][name]["sourceAttempt"])}}
                       for name in self.roots}
 
-    def inspect(self):
+    def inspect(self, expected_attempt=None):
         def inspect_platform(path, *, expected_head):
             self.assertEqual(expected_head, self.candidate)
-            return deepcopy(self.gates[path.name])
-        with mock.patch.object(evidence, "inspect_native", side_effect=inspect_platform):
-            return evidence.aggregate_native(self.roots, self.candidate)
+            platform = self.actual_platforms[path.name]
+            return deepcopy(self.gates[platform])
+        with mock.patch.object(evidence, "inspect_native", side_effect=inspect_platform), \
+             mock.patch.object(evidence, "native_selection_path", return_value=self.selection_path), \
+             mock.patch.object(evidence, "load_native_selection", return_value=deepcopy(self.selection)):
+            return evidence.aggregate_native(self.roots, self.candidate, selection_path=self.selection_path,
+                                             expected_attempt=expected_attempt)
 
     def test_four_complete_consistent_platforms_pass(self):
         self.assertTrue(self.inspect()["passed"])
+
+    def test_ci_requires_its_exact_aggregate_attempt_without_changing_offline_validation(self):
+        self.assertTrue(self.inspect(expected_attempt=3)["passed"])
+        self.assertTrue(self.inspect()["passed"])
+        for attempt in (1, 2, 4, 0, -1, True, "3"):
+            with self.subTest(attempt=attempt):
+                result = self.inspect(expected_attempt=attempt)
+                self.assertFalse(result["passed"])
+                self.assertTrue(any("current CI attempt" in error for error in result["errors"]))
 
     def test_missing_platform_cannot_pass(self):
         del self.roots["macos-x64"]
         self.assertFalse(self.inspect()["passed"])
 
     def test_duplicate_platform_payload_cannot_fill_a_different_slot(self):
-        self.roots["macos-x64"] = Path("macos-arm64")
+        self.roots["macos-x64"] = self.roots["macos-arm64"]
+        self.assertFalse(self.inspect()["passed"])
+
+    def test_runner_must_match_selected_source_attempt_not_aggregate_attempt(self):
+        self.assertTrue(self.inspect()["passed"])
+        self.gates["linux-x64"]["runnerIdentity"]["runAttempt"] = "3"
+        self.assertFalse(self.inspect()["passed"])
+
+    def test_another_artifact_directory_cannot_stand_in_for_the_selected_artifact(self):
+        self.selection["selected"]["linux-x64"]["artifactName"] += "-unselected"
+        result = self.inspect()
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("not the selected artifact" in error for error in result["errors"]))
+
+    def test_runner_head_profile_run_platform_or_type_changes_fail(self):
+        original = deepcopy(self.gates)
+        for field, value in (("schemaVersion", True), ("platformId", "windows-x64"),
+                             ("candidateHead", "0" * 40), ("testProfile", "fast"),
+                             ("runId", "654321"), ("runAttempt", 1)):
+            self.gates = deepcopy(original)
+            self.gates["linux-x64"]["runnerIdentity"][field] = value
+            with self.subTest(field=field):
+                self.assertFalse(self.inspect()["passed"])
+
+    def test_old_inspectable_units_without_bound_runner_cannot_pass_new_aggregate(self):
+        del self.gates["linux-x64"]["runnerIdentity"]
+        self.assertFalse(self.inspect()["passed"])
+
+    def test_no_selection_never_infers_legacy_latest_attempt(self):
+        with mock.patch.object(evidence, "inspect_native", return_value=self.gates["linux-x64"]), \
+             mock.patch.object(evidence, "native_selection_path", side_effect=ValueError("No selection")):
+            result = evidence.aggregate_native(self.roots, self.candidate)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("No selection" in error for error in result["errors"]))
+
+    def test_units_from_separate_parent_roots_are_not_combined(self):
+        self.roots["linux-x64"] = self.parent / "unrelated-run" / self.roots["linux-x64"].name
         self.assertFalse(self.inspect()["passed"])
 
     def test_single_platform_errors_are_preserved(self):

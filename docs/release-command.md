@@ -9,12 +9,17 @@
 ## 运行前提
 
 - 当前 checkout 必须干净，HEAD 为准备发布的完整 40 位提交 SHA。源码树和依赖锁哈希必须与原始验收记录一致。
-- 四个平台的原生 artifact 已下载并解压。父目录的每个直接子目录含 `reports/native-evidence.json`，平台集合必须恰好为 Windows x64、Linux x64、macOS arm64 和 macOS x64。
+- 四个平台的原生 artifact 已按同一次 CI 聚合结果下载并解压，保留 `qcs-native-<platformId>-<候选SHA>-attempt<原始执行次数>` 名称，各目录含 `reports/native-evidence.json`。平台集合必须恰好为 Windows x64、Linux x64、macOS arm64 和 macOS x64。
+- 原生材料父目录包含聚合生成的 `selection.json` 与其清单绑定的原始 API 分页快照，也支持把它们保留在一个 `qcs-native-aggregate-<候选SHA>-attempt<聚合次数>` 子目录中。不能用手写的平台到 attempt 映射替代这些材料。
 - 本机已按 [发行流程](releasing.md) 使用 `collect-local` 收集候选包、百万向量、十万物理文件和 Windows Computer Use 原始记录。传入包含 `manifest.json` 的目录。
 - 同一候选已经运行 `check --test-profile full`，保留完整 `check-report.json` 及其绑定的日志、测试和安装包材料。fast 或存在未执行阶段的报告不能用于本阶段。
 - 输出目录必须位于源码树之外，且不得与输入证据重叠。准备阶段使用新的输出目录，不覆盖旧候选。
 
 `prepare` 会复制已绑定的证据和包，并生成单独的证据 ZIP。原始包、上传资产和归档会占用多份磁盘空间，请为四平台材料及本机 full 产物预留空间。该阶段不会下载模型或重新生成应用、符号和源码包。缺失的材料应先通过开发与验收流程生成。
+
+下载四个已选择的原生 artifacts 时，同时下载对应的一个 aggregate artifact，保留各自的解压目录即可，无需手动把 `selection.json` 或快照搬到父目录。工具先查找父目录中的 `selection.json`，不存在时只接受一个 aggregate 子目录。存在多个 aggregate 时不会猜测“最新”结果，包含同一平台多个历史 attempt 的原生目录也会拒绝。应使用本次聚合选定的四个平台材料和对应 aggregate。
+
+`selection.json` 记录同一 run、候选和 full profile 下每个平台实际执行的 job 与 artifact。重试时允许复用 GitHub 复制到新 attempt 的已成功 job，但必须从保留的 jobs 和 artifacts API 快照重建其唯一原始执行，不能在最新执行失败时回退到旧的成功包。历史报告若没有 selection 及完整快照，可以用于人工诊断，不能用于新的发行准备或草稿上传。
 
 ## 准备材料
 
@@ -45,8 +50,13 @@ release-output/
     qcs-release-evidence-<提交前12位>-part001.zip
     SHA256SUMS
   evidence/
-    native/<platformId>/reports/...
-    native/<platformId>/pkg/...
+    native/
+      selection.json
+      selection-inputs/jobs-0001.json
+      selection-inputs/artifacts-0001.json
+      qcs-native-<platformId>-<候选SHA>-attempt<原始执行次数>/
+        reports/...
+        pkg/...
     local/...
     local-full/...
     release-preflight.json
@@ -56,7 +66,9 @@ release-output/
 
 准备阶段除了执行公共门禁，还验证对应源码 ZIP 的内部清单与 sidecar 一致、上游来源符合锁定记录、项目文件对应当前提交。源码内容按候选 `.gitattributes` 的 Git clean 规则比较提交 blob，接受合法的文本 CRLF/LF 差异，`-text` 夹具仍逐字节区分。符号 ZIP 必须含四个应用程序的调试信息，程序哈希必须对应该平台构建记录。许可 ZIP 来自包验收已经绑定并验证的运行时许可材料。
 
-`freezeManifest` 绑定原始证据、资产和本地 full 报告的相对路径、大小及 SHA-256。`SHA256SUMS` 使用实际上传文件名，包含其他全部资产，不包含自身。冻结 manifest 自己的 SHA-256由准备命令输出，并在草稿正文中记录，避免自引用校验和。
+`freezeManifest` 绑定原始证据、资产和本地 full 报告的相对路径、大小及 SHA-256，其中 `nativeSelection` 固定指向 `evidence/native/selection.json`。selection 和全部 API 快照按原始字节复制，每页在复制前后都校验哈希，复制完成后离线重算 artifact 选择。原生 artifact 目录名保留，避免丢失候选和原始执行 attempt 的对应关系。API 分页超过一页时，后续 `jobs-NNNN.json` 和 `artifacts-NNNN.json` 同样进入冻结清单和证据 ZIP。
+
+`SHA256SUMS` 使用实际上传文件名，包含其他全部资产，不包含自身。冻结 manifest 自己的 SHA-256由准备命令输出，并在草稿正文中记录，避免自引用校验和。
 
 原始证据 ZIP 按大小自动分成多个可独立解压的 `partNNN` 文件，同一目录下解压所有分块即可恢复 `evidence` 布局。每个发行资产必须小于 2 GiB，超过限制的单独输入包会明确失败，不会创建一个必定上传失败的发行包。该限制来自 [GitHub Releases 文档](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)。
 
@@ -71,7 +83,7 @@ release-output/
   --title 'QCopilots Search v0.1.0'
 ```
 
-这个命令会写入远端，应由发布负责人显式调用。工具在任何远端写入前重新验证本地候选来源、冻结文件、原始总门禁和本地 full 报告。它随后核实远端仓库规范名称和候选提交存在，并核对已有 tag 的最终 commit。
+这个命令会写入远端，应由发布负责人显式调用。工具在任何远端请求前重新验证本地候选来源、冻结文件、原始总门禁和本地 full 报告，并从冻结的 API 快照离线重算原生 artifact 选择。冻结目录整体搬移后仍可重验，不依赖原下载目录，也不会重新获取 CI 列表来替换历史证据。它随后核实远端仓库规范名称和候选提交存在，并核对已有 tag 的最终 commit。
 
 已有记录必须仍为草稿，tag 和 `target_commitish` 必须固定到同一候选 SHA。指向分支的旧草稿不会自动重定向，已公开 Release 也不会被修改。创建请求明确包含 `draft: true`。相关字段见 [GitHub Releases REST API](https://docs.github.com/en/rest/releases/releases)。
 
@@ -95,4 +107,4 @@ release-output/
 & $python "$source/tools/qcs-test-release.py" -v
 ```
 
-测试在外置临时目录中运行，遵守 `QCOPILOTS_SEARCH_TEST_ROOT`，覆盖缺失门禁、冻结后变更、完整资产来源、源码与符号契约、远端同名异哈希、断点续传、已公开 Release、错误 tag、认证输出及下载跳转。测试全部使用模拟 API，不创建真实 GitHub Release。
+测试在外置临时目录中运行，遵守 `QCOPILOTS_SEARCH_TEST_ROOT`，覆盖缺失门禁、selection 及原始 API 快照复制、重试 artifact 目录保留、离线重新选择、冻结后变更、完整资产来源、源码与符号契约、远端同名异哈希、断点续传、已公开 Release、错误 tag、认证输出及下载跳转。测试全部使用模拟 API，不创建真实 GitHub Release。

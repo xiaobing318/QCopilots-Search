@@ -44,6 +44,14 @@ def release_evidence():
     return module
 
 
+def artifact_selection():
+    spec = importlib.util.spec_from_file_location("qcs_artifact_selection",
+                                                SOURCE / ".github/scripts/qcs-artifact-selection.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def developer_workflow():
     """Share the developer tool's ownership contract before creating outputs."""
     spec = importlib.util.spec_from_file_location("qcopilots_search_dev",
@@ -747,15 +755,30 @@ def report_fast():
 
 def aggregate_fast(artifacts: Path, output: Path):
     evidence = release_evidence()
-    gates, errors = {}, []
-    for manifest in sorted(artifacts.rglob("fast-evidence.json")):
-        gate = inspect_fast(manifest.parent.parent, expected_head=candidate_head(),
-                            expected_run=os.environ["GITHUB_RUN_ID"], expected_attempt=os.environ["GITHUB_RUN_ATTEMPT"])
-        name = gate.get("platformId")
-        if name in gates:
-            errors.append(f"Duplicate fast platform: {name}")
-        gates[name] = gate
-        errors.extend(f"{name}: {message}" for message in gate["errors"])
+    gates, errors, selection = {}, [], None
+    try:
+        selection = artifact_selection().load_selection(artifacts / "selection.json",
+            expected_head=candidate_head(), expected_profile="fast", expected_run=os.environ["GITHUB_RUN_ID"])
+        if selection["aggregateAttempt"] != int(os.environ["GITHUB_RUN_ATTEMPT"]):
+            raise ValueError("Artifact selection belongs to another aggregate attempt")
+        selected = selection["selected"]
+        if set(selected) != set(evidence.PLATFORMS):
+            raise ValueError("Artifact selection must identify exactly four native platforms")
+        expected_roots = {artifacts / value["artifactName"] for value in selected.values()}
+        observed_roots = {path.parent.parent for path in artifacts.glob("*/reports/fast-evidence.json")}
+        if expected_roots != observed_roots:
+            raise ValueError("Downloaded fast evidence differs from the exact selected artifact directories")
+        for name, chosen in sorted(selected.items()):
+            gate = inspect_fast(artifacts / chosen["artifactName"], expected_head=candidate_head(),
+                expected_run=selection["runId"], expected_attempt=str(chosen["sourceAttempt"]))
+            if gate.get("platformId") != name:
+                gate["errors"].append("Selected artifact platform differs from its required slot")
+                gate["passed"] = False
+            gate["selection"] = chosen
+            gates[name] = gate
+            errors.extend(f"{name}: {message}" for message in gate["errors"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        errors.append(f"Cannot bind fast evidence to its immutable artifact selection: {error}")
     if set(gates) != set(evidence.PLATFORMS):
         errors.append("Exactly four distinct fast native platform combinations are required")
     identities = [gate.get("identity") for gate in gates.values()]
@@ -764,7 +787,8 @@ def aggregate_fast(artifacts: Path, output: Path):
     result = {"schemaVersion": 1, "kind": "native-fast-aggregate", "testProfile": "fast",
               "candidateHead": candidate_head(), "runId": os.environ["GITHUB_RUN_ID"],
               "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"], "passed": not errors,
-              "releaseComplete": False, "errors": errors, "gates": gates}
+              "releaseComplete": False, "errors": errors, "gates": gates,
+              "artifactSelection": selection}
     evidence.write_json(output, result)
     if errors:
         raise RuntimeError("Fast native aggregation failed: " + ", ".join(errors))

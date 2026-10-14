@@ -783,6 +783,22 @@ def validate_package_release(doc, root: Path, *, model_fingerprint=None,
     return errors
 
 
+def native_runner_identity(root: Path, manifest):
+    name = "reports/runner-identity.json"
+    records = [entry for entry in manifest.get("files", []) if entry.get("path") == name]
+    if not records:
+        return None
+    if len(records) != 1:
+        raise ValueError("Native manifest repeats its runner identity")
+    path = safe_file(root, name)
+    if path.stat().st_size != records[0].get("bytes") or digest(path) != records[0].get("sha256"):
+        raise ValueError("Native runner identity bytes differ from the bound manifest")
+    identity = read_json(path)
+    if not isinstance(identity, dict):
+        raise ValueError("Native runner identity must be an object")
+    return identity
+
+
 def inspect_native(root: Path, *, expected_head: str | None = None):
     errors = []
     result = {"schemaVersion": 1, "kind": "native-gate", "passed": False, "errors": errors}
@@ -799,6 +815,11 @@ def inspect_native(root: Path, *, expected_head: str | None = None):
         def document(name):
             check(errors, name in paths, f"Raw report is not bound to the native evidence manifest: {name}")
             return read_json(safe_file(root, name))
+        # Old units remain inspectable, but new aggregate/release gates below
+        # require this manifest-bound runner identity for every selected unit.
+        runner = native_runner_identity(root, manifest)
+        if runner is not None:
+            result["runnerIdentity"] = runner
         for name in ("reports/tests/ctest.xml", "reports/tests/ctest-inventory.json"):
             check(errors, name in paths, f"Missing bound CTest raw evidence: {name}")
         spec = importlib.util.spec_from_file_location("qcopilots_search_ctest_evidence", SOURCE / ".github/scripts/qcs-ctest-evidence.py")
@@ -885,14 +906,70 @@ def inspect_native(root: Path, *, expected_head: str | None = None):
     return result
 
 
-def aggregate_native(roots: dict[str, Path], candidate_head: str):
+def native_selection_path(parent: Path):
+    """Resolve a normalized bundle or one unambiguous downloaded aggregate."""
+    parent = Path(parent).resolve()
+    if (parent / "selection.json").exists():
+        return safe_file(parent, "selection.json")
+    candidates = sorted(parent.glob("qcs-native-aggregate-*/selection.json"))
+    if len(candidates) != 1:
+        raise ValueError("Native artifacts need selection.json or exactly one downloaded aggregate selection")
+    return safe_file(parent, candidates[0].relative_to(parent).as_posix())
+
+
+def load_native_selection(parent: Path, candidate_head: str, expected_run: str | None = None):
+    selection_path = native_selection_path(parent)
+    spec = importlib.util.spec_from_file_location("qcs_release_artifact_selection",
+        SOURCE / ".github/scripts/qcs-artifact-selection.py")
+    selector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(selector)
+    selection = selector.load_selection(selection_path, expected_head=candidate_head,
+        expected_profile="full", expected_run=expected_run)
+    if set(selection.get("selected", {})) != set(PLATFORMS):
+        raise ValueError("Full native acceptance requires exactly four selected platforms")
+    if selection_path.parent != Path(parent).resolve():
+        expected_name = f"qcs-native-aggregate-{candidate_head}-attempt{selection['aggregateAttempt']}"
+        if selection_path.parent.name != expected_name:
+            raise ValueError("Downloaded aggregate directory differs from its candidate or attempt")
+    return selection
+
+
+def aggregate_native(roots: dict[str, Path], candidate_head: str, *,
+                     selection_path: Path | None = None, expected_run: str | None = None,
+                     expected_attempt: int | None = None):
     errors = []
     check(errors, set(roots) == set(PLATFORMS), "Exactly four distinct native platform combinations are required")
+    selection = None
+    try:
+        parents = {Path(path).resolve().parent for path in roots.values()}
+        if len(parents) != 1:
+            raise ValueError("Selected native artifacts must share one parent directory")
+        parent = next(iter(parents))
+        selected_path = native_selection_path(parent)
+        if selection_path is not None and Path(selection_path).resolve() != selected_path:
+            raise ValueError("Native selection must be the artifact bundle's unambiguous selection")
+        selection = load_native_selection(parent, candidate_head, expected_run)
+        if expected_attempt is not None:
+            check(errors, type(expected_attempt) is int and expected_attempt >= 1
+                  and selection.get("aggregateAttempt") == expected_attempt,
+                  "Native artifact selection aggregate attempt differs from the current CI attempt")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        errors.append(f"Native artifact selection is missing, stale or unbound: {error}")
     gates = {name: inspect_native(path, expected_head=candidate_head) for name, path in roots.items()}
     identities = [gate.get("identity", {}) for gate in gates.values()]
     for name, gate in gates.items():
         errors.extend(f"{name}: {message}" for message in gate["errors"])
         check(errors, gate.get("platformId") == name, f"Native artifact platform does not match its required slot: {name}")
+        if selection is not None:
+            chosen = selection["selected"].get(name, {})
+            check(errors, Path(roots[name]).name == chosen.get("artifactName"),
+                  f"Native artifact directory is not the selected artifact: {name}")
+            runner = gate.get("runnerIdentity", {})
+            check(errors, type(runner.get("schemaVersion")) is int and runner["schemaVersion"] == 1 and runner.get("platformId") == name
+                  and runner.get("candidateHead") == candidate_head and runner.get("testProfile") == "full"
+                  and runner.get("runId") == selection.get("runId")
+                  and runner.get("runAttempt") == str(chosen.get("sourceAttempt")),
+                  f"Manifest-bound runner identity differs from the selected run, profile or source attempt: {name}")
     if identities:
         for identity in identities[1:]:
             for key in ("candidateHead", "checkoutCommit", "sourceTree", "lockHashes"):
@@ -900,7 +977,7 @@ def aggregate_native(roots: dict[str, Path], candidate_head: str):
         for key in ("modelFingerprint", "extractionFingerprint"):
             check(errors, len({gate.get(key) for gate in gates.values()}) == 1, f"Native executions disagree on {key}")
     return {"schemaVersion": 1, "kind": "native-aggregate", "candidateHead": candidate_head,
-            "passed": not errors, "errors": errors, "gates": gates}
+            "passed": not errors, "errors": errors, "gates": gates, "selection": selection}
 
 
 def timestamp(value):
@@ -1286,8 +1363,9 @@ def inspect_local_run(root: Path, receipt, kind: str, identity: dict):
     return errors
 
 
-def preflight(roots: dict[str, Path], local_root: Path, candidate_head: str):
-    native = aggregate_native(roots, candidate_head)
+def preflight(roots: dict[str, Path], local_root: Path, candidate_head: str, *,
+              selection_path: Path | None = None, expected_run: str | None = None):
+    native = aggregate_native(roots, candidate_head, selection_path=selection_path, expected_run=expected_run)
     errors = list(native["errors"])
     result = {"schemaVersion": 1, "kind": "release-preflight", "candidateHead": candidate_head,
               "native": native, "localGates": {}, "passed": False, "errors": errors, "published": False}
@@ -1367,6 +1445,9 @@ def main(argv=None):
             command.add_argument("--artifact-dir", required=True, type=Path)
         else:
             command.add_argument("--native-artifacts-dir", required=True, type=Path)
+            command.add_argument("--run-id", help="Require the selected GitHub Actions run ID")
+        if action == "aggregate-native":
+            command.add_argument("--run-attempt", type=int, help="Require the current GitHub Actions attempt")
         if action == "preflight":
             command.add_argument("--local-evidence-dir", required=True, type=Path)
     build = commands.add_parser("record-build")
@@ -1405,8 +1486,11 @@ def main(argv=None):
                 result = inspect_native(args.artifact_dir.resolve(), expected_head=args.candidate_commit)
             else:
                 roots = discover_native(args.native_artifacts_dir.resolve())
-                result = (aggregate_native(roots, args.candidate_commit) if args.action == "aggregate-native" else
-                          preflight(roots, args.local_evidence_dir.resolve(), args.candidate_commit))
+                result = (aggregate_native(roots, args.candidate_commit, expected_run=args.run_id,
+                                           expected_attempt=args.run_attempt)
+                          if args.action == "aggregate-native" else
+                          preflight(roots, args.local_evidence_dir.resolve(), args.candidate_commit,
+                                    expected_run=args.run_id))
             write_json(args.output, result)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result["passed"] else 1

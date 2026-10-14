@@ -2096,6 +2096,18 @@ class FastNativeTests(unittest.TestCase):
         return native.inspect_fast(root, expected_head=kwargs.get("head", "a" * 40),
             expected_run=kwargs.get("run", "123"), expected_attempt=kwargs.get("attempt", "1"))
 
+    def artifact_selection(self, attempt=1, retried_platform=None):
+        # The standalone selector tests exercise actual API snapshots. These
+        # fixtures isolate the aggregate's consumption of an already verified
+        # selection and its strict raw-report identity comparisons.
+        return {"schemaVersion": 1, "kind": "ci-artifact-selection", "passed": True,
+            "runId": "123", "aggregateAttempt": attempt, "candidateHead": "a" * 40,
+            "testProfile": "fast", "selected": {name: {"artifactName": name,
+                "artifactId": number, "artifactDigest": "sha256:" + "d" * 64,
+                "sourceAttempt": attempt if name == retried_platform else 1,
+                "sourceJobId": number, "observedJobId": number + 10}
+                for number, name in enumerate(native.release_evidence().PLATFORMS, 1)}}
+
     def test_daily_profile_defaults_fast_and_accepts_explicit_full(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(native.test_profile(), "fast")
@@ -2296,7 +2308,9 @@ class FastNativeTests(unittest.TestCase):
             with self.subTest(mutate=mutate), self.temporary() as temporary, \
                     mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}), \
                     mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
-                        "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}):
+                        "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+                    mock.patch.object(native, "artifact_selection") as selector:
+                selector.return_value.load_selection.return_value = self.artifact_selection()
                 root = Path(temporary)
                 platforms = list(native.release_evidence().PLATFORMS)
                 for platform_id in platforms[:-1] if mutate == "missing" else platforms:
@@ -2324,6 +2338,59 @@ class FastNativeTests(unittest.TestCase):
                 self.assertEqual(result["passed"], mutate is None)
                 self.assertFalse(result["releaseComplete"])
 
+    def test_fast_aggregate_binds_each_platform_source_attempt_after_one_job_retry(self):
+        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}), \
+                mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
+                    "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}), \
+                mock.patch.object(native, "artifact_selection") as selector:
+            root = Path(temporary)
+            for name in native.release_evidence().PLATFORMS:
+                identity = self.fixture(root / name, name)
+                if name == "windows-x64":
+                    runner = root / name / "reports/runner-identity.json"
+                    document = json.loads(runner.read_text(encoding="utf-8"))
+                    document["runAttempt"] = "2"
+                    runner.write_text(json.dumps(document), encoding="utf-8")
+                    self.seal(root / name, identity, name)
+            selection = self.artifact_selection(2, "windows-x64")
+            selector.return_value.load_selection.return_value = selection
+            native.aggregate_fast(root, root / "aggregate.json")
+            result = json.loads((root / "aggregate.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["passed"], result["errors"])
+            self.assertEqual(result["artifactSelection"], selection)
+            self.assertEqual({name: gate["selection"]["sourceAttempt"]
+                for name, gate in result["gates"].items()},
+                {name: 2 if name == "windows-x64" else 1 for name in native.release_evidence().PLATFORMS})
+            selector.return_value.load_selection.assert_called_once_with(root / "selection.json",
+                expected_head="a" * 40, expected_profile="fast", expected_run="123")
+
+    def test_fast_aggregate_never_uses_old_success_when_latest_selection_fails(self):
+        with self.temporary() as temporary, mock.patch.object(self, "FAST_FIXTURES", {"qcs-tests-core"}), \
+                mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
+                    "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}), \
+                mock.patch.object(native, "artifact_selection") as selector, \
+                mock.patch.object(native, "inspect_fast") as inspect:
+            root = Path(temporary)
+            for name in native.release_evidence().PLATFORMS:
+                self.fixture(root / name, name)
+            selector.return_value.load_selection.side_effect = ValueError("Latest Windows job failed or its artifact is missing")
+            with self.assertRaises(RuntimeError):
+                native.aggregate_fast(root, root / "aggregate.json")
+            result = json.loads((root / "aggregate.json").read_text(encoding="utf-8"))
+            self.assertFalse(result["passed"])
+            self.assertIn("Latest Windows job failed", " ".join(result["errors"]))
+            inspect.assert_not_called()
+
+    def test_fast_aggregate_rejects_a_selection_from_another_aggregate_attempt(self):
+        with self.temporary() as temporary, \
+                mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "GITHUB_EVENT_PATH": "",
+                    "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}), \
+                mock.patch.object(native, "artifact_selection") as selector:
+            root = Path(temporary)
+            selector.return_value.load_selection.return_value = self.artifact_selection(1)
+            with self.assertRaisesRegex(RuntimeError, "another aggregate attempt"):
+                native.aggregate_fast(root, root / "aggregate.json")
+
     def test_workflow_has_fast_daily_and_explicit_full_with_isolated_artifacts(self):
         workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
         self.assertIn("default: fast", workflow)
@@ -2336,6 +2403,13 @@ class FastNativeTests(unittest.TestCase):
         self.assertLess(workflow.index("qcs-native-ci.py test\n"), workflow.index("qcs-native-ci.py install\n"))
         self.assertIn("name: qcs-fast-${{ matrix.id }}", workflow)
         self.assertIn("name: qcs-native-${{ matrix.id }}", workflow)
+        self.assertEqual(workflow.count("-attempt${{ github.run_attempt }}"), 4)
+        self.assertEqual(workflow.count("overwrite: false"), 4)
+        self.assertNotIn("overwrite: true", workflow)
+        self.assertIn("artifact-ids: ${{ steps.selection.outputs.artifact_ids }}", workflow)
+        self.assertIn('--run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"', workflow)
+        self.assertIn("actions: read", workflow)
+        self.assertNotIn("pattern: qcs-", workflow)
         for action in ("install", "models", "capacity", "package", "installers", "sources"):
             step = next(item for item in workflow.split("      - name: ") if f"qcs-native-ci.py {action}\n" in item)
             self.assertIn("env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'", step)

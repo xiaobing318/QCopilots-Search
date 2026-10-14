@@ -49,14 +49,28 @@ class FreezeTests(ExternalTest):
     def setUp(self):
         super().setUp()
         self.native, self.local = self.root / "native", self.root / "local"
+        self.selection = {"schemaVersion": 1, "kind": "ci-artifact-selection", "candidateHead": CANDIDATE,
+                          "testProfile": "full", "runId": "123", "aggregateAttempt": 2, "selected": {}, "files": []}
+        self.native_roots = {}
         for platform_id in evidence.PLATFORMS:
-            root = self.native / platform_id
+            attempt = 2 if platform_id == "windows-x64" else 1
+            artifact_name = f"qcs-native-{platform_id}-{CANDIDATE}-attempt{attempt}"
+            root = self.native_roots[platform_id] = self.native / artifact_name
+            self.selection["selected"][platform_id] = {"artifactName": artifact_name, "sourceAttempt": attempt,
+                "sourceJobId": 100 + len(self.native_roots), "observedJobId": 200 + len(self.native_roots),
+                "artifactId": 300 + len(self.native_roots), "artifactDigest": "sha256:" + "4" * 64}
             for relative in ("pkg/qcs-example.zip", "pkg/qcs-source-manifest.json", "pkg/qcs-source-materials-example.zip",
                              "pkg/qcs-symbols-example.zip", "reports/package/runtime-license-materials/LICENSE"):
                 self.file(root.relative_to(self.root) / relative, (platform_id + ": " + relative).encode())
             document = {"identity": IDENTITY, "platformId": platform_id,
                         "files": [release.record(root, path) for path in sorted(root.rglob("*")) if path.is_file()]}
             release.write_json(root / "reports/native-evidence.json", document)
+        for kind in ("jobs", "artifacts"):
+            # Noncanonical whitespace proves collection preserves the raw API bytes.
+            snapshot = self.file(f"native/selection-inputs/{kind}-0001.json", b'{ "synthetic" : true }\r\n')
+            self.selection["files"].append(release.record(self.native, snapshot, kind=kind, page=1,
+                url=f"https://api.github.com/repos/{release.REPOSITORY}/actions/runs/123/{kind}?page=1"))
+        release.write_json(self.native / "selection.json", self.selection)
         self.file("local/candidate/qcs-example.zip", b"distinct local Computer Use package")
         release.write_json(self.local / "candidate/candidate.json", {"package": "qcs-example.zip"})
         release.write_json(self.local / "manifest.json", {"identity": IDENTITY,
@@ -67,9 +81,40 @@ class FreezeTests(ExternalTest):
         release.write_json(self.full_report, {"reportPath": "reports/run/check-report.json", "identity": IDENTITY,
             "files": [release.record(self.root / "full", full)]})
         self.gate = {"passed": True, "errors": [], "kind": "release-preflight", "candidateHead": CANDIDATE}
+
+        def selection_path(parent):
+            direct = parent / "selection.json"
+            if direct.exists():
+                return direct
+            nested = list(parent.glob("qcs-native-aggregate-*/selection.json"))
+            if len(nested) != 1:
+                raise ValueError("Missing or ambiguous native artifact selection")
+            return nested[0]
+
+        def load_selection(parent, candidate):
+            # The API pagination/reselection policy has separate helper tests. Here
+            # the fake checks the transport contract and bound bytes on every load.
+            path = selection_path(parent)
+            document = release.read_json(release.safe_file(path.parent, path.name))
+            if document["candidateHead"] != candidate or document["testProfile"] != "full":
+                raise ValueError("Native selection candidate or profile differs")
+            for item in document["files"]:
+                source = release.safe_file(path.parent, item["path"])
+                if source.stat().st_size != item["bytes"] or release.digest(source) != item["sha256"]:
+                    raise ValueError("Native selection snapshot changed")
+            return document
+
+        def preflight(roots, local, candidate, *, selection_path):
+            document = load_selection(selection_path.parent, candidate)
+            if any(roots[platform].name != item["artifactName"] for platform, item in document["selected"].items()):
+                raise ValueError("Native artifact directory differs from selection")
+            return deepcopy(self.gate)
+
         self.evidence = types.SimpleNamespace(verify_manifest=evidence.verify_manifest, PLATFORMS=evidence.PLATFORMS,
                                              discover_native=evidence.discover_native,
-                                             preflight=mock.Mock(side_effect=lambda *args: deepcopy(self.gate)))
+                                             native_selection_path=selection_path,
+                                             load_native_selection=mock.Mock(side_effect=load_selection),
+                                             preflight=mock.Mock(side_effect=preflight))
         self.full_passed = True
 
         def inspect_check(path, head):
@@ -93,6 +138,12 @@ class FreezeTests(ExternalTest):
 
     def test_prepare_and_portable_reverification_bind_every_asset(self):
         path = self.prepare()
+        relocated = self.root / "relocated-candidate"
+        path.parent.rename(relocated)
+        path = relocated / release.MANIFEST
+        self.native.rename(self.root / "original-native-moved")
+        self.local.rename(self.root / "original-local-moved")
+        self.full_report.parents[2].rename(self.root / "original-full-moved")
         document = release.verify_freeze(path, release.SOURCE)
         names = {item["name"] for item in document["assets"]}
         self.assertIn("qcs-local-windows-x64-example.zip", names)
@@ -123,7 +174,7 @@ class FreezeTests(ExternalTest):
             release.verify_freeze(path, release.SOURCE)
 
     def test_collection_rejects_changed_bound_inputs(self):
-        self.file("native/windows-x64/pkg/qcs-example.zip", b"changed")
+        (self.native_roots["windows-x64"] / "pkg/qcs-example.zip").write_bytes(b"changed")
         with self.assertRaisesRegex(ValueError, "changed evidence"):
             self.prepare()
         self.assertFalse((self.root / "frozen").exists())
@@ -152,6 +203,171 @@ class FreezeTests(ExternalTest):
         with self.assertRaisesRegex(ValueError, "omits or adds"):
             release.validate_asset_origins(path.parent, release.SOURCE, document,
                                            evidence.discover_native(path.parent / "evidence/native"))
+
+    def test_selection_and_raw_snapshots_are_frozen_with_original_artifact_names(self):
+        path = self.prepare()
+        document = release.verify_freeze(path, release.SOURCE)
+        self.assertEqual(document["freezeManifest"]["nativeSelection"], "evidence/native/selection.json")
+        frozen_files = {item["path"] for item in document["freezeManifest"]["files"]}
+        for relative in ["selection.json", *(item["path"] for item in self.selection["files"])]:
+            destination = "evidence/native/" + relative
+            self.assertIn(destination, frozen_files)
+            self.assertEqual((path.parent / destination).read_bytes(), (self.native / relative).read_bytes())
+        roots = evidence.discover_native(path.parent / "evidence/native")
+        self.assertEqual({key: root.name for key, root in roots.items()},
+                         {key: item["artifactName"] for key, item in self.selection["selected"].items()})
+        for item in document["assets"]:
+            if item["role"] == "native-package":
+                artifact_name = self.selection["selected"][item["platformId"]]["artifactName"]
+                self.assertTrue(item["provenance"].startswith("evidence/native/" + artifact_name + "/"))
+        for call in self.evidence.preflight.call_args_list:
+            self.assertEqual(call.kwargs["selection_path"].name, "selection.json")
+
+    def test_selected_aggregate_subdirectory_is_normalized_without_changing_snapshot_bytes(self):
+        aggregate = self.native / f"qcs-native-aggregate-{CANDIDATE}-attempt2"
+        aggregate.mkdir()
+        (self.native / "selection.json").rename(aggregate / "selection.json")
+        (self.native / "selection-inputs").rename(aggregate / "selection-inputs")
+        path = self.prepare()
+        release.verify_freeze(path, release.SOURCE)
+        self.assertEqual((path.parent / "evidence/native/selection.json").read_bytes(),
+                         (aggregate / "selection.json").read_bytes())
+        self.assertEqual(self.evidence.preflight.call_args_list[0].kwargs["selection_path"], aggregate / "selection.json")
+
+    def test_missing_selection_cannot_create_a_new_release(self):
+        (self.native / "selection.json").unlink()
+        with self.assertRaisesRegex(ValueError, "Missing.*selection"):
+            self.prepare()
+        self.assertFalse((self.root / "frozen").exists())
+
+    def test_changed_raw_snapshot_is_rejected_before_freezing(self):
+        (self.native / self.selection["files"][0]["path"]).write_bytes(b"replacement")
+        with self.assertRaisesRegex(ValueError, "snapshot changed"):
+            self.prepare()
+        self.assertFalse((self.root / "frozen").exists())
+
+    def test_selection_changed_after_preflight_is_rejected(self):
+        original_load = self.evidence.load_native_selection.side_effect
+        calls = 0
+
+        def changed(parent, candidate):
+            nonlocal calls
+            document = original_load(parent, candidate)
+            calls += 1
+            if calls == 2:
+                document["aggregateAttempt"] += 1
+            return document
+
+        self.evidence.load_native_selection.side_effect = changed
+        with self.assertRaisesRegex(ValueError, "selection changed during collection"):
+            self.prepare()
+        self.assertFalse((self.root / "frozen").exists())
+
+    def test_snapshot_changed_during_copy_is_rejected(self):
+        original_copy = release.shutil.copyfile
+
+        def changed(source, destination):
+            original_copy(source, destination)
+            if source.name == "jobs-0001.json":
+                destination.write_bytes(b"changed during copy")
+
+        with mock.patch.object(release.shutil, "copyfile", side_effect=changed):
+            with self.assertRaisesRegex(ValueError, "attachment changed during collection"):
+                self.prepare()
+        self.assertFalse((self.root / "frozen").exists())
+
+    def test_platform_directory_alias_cannot_replace_selected_artifact_name(self):
+        self.native_roots["windows-x64"].rename(self.native / "windows-x64")
+        with self.assertRaisesRegex(ValueError, "directory differs from selection"):
+            self.prepare()
+
+    def test_old_freeze_without_selection_cannot_upload(self):
+        path = self.prepare()
+        document = release.read_json(path)
+        del document["freezeManifest"]["nativeSelection"]
+        release.write_json(path, document)
+        api = FakeGitHub()
+        with self.assertRaisesRegex(ValueError, "no native artifact selection"):
+            release.upload_draft(path, release.SOURCE, "v0.0-test", api=api)
+        self.assertEqual(api.calls, [])
+
+    def test_selection_snapshot_must_be_bound_by_freeze_manifest(self):
+        path = self.prepare()
+        document = release.read_json(path)
+        omitted = "evidence/native/" + self.selection["files"][0]["path"]
+        document["freezeManifest"]["files"] = [item for item in document["freezeManifest"]["files"] if item["path"] != omitted]
+        release.write_json(path, document)
+        with self.assertRaisesRegex(ValueError, "attachment is not bound"):
+            release.verify_freeze(path, release.SOURCE)
+
+    def test_frozen_raw_snapshot_changes_prevent_upload(self):
+        path = self.prepare()
+        (path.parent / "evidence/native" / self.selection["files"][0]["path"]).write_bytes(b"changed")
+        api = FakeGitHub()
+        with self.assertRaisesRegex(ValueError, "Frozen release content changed"):
+            release.upload_draft(path, release.SOURCE, "v0.0-test", api=api)
+        self.assertEqual(api.calls, [])
+
+
+class SelectionCopyTests(ExternalTest):
+    def selection_fixture(self, nested=False):
+        spec = importlib.util.spec_from_file_location("qcs_release_test_selector",
+            release.SOURCE / ".github/scripts/qcs-artifact-selection.py")
+        selector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(selector)
+        parent = self.root / "native"
+        root = parent / f"qcs-native-aggregate-{CANDIDATE}-attempt2" if nested else parent
+        jobs, artifacts = [], []
+        for index, platform in enumerate(selector.PLATFORMS, 1):
+            attempt = 2 if platform == "windows-x64" else 1
+            jobs.append({"id": index, "run_id": 123, "run_attempt": attempt, "head_sha": CANDIDATE,
+                "workflow_name": "QCopilots Search", "head_branch": "codex/qcopilots-search-v1",
+                "name": "qcs " + platform, "status": "completed", "conclusion": "success",
+                "created_at": "2026-01-01T00:00:00Z", "started_at": "2026-01-01T00:01:00Z",
+                "completed_at": "2026-01-01T00:03:00Z", "runner_id": index,
+                "runner_name": platform, "labels": [platform], "steps": [{"name": "Test", "number": 1,
+                    "status": "completed", "conclusion": "success", "started_at": "2026-01-01T00:01:00Z",
+                    "completed_at": "2026-01-01T00:03:00Z"}]})
+            artifacts.append({"id": index + 100, "name": selector.artifact_name(platform, CANDIDATE, "full", attempt),
+                "workflow_run": {"id": 123, "head_sha": CANDIDATE}, "expired": False,
+                "digest": "sha256:" + "4" * 64, "created_at": "2026-01-01T00:02:00Z"})
+            if attempt < 2:
+                # GitHub records a current-attempt observation for a retained
+                # successful job, with its original execution details intact.
+                observed = deepcopy(jobs[-1])
+                observed.update(id=index + 10, run_attempt=2, created_at="2026-01-01T00:04:00Z")
+                jobs.append(observed)
+        document = selector.select(release.REPOSITORY, "123", CANDIDATE, "full", 2, jobs, artifacts)
+        self.assertTrue(document["passed"], document["errors"])
+        document.update(files=[], collectionErrors=[])
+        for kind, rows in (("jobs", jobs), ("artifacts", artifacts)):
+            raw = json.dumps({"total_count": len(rows), kind: rows}, indent=2).replace("\n", "\r\n").encode()
+            path = self.file(root.relative_to(self.root) / f"selection-inputs/{kind}-0001.json", raw)
+            document["files"].append(release.record(root, path, kind=kind, page=1,
+                                                   url=selector.page_url(release.REPOSITORY, "123", kind, 1)))
+        release.write_json(root / "selection.json", document)
+        return parent, document
+
+    def test_real_selector_recomputes_copied_nested_snapshots_without_network(self):
+        parent, expected = self.selection_fixture(nested=True)
+        destination = self.root / "frozen/evidence/native"
+        accepted = evidence.load_native_selection(parent, CANDIDATE, expected_run="123")
+        self.assertEqual(accepted["selected"]["linux-x64"]["sourceAttempt"], 1)
+        self.assertNotEqual(accepted["selected"]["linux-x64"]["sourceJobId"],
+                            accepted["selected"]["linux-x64"]["observedJobId"])
+        release.copy_selection(evidence, parent, destination, CANDIDATE, accepted)
+        self.assertEqual(evidence.load_native_selection(destination, CANDIDATE, expected_run="123"), expected)
+        original_root = evidence.native_selection_path(parent).parent
+        for relative in ["selection.json", *(item["path"] for item in expected["files"])]:
+            self.assertEqual((original_root / relative).read_bytes(), (destination / relative).read_bytes())
+
+    def test_real_selector_rejects_selection_claims_without_matching_api_history(self):
+        parent, expected = self.selection_fixture()
+        expected["selected"]["windows-x64"]["sourceAttempt"] = 1
+        release.write_json(parent / "selection.json", expected)
+        with self.assertRaisesRegex(ValueError, "differs from.*execution history"):
+            release.copy_selection(evidence, parent, self.root / "frozen", CANDIDATE, expected)
+        self.assertFalse((self.root / "frozen").exists())
 
 
 class FakeGitHub:

@@ -75,9 +75,11 @@ Linux 完整 CI 在固定 Ubuntu 22.04 容器中使用 `dpkg --install` 安装�
 
 `.github/workflows/qcs-native.yml` 在 PR 创建或同步、main 推送时运行四个原生组合，也支持手动触发。每个 job 使用独立外置根。`fast` 运行构建和所选测试，上传快速报告。`full` 还执行校验过的模型下载、全套测试、小规模容量、平台打包及安装验收，并上传报告与测试包。
 
-完整 CI 的 `required` job 下载当前运行的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `qcs-native-aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。快速汇总只验证快速范围并生成 `qcs-fast-aggregate.json`。这两个结果都不能代替最终 Windows 百万规模和 Computer Use，后两项由下面的本机门禁单独核验。
+完整 CI 的 `required` job 下载当前运行选中的四份原生 artifact，重新核对全部文件 SHA-256、CTest 注册集合和用例明细、九条黄金向量、真实语义逐查询结果、模型校验、容量与包级报告，再生成 `aggregate.json`。必需报告缺失、重复平台、失败或来源不一致都会失败。快速汇总使用独立的 fast artifact，只验证快速范围，报告明确保留 `releaseComplete: false`。这两种结果都不能代替最终 Windows 百万规模和 Computer Use，后两项由下面的本机门禁单独核验。
 
 PR 的候选提交使用事件中的 `pull_request.head.sha`，其他事件使用 `github.sha`。四个原生 job 和汇总 job 都显式检出该候选，分别记录候选 head 与实际 checkout commit，并核对 Git tree 和依赖锁哈希。PR 事件的 `GITHUB_SHA` 可能是 GitHub 生成的临时合并提交，不能替代实际 checkout 身份写入包报告。最终本机候选必须与原生证据一致，不能将旧报告事后绑定到新的 HEAD。
+
+原生平台包和汇总 artifact 均带 `-attempt<N>` 后缀，重试不会删除或覆盖旧证据。汇总中的 `selection.json` 绑定同一 run、候选和范围的四个平台执行，保留每个平台实际 `sourceAttempt`、job ID、artifact ID、摘要及原始 API 快照。下载发行输入时保留四个选中平台 artifact 的原目录名，同时下载对应的一个 `qcs-native-aggregate-<sha>-attempt<N>` artifact。发行准备会验证其选择链并自动复制快照，不需要手工搬动报告。最新失败不能用较早成功覆盖，多个聚合目录也不会被自动猜选。完整规则见 [原生 CI 与包级测试](testing.md#原生-ci-与包级测试)。
 
 ## 本机最终证据流程
 

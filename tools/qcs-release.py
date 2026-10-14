@@ -139,6 +139,28 @@ def copy_bound(evidence, source, manifest_name, target):
         raise ValueError("Evidence changed during collection: " + " | ".join(errors))
 
 
+def copy_selection(evidence, source, target, candidate, selection):
+    """Preserve the raw API snapshots needed to reselect retry artifacts offline."""
+    if evidence.load_native_selection(source, candidate) != selection:
+        raise ValueError("Native artifact selection changed during collection")
+    selection_path = evidence.native_selection_path(source)
+    selection_root = selection_path.parent
+    records = list(selection["files"]) + [record(selection_root, selection_path)]
+    if len({item["path"].casefold() for item in records}) != len(records):
+        raise ValueError("Native selection attachments contain colliding paths")
+    for item in records:
+        original = safe_file(selection_root, item["path"])
+        if original.stat().st_size != item["bytes"] or digest(original) != item["sha256"]:
+            raise ValueError("Native selection attachment changed before collection")
+        destination = target / item["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(original, destination)
+        if destination.stat().st_size != item["bytes"] or digest(destination) != item["sha256"]:
+            raise ValueError("Native selection attachment changed during collection")
+    if evidence.load_native_selection(target, candidate) != selection:
+        raise ValueError("Collected native artifact selection differs from the accepted input")
+
+
 def zip_files(destination, root, names):
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for relative in sorted(names):
@@ -330,20 +352,26 @@ def prepare(source, candidate, native_parent, local_root, full_report, output):
     output = external(output, source, (native_parent, local_root, full_report.parent))
     if output.exists():
         raise ValueError("Release output already exists. Use a new directory or upload its existing frozen manifest")
+    selection = evidence.load_native_selection(native_parent, candidate)
+    selection_path = evidence.native_selection_path(native_parent)
     roots = evidence.discover_native(native_parent)
-    gate = evidence.preflight(roots, local_root, candidate)
+    gate = evidence.preflight(roots, local_root, candidate, selection_path=selection_path)
     require_passed(gate, "Release preflight failed")
     inspect_full(full_report, candidate, identity)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".qcs-release-", dir=output.parent) as temporary:
         stage = Path(temporary) / "candidate"
         stage.mkdir()
+        copy_selection(evidence, native_parent, stage / "evidence/native", candidate, selection)
         for platform_id, root in sorted(roots.items()):
-            copy_bound(evidence, root, "reports/native-evidence.json", stage / "evidence/native" / platform_id)
+            artifact_name = selection["selected"][platform_id]["artifactName"]
+            copy_bound(evidence, root, "reports/native-evidence.json", stage / "evidence/native" / artifact_name)
         copy_bound(evidence, local_root, "manifest.json", stage / "evidence/local")
         full_relative = copy_full(full_report, stage / "evidence/local-full", candidate, identity)
         staged_roots = evidence.discover_native(stage / "evidence/native")
-        require_passed(evidence.preflight(staged_roots, stage / "evidence/local", candidate), "Collected release preflight failed")
+        require_passed(evidence.preflight(staged_roots, stage / "evidence/local", candidate,
+                                         selection_path=stage / "evidence/native/selection.json"),
+                       "Collected release preflight failed")
         assets = []
         (stage / "assets").mkdir()
 
@@ -367,14 +395,14 @@ def prepare(source, candidate, native_parent, local_root, full_report, output):
                 role = ("sources" if "-source-materials-" in name else "symbols" if "-symbols-" in name
                         else "source-manifest" if name.endswith("qcs-source-manifest.json") else "native-package")
                 add(original, asset_name(platform_id, original.name), role, platform_id,
-                    "evidence/native/" + platform_id + "/" + name)
+                    original.relative_to(stage).as_posix())
             licenses = [item["path"] for item in manifest["files"] if "/runtime-license-materials/" in item["path"]]
             if not licenses:
                 raise ValueError(f"No bound runtime license materials for {platform_id}")
             license_zip = stage / "assets" / f"qcs-{platform_id}-licenses.zip"
             zip_files(license_zip, root, licenses)
             assets.append(record(stage, license_zip, name=license_zip.name, role="licenses", platformId=platform_id,
-                                 provenance="evidence/native/" + platform_id))
+                                 provenance=root.relative_to(stage).as_posix()))
         local = read_json(stage / "evidence/local/manifest.json")
         candidate_path = safe_file(stage / "evidence/local", local["units"]["candidate"])
         candidate_doc = read_json(candidate_path)
@@ -403,6 +431,7 @@ def prepare(source, candidate, native_parent, local_root, full_report, output):
         document = {"schemaVersion": SCHEMA, "kind": "release-freeze", "repository": REPOSITORY,
                     "identity": identity, "createdAtUtc": datetime.now(timezone.utc).isoformat(),
                     "assets": assets, "freezeManifest": {"nativeEvidence": "evidence/native", "localEvidence": "evidence/local",
+                    "nativeSelection": "evidence/native/selection.json",
                     "localFullReport": "evidence/local-full/" + full_relative,
                     "preflight": "evidence/release-preflight.json", "files": [record(stage, path) for path in sorted(stage.rglob("*")) if path.is_file()]},
                     "published": False, "draftOnly": True}
@@ -426,6 +455,8 @@ def verify_freeze(manifest_path, source):
     if (freeze.get("nativeEvidence"), freeze.get("localEvidence"), freeze.get("preflight")) != (
             "evidence/native", "evidence/local", "evidence/release-preflight.json"):
         raise ValueError("Unexpected frozen evidence layout")
+    if freeze.get("nativeSelection") != "evidence/native/selection.json":
+        raise ValueError("The frozen candidate has no native artifact selection")
     errors = evidence.verify_manifest(root, {"identity": identity, "files": freeze["files"]})
     if errors:
         raise ValueError("Frozen release content changed: " + " | ".join(errors))
@@ -445,7 +476,13 @@ def verify_freeze(manifest_path, source):
     if safe_file(root, "assets/SHA256SUMS").read_text(encoding="utf-8") != expected:
         raise ValueError("Release checksums differ from the actual upload names")
     roots = evidence.discover_native(root / freeze["nativeEvidence"])
-    require_passed(evidence.preflight(roots, root / freeze["localEvidence"], identity["candidateHead"]), "Upload preflight failed")
+    selection_path = safe_file(root, freeze["nativeSelection"])
+    selection = evidence.load_native_selection(selection_path.parent, identity["candidateHead"])
+    for relative in ["selection.json", *(item["path"] for item in selection["files"])]:
+        if "evidence/native/" + relative not in files:
+            raise ValueError("Native selection attachment is not bound to the frozen file manifest")
+    require_passed(evidence.preflight(roots, root / freeze["localEvidence"], identity["candidateHead"],
+                                     selection_path=selection_path), "Upload preflight failed")
     for platform_id, native in roots.items():
         validate_materials(native, platform_id, identity, source, evidence)
     full_report = freeze.get("localFullReport", "")
