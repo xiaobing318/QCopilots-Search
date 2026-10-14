@@ -29,6 +29,8 @@ sys.dont_write_bytecode = True
 PRODUCT = "qcs"
 GUI_EXECUTABLE = "qcs-gui"
 APPLICATION_PROGRAMS = (GUI_EXECUTABLE, "qcs-service", "qcs-worker", "qcs-cli")
+WORKER_STDERR_LIMIT = 16 * 1024
+WORKER_STDERR_HEAD = 4 * 1024
 WINDOWS_PRODUCT_KEY = r"Software\QCopilots\qcopilots-search"
 WINDOWS_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\qcopilots-search"
 SOURCE = Path(__file__).resolve().parent.parent
@@ -49,6 +51,46 @@ def file_digest(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def worker_stderr_diagnostics(report_dir):
+    """Include bounded, actual worker output without interpreting a failure's cause."""
+    diagnostics = []
+    for filename, mode in (("worker.log", "auto"), ("backend-cpu.log", "cpu"), ("backend-gpu.log", "gpu")):
+        entry = {"source": filename, "process": "qcs-worker", "stream": "stderr", "requestedBackend": mode}
+        try:
+            with (report_dir / filename).open("rb") as stream:
+                total = os.fstat(stream.fileno()).st_size
+                if total <= WORKER_STDERR_LIMIT:
+                    head, tail = stream.read(total), b""
+                else:
+                    head = stream.read(WORKER_STDERR_HEAD)
+                    stream.seek(total - (WORKER_STDERR_LIMIT - WORKER_STDERR_HEAD))
+                    tail = stream.read(WORKER_STDERR_LIMIT - WORKER_STDERR_HEAD)
+            captured = len(head) + len(tail)
+            entry.update(available=True, totalBytes=total, capturedBytes=captured,
+                         omittedBytes=total - captured, truncated=total > captured,
+                         encoding="utf-8", decodingErrors="replace",
+                         headText=head.decode("utf-8", errors="replace"),
+                         tailText=tail.decode("utf-8", errors="replace"))
+        except FileNotFoundError:
+            # A preceding failure may have prevented this worker from starting.
+            continue
+        except OSError as error:
+            entry.update(available=False, readError=str(error))
+        diagnostics.append(entry)
+    return diagnostics
+
+
+def write_verification_report(report, report_dir):
+    # Called after cleanup, including when backend verification never returned.
+    # Diagnostics must not change the existing pass/fail or hardware-test result.
+    report["workerStderrDiagnostics"] = worker_stderr_diagnostics(report_dir)
+    encoded = json.dumps(report, indent=2, ensure_ascii=False)
+    (report_dir / "report.json").write_text(encoded, encoding="utf-8")
+    # Preserve JSON values while preventing actual stderr from becoming a native
+    # GitHub Actions command, including the legacy command syntax.
+    print(encoded.replace("::", r"\u003a\u003a").replace("##[", r"\u0023\u0023["), flush=True)
 
 
 def installed_program_inventory(binary, application, identity, package_sha256, installed_files=None):
@@ -1096,8 +1138,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
             and report.get("programInventory", {}).get("stable") is True
             and report.get("backendVerification", {}).get("cpu", {}).get("passed") is True
             and report.get("backendVerification", {}).get("strictGpu", {}).get("passed") is True)
-        (report_dir/"report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding="utf-8")
-        print(json.dumps(report,indent=2,ensure_ascii=False),flush=True)
+        write_verification_report(report, report_dir)
     if not report["passed"]:
         raise RuntimeError(report.get("error", report.get("cleanupError", "Package verification failed")))
 

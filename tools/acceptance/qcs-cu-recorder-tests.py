@@ -671,6 +671,10 @@ class RealCandidateIdentityTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("real_cu_release_identity", release_path)
         self.release = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.release)
+        fixture_path = SCRIPT.parents[2] / ".github/scripts/qcs-tests-release-evidence.py"
+        fixture_spec = importlib.util.spec_from_file_location("cu_package_contract_fixtures", fixture_path)
+        self.fixtures = importlib.util.module_from_spec(fixture_spec)
+        fixture_spec.loader.exec_module(self.fixtures)
         for relative in (*self.release.LOCKS, "src/core/pipeline_manifest.h"):
             target = self.source / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -701,14 +705,27 @@ class RealCandidateIdentityTests(unittest.TestCase):
         with zipfile.ZipFile(package, "w") as archive:
             for path in programs.values():
                 archive.write(path, "bin/" + path.name)
-        candidate = {"schemaVersion": 1, "kind": "package-candidate", "syntheticTestOnly": True,
-                     "identity": build["identity"], "recordedAt": recorder.now(),
-                     "executables": {name: {"sha256": recorder.sha(path)} for name, path in programs.items()},
-                     "packageSha256": recorder.sha(package), **recorder.fingerprints(self.source),
-                     "buildProvenance": {"path": provenance.name, "sha256": recorder.sha(provenance)}}
-        record = provenance.parent / "package-candidate.json"
-        recorder.write(record, candidate)
-        return SimpleNamespace(candidate_record=record, source=self.source, package=package, app_dir=app,
+        application = self.root / "installed"
+        with zipfile.ZipFile(package) as archive:
+            archive.extractall(application)
+        verification_root = self.root / "verification"
+        contracts = recorder.fingerprints(self.source)
+        report = self.fixtures.package_release_fixture(verification_root,
+            worker=application / "bin/qcs-worker.exe", application_root=application,
+            model_fingerprint=contracts["modelFingerprint"],
+            extraction_fingerprint=contracts["extractionFingerprint"])
+        report.update({"commit": self.commit, "workingTreeModified": False,
+            "packageSha256": recorder.sha(package),
+            "checks": [{"name": f"synthetic-validator-{number}", "passed": True} for number in range(9)]})
+        report["buildIdentity"]["candidateCommit"] = self.commit
+        self.fixtures.write_program_inventory(verification_root, report)
+        verification = verification_root / "verification.json"
+        recorder.write(verification, report)
+        record, candidate = self.release.record_package(provenance, package, verification,
+            self.root / "candidates", contracts["modelFingerprint"], contracts["extractionFingerprint"])
+        self.assertEqual(self.release.inspect_candidate(record.parent, candidate), [])
+        return SimpleNamespace(candidate_record=record, source=self.source,
+                               package=record.parent / candidate["package"], app_dir=application / "bin",
                                run_parent=self.root / "runs", fixture_manifest=None), candidate
 
     def test_release_and_recorder_share_complete_real_git_identity(self):
@@ -752,6 +769,55 @@ class RealCandidateIdentityTests(unittest.TestCase):
         self.assertFalse(arguments.run_parent.exists())
 
 
+    def initialize_fixture(self, arguments):
+        # Inert fixture files exercise the Windows recorder contract on every OS.
+        # This platform substitution never represents actual Windows acceptance.
+        output = io.StringIO()
+        with (mock.patch.object(recorder.platform, "system", return_value="Windows"),
+              mock.patch.object(recorder.platform, "machine", return_value="AMD64"),
+              redirect_stdout(output)):
+            recorder.initialize(arguments)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["status"], "initialized_no_ui_operations")
+        return Path(result["runRoot"])
+
+    def test_new_run_binds_original_candidate_and_keeps_canonical_executables(self):
+        arguments, candidate = self.candidate()
+        run = self.initialize_fixture(arguments)
+        _, state = recorder.load_run(run)
+        self.assertEqual(state["candidateRecordPath"], str(arguments.candidate_record.resolve()))
+        self.assertEqual(state["candidateRecordSha256"], recorder.sha(arguments.candidate_record))
+        self.assertEqual(state["executables"], candidate["executables"])
+        self.assertTrue((run / "inputs/package-build-provenance.json").is_file())
+        self.assertFalse((run / "inputs/package-ci-provenance.json").exists())
+        self.assertTrue(all("absolutePath" not in value for value in state["executables"].values()))
+        arguments.candidate_record.write_bytes(arguments.candidate_record.read_bytes() + b"\n")
+        with self.assertRaisesRegex(ValueError, "Original candidate record changed"):
+            recorder.load_run(run)
+
+    def test_existing_local_run_without_original_record_fields_remains_loadable(self):
+        arguments, _ = self.candidate()
+        run = self.initialize_fixture(arguments)
+        state = recorder.read(run / "run.json")
+        state.pop("candidateRecordPath")
+        state.pop("candidateRecordSha256")
+        recorder.write(run / "run.json", state)
+        self.assertEqual(recorder.load_run(run)[1], state)
+
+    def test_run_identity_fields_cannot_diverge_from_its_retained_candidate(self):
+        arguments, _ = self.candidate()
+        run = self.initialize_fixture(arguments)
+        original = recorder.read(run / "run.json")
+        for key in ("identity", "packageSha256", "executables", "modelFingerprint", "extractionFingerprint"):
+            with self.subTest(field=key):
+                state = dict(original)
+                state[key] = "SYNTHETIC changed run field"
+                recorder.write(run / "run.json", state)
+                with self.assertRaisesRegex(ValueError, "Run differs from its frozen candidate"):
+                    recorder.load_run(run)
+
+
 class RedirectedCliTests(unittest.TestCase):
     def test_init_and_summary_use_ascii_run_roots_and_preserve_chinese_content(self):
         # Only a Python CLI child is launched. Four dummy ZIP members are never
@@ -784,7 +850,7 @@ from unittest import mock
 spec=importlib.util.spec_from_file_location("synthetic_cli",sys.argv[1])
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 c=json.load(open(sys.argv[2],encoding="utf-8"))
-with mock.patch.object(m,"identity",return_value=c["identity"]), mock.patch.object(m,"fingerprints",return_value={k:c[k] for k in ("modelFingerprint","extractionFingerprint")}), mock.patch.object(m.subprocess,"check_output",return_value=""), mock.patch.object(m.platform,"system",return_value="Windows"), mock.patch.object(m.platform,"machine",return_value="AMD64"):
+with mock.patch.object(m,"identity",return_value=c["identity"]), mock.patch.object(m,"fingerprints",return_value={k:c[k] for k in ("modelFingerprint","extractionFingerprint")}), mock.patch.object(m,"inspect_package_candidate"), mock.patch.object(m.subprocess,"check_output",return_value=""), mock.patch.object(m.platform,"system",return_value="Windows"), mock.patch.object(m.platform,"machine",return_value="AMD64"):
     raise SystemExit(m.main(sys.argv[3:]))
 '''
             environment = {**os.environ, "PYTHONIOENCODING": "ascii"}
@@ -819,6 +885,183 @@ with mock.patch.object(m,"identity",return_value=c["identity"]), mock.patch.obje
             retained = recorder.read(report["report"])
             self.assertEqual(retained["scenarios"][0]["expected"], "中文搜索内容保留")
             self.assertEqual(sample.read_text(encoding="utf-8"), "中文搜索内容保留")
+
+
+class CiCandidateRecorderTests(unittest.TestCase):
+    """Real freeze/candidate readers over inert packages, never CI or UI acceptance."""
+
+    def setUp(self):
+        fixture_path = SCRIPT.parents[2] / ".github/scripts/qcs-tests-release-evidence.py"
+        spec = importlib.util.spec_from_file_location("cu_ci_origin_fixtures", fixture_path)
+        self.fixtures = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.fixtures)
+        self.fixture = self.fixtures.CiOriginEvidenceTests(
+            "test_existing_local_build_candidate_remains_valid_without_release_comparison")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        path, candidate, _, manifest, verification = self.fixture.ci_candidate()
+        self.candidate = candidate
+        report = recorder.read(verification)
+        self.arguments = SimpleNamespace(candidate_record=path, source=self.fixture.source,
+            package=manifest.parent / "assets" / Path(candidate["package"]).name,
+            app_dir=Path(report["modelSmoke"]["runtime"]["workerExecutable"]["path"]).parent,
+            run_parent=self.fixture.root / "synthetic CI recorder runs", fixture_manifest=None)
+        # Keep all actual candidate, artifact, digest and package validation.
+        # Only source material production and declarative fingerprint parsing
+        # use synthetic boundaries. The temporary Git identity remains real.
+        for patch in (mock.patch.object(recorder, "release_evidence", return_value=self.fixtures.evidence),
+                      mock.patch.object(recorder, "fingerprints", return_value={
+                          name: candidate[name] for name in ("modelFingerprint", "extractionFingerprint")})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def initialize(self):
+        return RealCandidateIdentityTests.initialize_fixture(self, self.arguments)
+
+    def test_ci_candidate_initializes_and_reloads_without_invented_local_build(self):
+        self.assertNotIn("buildProvenance", self.candidate)
+        self.assertNotEqual(self.arguments.package.resolve(),
+                            (self.arguments.candidate_record.parent / self.candidate["package"]).resolve())
+        run = self.initialize()
+        _, state = recorder.load_run(run)
+        self.assertEqual(state["identity"], self.candidate["identity"])
+        self.assertEqual(state["executables"], self.candidate["executables"])
+        self.assertTrue((run / "inputs/package-ci-provenance.json").is_file())
+        self.assertFalse((run / "inputs/package-build-provenance.json").exists())
+        paths = {item["path"] for item in state["inputs"]}
+        self.assertEqual(len([path for path in paths if "/ci/artifacts/" in path]), 1)
+        self.assertFalse(any("/ci/package/" in path for path in paths))
+        self.assertFalse(any(path.endswith("begin.json") or "/build/" in path for path in paths))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(recorder.summarize(SimpleNamespace(run=run)), 1)
+        report = next(recorder.read(path) for path in run.glob("windows-computer-use-*.json")
+                      if not path.stem.endswith("-files"))
+        self.assertFalse(report["passed"])
+        self.assertEqual([item["id"] for item in report["scenarios"]], list(recorder.CASES))
+        self.assertTrue(all(item["status"] == "not_run" for item in report["scenarios"]))
+        self.assertEqual(report["executables"], self.candidate["executables"])
+
+    def test_ci_initialization_rejects_different_package_and_each_changed_program(self):
+        package = self.arguments.package
+        original = package.read_bytes()
+        alternative = self.fixture.root / "SYNTHETIC-same-programs-other-zip.zip"
+        alternative.write_bytes(original)
+        with zipfile.ZipFile(alternative, "a") as archive:
+            archive.comment = b"SYNTHETIC different archive, same commit and executable bytes"
+        self.assertNotEqual(recorder.sha(alternative), self.candidate["packageSha256"])
+        with zipfile.ZipFile(package) as expected, zipfile.ZipFile(alternative) as changed:
+            self.assertEqual({item.filename: expected.read(item) for item in expected.infolist()},
+                             {item.filename: changed.read(item) for item in changed.infolist()})
+        self.arguments.package = alternative
+        with self.assertRaisesRegex(ValueError, "package SHA differs"):
+            self.initialize()
+        self.arguments.package = package
+        package.write_bytes(original + b"SYNTHETIC ZIP changed")
+        with self.assertRaises(ValueError):
+            self.initialize()
+        package.write_bytes(original)
+        for name in recorder.NAMES:
+            path = self.arguments.app_dir / (name + ".exe")
+            original = path.read_bytes()
+            path.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+            with self.subTest(program=name), self.assertRaisesRegex(ValueError, "disagree"):
+                self.initialize()
+            path.write_bytes(original)
+        self.assertFalse(self.arguments.run_parent.exists())
+
+    def test_ci_reload_rejects_package_and_each_changed_program(self):
+        run = self.initialize()
+        package = self.arguments.package
+        original = package.read_bytes()
+        package.write_bytes(original + b"SYNTHETIC changed after init")
+        with self.assertRaises(ValueError):
+            recorder.load_run(run)
+        package.write_bytes(original)
+        for name in recorder.NAMES:
+            path = self.arguments.app_dir / (name + ".exe")
+            original = path.read_bytes()
+            path.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+            with self.subTest(program=name), self.assertRaisesRegex(ValueError, "disagree"):
+                recorder.load_run(run)
+            path.write_bytes(original)
+        recorder.load_run(run)
+
+    def test_ci_reload_rejects_changed_retained_and_original_provenance(self):
+        run = self.initialize()
+        retained = run / "inputs/package-ci-provenance.json"
+        original = self.arguments.candidate_record.parent / self.candidate["ciProvenance"]["path"]
+        for path in (retained, original):
+            data = path.read_bytes()
+            path.write_bytes(data + b"\n")
+            with self.subTest(path=path.name), self.assertRaises(ValueError):
+                recorder.load_run(run)
+            path.write_bytes(data)
+        recorder.load_run(run)
+
+    def test_ci_reload_requires_original_candidate_binding(self):
+        run = self.initialize()
+        state = recorder.read(run / "run.json")
+        state.pop("candidateRecordPath")
+        state.pop("candidateRecordSha256")
+        recorder.write(run / "run.json", state)
+        with self.assertRaisesRegex(ValueError, "missing its original provenance binding"):
+            recorder.load_run(run)
+
+    def test_ci_candidate_mutation_during_copy_is_rejected(self):
+        original_copy = recorder.shutil.copyfile
+        candidate_path = self.arguments.candidate_record
+        def changed_copy(source, destination, *args, **kwargs):
+            if Path(source) == candidate_path:
+                changed = recorder.read(candidate_path)
+                changed["recordedAt"] = START
+                recorder.write(candidate_path, changed)
+            return original_copy(source, destination, *args, **kwargs)
+        with mock.patch.object(recorder.shutil, "copyfile", side_effect=changed_copy):
+            with self.assertRaisesRegex(ValueError, "changed while being captured"):
+                self.initialize()
+        self.assertFalse(list(self.arguments.run_parent.rglob("run.json")))
+
+    def test_ci_provenance_mutation_during_copy_is_rejected(self):
+        original_copy = recorder.shutil.copyfile
+        provenance = self.arguments.candidate_record.parent / self.candidate["ciProvenance"]["path"]
+        def changed_copy(source, destination, *args, **kwargs):
+            if Path(source) == provenance:
+                provenance.write_bytes(provenance.read_bytes() + b"\n")
+            return original_copy(source, destination, *args, **kwargs)
+        with mock.patch.object(recorder.shutil, "copyfile", side_effect=changed_copy):
+            with self.assertRaisesRegex(ValueError, "changed while being captured"):
+                self.initialize()
+        self.assertFalse(list(self.arguments.run_parent.rglob("run.json")))
+
+    def test_ci_evidence_copy_corruption_of_same_size_is_rejected(self):
+        original_copy = recorder.shutil.copyfile
+        entry = next(item for item in self.candidate["files"] if item["path"].startswith("model-")
+                     and item["path"].endswith("-reply.json"))
+        evidence_path = self.arguments.candidate_record.parent / entry["path"]
+        def changed_copy(source, destination, *args, **kwargs):
+            result = original_copy(source, destination, *args, **kwargs)
+            if Path(source) == evidence_path:
+                path = Path(destination)
+                data = path.read_bytes()
+                path.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+            return result
+        with mock.patch.object(recorder.shutil, "copyfile", side_effect=changed_copy):
+            with self.assertRaisesRegex(ValueError, "changed while being captured"):
+                self.initialize()
+        self.assertFalse(list(self.arguments.run_parent.rglob("run.json")))
+
+    def test_ci_program_changed_while_inputs_are_captured_is_rejected(self):
+        original_copy = recorder.shutil.copyfile
+        def changed_copy(source, destination, *args, **kwargs):
+            result = original_copy(source, destination, *args, **kwargs)
+            if Path(source) == self.arguments.candidate_record:
+                program = self.arguments.app_dir / "qcs-gui.exe"
+                program.write_bytes(program.read_bytes() + b"SYNTHETIC changed during capture")
+            return result
+        with mock.patch.object(recorder.shutil, "copyfile", side_effect=changed_copy):
+            with self.assertRaisesRegex(ValueError, "disagree"):
+                self.initialize()
+        self.assertFalse(list(self.arguments.run_parent.rglob("run.json")))
 
 
 if __name__ == "__main__":

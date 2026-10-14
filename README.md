@@ -50,6 +50,8 @@ CI 使用一套流程构建 11 个变体，产生 21 个用户文件。Windows �
 
 CI 源码检出目录为 `qcs-src`。包验证的解包、安装、搬移、profile 及 Windows CU 运行根使用英文且无空格的路径，中文查询和样本文件继续验证搜索能力。每个 CI artifact 仅包含对应变体已验证的用户安装包和便携包。构建、测试与失败诊断保留在 GitHub 原生日志中。发布准备可按 run ID、attempt 和候选提交自动下载 CI 成品，验证来源与字节后生成本地冻结清单。源码材料独立生成，符号保留独立生成能力，草稿上传必须显式执行。详细矩阵和协议见 [发布指南](docs/releasing.md) 与 [发布命令](docs/release-command.md)。
 
+正式交付先完成同一干净候选的本机完整 `check` 和 11 变体 CI，再冻结 CI 成品。本机重新验证冻结的 Windows CPU ZIP，经 `record-ci-package` 记录来源后，用这一 ZIP 执行 CU-01 至 CU-10，最后通过 `validate-local --release-manifest` 交叉核对。相同提交的本地重建包不能替代 CI 包字节，具体命令见 [候选验收运行器](tools/acceptance/README.md)。
+
 ## 文档
 
 - [开发指南](docs/development.md) 与 [脚本审查清单](docs/script-audit.md)

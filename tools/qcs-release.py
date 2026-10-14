@@ -26,6 +26,8 @@ SOURCE = Path(__file__).resolve().parents[1]
 REPOSITORY = "xiaobing318/QCopilots-Search"
 MANIFEST = "qcs-release-manifest.json"
 SCHEMA = 2
+CPU_VARIANT = "windows-x64-cpu"
+CI_CPU_ORIGIN = "ci-origin.json"
 # GitHub requires every completed release asset to be smaller than 2 GiB.
 MAX_ASSET_BYTES = 2 * 1024**3 - 1
 WORKFLOW_PATH = ".github/workflows/qcs-native.yml"
@@ -450,6 +452,143 @@ def verify_freeze(manifest_path, source):
     if set(files) != provenance | {"assets/" + name for name in expected_assets}:
         raise ValueError("Frozen release contains unexpected provenance or assets")
     return document
+
+
+def verify_frozen_cpu_package(manifest_path: Path, source: Path) -> dict:
+    """Resolve the portable CPU package only after verifying the complete freeze."""
+    document = verify_freeze(manifest_path, source)
+    root = manifest_path.parent.resolve()
+    configuration = document["configurations"][CPU_VARIANT]
+    selected = {key: value for key, value in configuration.items() if key != "packages"}
+    packages = [item for item in configuration["packages"] if item["filename"].endswith(".zip")]
+    if len(packages) != 1:
+        raise ValueError("The frozen Windows CPU configuration needs exactly one portable ZIP")
+    package = packages[0]
+    artifact = safe_file(root, f"provenance/artifacts/{selected['artifactId']}.zip")
+    github = safe_file(root, "provenance/github.json")
+    return {"identity": document["identity"], "version": document["version"],
+            "runId": document["runId"], "requestedAttempt": document["requestedAttempt"],
+            "variant": CPU_VARIANT, "selected": selected,
+            "package": {"path": safe_file(root, "assets/" + package["filename"]), **package},
+            "githubSnapshot": {"path": github, "bytes": github.stat().st_size, "sha256": digest(github)},
+            "artifact": {"path": artifact, "bytes": artifact.stat().st_size,
+                         "sha256": digest(artifact), "digest": selected["artifactDigest"]}}
+
+
+def verify_ci_origin_tree(root, files):
+    """A portable origin is a closed, ordinary tree, including empty directories."""
+    root = root.expanduser().absolute()
+    for path in (root, *root.parents):
+        if redirected(path):
+            raise ValueError("CI origin cannot use links or junctions")
+    if not root.is_dir():
+        raise ValueError("CI origin root must be an ordinary directory")
+    directories = {str(parent) for name in files for parent in PurePosixPath(name).parents
+                   if str(parent) != "."}
+    actual = set()
+    for current, children, names in os.walk(root, followlinks=False):
+        for name in [*children, *names]:
+            path = Path(current) / name
+            relative = path.relative_to(root).as_posix()
+            if redirected(path):
+                raise ValueError("CI origin cannot use links or junctions")
+            if path.is_dir():
+                if relative not in directories:
+                    raise ValueError("CI origin contains unexpected directories")
+            elif path.is_file() and stat.S_ISREG(path.stat().st_mode):
+                actual.add(relative)
+            else:
+                raise ValueError("CI origin contains a non-ordinary file")
+    if actual != files:
+        raise ValueError("CI origin contains missing or extra files")
+    return root.resolve()
+
+
+def verify_ci_origin_record(root, entry, expected_path, extra=()):
+    if not isinstance(entry, dict) or set(entry) != {"path", "bytes", "sha256", *extra}:
+        raise ValueError("CI origin file record is invalid")
+    if (entry["path"] != expected_path or type(entry["bytes"]) is not int or entry["bytes"] <= 0
+            or not isinstance(entry["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])):
+        raise ValueError("CI origin file identity or path is invalid")
+    path = safe_file(root, expected_path)
+    if entry["bytes"] != path.stat().st_size or entry["sha256"] != digest(path):
+        raise ValueError("CI origin file bytes changed: " + expected_path)
+    return path
+
+
+def verify_ci_cpu_origin(root: Path, doc: dict, source: Path) -> dict:
+    """Validate the closed CPU origin tree and replay the complete frozen CI selection offline."""
+    try:
+        return _verify_ci_cpu_origin(root, doc, source)
+    except (KeyError, TypeError, AttributeError, zipfile.BadZipFile) as error:
+        raise ValueError("Malformed CI CPU package origin: " + str(error)) from error
+
+
+def _verify_ci_cpu_origin(root: Path, doc: dict, source: Path) -> dict:
+    """Replay all CI metadata offline while retaining only the CPU artifact bytes.
+
+    The dedicated root contains ci-origin.json, github.json, artifacts/<id>.zip
+    and package/<portable filename>. This proves the selected CI package origin,
+    independently from local build execution and Computer Use evidence.
+    """
+    keys = {"schemaVersion", "kind", "repository", "identity", "version", "runId", "requestedAttempt",
+            "variant", "selected", "githubSnapshot", "artifact", "package"}
+    if (not isinstance(doc, dict) or set(doc) != keys or type(doc["schemaVersion"]) is not int
+            or doc["schemaVersion"] != 1 or doc["kind"] != "ci-cpu-package-origin"
+            or doc["repository"] != REPOSITORY or doc["variant"] != CPU_VARIANT):
+        raise ValueError("Unsupported CI CPU package origin")
+    evidence = module("qcs-release-evidence")
+    identity = doc["identity"]
+    errors = evidence.valid_identity(identity)
+    if errors or identity["candidateHead"] != identity["checkoutCommit"]:
+        raise ValueError("CI CPU origin needs one clean immutable candidate")
+    candidate = identity["candidateHead"]
+    if identity_for(source, candidate, evidence) != identity or doc["version"] != project_version(source):
+        raise ValueError("CI CPU origin differs from the current clean candidate")
+    selector = selector_module()
+    selector.arguments(REPOSITORY, doc["runId"], candidate, doc["requestedAttempt"])
+    selected = doc["selected"]
+    if (not isinstance(selected, dict) or set(selected) != {"sourceAttempt", "sourceJobId", "observedJobId",
+                                                          "artifactId", "artifactName", "artifactDigest"}):
+        raise ValueError("CI CPU origin selected configuration is invalid")
+    for key in ("sourceAttempt", "sourceJobId", "observedJobId", "artifactId"):
+        positive_id(selected[key])
+    if (not isinstance(selected["artifactName"], str) or not isinstance(selected["artifactDigest"], str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", selected["artifactDigest"])):
+        raise ValueError("CI CPU origin selected artifact identity is invalid")
+    artifact_id = positive_id(selected.get("artifactId"))
+    expected_names = package_names(CPU_VARIANT, doc["version"], candidate, selected.get("sourceAttempt"))
+    package_name = next(name for name in expected_names if name.endswith(".zip"))
+    github_relative, artifact_relative = "github.json", f"artifacts/{artifact_id}.zip"
+    package_relative = "package/" + package_name
+    root = verify_ci_origin_tree(root, {CI_CPU_ORIGIN, github_relative, artifact_relative, package_relative})
+    if read_json(safe_file(root, CI_CPU_ORIGIN)) != doc:
+        raise ValueError("CI CPU origin document differs from its saved bytes")
+    github = verify_ci_origin_record(root, doc["githubSnapshot"], github_relative)
+    collected = read_json(github)
+    validate_context(collected["context"], candidate, doc["runId"], doc["requestedAttempt"])
+    selection = selector.select(REPOSITORY, doc["runId"], candidate, doc["requestedAttempt"],
+                                collected["jobs"], collected["artifacts"])
+    require_passed(selection, "CI CPU origin package selection failed")
+    if (selection != collected["selection"] or set(selection["selected"]) != set(variants())
+            or selected != selection["selected"][CPU_VARIANT]):
+        raise ValueError("CI CPU origin selection differs from its complete execution history")
+    artifact = verify_ci_origin_record(root, doc["artifact"], artifact_relative, ("digest",))
+    if (doc["artifact"]["digest"] != selected["artifactDigest"]
+            or doc["artifact"]["sha256"] != selected["artifactDigest"].removeprefix("sha256:")):
+        raise ValueError("CI CPU origin artifact digest differs from GitHub")
+    packages = inspect_packages(artifact, expected_names)
+    package = verify_ci_origin_record(root, doc["package"], package_relative, ("filename",))
+    if (doc["package"]["filename"] != package_name
+            or {key: doc["package"][key] for key in ("bytes", "sha256")} != packages[package_name]):
+        raise ValueError("CI CPU portable ZIP differs from its original artifact member")
+    if identity_for(source, candidate, evidence) != identity:
+        raise ValueError("Source identity changed during CI CPU origin verification")
+    return {"identity": identity, "version": doc["version"], "runId": doc["runId"],
+            "requestedAttempt": doc["requestedAttempt"], "variant": CPU_VARIANT, "selected": selected,
+            "package": {**doc["package"], "path": package},
+            "githubSnapshot": {**doc["githubSnapshot"], "path": github},
+            "artifact": {**doc["artifact"], "path": artifact}}
 
 
 class ApiError(RuntimeError):

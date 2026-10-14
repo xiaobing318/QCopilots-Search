@@ -1,12 +1,12 @@
 # Windows 用户操作验收
 
-本验收使用最终 Windows CPU 安装包中的应用，通过 Windows Computer Use 插件实际观察和操作窗口。QtTest 报告与本报告分别保存。CLI 冒烟或截图生成不能替代真实用户流程。
+正式验收使用 `release-prepare` 冻结清单中的 Windows CPU portable ZIP，通过 Windows Computer Use 插件实际观察和操作其中的应用。先完成同一干净候选的本机完整 `check` 和 11 变体 CI，再冻结 CI 包、在本机验证这一 ZIP，并通过 `record-ci-package` 建立来源候选。QtTest 报告与本报告分别保存，CLI 冒烟或截图生成不能替代真实用户流程。
 
 ## 运行前准备
 
 创建唯一的验收根、profile 和样本目录。受控验收根、应用解包目录、安装及搬移目录、profile 均使用英文且无空格的路径，放在显式外置测试根下。中文查询、中文及空格样本文件继续保留，用于验证内容搜索和文件处理。把相同 profile 传给应用及其服务，只读取专用样本，不连接正式实例。记录安装包文件名、SHA-256、源码提交、模型指纹、Windows 版本、显示缩放和输入法。
 
-先固定最终包与 `package-candidate.json` 身份，再从该包启动 `qcs-gui`。本次应用、服务、worker、模型目录和外部工具的位置必须明确记录，不能混用构建树中的旧程序。任何修复或重新打包都会产生新的候选，相关操作必须在新包上重跑，不能只替换报告中的哈希。样本准备、外部工具和报告均位于源码树与正式用户 profile 之外，不修改已经计算哈希的包来补装依赖。
+先固定 CI ZIP 与 `record-ci-package` 输出的 `package-candidate.json` 身份，再从该 ZIP 的新解包副本启动 `qcs-gui`。本次应用、服务、worker、模型目录和外部工具的位置必须明确记录，不能混用构建树中的旧程序。相同源码提交不保证本地重建包与 CI 包字节相同。源码修复产生新候选，同一提交重新打包或更换 CI attempt 也可能改变包身份，必须按新的来源重新记录和执行相关验收，不能只替换旧报告哈希。样本准备、外部工具和报告均位于源码树与正式用户 profile 之外，不修改已冻结的包来补装依赖。完整验包与 `record-ci-package` 命令见 [候选验收运行器](../tools/acceptance/README.md#包与-windows-操作记录)。
 
 准备至少 205 个文件作为三页浏览样本，保存文件清单、相对路径、类型、修改时间及内容哈希。修改时间应有可核对的先后顺序，也包含相同修改时间的文件，用于验证默认倒序和重复时间下的稳定分页。另准备中文及空格文件名、长路径、多页 PDF、可继续读取的长文档、图片、带明确命中时刻的音视频、代码和 Notebook。普通文件与代码分别设置根目录及排除目录，包含仅属于其中一个空间的样本和允许在两空间独立出现的文本。样本总量、关键词定位用例与空范围查询应在操作前记录。语义结果记录实际返回文件和定位字段，不要求自然语言查询命中特定片段。
 
@@ -45,12 +45,13 @@ if ($LASTEXITCODE -ne 0) { throw 'CU 夹具计划创建失败' }
 
 定位检查以最终包实际返回结果的时间字段为准。夹具中的 `targetRegionMs`、`expectedWindowStartMs`、`expectedFrameStartMs` 保留用于提取与定位一致性检查，不要求自然语言查询一定选中这些预设片段。记录结果自身的非零时间或非首页字段，再核对内置预览及外部应用是否到达相同位置。只打开文件或看到进程启动不能标记定位通过。
 
-取得同一候选的 `package-candidate.json` 与最终包后，先初始化记录器，再复制夹具。`--fixture-manifest` 传准备结果中的来源清单，将它保留为候选输入。示例中的包、解包目录及运行根均来自本次冻结候选，解包目录和运行根使用英文且无空格的路径。
+取得 `record-ci-package` 输出的 `package-candidate.json` 与冻结 CI ZIP 后，先初始化记录器，再复制夹具。`--fixture-manifest` 传准备结果中的来源清单，将它保留为候选输入。示例中的包和解包目录均来自同一冻结资产，解包目录和运行根使用英文且无空格的路径。原冻结发行目录与候选记录目录在运行期间持续保留，记录器每次核对实际来源与包字节。
 
 ```powershell
 python -B "$qcsTools/qcs-cu-recorder.py" init `
-  --candidate-record '<package-candidate.json绝对路径>' --package '<最终ZIP绝对路径>' `
-  --app-dir '<该ZIP的解包应用目录>' --source $qcsSource `
+  --candidate-record '<record-ci-package输出的package-candidate.json绝对路径>' `
+  --package '<冻结manifest所选CPU ZIP绝对路径>' `
+  --app-dir '<该ZIP新解包副本的bin目录>' --source $qcsSource `
   --run-parent '<外置CU运行父目录>' `
   --fixture-manifest "$qcsFixtureSource/negative-models/qcs-fixture-source.json"
 if ($LASTEXITCODE -ne 0) { throw 'CU 记录器初始化失败' }
@@ -98,7 +99,7 @@ CU-10 只对本次独立 profile 的进程注入故障，先核对 PID、可执�
 
 空结果界面使用明确为空的目录、类型或关键词条件验证。语义查询可能返回低相似度结果，不能要求无答案自然语言一定返回空列表。模型不可用、后端回退及搜索失败按实际状态记录。
 
-所有场景使用同一最终安装包及其独立动态 profile，不能拼接不同候选的截图作为一次通过。工具无法操作、用户协助和工具随后核验的部分分别写入操作记录。必需场景没有实际完成时，本轮验收保持未通过。QtTest 自动化和 Computer Use 各自提供证据，并与本地完整自动化、11 变体原生 Actions 一起判定交付。
+所有场景使用同一冻结 CI CPU ZIP 及其独立动态 profile，不能拼接不同候选或不同包字节的截图作为一次通过。工具无法操作、用户协助和工具随后核验的部分分别写入操作记录。必需场景没有实际完成时，本轮验收保持未通过。QtTest 自动化和 Computer Use 各自提供证据，并与本地完整自动化、11 变体原生 Actions 一起判定交付。
 
 外部 Notebook 单元格定位只在明确支持该能力的编辑器配置下单独验收。编辑器命令中的 `{cell}` 只是参数替换，通用的文件与行号打开方式不保证跳到 Notebook 单元格，不能用应用内定位截图代替外部编辑器证据。
 
@@ -114,13 +115,13 @@ CU-10 只对本次独立 profile 的进程注入故障，先核对 PID、可执�
 | 每个场景 | `id`、`status`、非空 `expected` / `actual`、非空 `actions` 数组、`packageSha256`、`executables`、UTC `startedAt` / `finishedAt`、非空 `screenshots` 数组、`operationLog` |
 | 每个附件 | `files` 中的 `{path, bytes, sha256}`，对应实际文件的相对路径、字节数和 SHA-256 |
 
-从实际构建产生的 `package-candidate.json` 原样保留 `identity`，其中包括 `candidateHead`、`checkoutCommit`、`sourceTree`、`workingTreeModified: false` 和完整 `lockHashes`。同样原样保留四个程序的 `executables` 对象及每个对象的字段，不能仅摘取程序名或事后用当前 HEAD 替换来源。每个场景的包哈希和 `executables` 必须与报告顶层一致。
+从 `record-ci-package` 产生的 `package-candidate.json` 原样保留 `identity`，其中包括 `candidateHead`、`checkoutCommit`、`sourceTree`、`workingTreeModified: false` 和完整 `lockHashes`，并保留其 CI 来源记录。同样原样保留四个程序的 `executables` 对象及每个对象的字段，不能仅摘取程序名、补造本地构建历史或事后用当前 HEAD 替换来源。每个场景的包哈希和 `executables` 必须与报告顶层一致。本地 `record-build` / `record-package` 记录可用于开发验证，不能仅因 commit 相同就作为本流程的 CI 来源。
 
 `CU-01` 至 `CU-10` 各出现一次。每个场景的开始时间必须早于结束时间，且完整落在本次报告的执行区间内。只有十个场景实际通过且证据完整时才能写 `passed: true`。失败、未运行和能力不可用分别保留 `failed`、`not_run`、`unsupported`，不能改写为 `passed`。
 
 所有 `screenshots`、`operationLog` 和 `files[].path` 均以原始报告所在目录为根，使用不含 `..` 的相对 POSIX 路径。每张实际 PNG/JPEG 截图和每份非空操作日志必须在顶层 `files` 中登记，记录内容哈希。不要将报告自身放入其 `files`，以免产生自引用哈希。附加的 `-files.json` 可以用于归档，但不能代替原始报告内嵌的清单。
 
-执行 [发布指南](releasing.md#本机最终证据流程) 中的 `collect-local` 时，`--computer-use` 传入这份自包含的原始 JSON，不传入附加清单。导入器按该 JSON 所在目录查找并校验附件，再复制到新的证据根。最后运行 `validate-local` 核对候选与 CU 的身份和附件。该命令只验证本机记录，不代表远端 11 个变体已经通过。
+执行 [发布指南](releasing.md#本机最终证据流程) 中的 `collect-local` 时，`--computer-use` 传入这份自包含的原始 JSON，不传入附加清单。导入器按该 JSON 所在目录查找并校验附件，再复制到新的证据根。最后运行 `validate-local --release-manifest <同一冻结发行清单>`，交叉核对 CI 来源、实际 ZIP、四个程序、候选与 CU 附件，要求结果的 `scope` 为 `final-release-package`、`passed` 为 true，且 `localGates.finalReleasePackage` 通过。这一步验证已有来源与实际操作的绑定，不重新运行 CI。省略 `--release-manifest` 时 `scope` 为 `local-package`，不满足正式发行包验收。
 
 报告发布前将个人目录和无关桌面内容脱敏。清理时只停止本次创建的应用与服务，只删除经过边界验证的验收根。源文件删除、安装或其他需当场确认的 UI 行为按 Computer Use 技能要求执行，测试范围本身不扩大插件权限。
 

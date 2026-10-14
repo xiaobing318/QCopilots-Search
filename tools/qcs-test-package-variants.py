@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import copy
+from contextlib import redirect_stdout
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 sys.dont_write_bytecode = True
@@ -87,6 +90,148 @@ class PackageVariantTests(unittest.TestCase):
 
     def write_identity(self):
         write_json(self.materials / "build-identity.json", self.identity)
+
+    def test_worker_stderr_preserves_actual_output_and_safe_json_values(self):
+        report_dir = self.root / "stderr-report"
+        report_dir.mkdir()
+        messages = {}
+        for filename, mode in (("worker.log", "auto"), ("backend-cpu.log", "cpu"), ("backend-gpu.log", "gpu")):
+            message = (mode.encode() + b" synthetic child stderr\r\n\x00\x1b[31m\xff\n"
+                       b"::error::raw diagnostic\n::stop-commands::token\n##[error]legacy diagnostic")
+            with (report_dir / filename).open("wb") as stream:
+                child = subprocess.run([sys.executable, "-c",
+                    "import os, sys; os.write(2, " + repr(message) + "); sys.exit(73)"],
+                    cwd=self.root, stderr=stream, stdout=subprocess.DEVNULL, timeout=10)
+            self.assertEqual(child.returncode, 73)
+            messages[filename] = message
+        report = {"passed": False, "releaseComplete": False, "error": "Original verification failure"}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            package.write_verification_report(report, report_dir)
+        text = output.getvalue()
+        self.assertNotIn("::", text)
+        self.assertNotIn("##[", text)
+        decoded = json.loads(text)
+        self.assertEqual(decoded, json.loads((report_dir / "report.json").read_text(encoding="utf-8")))
+        self.assertFalse(decoded["passed"])
+        self.assertFalse(decoded["releaseComplete"])
+        self.assertEqual(decoded["error"], "Original verification failure")
+        for item, mode in zip(decoded["workerStderrDiagnostics"], ("auto", "cpu", "gpu")):
+            original = messages[item["source"]]
+            self.assertEqual((item["process"], item["stream"], item["requestedBackend"]), ("qcs-worker", "stderr", mode))
+            self.assertTrue(item["available"])
+            self.assertFalse(item["truncated"])
+            self.assertEqual(item["totalBytes"], len(original))
+            self.assertEqual(item["capturedBytes"], len(original))
+            self.assertEqual(item["omittedBytes"], 0)
+            self.assertEqual(item["decodingErrors"], "replace")
+            self.assertEqual(item["headText"], original.decode("utf-8", errors="replace"))
+            self.assertEqual(item["tailText"], "")
+
+    def test_worker_stderr_limits_each_fixed_source_and_keeps_head_and_tail(self):
+        data = b"module discovery start\n" + b"m" * (package.WORKER_STDERR_LIMIT * 8) + b"\nbackend initialization failed"
+        for name in ("worker.log", "backend-cpu.log", "backend-gpu.log", "unrelated.log"):
+            (self.root / name).write_bytes(data)
+        real_open = Path.open
+        reads = []
+        def bounded_open(path, *args, **kwargs):
+            stream = real_open(path, *args, **kwargs)
+            wrapper = Mock(wraps=stream)
+            wrapper.__enter__ = Mock(return_value=wrapper)
+            wrapper.__exit__ = Mock(side_effect=lambda *unused: stream.close())
+            def bounded_read(size=-1):
+                self.assertGreaterEqual(size, 0)
+                self.assertLessEqual(size, package.WORKER_STDERR_LIMIT)
+                reads.append(size)
+                return stream.read(size)
+            wrapper.read.side_effect = bounded_read
+            return wrapper
+        with patch.object(Path, "open", bounded_open):
+            entries = package.worker_stderr_diagnostics(self.root)
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(sum(reads), 3 * package.WORKER_STDERR_LIMIT)
+        for item in entries:
+            self.assertTrue(item["truncated"])
+            self.assertEqual(item["totalBytes"], len(data))
+            self.assertEqual(item["capturedBytes"], package.WORKER_STDERR_LIMIT)
+            self.assertEqual(item["omittedBytes"], len(data) - package.WORKER_STDERR_LIMIT)
+            self.assertTrue(item["headText"].startswith("module discovery start\n"))
+            self.assertTrue(item["tailText"].endswith("\nbackend initialization failed"))
+
+    def test_worker_stderr_missing_empty_and_unreadable_sources_do_not_change_result(self):
+        self.assertEqual(package.worker_stderr_diagnostics(self.root), [])
+        (self.root / "worker.log").write_bytes(b"")
+        empty = package.worker_stderr_diagnostics(self.root)[0]
+        self.assertEqual((empty["totalBytes"], empty["capturedBytes"], empty["omittedBytes"]), (0, 0, 0))
+        self.assertFalse(empty["truncated"])
+        real_open = Path.open
+        def unavailable(path, *args, **kwargs):
+            if path.name == "worker.log":
+                raise PermissionError("Synthetic stderr read denial")
+            return real_open(path, *args, **kwargs)
+        report = {"passed": True, "releaseComplete": True, "backendVerification": {
+            "strictGpu": {"passed": True, "hardwareTested": False, "reason": "Strict GPU unavailable"}}}
+        baseline = copy.deepcopy(report)
+        with patch.object(Path, "open", unavailable), redirect_stdout(io.StringIO()):
+            package.write_verification_report(report, self.root)
+        item = report.pop("workerStderrDiagnostics")[0]
+        self.assertEqual(report, baseline)
+        self.assertFalse(item["available"])
+        self.assertIn("stderr read denial", item["readError"])
+
+    def test_outer_verification_failure_keeps_worker_stderr_in_final_output(self):
+        report_dir = self.root / "failed-verification"
+        archive = self.root / "synthetic.zip"
+        archive.write_bytes(b"synthetic package test input")
+        def fail_with_existing_logs(*unused):
+            (report_dir / "worker.log").write_bytes(b"auto module initialization diagnostic")
+            (report_dir / "backend-gpu.log").write_bytes(b"strict module initialization diagnostic")
+            raise RuntimeError("Original worker response failure")
+        output = io.StringIO()
+        with patch.object(package, "package_source_identity", return_value={"commit": CANDIDATE}), \
+                patch.object(package, "unpack", side_effect=fail_with_existing_logs), \
+                patch.dict(os.environ, {"QCOPILOTS_SEARCH_TEST_ROOT": str(self.root / "runs")}), \
+                redirect_stdout(output), self.assertRaisesRegex(RuntimeError, "Original worker response failure"):
+            package.verify(archive, self.root / "build", explicit_report=report_dir, model_dir=self.root)
+        report = json.loads(output.getvalue())
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["releaseComplete"])
+        self.assertEqual(report["error"], "Original worker response failure")
+        self.assertEqual([item["requestedBackend"] for item in report["workerStderrDiagnostics"]], ["auto", "gpu"])
+        self.assertEqual(report["workerStderrDiagnostics"][1]["headText"], "strict module initialization diagnostic")
+
+    def test_strict_gpu_rejection_keeps_diagnostics_without_claiming_hardware(self):
+        def launch_child(*args, **kwargs):
+            mode = kwargs["env"]["QCOPILOTS_SEARCH_BACKEND"]
+            kwargs["stderr"].write(mode + " synthetic protocol worker stderr\n")
+            if mode == "cpu":
+                reply = {"id": "backend-cpu", "ok": True, "result": {
+                    "runtime": diagnostic(self.identity, "cpu", "cpu"), "embedding": [1.0] + [0.0] * 767}}
+            else:
+                reply = {"id": "backend-gpu", "ok": False, "error": {
+                    "runtime": diagnostic(self.identity, "gpu", "", loaded=False), "message": "Strict GPU unavailable"}}
+            shutdown = {"id": "worker-shutdown", "ok": True, "result": {"stopping": True}}
+            child = Mock()
+            child.stdin = io.StringIO()
+            child.stdout = io.StringIO(json.dumps(reply) + "\n" + json.dumps(shutdown) + "\n")
+            child.poll.return_value = None
+            child.returncode = 0
+            return child
+        with patch.object(package.subprocess, "Popen", side_effect=launch_child), \
+                patch.object(package, "inference_runtime_origins", return_value={}), \
+                patch.object(package, "force_stop", return_value=None):
+            outcomes = package.verify_backend_modes(self.binary / "qcs-worker.exe", self.application,
+                self.root, self.root, {}, [], self.identity, [1.0] + [0.0] * 767, None, 5)
+        self.assertTrue(outcomes["strictGpu"]["passed"])
+        self.assertFalse(outcomes["strictGpu"]["hardwareTested"])
+        report = {"passed": True, "releaseComplete": True, "backendVerification": outcomes}
+        with redirect_stdout(io.StringIO()):
+            package.write_verification_report(report, self.root)
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["releaseComplete"])
+        self.assertFalse(report["backendVerification"]["strictGpu"]["hardwareTested"])
+        self.assertEqual(report["workerStderrDiagnostics"][1]["requestedBackend"], "gpu")
+        self.assertEqual(report["workerStderrDiagnostics"][1]["headText"], "gpu synthetic protocol worker stderr" + os.linesep)
 
     def validate_identity(self, **overrides):
         return package.validate_build_identity(

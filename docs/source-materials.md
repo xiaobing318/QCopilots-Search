@@ -24,6 +24,8 @@ python tools/qcs-source-bundle.py `
 
 材料包保留上游归档的压缩形式，不展开体积较大的 Qt WebEngine / PDF 源码。它包含实际使用的 Qt base、SVG、Core5Compat、Image Formats、Multimedia、translations 和配套 PDF 源码。Qt PDF 的源归档名称为 Qt WebEngine，因为两个模块共用该源码仓库。
 
+当前锁定清单包含 45 份上游归档，覆盖范围以 `source-manifest.json` 的实际条目为准。ROCm 部分包含 18 份系统依赖源码和一份 TheRock 构建配方归档。`rocm-libraries`、`rocm-systems`、`llvm-project` 的精确提交已锁定，但完整源码归档未收录，TheRock 归档不包含 Git submodules。CUDA 构建使用的 CCCL `v3.4.3` 也没有独立源码归档条目。因此本材料不构成完整离线 GPU SDK 源码集。源码归档完整性与用户包中实际 runtime license 材料分别验证，不以其中一个通过替代另一个。
+
 FFmpeg 使用固定 9.0.1 源码。Windows 配套 FFmpeg 使用的 zlib 1.3.1 源码与应用自身使用的 zlib 1.3.2 分开保留。第三方源归档内部包含其原始许可证和版权声明。开发者指定 `--qt-root` 时，附加元数据记录该 SDK 的真实 `avcodec_configuration()`、许可证及运行库 SHA-256。
 
 开发材料在 Linux 读取 Qt SDK 的 FFmpeg 元数据时，先从选中的 `libavcodec.so.63` 所在目录以 `RTLD_LOCAL` 加载 `libavformat.so.63` 及其依赖组，再以相同方式加载 avcodec，并在元数据读取期间保留依赖组句柄。缺少同目录的 avformat、动态加载失败或元数据符号读取失败都会明确失败，不跨 SDK 寻找替代库。Windows 和 macOS 保留原有加载路径，FFmpeg ABI 及 GPL / nonfree 配置拒绝规则保持不变。

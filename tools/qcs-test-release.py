@@ -230,6 +230,327 @@ class FreezeTests(ExternalTest):
         self.assertFalse(self.output.exists())
 
 
+class CiCpuOriginTests(ExternalTest):
+    def setUp(self):
+        super().setUp()
+        self.api = FakeCI()
+        self.origin = self.root / "candidate/ci"
+        patch = mock.patch.object(release, "identity_for", return_value=IDENTITY)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def create_origin(self, attempt=1):
+        collected = release.collect_ci(self.api, CANDIDATE, "123", attempt)
+        selected = collected["selection"]["selected"][release.CPU_VARIANT]
+        artifact = self.file("candidate/ci/artifacts/" + str(selected["artifactId"]) + ".zip",
+                             self.api.downloads[selected["artifactId"]])
+        github = self.origin / "github.json"
+        release.write_json(github, collected)
+        names = release.package_names(release.CPU_VARIANT, release.project_version(release.SOURCE),
+                                      CANDIDATE, selected["sourceAttempt"])
+        filename = next(name for name in names if name.endswith(".zip"))
+        with zipfile.ZipFile(artifact) as archive:
+            package = self.file("candidate/ci/package/" + filename, archive.read(filename))
+        self.document = {"schemaVersion": 1, "kind": "ci-cpu-package-origin", "repository": release.REPOSITORY,
+                         "identity": deepcopy(IDENTITY), "version": release.project_version(release.SOURCE),
+                         "runId": "123", "requestedAttempt": attempt, "variant": release.CPU_VARIANT,
+                         "selected": selected, "githubSnapshot": release.record(self.origin, github),
+                         "artifact": release.record(self.origin, artifact, digest=selected["artifactDigest"]),
+                         "package": release.record(self.origin, package, filename=filename)}
+        self.save()
+        return self.document
+
+    def save(self):
+        release.write_json(self.origin / release.CI_CPU_ORIGIN, self.document)
+
+    def verify(self):
+        with mock.patch.object(release, "GitHub", side_effect=AssertionError("Verification must remain offline")), \
+                mock.patch.object(release, "authentication", side_effect=AssertionError("No credentials permitted")):
+            return release.verify_ci_cpu_origin(self.origin, self.document, release.SOURCE)
+
+    def replace_snapshot(self, collected):
+        path = self.origin / "github.json"
+        release.write_json(path, collected)
+        self.document["githubSnapshot"] = release.record(self.origin, path)
+        self.save()
+
+    def test_subset_replays_all_eleven_without_other_artifact_files(self):
+        self.create_origin()
+        # Surrounding candidate evidence is intentionally outside the closed ci/ tree.
+        self.file("candidate/package-verification.json")
+        result = self.verify()
+        self.assertEqual(result["identity"], IDENTITY)
+        self.assertEqual(result["selected"], self.document["selected"])
+        self.assertEqual(result["package"]["path"], self.origin / self.document["package"]["path"])
+        self.assertEqual(len(list((self.origin / "artifacts").glob("*.zip"))), 1)
+        self.assertEqual(len(release.read_json(self.origin / "github.json")["selection"]["selected"]), 11)
+        self.assertTrue(all(result[key]["path"].is_absolute() for key in ("package", "artifact", "githubSnapshot")))
+
+    def test_origin_can_move_without_original_freeze(self):
+        self.create_origin()
+        relocated = self.root / "moved"
+        self.origin.rename(relocated)
+        self.origin = relocated
+        self.assertEqual(self.verify()["package"]["sha256"], self.document["package"]["sha256"])
+
+    def test_complete_frozen_cpu_resolver_checks_other_variants_first(self):
+        source_bundle = self.file(f"qcs-source-materials-{CANDIDATE[:12]}.zip", b"SYNTHETIC SOURCES")
+        with mock.patch.object(release, "build_sources", return_value=source_bundle), \
+                mock.patch.object(release, "validate_sources"):
+            manifest = release.prepare(release.SOURCE, CANDIDATE, "123", 1, self.root / "freeze", api=self.api)
+            result = release.verify_frozen_cpu_package(manifest, release.SOURCE)
+            self.assertEqual(result["selected"]["artifactId"], 1001)
+            self.assertEqual(result["package"]["sha256"], release.digest(result["package"]["path"]))
+            self.assertEqual(result["artifact"]["digest"], "sha256:" + result["artifact"]["sha256"])
+            (manifest.parent / "provenance/artifacts/1002.zip").write_bytes(b"changed other variant")
+            with self.assertRaisesRegex(ValueError, "content changed"):
+                release.verify_frozen_cpu_package(manifest, release.SOURCE)
+
+    def test_wrong_origin_candidate_run_attempt_variant_or_source_rejected(self):
+        self.create_origin()
+        original = deepcopy(self.document)
+        mutations = [("identity", {**IDENTITY, "candidateHead": "9" * 40}),
+                     ("identity", {**IDENTITY, "workingTreeModified": True}),
+                     ("identity", {**IDENTITY, "sourceTree": "9" * 40}),
+                     ("repository", "another/repository"), ("runId", "124"),
+                     ("requestedAttempt", 2), ("variant", "windows-x64-vulkan"), ("version", "9.9.9")]
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                self.document = deepcopy(original)
+                self.document[key] = value
+                self.save()
+                with self.assertRaises(ValueError):
+                    self.verify()
+
+    def test_origin_requires_current_clean_identity(self):
+        self.create_origin()
+        with mock.patch.object(release, "identity_for", return_value={**IDENTITY, "workingTreeModified": True}):
+            with self.assertRaisesRegex(ValueError, "current clean candidate"):
+                self.verify()
+
+    def test_source_identity_is_rechecked_after_package_verification(self):
+        self.create_origin()
+        with mock.patch.object(release, "identity_for", side_effect=[IDENTITY, {**IDENTITY, "workingTreeModified": True}]):
+            with self.assertRaisesRegex(ValueError, "Source identity changed"):
+                self.verify()
+
+    def test_selected_cpu_execution_fields_must_match_snapshot(self):
+        self.create_origin()
+        original = deepcopy(self.document)
+        for key in ("sourceJobId", "observedJobId", "artifactId", "sourceAttempt", "artifactDigest", "artifactName"):
+            with self.subTest(key=key):
+                self.document = deepcopy(original)
+                value = self.document["selected"][key]
+                self.document["selected"][key] = value + 1 if type(value) is int else value + "changed"
+                self.save()
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    self.verify()
+
+    def test_non_cpu_latest_failure_cannot_be_ignored(self):
+        self.create_origin()
+        collected = release.read_json(self.origin / "github.json")
+        collected["jobs"][-1]["conclusion"] = "failure"
+        self.replace_snapshot(collected)
+        with self.assertRaisesRegex(ValueError, "Latest native job"):
+            self.verify()
+
+    def test_non_cpu_missing_job_or_artifact_invalidates_subset(self):
+        self.create_origin()
+        original = release.read_json(self.origin / "github.json")
+        for key in ("jobs", "artifacts"):
+            with self.subTest(key=key):
+                collected = deepcopy(original)
+                collected[key].pop()
+                self.replace_snapshot(collected)
+                with self.assertRaisesRegex(ValueError, "selection failed"):
+                    self.verify()
+
+    def test_saved_selection_and_exclusions_must_equal_replay(self):
+        self.create_origin()
+        original = release.read_json(self.origin / "github.json")
+        for field in ("selected", "excluded"):
+            with self.subTest(field=field):
+                collected = deepcopy(original)
+                if field == "selected":
+                    collected["selection"][field].pop("macos-arm64-metal")
+                else:
+                    collected["selection"][field].append({"artifactId": 9999})
+                self.replace_snapshot(collected)
+                with self.assertRaisesRegex(ValueError, "complete execution history"):
+                    self.verify()
+
+    def test_copied_cpu_job_retains_original_attempt_package(self):
+        self.api.run["run_attempt"] = self.api.attempt["run_attempt"] = 2
+        for index, job in enumerate(deepcopy(self.api.jobs), 101):
+            job.update(id=index, run_attempt=2, created_at="2026-01-01T03:00:00Z")
+            self.api.jobs.append(job)
+        self.create_origin(attempt=2)
+        result = self.verify()
+        self.assertEqual(result["requestedAttempt"], 2)
+        self.assertEqual(result["selected"]["sourceAttempt"], 1)
+        self.assertEqual(result["selected"]["sourceJobId"], 1)
+        self.assertEqual(result["selected"]["observedJobId"], 101)
+        self.assertIn("-attempt1.zip", result["package"]["filename"])
+
+    def test_snapshot_context_candidate_repository_workflow_must_match(self):
+        self.create_origin()
+        original = release.read_json(self.origin / "github.json")
+        for scope, key, value in (("run", "head_sha", "9" * 40), ("run", "run_attempt", 2),
+                                  ("attempt", "conclusion", "failure"), ("workflow", "path", "other.yml"),
+                                  ("repository", "full_name", "another/repository")):
+            with self.subTest(scope=scope, key=key):
+                collected = deepcopy(original)
+                collected["context"][scope][key] = value
+                self.replace_snapshot(collected)
+                with self.assertRaises(ValueError):
+                    self.verify()
+
+    def test_each_bound_file_mutation_rejected(self):
+        self.create_origin()
+        for key in ("githubSnapshot", "artifact", "package"):
+            with self.subTest(key=key):
+                path = self.origin / self.document[key]["path"]
+                content = path.read_bytes()
+                path.write_bytes(content + b"changed")
+                with self.assertRaisesRegex(ValueError, "file bytes changed"):
+                    self.verify()
+                path.write_bytes(content)
+
+    def test_rewritten_package_manifest_cannot_replace_artifact_member(self):
+        self.create_origin()
+        package = self.origin / self.document["package"]["path"]
+        package.write_bytes(b"self-consistent substituted ZIP")
+        self.document["package"] = release.record(self.origin, package, filename=package.name)
+        self.save()
+        with self.assertRaisesRegex(ValueError, "original artifact member"):
+            self.verify()
+
+    def test_rewritten_artifact_record_cannot_replace_github_digest(self):
+        self.create_origin()
+        artifact = self.origin / self.document["artifact"]["path"]
+        artifact.write_bytes(artifact.read_bytes() + b"changed")
+        self.document["artifact"] = release.record(self.origin, artifact, digest="sha256:" + release.digest(artifact))
+        self.save()
+        with self.assertRaisesRegex(ValueError, "digest differs from GitHub"):
+            self.verify()
+
+    def test_artifact_digest_declaration_must_equal_selected_digest(self):
+        self.create_origin()
+        self.document["artifact"]["digest"] = "sha256:" + "9" * 64
+        self.save()
+        with self.assertRaisesRegex(ValueError, "digest differs from GitHub"):
+            self.verify()
+
+    def test_missing_installer_extra_package_and_case_duplicate_rejected(self):
+        self.create_origin()
+        original = deepcopy(self.document)
+        snapshot = release.read_json(self.origin / "github.json")
+        artifact = self.origin / self.document["artifact"]["path"]
+        names = sorted(release.package_names(release.CPU_VARIANT, self.document["version"], CANDIDATE, 1))
+        for members in ([names[1]], [*names, "report.json"], [*names, names[1].upper()], [*names, "../outside"]):
+            with self.subTest(members=members):
+                self.document = deepcopy(original)
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    for name in members:
+                        archive.writestr(name, b"SYNTHETIC USER PACKAGE: " + name.encode())
+                value = "sha256:" + release.digest(artifact)
+                collected = deepcopy(snapshot)
+                collected["artifacts"][0]["digest"] = value
+                collected["selection"]["selected"][release.CPU_VARIANT]["artifactDigest"] = value
+                self.document["selected"]["artifactDigest"] = value
+                self.document["artifact"] = release.record(self.origin, artifact, digest=value)
+                self.replace_snapshot(collected)
+                with self.assertRaisesRegex(ValueError, "extra user packages"):
+                    self.verify()
+
+    def test_extra_file_and_empty_directory_are_rejected(self):
+        self.create_origin()
+        extra = self.origin / "extra"
+        extra.write_text("unexpected")
+        with self.assertRaisesRegex(ValueError, "extra files"):
+            self.verify()
+        extra.unlink()
+        extra.mkdir()
+        with self.assertRaisesRegex(ValueError, "unexpected directories"):
+            self.verify()
+
+    def test_root_or_parent_reparse_point_is_rejected(self):
+        self.create_origin()
+        original = release.redirected
+        for redirected_root in (self.origin, self.origin.parent):
+            with self.subTest(path=redirected_root), \
+                    mock.patch.object(release, "redirected", side_effect=lambda path: path == redirected_root or original(path)):
+                with self.assertRaisesRegex(ValueError, "links or junctions"):
+                    self.verify()
+
+    def test_inner_reparse_point_is_rejected(self):
+        self.create_origin()
+        original = release.redirected
+        target = self.origin / "package"
+        with mock.patch.object(release, "redirected", side_effect=lambda path: path == target or original(path)):
+            with self.assertRaisesRegex(ValueError, "links or junctions"):
+                self.verify()
+
+    def test_path_traversal_or_alias_in_record_is_rejected(self):
+        self.create_origin()
+        original = deepcopy(self.document)
+        for key in ("githubSnapshot", "artifact", "package"):
+            for path in ("../outside", "C:/outside", "package/../github.json", "package\\file", "/outside"):
+                with self.subTest(key=key, path=path):
+                    self.document = deepcopy(original)
+                    self.document[key]["path"] = path
+                    self.save()
+                    with self.assertRaisesRegex(ValueError, "identity or path"):
+                        self.verify()
+
+    def test_saved_origin_must_match_supplied_document(self):
+        self.create_origin()
+        path = self.origin / release.CI_CPU_ORIGIN
+        saved = deepcopy(self.document)
+        saved["runId"] = "999"
+        release.write_json(path, saved)
+        with self.assertRaisesRegex(ValueError, "saved bytes"):
+            self.verify()
+
+    def test_schema_and_numeric_booleans_are_rejected(self):
+        self.create_origin()
+        original = deepcopy(self.document)
+        for key in ("schemaVersion", "requestedAttempt"):
+            with self.subTest(key=key):
+                self.document = deepcopy(original)
+                self.document[key] = True
+                self.save()
+                with self.assertRaises(ValueError):
+                    self.verify()
+        self.document = deepcopy(original)
+        self.document["package"]["bytes"] = True
+        self.save()
+        with self.assertRaisesRegex(ValueError, "identity or path"):
+            self.verify()
+        for key in ("sourceAttempt", "sourceJobId", "observedJobId", "artifactId"):
+            with self.subTest(key=key):
+                self.document = deepcopy(original)
+                self.document["selected"][key] = True
+                self.save()
+                with self.assertRaisesRegex(ValueError, "object ID"):
+                    self.verify()
+
+    def test_malformed_documents_and_snapshot_fail_with_validation_error(self):
+        self.create_origin()
+        original = deepcopy(self.document)
+        for bad in (None, [], {}, {**original, "selected": []}, {**original, "githubSnapshot": []},
+                    {**original, "identity": None}, {**original, "package": {}}):
+            with self.subTest(document=bad):
+                with self.assertRaises(ValueError):
+                    release.verify_ci_cpu_origin(self.origin, bad, release.SOURCE)
+        snapshot = release.read_json(self.origin / "github.json")
+        for bad in (None, [], {}, {**snapshot, "context": []}):
+            with self.subTest(snapshot=bad):
+                self.replace_snapshot(bad)
+                with self.assertRaises(ValueError):
+                    self.verify()
+
+
 class PackageArchiveTests(ExternalTest):
     def archive(self, names):
         path = self.root / "artifact.zip"

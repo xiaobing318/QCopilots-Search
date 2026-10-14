@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record real Windows CU evidence. Never launches or controls an application.
 
-Requires a package build record made when the frozen candidate was built.
+Requires a frozen package candidate with verified local-build or CI provenance.
 It checks evidence integrity, not whether operator descriptions are truthful.
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -306,7 +307,7 @@ def fingerprints(source):
 
 def verify_binaries(package, app_dir, candidate):
     if sha(package) != candidate["packageSha256"]:
-        raise ValueError("Candidate package SHA differs from its build record")
+        raise ValueError("Candidate package SHA differs from its provenance record")
     executables = candidate["executables"]
     if set(executables) != set(NAMES):
         raise ValueError("Exactly four named QCopilots executables are required")
@@ -325,29 +326,60 @@ def verify_binaries(package, app_dir, candidate):
                     hasher.update(data)
             actual = hasher.hexdigest()
             path = Path(app_dir) / (name + ".exe")
-            if actual != executables[name]["sha256"] or sha(path) != actual:
-                raise ValueError(f"Build record, package and extracted executable disagree: {name}")
+            if (actual != executables[name]["sha256"] or sha(path) != actual
+                    or executables[name].get("packageMember", member.filename) != member.filename
+                    or path.stat().st_size != member.file_size):
+                raise ValueError(f"Candidate record, package and extracted executable disagree: {name}")
             result[name] = {"sha256": actual, "bytes": path.stat().st_size,
                             "packageMember": member.filename, "absolutePath": str(path.resolve())}
     return result
 
 
+def release_evidence():
+    spec = importlib.util.spec_from_file_location(
+        "qcs_cu_candidate_evidence", Path(__file__).resolve().parents[1] / "qcs-release-evidence.py")
+    evidence = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evidence)
+    return evidence
+
+
+def inspect_package_candidate(path, candidate):
+    """Use the release consumer's full source-specific contract before any CU."""
+    evidence = release_evidence()
+    errors = evidence.inspect_candidate(Path(path).resolve().parent, candidate)
+    if errors:
+        raise ValueError("Candidate provenance validation failed: " + "; ".join(errors))
+
+
+def copy_candidate_file(source, destination, expected_sha256, expected_bytes=None):
+    shutil.copyfile(source, destination)
+    if (sha(destination) != expected_sha256 or sha(source) != expected_sha256
+            or (expected_bytes is not None and Path(destination).stat().st_size != expected_bytes)):
+        raise ValueError("Candidate evidence changed while being captured")
+
+
 def initialize(args):
+    candidate_sha256 = sha(args.candidate_record)
     candidate = read(args.candidate_record)
+    if sha(args.candidate_record) != candidate_sha256:
+        raise ValueError("Candidate record changed while being read")
     if candidate.get("kind") != "package-candidate" or candidate.get("schemaVersion") != 1:
-        raise ValueError("Requires a schemaVersion 1 package-candidate build record, not a historical CU report")
+        raise ValueError("Requires a schemaVersion 1 package-candidate record, not a historical CU report")
     expected_identity = candidate["identity"]
     actual_identity = identity(args.source, expected_identity["candidateHead"])
     if expected_identity != actual_identity:
         raise ValueError("Build-time identity differs from the clean candidate source")
-    if not isinstance(candidate.get("buildProvenance"), dict) or not candidate.get("recordedAt"):
-        raise ValueError("Build record must retain its original buildProvenance and recordedAt")
-    provenance = candidate["buildProvenance"]
+    origins = [name for name in ("buildProvenance", "ciProvenance") if name in candidate]
+    if (len(origins) != 1 or not isinstance(candidate[origins[0]], dict)
+            or not candidate.get("recordedAt")):
+        raise ValueError("Candidate must retain exactly one original provenance and recordedAt")
+    inspect_package_candidate(args.candidate_record, candidate)
+    provenance = candidate[origins[0]]
     provenance_file = safe(args.candidate_record.resolve().parent, provenance["path"])
     if sha(provenance_file) != provenance["sha256"]:
-        raise ValueError("Candidate build provenance hash mismatch")
+        raise ValueError("Candidate provenance hash mismatch")
     if instant(candidate["recordedAt"]) > instant(now()):
-        raise ValueError("Build record is dated in the future")
+        raise ValueError("Candidate record is dated in the future")
     contracts = fingerprints(args.source)
     if any(candidate.get(key) != value for key, value in contracts.items()):
         raise ValueError("Candidate model/extraction contract fingerprints do not match its source")
@@ -363,17 +395,19 @@ def initialize(args):
     root = Path(tempfile.mkdtemp(prefix="qcs-cu-run-", dir=parent))
     for folder in ("inputs", "evidence", "profile", "models", "samples", "exports"):
         (root / folder).mkdir()
-    shutil.copyfile(args.candidate_record, root / "inputs/package-candidate.json")
-    shutil.copyfile(provenance_file, root / "inputs/package-build-provenance.json")
-    retained_provenance = [{"sourcePath": str(provenance_file), "sha256": provenance["sha256"], "retainedPath": "inputs/package-build-provenance.json"}]
+    copy_candidate_file(args.candidate_record, root / "inputs/package-candidate.json", candidate_sha256)
+    provenance_name = "package-ci-provenance.json" if origins[0] == "ciProvenance" else "package-build-provenance.json"
+    retained_path = "inputs/" + provenance_name
+    copy_candidate_file(provenance_file, root / retained_path, provenance["sha256"])
+    retained_provenance = [{"sourcePath": str(provenance_file), "sha256": provenance["sha256"], "retainedPath": retained_path}]
     for item in candidate.get("files", []):
         original = check_record(args.candidate_record.resolve().parent, item)
-        if original.resolve() == args.package.resolve():
+        if item["path"] == candidate.get("package") or original.resolve() == args.package.resolve():
             # The final release importer retains the large ZIP once in its package bundle.
             continue
         destination = safe(root, "inputs/package-evidence/" + item["path"], exists=False)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(original, destination)
+        copy_candidate_file(original, destination, item["sha256"], item["bytes"])
         retained_provenance.append({"sourcePath": str(original), "sha256": item["sha256"], "retainedPath": destination.relative_to(root).as_posix()})
     shutil.copyfile(__file__, root / "inputs/qcs-cu-recorder.py")
     tracked = subprocess.check_output(["git", "-C", str(source), "ls-files", "-z"], encoding="utf-8").split("\0")
@@ -381,15 +415,21 @@ def initialize(args):
     write(root / "inputs/source-manifest.json", {"identity": actual_identity, "files": source_files}, exclusive=True)
     if args.fixture_manifest:
         shutil.copyfile(args.fixture_manifest, root / "inputs/fixture-source-manifest.json")
+    if (sha(args.candidate_record) != candidate_sha256
+            or identity(args.source, expected_identity["candidateHead"]) != actual_identity
+            or verify_binaries(args.package, args.app_dir, candidate) != executable_records):
+        raise ValueError("Candidate source, record or binaries changed while initializing CU")
     state = {"schemaVersion": 1, "kind": "qcopilots-search-cu-run", "runId": str(uuid.uuid4()),
              "startedAt": now(), "identity": actual_identity, "source": str(source),
+             "candidateRecordPath": str(args.candidate_record.resolve()),
+             "candidateRecordSha256": candidate_sha256,
              "packagePath": str(args.package.resolve()), "packageSha256": candidate["packageSha256"],
              "appDirectory": str(args.app_dir.resolve()), "executables": candidate["executables"],
              "verifiedExecutables": executable_records, **contracts,
              "profileRoot": str(root / "profile"), "modelDirectory": str(root / "models"),
              "samplesDirectory": str(root / "samples"), "platform": native_platform,
              "candidateProvenance": retained_provenance,
-             "fingerprintOrigin": "Build record verified against the exact clean source contracts. Not a runtime status observation.",
+             "fingerprintOrigin": "Candidate provenance verified against the exact clean source contracts. Not a runtime status observation.",
              "inputs": [record(root, path) for path in sorted((root / "inputs").rglob("*")) if path.is_file()]}
     write(root / "run.json", state, exclusive=True)
     print(json.dumps({"runRoot": str(root), "profileRoot": state["profileRoot"], "modelDirectory": state["modelDirectory"], "passed": False, "status": "initialized_no_ui_operations"}, ensure_ascii=False))
@@ -404,6 +444,17 @@ def load_run(root, *, verify=True):
         for item in state["inputs"]:
             check_record(root, item)
         candidate = read(root / "inputs/package-candidate.json")
+        for key in ("identity", "packageSha256", "executables", "modelFingerprint", "extractionFingerprint"):
+            if candidate.get(key) != state.get(key):
+                raise ValueError("Run differs from its frozen candidate: " + key)
+        if "candidateRecordPath" in state:
+            original = external_evidence_file(Path(state["candidateRecordPath"]))
+            expected = state["candidateRecordSha256"]
+            if sha(original) != expected or sha(root / "inputs/package-candidate.json") != expected:
+                raise ValueError("Original candidate record changed during CU run")
+            inspect_package_candidate(original, candidate)
+        elif "ciProvenance" in candidate:
+            raise ValueError("CI candidate run is missing its original provenance binding")
         if identity(state["source"], state["identity"]["candidateHead"]) != state["identity"]:
             raise ValueError("Source identity changed during CU run")
         current = verify_binaries(state["packagePath"], state["appDirectory"], candidate)
@@ -602,7 +653,8 @@ def main(argv=None):
             stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    init = commands.add_parser("init", help="Verify one frozen package and create empty isolated runtime directories")
+    init = commands.add_parser("init", help="Verify one frozen package and create empty isolated runtime directories",
+        description="The original frozen candidate directory and package must remain available and unchanged throughout this CU run.")
     for name in ("candidate-record", "package", "app-dir", "source", "run-parent"):
         init.add_argument("--" + name, required=True, type=Path)
     init.add_argument("--fixture-manifest", type=Path)

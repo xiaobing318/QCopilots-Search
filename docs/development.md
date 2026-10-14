@@ -95,6 +95,8 @@ $variant = 'windows-x64-cpu'
 
 `verify-package` 使用最终包内的 worker 执行真实文字、图片与音频编码，并由包内服务执行语义搜索。它需要完整、校验通过的模型。独立 `--keyword-only` 仅用于排查，没有完整模型验证的报告不能成为最终包验收。
 
+本机 `check` 的包记录证明本机流程通过，相同源码提交的 CI 包仍可能具有不同字节。正式 Windows 操作验收必须等待同一候选的 11 变体 CI 通过并完成 `release-prepare`，对冻结 manifest 中的 Windows CPU ZIP 重新执行完整 `verify-package`，然后通过 `record-ci-package`、CU-01 至 CU-10 和 `validate-local --release-manifest` 绑定来源与实际包。不能复用本地重建包的验证报告，命令见 [候选验收运行器](../tools/acceptance/README.md)。
+
 ## 直接使用 CMake
 
 可设置 `QCOPILOTS_SEARCH_BUILD_ROOT`、`QCOPILOTS_SEARCH_QT_PREFIX` 和 `QCOPILOTS_SEARCH_VARIANT` 后使用 `qcs-release` 或 `qcs-debug` preset。Qt prefix 指向具体 kit，与开发入口的 Qt SDK 根不同。两个测试 preset 都执行完整注册清单，直接 CTest 也需要准备模型和测试依赖。

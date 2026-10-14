@@ -5,9 +5,11 @@ These documents are test inputs, never application acceptance reports. No model,
 application process, source-tree temporary directory, or developer profile is used.
 """
 import base64
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 import hashlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -1577,6 +1579,378 @@ class ExecutionProvenanceTests(unittest.TestCase):
         path, receipt = self.build()
         self.assertFalse(receipt["passed"])
         self.assertTrue(evidence.verified_build(path.parent, receipt))
+
+
+class CiOriginEvidenceTests(unittest.TestCase):
+    """Synthetic package/CU contracts, never application or UI acceptance."""
+
+    setUp = ExecutionProvenanceTests.setUp
+    git = ExecutionProvenanceTests.git
+    build = ExecutionProvenanceTests.build
+    candidate = ExecutionProvenanceTests.candidate
+
+    def frozen_ci(self, candidate_path, candidate, *, package_comment=None):
+        """Use the real eleven-configuration freeze, replacing only source generation."""
+        spec = importlib.util.spec_from_file_location("qcs_synthetic_release_fixture",
+            Path(__file__).resolve().parents[2] / "tools/qcs-test-release.py")
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        fixture.CANDIDATE = candidate["identity"]["candidateHead"]
+        release = fixture.release
+        api = fixture.FakeCI()
+        package = candidate_path.parent / candidate["package"]
+        package_bytes = package.read_bytes()
+        if package_comment is not None:
+            modified = io.BytesIO(package_bytes)
+            with zipfile.ZipFile(modified, "a") as archive:
+                archive.comment = package_comment
+            package_bytes = modified.getvalue()
+        selected = next(item for item in api.artifacts
+                        if "windows-x64-cpu-" in item["name"])
+        with zipfile.ZipFile(io.BytesIO(api.downloads[selected["id"]])) as archive:
+            members = {item.filename: archive.read(item) for item in archive.infolist()}
+        cpu_name = next(name for name in members if name.endswith(".zip"))
+        members[cpu_name] = package_bytes
+        artifact = io.BytesIO()
+        with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name, data in members.items():
+                archive.writestr(name, data)
+        api.downloads[selected["id"]] = artifact.getvalue()
+        selected["digest"] = "sha256:" + hashlib.sha256(artifact.getvalue()).hexdigest()
+        source_bundle = self.root / f"qcs-source-materials-{fixture.CANDIDATE[:12]}.zip"
+        source_bundle.write_bytes(b"SYNTHETIC SOURCE GENERATION BOUNDARY, NOT RELEASE SOURCES")
+        for patch in (mock.patch.object(release, "identity_for", return_value=candidate["identity"]),
+                      mock.patch.object(release, "build_sources", return_value=source_bundle),
+                      mock.patch.object(release, "validate_sources")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        manifest = release.prepare(release.SOURCE, fixture.CANDIDATE, "123", 1,
+            self.root / "synthetic frozen CI release", api=api)
+        document = release.verify_freeze(manifest, release.SOURCE)
+        self.assertEqual(len(document["configurations"]), 11)
+        self.assertEqual(sum(item["role"] == "user-package" for item in document["assets"]), 21)
+        frozen_package = manifest.parent / "assets" / cpu_name
+        self.assertEqual(frozen_package.read_bytes(), package_bytes)
+        report_root = self.root / "synthetic CI verification"
+        application = report_root / "synthetic application"
+        application.mkdir(parents=True)
+        with zipfile.ZipFile(frozen_package) as archive:
+            archive.extractall(application)
+        report = package_release_fixture(report_root,
+            worker=application / "bin/qcs-worker.exe", application_root=application)
+        report.update({"commit": fixture.CANDIDATE, "workingTreeModified": False,
+            "packageSha256": evidence.digest(frozen_package),
+            "checks": [{"name": f"synthetic-validator-{number}", "passed": True} for number in range(9)]})
+        report["buildIdentity"]["candidateCommit"] = fixture.CANDIDATE
+        write_program_inventory(report_root, report)
+        verification = report_root / "synthetic-package-verification.json"
+        evidence.write_json(verification, report)
+        self.assertEqual(evidence.validate_package_release(report, report_root,
+            package_sha256=evidence.digest(frozen_package)), [])
+        return release, manifest, verification
+
+    def ci_candidate(self):
+        """Capture through the official bridge with real frozen artifact bytes."""
+        local_path, local = self.candidate()
+        release, manifest, verification = self.frozen_ci(local_path, local)
+        patch = mock.patch.object(evidence, "release_module", return_value=release)
+        patch.start()
+        self.addCleanup(patch.stop)
+        path, candidate = evidence.record_ci_package(manifest, verification,
+            self.root / "recorded CI candidates", local["modelFingerprint"], local["extractionFingerprint"])
+        return path, candidate, release, manifest, verification
+
+    def rebind_candidate_files(self, root, candidate):
+        candidate["files"] = [evidence.file_record(root, root / entry["path"])
+                              for entry in candidate["files"]]
+
+    def local_evidence(self, candidate_path, candidate):
+        """Bind test-only pixel and operation text to the supplied actual ZIP."""
+        root = self.root / "synthetic computer-use validator input"
+        root.mkdir()
+        picture = root / "SYNTHETIC-validator-pixel.png"
+        picture.write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jR1cAAAAASUVORK5CYII="))
+        operation = root / "SYNTHETIC-validator-operation.log"
+        operation.write_text("Synthetic validator input only. No UI operation occurred.\n", encoding="utf-8")
+        document = {"schemaVersion": 1, "kind": "windows-computer-use", "passed": True,
+            "syntheticValidatorFixture": True, "identity": deepcopy(candidate["identity"]),
+            "commit": candidate["identity"]["checkoutCommit"],
+            "packageSha256": candidate["packageSha256"],
+            "modelFingerprint": candidate["modelFingerprint"],
+            "extractionFingerprint": candidate["extractionFingerprint"],
+            "executables": deepcopy(candidate["executables"]),
+            "startedAt": "2026-01-01T00:00:00Z", "finishedAt": "2026-01-01T00:30:00Z",
+            "scenarios": [{"id": f"CU-{number:02}", "status": "passed",
+                "expected": "Synthetic schema expectation, no application run",
+                "actual": "Synthetic schema observation, no application run",
+                "actions": ["Synthetic validator action, no UI operation"],
+                "packageSha256": candidate["packageSha256"],
+                "executables": deepcopy(candidate["executables"]),
+                "startedAt": f"2026-01-01T00:{number:02}:00Z",
+                "finishedAt": f"2026-01-01T00:{number:02}:30Z",
+                "screenshots": [picture.name], "operationLog": operation.name}
+                for number in range(1, 11)],
+            "files": [evidence.file_record(root, picture), evidence.file_record(root, operation)]}
+        report = root / "SYNTHETIC-computer-use.json"
+        evidence.write_json(report, document)
+        self.assertEqual(evidence.validate_cu(document, root, identity=candidate["identity"],
+            package_sha256=candidate["packageSha256"], model_fingerprint=candidate["modelFingerprint"]), [])
+        manifest, _ = evidence.collect_local({"candidate": candidate_path, "computerUse": report},
+                                             self.root / "synthetic local evidence")
+        return manifest.parent
+
+    def test_existing_local_build_candidate_remains_valid_without_release_comparison(self):
+        path, candidate = self.candidate()
+        root = self.local_evidence(path, candidate)
+        result = evidence.local_preflight(root, candidate["identity"]["candidateHead"])
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertTrue(result["localGates"]["candidate"]["passed"])
+        self.assertTrue(result["localGates"]["computerUse"]["passed"])
+
+    def test_recorded_ci_origin_contains_real_selected_zip_and_independent_program_inventory(self):
+        path, candidate, release, manifest, verification = self.ci_candidate()
+        self.assertNotIn("buildProvenance", candidate)
+        self.assertEqual(candidate["kind"], "package-candidate")
+        self.assertEqual(evidence.inspect_candidate(path.parent, candidate), [])
+        origin_path = path.parent / candidate["ciProvenance"]["path"]
+        self.assertEqual(evidence.digest(origin_path), candidate["ciProvenance"]["sha256"])
+        origin = evidence.read_json(origin_path)
+        self.assertEqual(origin["kind"], "ci-cpu-package-origin")
+        self.assertEqual(origin["variant"], "windows-x64-cpu")
+        selected = release.verify_frozen_cpu_package(manifest, release.SOURCE)
+        self.assertEqual(origin["selected"], selected["selected"])
+        self.assertEqual((path.parent / candidate["package"]).read_bytes(), selected["package"]["path"].read_bytes())
+        self.assertEqual(set(candidate["executables"]), evidence.APPLICATIONS)
+        self.assertEqual(evidence.read_json(verification)["packageSha256"], candidate["packageSha256"])
+
+    def test_ci_package_and_cu_bind_the_same_final_release_zip(self):
+        path, candidate, release, manifest, _ = self.ci_candidate()
+        local = self.local_evidence(path, candidate)
+        result = evidence.local_preflight(local, candidate["identity"]["candidateHead"], manifest)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["scope"], "final-release-package")
+        gate = result["localGates"]["finalReleasePackage"]
+        self.assertTrue(gate["passed"], gate["errors"])
+        self.assertEqual(gate["packageSha256"], candidate["packageSha256"])
+        self.assertEqual(gate["releaseManifestSha256"], evidence.digest(manifest))
+
+    def test_local_build_origin_can_match_the_exact_same_ci_zip(self):
+        path, candidate = self.candidate()
+        release, manifest, _ = self.frozen_ci(path, candidate)
+        local = self.local_evidence(path, candidate)
+        with mock.patch.object(evidence, "release_module", return_value=release):
+            result = evidence.local_preflight(local, candidate["identity"]["candidateHead"], manifest)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertTrue(result["localGates"]["finalReleasePackage"]["passed"])
+
+    def test_same_commit_and_four_programs_cannot_substitute_a_different_zip_for_ci(self):
+        path, candidate = self.candidate()
+        release, manifest, _ = self.frozen_ci(path, candidate,
+            package_comment=b"SYNTHETIC second archive of identical executable bytes")
+        selected = release.verify_frozen_cpu_package(manifest, release.SOURCE)
+        self.assertNotEqual(selected["package"]["sha256"], candidate["packageSha256"])
+        with zipfile.ZipFile(selected["package"]["path"]) as archive:
+            for program in candidate["executables"].values():
+                self.assertEqual(hashlib.sha256(archive.read(program["packageMember"])).hexdigest(), program["sha256"])
+        local = self.local_evidence(path, candidate)
+        self.assertTrue(evidence.local_preflight(local, candidate["identity"]["candidateHead"])["passed"])
+        with mock.patch.object(evidence, "release_module", return_value=release):
+            result = evidence.local_preflight(local, candidate["identity"]["candidateHead"], manifest)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["localGates"]["candidate"]["passed"])
+        self.assertTrue(result["localGates"]["computerUse"]["passed"])
+        self.assertFalse(result["localGates"]["finalReleasePackage"]["passed"])
+
+    def test_candidate_requires_exactly_one_local_or_ci_origin(self):
+        path, candidate, _, _, _ = self.ci_candidate()
+        for mutation in ("both", "neither", "null-local", "null-ci"):
+            with self.subTest(mutation=mutation):
+                changed = deepcopy(candidate)
+                if mutation == "both":
+                    changed["buildProvenance"] = deepcopy(changed["ciProvenance"])
+                elif mutation == "neither":
+                    changed.pop("ciProvenance")
+                elif mutation == "null-local":
+                    changed["buildProvenance"] = None
+                else:
+                    changed["ciProvenance"] = None
+                self.assertTrue(evidence.inspect_candidate(path.parent, changed))
+
+    def test_ci_origin_hash_and_every_raw_source_file_are_content_bound(self):
+        path, candidate, _, _, _ = self.ci_candidate()
+        stale = deepcopy(candidate)
+        stale["ciProvenance"]["sha256"] = "0" * 64
+        self.assertTrue(evidence.inspect_candidate(path.parent, stale))
+        for entry in candidate["files"]:
+            if not entry["path"].startswith("ci/"):
+                continue
+            with self.subTest(unbound=entry["path"]):
+                changed = deepcopy(candidate)
+                changed["files"] = [item for item in changed["files"] if item["path"] != entry["path"]]
+                self.assertTrue(evidence.inspect_candidate(path.parent, changed))
+
+    def test_record_ci_package_rejects_stale_or_unsuccessful_verification(self):
+        _, candidate, _, manifest, verification = self.ci_candidate()
+        original = evidence.read_json(verification)
+        for field, value in (("commit", "0" * 40), ("packageSha256", "0" * 64),
+                             ("workingTreeModified", True), ("passed", False)):
+            with self.subTest(field=field):
+                changed = deepcopy(original)
+                changed[field] = value
+                evidence.write_json(verification, changed)
+                with self.assertRaises(ValueError):
+                    evidence.record_ci_package(manifest, verification, self.root / "rejected CI candidates",
+                        candidate["modelFingerprint"], candidate["extractionFingerprint"])
+        evidence.write_json(verification, original)
+
+    def test_rehashed_ci_origin_still_requires_original_workflow_artifact_and_candidate(self):
+        path, candidate, _, _, _ = self.ci_candidate()
+        origin_path = path.parent / candidate["ciProvenance"]["path"]
+        original = evidence.read_json(origin_path)
+        changes = (("repository", "another/repository"), ("variant", "windows-x64-vulkan"),
+                   ("runId", "999"), ("requestedAttempt", 2),
+                   ("identity", {**original["identity"], "candidateHead": "0" * 40}),
+                   ("identity", {**original["identity"], "candidateHead": "0" * 40,
+                                 "checkoutCommit": "0" * 40}),
+                   ("selected", {**original["selected"], "artifactId": 99999}),
+                   ("selected", {**original["selected"], "sourceJobId": 99999}),
+                   ("artifact", {**original["artifact"], "digest": "sha256:" + "0" * 64}))
+        for field, value in changes:
+            with self.subTest(field=field, value=value):
+                changed_origin = deepcopy(original)
+                changed_origin[field] = value
+                evidence.write_json(origin_path, changed_origin)
+                changed_candidate = deepcopy(candidate)
+                changed_candidate["ciProvenance"]["sha256"] = evidence.digest(origin_path)
+                self.rebind_candidate_files(path.parent, changed_candidate)
+                self.assertEqual(evidence.verify_manifest(path.parent, changed_candidate), [])
+                self.assertTrue(evidence.inspect_candidate(path.parent, changed_candidate))
+        evidence.write_json(origin_path, original)
+
+    def test_frozen_ci_byte_changes_fail_capture_and_final_preflight(self):
+        path, candidate, release, manifest, verification = self.ci_candidate()
+        local = self.local_evidence(path, candidate)
+        selected = release.verify_frozen_cpu_package(manifest, release.SOURCE)
+        package = selected["package"]["path"]
+        package.write_bytes(package.read_bytes() + b"SYNTHETIC mutation after freeze")
+        with self.assertRaises(ValueError):
+            evidence.record_ci_package(manifest, verification, self.root / "rejected changed freeze",
+                candidate["modelFingerprint"], candidate["extractionFingerprint"])
+        result = evidence.local_preflight(local, candidate["identity"]["candidateHead"], manifest)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["localGates"]["finalReleasePackage"]["passed"])
+        self.assertEqual(evidence.inspect_candidate(path.parent, candidate), [])
+
+    def test_all_four_programs_remain_bound_to_ci_when_local_metadata_is_rehashed(self):
+        _, original, _, manifest, verification = self.ci_candidate()
+        for name in sorted(evidence.APPLICATIONS):
+            with self.subTest(program=name):
+                path, candidate = evidence.record_ci_package(manifest, verification,
+                    self.root / "mutated program candidates", original["modelFingerprint"],
+                    original["extractionFingerprint"])
+                root = path.parent
+                package = root / candidate["package"]
+                member = candidate["executables"][name]["packageMember"]
+                with zipfile.ZipFile(package) as archive:
+                    members = {entry.filename: archive.read(entry) for entry in archive.infolist()}
+                members[member] += b" SYNTHETIC PROGRAM REPLACEMENT AFTER CI CAPTURE"
+                with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_STORED) as archive:
+                    for relative, payload in members.items():
+                        archive.writestr(relative, payload)
+                program_hash = hashlib.sha256(members[member]).hexdigest()
+                package_hash = evidence.digest(package)
+                candidate["packageSha256"] = package_hash
+                candidate["executables"][name]["sha256"] = program_hash
+                report_path = root / candidate["verification"]
+                report = evidence.read_json(report_path)
+                report["packageSha256"] = package_hash
+                inventory_path = root / report["programInventory"]["path"]
+                inventory = evidence.read_json(inventory_path)
+                inventory["packageSha256"] = package_hash
+                inventory["programs"][name].update(bytes=len(members[member]), sha256=program_hash)
+                evidence.write_json(inventory_path, inventory)
+                report["programInventory"]["sha256"] = evidence.digest(inventory_path)
+                if name == "qcs-worker":
+                    report["modelSmoke"]["runtime"]["workerExecutable"].update(
+                        bytes=len(members[member]), sha256=program_hash)
+                evidence.write_json(report_path, report)
+                origin_path = root / candidate["ciProvenance"]["path"]
+                origin = evidence.read_json(origin_path)
+                origin["package"].update(bytes=package.stat().st_size, sha256=package_hash)
+                evidence.write_json(origin_path, origin)
+                candidate["ciProvenance"]["sha256"] = evidence.digest(origin_path)
+                self.rebind_candidate_files(root, candidate)
+                self.assertEqual(evidence.verify_manifest(root, candidate), [])
+                self.assertEqual(evidence.validate_package_release(report, root,
+                    package_sha256=package_hash), [])
+                errors = evidence.inspect_candidate(root, candidate)
+                self.assertTrue(any("CI CPU portable ZIP differs from its original artifact member" in error
+                                    for error in errors), errors)
+
+    def test_record_ci_rejects_rehashed_final_inventory_different_from_selected_zip(self):
+        _, candidate, _, manifest, verification = self.ci_candidate()
+        original = evidence.read_json(verification)
+        inventory_path = verification.parent / original["programInventory"]["path"]
+        original_inventory = evidence.read_json(inventory_path)
+        for name in sorted(evidence.APPLICATIONS):
+            with self.subTest(program=name):
+                report, inventory = deepcopy(original), deepcopy(original_inventory)
+                inventory["programs"][name]["sha256"] = "0" * 64
+                evidence.write_json(inventory_path, inventory)
+                report["programInventory"]["sha256"] = evidence.digest(inventory_path)
+                if name == "qcs-worker":
+                    report["modelSmoke"]["runtime"]["workerExecutable"]["sha256"] = "0" * 64
+                evidence.write_json(verification, report)
+                self.assertEqual(evidence.validate_package_release(report, verification.parent,
+                    package_sha256=candidate["packageSha256"]), [])
+                with self.assertRaises(ValueError):
+                    evidence.record_ci_package(manifest, verification,
+                        self.root / "rejected program inventories", candidate["modelFingerprint"],
+                        candidate["extractionFingerprint"])
+        evidence.write_json(inventory_path, original_inventory)
+        evidence.write_json(verification, original)
+
+    def test_official_cli_records_selected_ci_package_and_validates_release_binding(self):
+        _, source_candidate, _, manifest, verification = self.ci_candidate()
+        arguments = ["record-ci-package", "--release-manifest", str(manifest),
+            "--verification", str(verification), "--output-root", str(self.root / "CLI CI candidates"),
+            "--model-fingerprint", source_candidate["modelFingerprint"],
+            "--extraction-fingerprint", source_candidate["extractionFingerprint"]]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = evidence.main(arguments)
+        self.assertEqual(status, 0, output.getvalue())
+        path = Path(json.loads(output.getvalue())["record"])
+        candidate = evidence.read_json(path)
+        self.assertEqual(evidence.inspect_candidate(path.parent, candidate), [])
+        local = self.local_evidence(path, candidate)
+        preflight = self.root / "CLI-final-package-preflight.json"
+        with redirect_stdout(io.StringIO()):
+            status = evidence.main(["validate-local", "--candidate-commit", candidate["identity"]["candidateHead"],
+                "--local-evidence-dir", str(local), "--release-manifest", str(manifest), "--output", str(preflight)])
+        self.assertEqual(status, 0)
+        result = evidence.read_json(preflight)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["scope"], "final-release-package")
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as rejected:
+            evidence.main([*arguments, "--package", str(path.parent / candidate["package"])])
+        self.assertEqual(rejected.exception.code, 2)
+
+    def test_cli_help_advertises_frozen_source_and_optional_final_release_comparison(self):
+        for command, expected, excluded in (
+                ("record-ci-package", ("--release-manifest", "--verification", "--model-fingerprint"),
+                    ("--build-record", "--package ")),
+                ("validate-local", ("--release-manifest", "--local-evidence-dir"), ())):
+            with self.subTest(command=command):
+                output = io.StringIO()
+                with redirect_stdout(output), self.assertRaises(SystemExit) as shown:
+                    evidence.main([command, "--help"])
+                self.assertEqual(shown.exception.code, 0)
+                for name in expected:
+                    self.assertIn(name, output.getvalue())
+                for name in excluded:
+                    self.assertNotIn(name, output.getvalue())
 
 
 if __name__ == "__main__":

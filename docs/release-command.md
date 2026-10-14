@@ -10,7 +10,7 @@ Windows 可使用 `qcs-dev.ps1 release-prepare` 和 `release-upload-draft`，mac
 
 使用 `GH_TOKEN`、`GITHUB_TOKEN` 或已经登录的 GitHub CLI 提供访问权限。工具不读取浏览器凭据，不输出令牌，也不把令牌放入命令行。准备需要读取 Actions 运行和 artifacts，草稿上传另需创建 Release 与上传附件的权限。
 
-本机完整检查和最终 Windows CPU 包的 Computer Use 是项目交付检查，仍应对应同一候选。`prepare` 验证 CI 成品与对应源码来源，不把下载和冻结成功解释为这些本机场景已经执行。
+正式交付应先完成同一干净候选的本机完整 `check` 与 11 变体 CI，再运行 `prepare` 冻结 CI 成品。冻结后，对其中准确的 Windows CPU ZIP 完成本机正式验包、CI 来源候选记录和 CU-01 至 CU-10。相同提交的本地重建包不能代替这一 ZIP，下载和冻结成功也不表示这些本机场景已经执行。
 
 ## 准备命令
 
@@ -57,6 +57,16 @@ release-output/
 manifest 绑定实际文件名、大小、SHA-256、变体和来源。校验和不包含自身，manifest 自身的摘要由命令输出。来源快照与下载的 artifact ZIP 保存在本地，供离线重验字节来源，不作为 Release 附件上传。准备目录需要同时容纳原始下载和最终资产，应预留相应空间。
 
 每个 Release 附件必须小于 2 GiB，超限明确失败，不分卷、不裁剪 GPU 目标。来源与限制分别见 [GitHub Actions artifacts API](https://docs.github.com/en/rest/actions/artifacts) 和 [GitHub Releases](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)。
+
+## 从冻结 CI 包进入 Windows 验收
+
+从 `qcs-release-manifest.json` 的 `assets` 中选取 `configuration: windows-x64-cpu`、`role: user-package` 的唯一 portable ZIP，实际文件位于 manifest 的相对 `path`。不要从本机 `pkg` 目录按最新时间另选一个包，也不要只凭候选提交或文件名判断字节相同。
+
+对这个准确 ZIP 运行完整 `tools/qcs-verify-package.py --package-file ... --model-dir ... --variant windows-x64-cpu`，随后执行 `tools/qcs-release-evidence.py record-ci-package --release-manifest ... --verification ...`。该入口从冻结清单定位原包并绑定本机验包结果，不接受任意包替换来源。用其输出的 `package-candidate.json` 和相同 ZIP 初始化 CU 记录器，实际完成全部十个场景，再执行 `collect-local` 和 `validate-local --release-manifest <同一冻结清单>`。
+
+完整必填参数和可执行示例见 [候选验收运行器](../tools/acceptance/README.md#包与-windows-操作记录)，场景要求见 [Windows 用户操作验收](windows-user-acceptance.md)。最终验证会交叉核对 CI 包、四个程序和 CU 身份，未传 `--release-manifest` 的 local-only 结果不能替代此步骤。保持冻结目录与候选记录目录可用，受控解包、运行及 profile 路径使用英文且无空格，中文功能样本继续保留。
+
+`prepare` 不依赖 CU 已完成，显式 `upload-draft` 也不自动执行或证明 CU 验收。项目最终完成结论仍要求本机完整检查、全部 11 变体 CI、十个 CU 场景，以及 `validate-local` 的 `scope: final-release-package` 和 `localGates.finalReleasePackage` 全部通过，不能由草稿存在反推验收成功。
 
 ## 显式上传草稿
 

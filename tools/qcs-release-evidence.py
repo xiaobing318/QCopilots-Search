@@ -191,6 +191,40 @@ def package_contract():
     return module.MODEL_ARTIFACTS, module.REFERENCE_HASHES, read_json(path)["vectors"]
 
 
+def release_module():
+    """Load the official offline CI provenance verifier without API access."""
+    spec = importlib.util.spec_from_file_location("qcs_release_origin", SOURCE / "tools/qcs-release.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def zip_application_programs(package: Path):
+    """Hash the four actual ZIP members, independently of runtime reports."""
+    programs = {}
+    with zipfile.ZipFile(package) as archive:
+        for name in sorted(APPLICATIONS):
+            entries = [item for item in archive.infolist() if PurePosixPath(item.filename).name == name + ".exe"]
+            if len(entries) != 1:
+                raise ValueError(f"Candidate ZIP executable count is invalid: {name}")
+            item = entries[0]
+            member = PurePosixPath(item.filename)
+            if (member.is_absolute() or ".." in member.parts or "\\" in item.filename or ":" in item.filename
+                    or member.as_posix() != item.filename or item.is_dir() or item.file_size <= 0):
+                raise ValueError(f"Candidate ZIP executable path is invalid: {name}")
+            value = hashlib.sha256()
+            with archive.open(item) as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    value.update(block)
+            programs[name] = {"path": item.filename, "bytes": item.file_size, "sha256": value.hexdigest()}
+    return programs
+
+
+def candidate_executables(programs):
+    return {name: {"sha256": item["sha256"], "packageMember": item["path"]}
+            for name, item in programs.items()}
+
+
 def package_program_inventory(doc, root: Path):
     """Validate the frozen pre-execution file inventory, without reading removed installs."""
     reference = doc.get("programInventory", {})
@@ -638,18 +672,105 @@ def record_package(build_record: Path, package: Path, verification: Path, parent
     return root / "package-candidate.json", candidate
 
 
+def record_ci_package(release_manifest: Path, verification: Path, parent: Path,
+                      model_fingerprint: str, extraction_fingerprint: str):
+    """Capture a verified CI CPU package without inventing local build history."""
+    release = release_module()
+    manifest_hash = digest(release_manifest)
+    frozen = release.verify_frozen_cpu_package(release_manifest, SOURCE)
+    checked = read_json(verification)
+    verification_hash = digest(verification)
+    package = frozen["package"]["path"]
+    package_hash = frozen["package"]["sha256"]
+    if (checked.get("passed") is not True or checked.get("commit") != frozen["identity"]["checkoutCommit"]
+            or checked.get("workingTreeModified") is not False or checked.get("packageSha256") != package_hash):
+        raise ValueError("CI package verification is stale, modified or bound to different package bytes")
+    programs = zip_application_programs(package)
+    errors = validate_package_release(checked, verification.parent,
+        model_fingerprint=model_fingerprint, extraction_fingerprint=extraction_fingerprint,
+        platform_id="windows-x64-cpu", worker_sha256=programs["qcs-worker"]["sha256"],
+        package_sha256=package_hash)
+    if errors or package_program_inventory(checked, verification.parent)["programs"] != programs:
+        raise ValueError("CI package release evidence is incomplete or differs from the final ZIP: " + "; ".join(errors))
+    root = fresh_directory(parent, "candidate-evidence")
+    ci_root = root / "ci"
+    ci_root.mkdir()
+    origin = {"schemaVersion": 1, "kind": "ci-cpu-package-origin", "repository": release.REPOSITORY,
+              **{key: frozen[key] for key in ("identity", "version", "runId", "requestedAttempt", "variant", "selected")}}
+    paths = {"githubSnapshot": "github.json", "artifact": f"artifacts/{frozen['selected']['artifactId']}.zip",
+             "package": "package/" + frozen["package"]["filename"]}
+    for key, relative in paths.items():
+        entry = frozen[key]
+        destination = ci_root.joinpath(*PurePosixPath(relative).parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(entry["path"], destination)
+        if destination.stat().st_size != entry["bytes"] or digest(destination) != entry["sha256"]:
+            raise ValueError("Frozen CI origin changed while copying: " + key)
+        origin[key] = {**{name: value for name, value in entry.items() if name != "path"}, "path": relative}
+    origin_path = ci_root / "ci-origin.json"
+    write_json(origin_path, origin)
+    release.verify_ci_cpu_origin(ci_root, origin, SOURCE)
+    shutil.copyfile(verification, root / "package-verification.json")
+    if digest(root / "package-verification.json") != verification_hash:
+        raise ValueError("CI package verification changed while capturing its evidence")
+    for relative in package_evidence_paths(checked, verification.parent):
+        source = safe_file(verification.parent, relative)
+        destination = root.joinpath(*PurePosixPath(relative).parts)
+        if destination.exists() or PurePosixPath(relative).parts[0] == "ci":
+            raise ValueError("Package evidence would overwrite reserved CI candidate provenance")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    candidate = {"schemaVersion": 1, "kind": "package-candidate", "identity": frozen["identity"],
+                 "package": "ci/" + paths["package"], "packageSha256": package_hash,
+                 "executables": candidate_executables(programs), "modelFingerprint": model_fingerprint,
+                 "extractionFingerprint": extraction_fingerprint, "recordedAt": datetime.now(timezone.utc).isoformat(),
+                 "verification": "package-verification.json",
+                 "ciProvenance": {"path": "ci/ci-origin.json", "sha256": digest(origin_path)}}
+    candidate["files"] = [file_record(root, path) for path in root.rglob("*") if path.is_file()]
+    errors = inspect_candidate(root, candidate)
+    if errors or digest(release_manifest) != manifest_hash or digest(verification) != verification_hash:
+        raise ValueError("CI candidate changed or failed its independent validation: " + "; ".join(errors))
+    write_json(root / "package-candidate.json", candidate)
+    return root / "package-candidate.json", candidate
+
+
 def inspect_candidate(root: Path, candidate):
+    try:
+        return _inspect_candidate(root, candidate)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError,
+            zipfile.BadZipFile) as error:
+        return ["Candidate evidence is missing, stale or unbound: " + str(error)]
+
+
+def _inspect_candidate(root: Path, candidate):
     errors = verify_manifest(root, candidate)
     check(errors, candidate.get("kind") == "package-candidate", "The candidate is not a captured package")
     bound = {item["path"] for item in candidate["files"]}
-    provenance = candidate["buildProvenance"]
+    kinds = {key for key in ("buildProvenance", "ciProvenance") if key in candidate}
+    if len(kinds) != 1:
+        return errors + ["Candidate must have exactly one local-build or CI-origin provenance"]
+    kind = next(iter(kinds))
+    provenance = candidate[kind]
+    if not isinstance(provenance, dict) or set(provenance) != {"path", "sha256"}:
+        return errors + ["Candidate provenance reference is malformed"]
     for name in (provenance["path"], candidate["package"], candidate["verification"]):
-        check(errors, name in bound, "Candidate package/build/verification bytes are not bound")
-    build_path = safe_file(root, provenance["path"])
-    build = read_json(build_path)
-    errors.extend(verified_build(build_path.parent, build))
-    check(errors, digest(build_path) == provenance["sha256"] and build.get("identity") == candidate.get("identity"),
-          "Candidate package has stale executable build provenance")
+        check(errors, name in bound, "Candidate package/provenance/verification bytes are not bound")
+    provenance_path = safe_file(root, provenance["path"])
+    provenance_doc = read_json(provenance_path)
+    check(errors, digest(provenance_path) == provenance["sha256"]
+          and provenance_doc.get("identity") == candidate.get("identity"), "Candidate package has stale source provenance")
+    build = None
+    if kind == "buildProvenance":
+        build = provenance_doc
+        errors.extend(verified_build(provenance_path.parent, build))
+    else:
+        check(errors, provenance["path"] == "ci/ci-origin.json", "CI candidate origin must use its dedicated directory")
+        origin = release_module().verify_ci_cpu_origin(provenance_path.parent, provenance_doc, SOURCE)
+        check(errors, origin["package"]["path"] == safe_file(root, candidate["package"])
+              and origin["package"]["sha256"] == candidate["packageSha256"], "Candidate is not its selected CI CPU ZIP")
+        for key in ("package", "githubSnapshot", "artifact"):
+            check(errors, origin[key]["path"].relative_to(root.resolve()).as_posix() in bound,
+                  "Candidate CI origin bytes are not bound")
     package = safe_file(root, candidate["package"])
     check(errors, digest(package) == candidate["packageSha256"], "Candidate archive bytes changed")
     verification = read_json(safe_file(root, candidate["verification"]))
@@ -667,23 +788,15 @@ def inspect_candidate(root: Path, candidate):
         errors.append("Candidate final program inventory is invalid: " + str(error))
         final_programs = {}
     check(errors, set(candidate.get("executables", {})) == APPLICATIONS, "Candidate must contain all four application executable identities")
-    with zipfile.ZipFile(package) as archive:
-        for name in APPLICATIONS:
-            entries = [item for item in archive.infolist() if PurePosixPath(item.filename).name == name + ".exe"]
-            if len(entries) != 1:
-                errors.append(f"Candidate ZIP executable count is invalid: {name}")
-                continue
-            with archive.open(entries[0]) as stream:
-                value = hashlib.sha256()
-                for data in iter(lambda: stream.read(1024 * 1024), b""):
-                    value.update(data)
-            expected = candidate.get("executables", {}).get(name, {})
-            check(errors, expected.get("packageMember") == entries[0].filename
-                  and expected.get("sha256") == value.hexdigest() == build.get("programs", {}).get(name, {}).get("sha256"),
+    programs = zip_application_programs(package)
+    for name, item in programs.items():
+        check(errors, candidate.get("executables", {}).get(name) == candidate_executables(programs)[name],
+              f"Candidate executable differs from its recorded ZIP member: {name}")
+        if build is not None:
+            check(errors, item["sha256"] == build.get("programs", {}).get(name, {}).get("sha256"),
                   f"Candidate executable is not the recorded build output: {name}")
-            check(errors, final_programs.get(name) == {"path": entries[0].filename, "bytes": entries[0].file_size,
-                                                     "sha256": value.hexdigest()},
-                  f"Candidate executable differs from its independent final inventory: {name}")
+        check(errors, final_programs.get(name) == item,
+              f"Candidate executable differs from its independent final inventory: {name}")
     return errors
 
 
@@ -791,14 +904,16 @@ def validate_semantic(doc):
     return errors
 
 
-def local_preflight(local_root: Path, candidate_head: str):
-    """Verify only the local final package and observed Windows UI session.
+def local_preflight(local_root: Path, candidate_head: str, release_manifest: Path | None = None):
+    """Verify observed Windows UI evidence and optionally its frozen CI package.
 
-    CI artifact provenance is verified independently by qcs-release.py. This
-    result never represents remote jobs or GPU execution that was not observed.
+    Without a release manifest the result describes only the captured local
+    package. The release gate binds the very same archive and four programs,
+    never GPU execution or UI actions that were not observed.
     """
     errors = []
     result = {"schemaVersion": 2, "kind": "local-release-preflight", "candidateHead": candidate_head,
+              "scope": "final-release-package" if release_manifest is not None else "local-package",
               "localGates": {}, "passed": False, "errors": errors, "published": False}
     try:
         manifest = read_json(local_root / "manifest.json")
@@ -828,7 +943,38 @@ def local_preflight(local_root: Path, candidate_head: str):
               "Computer Use does not bind the same final packaged executables and extraction pipeline")
         result["localGates"]["computerUse"] = {"passed": not failures, "errors": failures}
         errors.extend(failures)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        if release_manifest is not None:
+            failures = []
+            gate = {"passed": False, "errors": failures, "variant": "windows-x64-cpu"}
+            result["localGates"]["finalReleasePackage"] = gate
+            try:
+                manifest_hash = digest(release_manifest)
+                frozen = release_module().verify_frozen_cpu_package(release_manifest, SOURCE)
+                package = safe_file(candidate_path.parent, candidate["package"])
+                check(failures, frozen["identity"] == identity,
+                      "Computer Use and frozen release have different source identities")
+                check(failures, frozen["package"]["sha256"] == candidate["packageSha256"] == digest(package)
+                      and frozen["package"]["bytes"] == package.stat().st_size,
+                      "Computer Use did not observe the frozen CI CPU ZIP bytes")
+                programs = zip_application_programs(frozen["package"]["path"])
+                check(failures, candidate_executables(programs) == candidate.get("executables")
+                      and programs == package_program_inventory(
+                          read_json(safe_file(candidate_path.parent, candidate["verification"])),
+                          candidate_path.parent)["programs"],
+                      "Computer Use programs differ from the frozen CI CPU ZIP")
+                check(failures, digest(release_manifest) == manifest_hash
+                      and digest(frozen["package"]["path"]) == frozen["package"]["sha256"],
+                      "Frozen release changed during final Computer Use validation")
+                gate.update({"releaseManifestSha256": manifest_hash,
+                             "packageSha256": frozen["package"]["sha256"],
+                             "runId": frozen["runId"], "requestedAttempt": frozen["requestedAttempt"]})
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError,
+                    zipfile.BadZipFile) as error:
+                failures.append("Frozen release package binding failed: " + str(error))
+            gate["passed"] = not failures
+            errors.extend(failures)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError,
+            zipfile.BadZipFile) as error:
         errors.append(f"Local evidence is missing, stale or unbound: {error}")
     result["passed"] = not errors
     return result
@@ -840,6 +986,8 @@ def main(argv=None):
     validate = commands.add_parser("validate-local", help="Validate the final Windows package and observed UI evidence")
     validate.add_argument("--candidate-commit", required=True)
     validate.add_argument("--local-evidence-dir", required=True, type=Path)
+    validate.add_argument("--release-manifest", type=Path,
+                          help="Bind observed CU to the exact CPU ZIP in a complete frozen CI release")
     validate.add_argument("--output", required=True, type=Path)
     build = commands.add_parser("record-build")
     build.add_argument("--source", type=Path, default=SOURCE)
@@ -852,6 +1000,11 @@ def main(argv=None):
         package.add_argument("--" + name, type=Path, required=True)
     package.add_argument("--model-fingerprint", required=True)
     package.add_argument("--extraction-fingerprint", required=True)
+    ci_package = commands.add_parser("record-ci-package", help="Capture the verified frozen CI Windows CPU ZIP for Computer Use")
+    for name in ("release-manifest", "verification", "output-root"):
+        ci_package.add_argument("--" + name, type=Path, required=True)
+    ci_package.add_argument("--model-fingerprint", required=True)
+    ci_package.add_argument("--extraction-fingerprint", required=True)
     collect = commands.add_parser("collect-local")
     for name in ("candidate", "computer-use", "output-root"):
         collect.add_argument("--" + name, type=Path, required=True)
@@ -860,7 +1013,8 @@ def main(argv=None):
         if args.action == "validate-local":
             if not re.fullmatch(r"[0-9a-f]{40}", args.candidate_commit):
                 raise ValueError("The candidate must be a full immutable Git SHA")
-            result = local_preflight(args.local_evidence_dir.resolve(), args.candidate_commit)
+            result = local_preflight(args.local_evidence_dir.resolve(), args.candidate_commit,
+                args.release_manifest.resolve() if args.release_manifest is not None else None)
             write_json(args.output, result)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result["passed"] else 1
@@ -873,6 +1027,9 @@ def main(argv=None):
                 working_directory=args.working_directory)
         elif args.action == "record-package":
             path, result = record_package(args.build_record.resolve(), args.package.resolve(), args.verification.resolve(),
+                args.output_root, args.model_fingerprint, args.extraction_fingerprint)
+        elif args.action == "record-ci-package":
+            path, result = record_ci_package(args.release_manifest.resolve(), args.verification.resolve(),
                 args.output_root, args.model_fingerprint, args.extraction_fingerprint)
         else:
             path, result = collect_local({"candidate": args.candidate.resolve(),

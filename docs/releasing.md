@@ -48,7 +48,7 @@ CI 将源码检出到 `qcs-src`。每个变体顺序执行工具链准备、构�
 
 工具从同一干净候选和依赖锁独立生成一份平台无关的对应源码材料。冻结输出包含用户包、源码包、校验和、发布 manifest，以及本地来源快照。CI 不承担源码材料上传。符号通过独立动作按需生成，不作为每次打包的附带产物。
 
-发布准备是 CI 成品的获取与冻结过程，不能替代本机完整测试和最终 Windows CPU 包的 Computer Use。项目完成结论仍需这些独立检查对应同一源码和实际包身份，实际操作不得复用另一包的截图或报告。
+正式交付顺序为同一干净候选的本机完整 `check` 和全部 11 变体 CI 通过，再执行 `release-prepare`。随后在本机验证冻结 manifest 中的 Windows CPU ZIP，以 `record-ci-package` 建立 CI 来源候选，使用该 ZIP 完成 CU-01 至 CU-10，最后执行 `validate-local --release-manifest`。发布准备成功仅证明 CI 成品获取和冻结通过，不能替代后续本机包验证与实际操作。相同提交的本地重建包不能替代 CI 包字节，也不能复用另一包的截图或报告。
 
 显式 `release-upload-draft` 上传前再次核对冻结字节，只创建或续传草稿，不合并分支、不公开发布。每个 Release 附件必须小于 2 GiB，超限明确失败，本轮不提供附件分卷，也不裁剪 GPU 目标绕过限制。限制见 [GitHub Releases 文档](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)。
 
@@ -56,8 +56,10 @@ CI 将源码检出到 `qcs-src`。每个变体顺序执行工具链准备、构�
 
 ## 本机最终证据流程
 
-候选记录工具保留 `record-build`、`record-package`、`collect-local` 等现有职责。构建记录绑定真实构建命令、执行前后源码身份及 `qcs-gui`、`qcs-service`、`qcs-worker`、`qcs-cli` 四个程序。包记录核对最终 ZIP 内程序字节，记录模型和提取指纹。
+`record-build` 与 `record-package` 保留用于本机构建及开发包验证，绑定真实构建命令、源码身份和四个应用程序。正式交付使用 `record-ci-package --release-manifest <冻结清单> --verification <该CI包的本机验包报告>`。该入口自动选择冻结清单中的 Windows CPU portable ZIP，记录真实 run、attempt、job、artifact 与包来源，核对包内程序、完整验证报告及实际模型和提取指纹，不编造本地 build history。
 
-Windows Computer Use 使用英文且无空格的独立运行根，从这一最终 CPU 包启动独立 profile，完成 CU-01 至 CU-10 并保留实际操作、截图、时间和包哈希。`collect-local` 仅收集候选与 Computer Use 记录，按附件清单校验字节，不导入整个数据库目录。详细命令见 [候选验收运行器](../tools/acceptance/README.md)。
+Windows Computer Use 使用英文且无空格的独立运行根，从同一冻结 CI ZIP 的解包副本启动独立 profile，完成 CU-01 至 CU-10 并保留实际操作、截图、时间和包哈希。中文查询与中文、空格样本文件继续保留。`collect-local` 收集 CI 来源候选与 Computer Use 原始记录，按附件清单校验字节，不导入整个数据库目录。随后 `validate-local --release-manifest <同一冻结清单>` 精确交叉绑定 ZIP、四个程序、CI 来源和 CU 记录。正式通过要求 `scope: final-release-package`、`passed: true` 且 `localGates.finalReleasePackage` 通过。未提供该参数时 `scope` 为 `local-package`，只形成独立本机结论。详细命令见 [候选验收运行器](../tools/acceptance/README.md)。
+
+冻结发行目录和 `record-ci-package` 输出的候选目录在验收期间必须持续存在。记录器按来源引用并校验原始包，不靠另存同名 ZIP 或改写历史报告维持来源。候选源码、CI 包或所选 attempt 改变后，重新建立对应的验证与操作证据。
 
 Windows 工作目录仍受 `CreateProcessW` 限制。记录器可使用明确指定的短工作目录，或在验证指向相同目录后使用已有 8.3 名称，不通过改写来源或手工补报告掩盖失败。
