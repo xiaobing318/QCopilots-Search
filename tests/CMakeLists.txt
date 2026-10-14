@@ -84,10 +84,12 @@ cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL
 qcopilots_search_add_test(NAME qcs-tests-acceptance-runners
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py" --suite pure)
 set_tests_properties(qcs-tests-acceptance-runners PROPERTIES LABELS "unit;tooling;acceptance" TIMEOUT 240)
-qcopilots_search_add_test(NAME qcs-tests-acceptance-native
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py" --suite native)
-# Real ACL restoration, process token recovery and owned timeout cleanup.
-set_tests_properties(qcs-tests-acceptance-native PROPERTIES LABELS "tooling;acceptance;native;slow" TIMEOUT 240)
+if(WIN32)
+  qcopilots_search_add_test(NAME qcs-tests-acceptance-native
+    COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py" --suite native)
+  # Real ACL restoration, process token recovery and owned timeout cleanup.
+  set_tests_properties(qcs-tests-acceptance-native PROPERTIES LABELS "tooling;acceptance;native;slow" TIMEOUT 240)
+endif()
 
 qcopilots_search_add_test(NAME qcs-tests-ci-evidence
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-ci-evidence.py" -v)

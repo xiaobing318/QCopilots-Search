@@ -28,7 +28,8 @@ GUI_EXECUTABLE = PRODUCT + "-gui"
 NAMES = (GUI_EXECUTABLE, PRODUCT + "-service", PRODUCT + "-worker", PRODUCT + "-cli")
 CASES = tuple(f"CU-{n:02d}" for n in range(1, 11))
 LOCKS = ("dependencies.lock.json", "tools/qt-packages.lock.json", "tools/nsis-package.lock.json",
-         "tools/qcs-source-packages.lock.json", "cmake/qcs-native-deps.cmake")
+         "tools/qcs-source-packages.lock.json", "cmake/qcs-native-deps.cmake",
+         "config/build-variants.json", "config/gpu-sdk.lock.json", "config/gpu-license-sources.lock.json")
 FIXTURE_INPUT = "inputs/fixture-source-manifest.json"
 FIXTURE_SOURCE = "negative-models/qcs-fixture-source.json"
 FIXTURE_COPY = "negative-models/qcs-fixture-copy.json"

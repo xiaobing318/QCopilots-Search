@@ -2,9 +2,10 @@
 """Synthetic stdlib tests for the external CU recorder; no UI or real candidate.
 
 Every fixture and generated export lives in a fresh TemporaryDirectory. No test
-creates ten passing cases or a passed CU summary. Only the redirected CLI test
-starts Python child processes. Other tests block subprocess, and no test starts
-the application. A mocked load_run supplies clearly marked synthetic state.
+creates ten passing cases or a passed CU summary. The real identity contracts
+use temporary Git repositories and Python to produce inert fixture files. The
+redirected CLI test starts Python children. Other tests block subprocess, and
+no test starts the application. Scenario tests use clearly marked synthetic state.
 """
 from __future__ import annotations
 
@@ -654,6 +655,101 @@ class FixtureReceiptTests(TemporaryTest):
         self.assertIn(recorder.FIXTURE_COPY, {item["path"] for item in files})
         (fixture.run / "samples/笔记.txt").unlink()
         self.assertEqual(recorder.fixture_copy_evidence(fixture.run, state), files)
+
+
+class RealCandidateIdentityTests(unittest.TestCase):
+    """Real Git/build-receipt contracts with inert files, never product or CU acceptance."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="qcs-recorder-identity-",
+                                               dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.source = self.root / "source"
+        self.source.mkdir()
+        release_path = SCRIPT.parents[1] / "qcs-release-evidence.py"
+        spec = importlib.util.spec_from_file_location("real_cu_release_identity", release_path)
+        self.release = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.release)
+        for relative in (*self.release.LOCKS, "src/core/pipeline_manifest.h"):
+            target = self.source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((SCRIPT.parents[2] / relative).read_bytes())
+        self.git("init", "--quiet")
+        self.git("config", "core.autocrlf", "false")
+        self.git("add", ".")
+        self.git("-c", "user.name=QCS synthetic fixture", "-c", "user.email=synthetic@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Synthetic identity fixture")
+        self.commit = self.git("rev-parse", "HEAD")
+
+    def git(self, *arguments):
+        return subprocess.check_output(["git", "-C", str(self.source), *arguments],
+                                       encoding="utf-8").strip()
+
+    def candidate(self):
+        app = self.root / "app"
+        app.mkdir()
+        programs = {name: app / (name + ".exe") for name in recorder.NAMES}
+        command = [sys.executable, "-B", "-c",
+                   "from pathlib import Path; import sys; "
+                   "[Path(p).write_bytes(b'SYNTHETIC NOT EXECUTABLE ' + Path(p).name.encode()) for p in sys.argv[1:]]",
+                   *(str(path) for path in programs.values())]
+        provenance, build = self.release.record_build(self.source, self.root / "provenance", programs, command)
+        self.assertTrue(build["passed"])
+        self.assertEqual(self.release.verified_build(provenance.parent, build), [])
+        package = self.root / "synthetic.zip"
+        with zipfile.ZipFile(package, "w") as archive:
+            for path in programs.values():
+                archive.write(path, "bin/" + path.name)
+        candidate = {"schemaVersion": 1, "kind": "package-candidate", "syntheticTestOnly": True,
+                     "identity": build["identity"], "recordedAt": recorder.now(),
+                     "executables": {name: {"sha256": recorder.sha(path)} for name, path in programs.items()},
+                     "packageSha256": recorder.sha(package), **recorder.fingerprints(self.source),
+                     "buildProvenance": {"path": provenance.name, "sha256": recorder.sha(provenance)}}
+        record = provenance.parent / "package-candidate.json"
+        recorder.write(record, candidate)
+        return SimpleNamespace(candidate_record=record, source=self.source, package=package, app_dir=app,
+                               run_parent=self.root / "runs", fixture_manifest=None), candidate
+
+    def test_release_and_recorder_share_complete_real_git_identity(self):
+        expected = self.release.source_identity(self.source, self.commit)
+        self.assertEqual(len(expected["lockHashes"]), 8)
+        self.assertEqual(set(recorder.LOCKS), set(self.release.LOCKS))
+        self.assertEqual(recorder.identity(self.source, self.commit), expected)
+
+    def test_init_and_reload_accept_real_build_identity_and_reject_lock_mutation(self):
+        arguments, candidate = self.candidate()
+        if recorder.platform.system() != "Windows" or recorder.platform.machine().lower() not in ("amd64", "x86_64"):
+            with self.assertRaisesRegex(ValueError, "native Windows x64"):
+                recorder.initialize(arguments)
+            return
+        output = io.StringIO()
+        with redirect_stdout(output):
+            recorder.initialize(arguments)
+        initialized = json.loads(output.getvalue())
+        self.assertFalse(initialized["passed"])
+        run, state = recorder.load_run(initialized["runRoot"])
+        self.assertEqual(state["identity"], candidate["identity"])
+        self.assertEqual(state["identity"]["lockHashes"], self.release.source_identity(self.source)["lockHashes"])
+        self.assertEqual(list((run / "evidence").iterdir()), [])
+        lock = self.source / "config/gpu-sdk.lock.json"
+        lock.write_bytes(lock.read_bytes() + b"\n")
+        with self.assertRaisesRegex(ValueError, "clean"):
+            recorder.load_run(run)
+
+    def test_init_rejects_missing_extra_and_changed_real_lock_hashes(self):
+        arguments, candidate = self.candidate()
+        original = dict(candidate["identity"]["lockHashes"])
+        missing = {name: value for name, value in original.items() if name != "config/gpu-sdk.lock.json"}
+        extra = {**original, "unrelated.lock": "0" * 64}
+        changed = {**original, "config/gpu-sdk.lock.json": "0" * 64}
+        for description, locks in (("missing", missing), ("extra", extra), ("changed", changed)):
+            with self.subTest(locks=description):
+                candidate["identity"]["lockHashes"] = locks
+                recorder.write(arguments.candidate_record, candidate)
+                with self.assertRaisesRegex(ValueError, "Build-time identity differs"):
+                    recorder.initialize(arguments)
+        self.assertFalse(arguments.run_parent.exists())
 
 
 class RedirectedCliTests(unittest.TestCase):
