@@ -556,6 +556,49 @@ class FixtureSourceTests(unittest.TestCase):
         # Equal-time rows are intentionally not ordered by filename here. The
         # product's tie breaker is the file ID assigned by the real index.
 
+    def test_zoom_images_have_valid_bmp_pixels_sizes_and_distinct_scroll_landmarks(self):
+        root, manifest = self.prepare("image zoom cases")
+        rows = [row for row in manifest["files"] if row["role"] == "image-zoom"]
+        self.assertEqual({(row["width"], row["height"], row["purpose"]) for row in rows},
+                         {(1600, 900, "landscape"), (900, 1600, "portrait"), (160, 120, "small-reset")})
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            with self.subTest(path=row["relativePath"]):
+                self.assertEqual(row["scenario"], "CU-06")
+                self.assertEqual(PurePosixPath(row["relativePath"]).parent.as_posix(), copy.IMAGE_ZOOM_ROOT)
+                self.assertFalse(row["relativePath"].startswith(copy.BROWSE_ROOT + "/"))
+                self.assertNotIn("query", row, "Preview controls do not assert semantic quality")
+                data = (root / row["relativePath"]).read_bytes()
+                self.assertEqual(data[:2], b"BM")
+                file_size, reserved1, reserved2, offset = struct.unpack_from("<IHHI", data, 2)
+                self.assertEqual((file_size, reserved1, reserved2, offset), (len(data), 0, 0, 54))
+                header, width, height, planes, depth, compression, image_size = struct.unpack_from("<IiiHHII", data, 14)
+                self.assertEqual((header, width, height, planes, depth, compression),
+                                 (40, row["width"], row["height"], 1, 24, 0))
+                stride = (width * 3 + 3) // 4 * 4
+                self.assertEqual(image_size, stride * height)
+                self.assertEqual(len(data), offset + image_size)
+
+                def rgb(x, y):
+                    position = offset + (height - 1 - y) * stride + x * 3
+                    blue, green, red = data[position:position + 3]
+                    return red, green, blue
+
+                self.assertEqual(rgb(1, 1), (220, 40, 40))
+                self.assertEqual(rgb(width - 2, 1), (40, 180, 40))
+                self.assertEqual(rgb(1, height - 2), (40, 90, 220))
+                self.assertEqual(rgb(width - 2, height - 2), (220, 190, 40))
+                self.assertEqual(rgb(100, 1), (32, 32, 32))
+                self.assertEqual(rgb(1, 100), (32, 32, 32))
+
+    def test_bmp_odd_width_rows_are_padded_without_moving_pixels(self):
+        data = copy._bmp_fixture(3, 2)
+        self.assertEqual(struct.unpack_from("<I", data, 10)[0], 54)
+        self.assertEqual(struct.unpack_from("<I", data, 34)[0], 24)
+        self.assertEqual(len(data), 54 + 24)
+        self.assertEqual(data[54:66], b"\x20\x20\x20" + b"\x28\xbe\xdc" * 2 + b"\0" * 3)
+        self.assertEqual(data[66:78], b"\x20\x20\x20" * 3 + b"\0" * 3)
+
     def test_generated_fixture_identity_is_reproducible_across_roots(self):
         _, first = self.prepare("first source")
         _, second = self.prepare("second 中文 source")

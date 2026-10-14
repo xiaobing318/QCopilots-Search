@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Regression checks for release evidence that can otherwise falsely pass."""
+import ast
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -2417,6 +2419,102 @@ class FastNativeTests(unittest.TestCase):
         self.assertNotIn("/pkg/", fast_upload)
         self.assertNotIn("/runs/", fast_upload)
         self.assertIn("/reports", fast_upload)
+
+
+class NativeStageDependencyTests(unittest.TestCase):
+    """Exercise the actual workflow predicates without a GitHub runner."""
+
+    ACTIONS = ("capacity", "install", "package", "installers", "sources")
+
+    def step(self, action):
+        workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
+        return next(item for item in workflow.split("      - name: ")
+                    if f"qcs-native-ci.py {action}\n" in item)
+
+    def eligible(self, action, outcomes, *, profile="full", system="Windows", cancelled=False):
+        match = re.search(r"^        if: (.+)$", self.step(action), re.MULTILINE)
+        self.assertIsNotNone(match, f"{action} needs an explicit dependency condition")
+        expression = match.group(1).strip()
+        self.assertTrue(expression.startswith("${{ ") and expression.endswith(" }}"))
+        self.assertIn("!cancelled()", expression, "The default success() must not suppress independent work")
+        expression = expression[3:-2].strip().replace("!cancelled()", repr(not cancelled))
+        expression = expression.replace("env.QCOPILOTS_SEARCH_TEST_PROFILE", repr(profile))
+        expression = expression.replace("runner.os", repr(system))
+        expression = re.sub(r"steps\.([a-z_]+)\.outcome", lambda match: repr(outcomes.get(match.group(1), "skipped")), expression)
+        expression = expression.replace("&&", "and").replace("||", "or")
+        tree = ast.parse(expression, mode="eval")
+        allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.Constant)
+        self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)),
+                        "Unexpected workflow predicate syntax must be reviewed explicitly")
+        return eval(compile(tree, "<workflow-condition>", "eval"), {"__builtins__": {}}, {})
+
+    def scheduled(self, failures=(), *, profile="full", system="Windows", cancelled=False):
+        failures = set(failures)
+        outcomes = {"build": "failure" if "build" in failures else "success"}
+        outcomes["models"] = ("skipped" if outcomes["build"] != "success" or profile != "full"
+                              else "failure" if "models" in failures else "success")
+        outcomes["tests"] = ("failure" if "tests" in failures else "success")
+        started = set()
+        for action in self.ACTIONS:
+            if self.eligible(action, outcomes, profile=profile, system=system, cancelled=cancelled):
+                started.add(action)
+                outcomes[action] = "failure" if action in failures else "success"
+            else:
+                outcomes[action] = "skipped"
+        return started, outcomes
+
+    def test_full_tests_failure_keeps_independent_acceptance_and_preserves_failure(self):
+        # Quality failure, timeout and incomplete raw reports all retain the
+        # same nonzero test-step outcome. None becomes a passing full result.
+        started, outcomes = self.scheduled({"tests"})
+        self.assertEqual(started, set(self.ACTIONS))
+        self.assertEqual(outcomes["tests"], "failure")
+        self.assertTrue(self.eligible("preflight", {**outcomes, "report": "success"}))
+        workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
+        self.assertNotIn("continue-on-error:", workflow)
+        self.assertNotIn("if:", self.step("test"))
+        self.assertIn("if: always()", self.step("report"))
+        self.assertIn('run: test "$NATIVE_RESULT" = success', workflow)
+
+    def test_outcome_references_have_the_expected_native_step_ids(self):
+        for action in ("build", "models", "test", *self.ACTIONS, "report"):
+            with self.subTest(action=action):
+                expected = "tests" if action == "test" else action
+                match = re.search(r"^        id: ([a-z_]+)$", self.step(action), re.MULTILINE)
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(1), expected)
+
+    def test_failed_or_missing_build_blocks_all_dependent_actions(self):
+        self.assertEqual(self.scheduled({"build"})[0], set())
+        for status in ("failure", "skipped", "cancelled", ""):
+            for action in ("capacity", "install", "sources"):
+                with self.subTest(status=status, action=action):
+                    self.assertFalse(self.eligible(action, {"build": status}))
+
+    def test_model_failure_still_allows_model_independent_actions(self):
+        self.assertEqual(self.scheduled({"models"})[0], {"capacity", "install", "sources"})
+
+    def test_stage_failure_stops_only_its_actual_dependents(self):
+        cases = (("capacity", set(self.ACTIONS)),
+                 ("install", {"capacity", "install", "sources"}),
+                 ("package", {"capacity", "install", "package", "sources"}),
+                 ("installers", set(self.ACTIONS)))
+        for failed, expected in cases:
+            with self.subTest(failed=failed):
+                self.assertEqual(self.scheduled({failed})[0], expected)
+
+    def test_fast_cancellation_and_platform_scope_remain_bounded(self):
+        self.assertEqual(self.scheduled(profile="fast")[0], set())
+        self.assertEqual(self.scheduled(cancelled=True)[0], set())
+        self.assertEqual(self.scheduled(system="macOS")[0], set(self.ACTIONS) - {"installers"})
+        self.assertEqual(self.scheduled(system="Linux")[0], set(self.ACTIONS))
+
+    def test_gate_requires_report_and_never_runs_after_cancellation(self):
+        self.assertTrue(self.eligible("preflight", {"report": "success", "tests": "failure"}))
+        for status in ("failure", "skipped", "cancelled", ""):
+            with self.subTest(status=status):
+                self.assertFalse(self.eligible("preflight", {"report": status}))
+        self.assertFalse(self.eligible("preflight", {"report": "success"}, cancelled=True))
 
 
 if __name__ == "__main__":

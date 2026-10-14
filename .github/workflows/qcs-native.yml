@@ -107,40 +107,50 @@ jobs:
         timeout-minutes: 30
         run: python .github/scripts/qcs-native-ci.py configure
       - name: Build
+        id: build
         timeout-minutes: 60
         run: python .github/scripts/qcs-native-ci.py build
       - name: Download and verify required real models
+        id: models
         if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
         timeout-minutes: 35
         run: python .github/scripts/qcs-native-ci.py models
       - name: Run selected portable tests (full includes real-model and capacity tests)
+        id: tests
         timeout-minutes: ${{ env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && 180 || 45 }}
         run: python .github/scripts/qcs-native-ci.py test
       - name: Exercise the capacity path at CI scale
-        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
+        id: capacity
+        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.build.outcome == 'success' }}
         timeout-minutes: 20
         run: python .github/scripts/qcs-native-ci.py capacity
-      - name: Install staging tree after automated tests pass
-        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
+      - name: Install staging tree from the successful build
+        id: install
+        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.build.outcome == 'success' }}
         timeout-minutes: 15
         run: python .github/scripts/qcs-native-ci.py install
       - name: Package and verify deployment
-        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
+        id: package
+        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.install.outcome == 'success' && steps.models.outcome == 'success' }}
         timeout-minutes: 45
         run: python .github/scripts/qcs-native-ci.py package
       - name: Install and remove the final NSIS or DEB package
-        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && (runner.os == 'Windows' || runner.os == 'Linux')
+        id: installers
+        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.package.outcome == 'success' && steps.models.outcome == 'success' && (runner.os == 'Windows' || runner.os == 'Linux') }}
         timeout-minutes: 45
         run: python .github/scripts/qcs-native-ci.py installers
       - name: Collect corresponding source materials
-        if: env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full'
+        id: sources
+        if: ${{ !cancelled() && env.QCOPILOTS_SEARCH_TEST_PROFILE == 'full' && steps.build.outcome == 'success' }}
         timeout-minutes: 30
         run: python .github/scripts/qcs-native-ci.py sources
       - name: Record evidence for the selected profile
+        id: report
         if: always()
         timeout-minutes: 10
         run: python .github/scripts/qcs-native-ci.py report
       - name: Verify this native evidence unit
+        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
         timeout-minutes: 10
         run: python .github/scripts/qcs-native-ci.py preflight
       - name: Upload reports and test packages

@@ -37,6 +37,7 @@ SOURCE_MANIFEST = "negative-models/qcs-fixture-source.json"
 RECORDER_SOURCE_MANIFEST = "inputs/fixture-source-manifest.json"
 PREPARING = ".qcs-fixture-preparing.json"
 BROWSE_ROOT = "samples/分页 普通文件"
+IMAGE_ZOOM_ROOT = "samples/内容定位/图片缩放"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_EPOCH_MS = 1767225600000
 ROOTS = {"samples", "negative-models"}
@@ -199,6 +200,30 @@ def _docx_fixture():
     return content.getvalue()
 
 
+def _bmp_fixture(width, height):
+    """Original corner colors and 100-pixel grid for visible zoom/scroll checks."""
+    stride = (width * 3 + 3) // 4 * 4
+    pixels = bytearray(stride * height)
+    # BMP stores BGR pixels bottom-up. Distinct corner colors let the operator
+    # recognize which region becomes visible after either scrollbar moves.
+    colors = ((b"\x28\x28\xdc", b"\x28\xb4\x28"),
+              (b"\xdc\x5a\x28", b"\x28\xbe\xdc"))
+    grid = b"\x20\x20\x20"
+    for y in range(height):
+        left, right = colors[y >= height // 2]
+        row = bytearray(left * (width // 2) + right * (width - width // 2))
+        if y % 100 == 0:
+            row[:] = grid * width
+        else:
+            for x in range(0, width, 100):
+                row[x * 3:x * 3 + 3] = grid
+        offset = (height - 1 - y) * stride
+        pixels[offset:offset + width * 3] = row
+    header = b"BM" + struct.pack("<IHHI", 54 + len(pixels), 0, 0, 54)
+    header += struct.pack("<IiiHHIIiiII", 40, width, height, 1, 24, 0, len(pixels), 2835, 2835, 0, 0)
+    return header + pixels
+
+
 def _video_fixture():
     """Original 12-second AVI: red circle first, blue square from second six."""
     width, height, fps, frames = 160, 120, 2, 24
@@ -294,6 +319,12 @@ def prepare_source(source_root):
     emit("samples/内容定位/三页 literal {page}.pdf", _pdf_fixture(), "pdf", query="qcsthirdpagemarker", physicalPage=3)
     emit("samples/内容定位/Office 中文.docx", _docx_fixture(), "office", queries=["qcswordbodymarker", "qcswordtablemarker"])
     emit("samples/内容定位/照片 中文.jpg", source_bytes[input_names[2]], "image", sourceInput=input_names[2], query="A domestic cat walking through white snow outdoors")
+    for name, width, height, purpose in (("大横图 1600x900.bmp", 1600, 900, "landscape"),
+                                       ("大竖图 900x1600.bmp", 900, 1600, "portrait"),
+                                       ("小图 160x120.bmp", 160, 120, "small-reset")):
+        emit(IMAGE_ZOOM_ROOT + "/" + name, _bmp_fixture(width, height), "image-zoom",
+             scenario="CU-06", width=width, height=height, purpose=purpose,
+             landmarks="Top-left red, top-right green, bottom-left blue, bottom-right gold, 100-pixel dark grid")
     emit("samples/内容定位/延迟语音 中文.wav", audio.getvalue(), "audio", query="A spoken reminder to buy milk, eggs and bread", targetRegionMs=[55000, 75000], expectedWindowStartMs=50000)
     emit("samples/内容定位/两段图形 中文.avi", _video_fixture(), "video", query="A blue square on a white background", targetRegionMs=[6000, 12000], expectedFrameStartMs=6500)
     notebook = {"nbformat": 4, "nbformat_minor": 5, "metadata": {"language_info": {"name": "python"}}, "cells": [
@@ -317,7 +348,7 @@ def prepare_source(source_root):
                 "sourceInputs": inputs, "sourceRoot": str(root), "browseRoot": BROWSE_ROOT, "browsingFiles": 205,
                 "browseOrder": {"primary": "mtimeMs DESC", "tie": "actual indexed file_id DESC", "tieGroupsZeroBased": [[98, 99, 100, 101], [198, 199, 200, 201]], "pageSizes": [100, 100, 5]},
                 "files": files, "acceptancePassed": False,
-                "license": "Original generated text, code, PDF, DOCX and AVI use the repository MIT license. Photo and source audio retain their recorded asset licenses.",
+                "license": "Original generated text, code, PDF, DOCX, BMP and AVI use the repository MIT license. Photo and source audio retain their recorded asset licenses.",
                 "limits": ["Media target regions are authored expectations. Actual search hits and external positions must be observed.", "Generated UI fixtures are not semantic-quality or capacity acceptance evidence.", "Index only browseRoot first. Add the other roots for later scenarios."]}
     path = target(root, SOURCE_MANIFEST)
     write_json(path, manifest)

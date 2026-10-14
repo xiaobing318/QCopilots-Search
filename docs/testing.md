@@ -132,6 +132,10 @@ CI 在 Windows x64、Linux x64、macOS arm64 和 macOS x86_64 分别原生编译
 
 普通 PR 默认 `fast`，带 `ci:full` 标签的 PR 执行 full，标签保留时后续同步也继续 full。推送到 `main` 执行 full。默认分支已经包含工作流后，`workflow_dispatch` 也可选择 `test_profile`，默认 fast。两种范围都配置、构建四个原生组合并运行所选 CTest，fast 不执行安装暂存、模型缓存与下载、容量、打包、安装器验收和对应源码归档。full 保留这些阶段，模型缓存命中后仍由 CLI 校验内容。
 
+full CI 按阶段的实际前置条件继续独立验收。构建成功后可以执行合成容量、安装暂存和源码收集，暂存安装与模型校验成功后才执行打包及包验证，包验证成功后才执行适用平台的安装器验收。语义测试失败、测试超时或原始报告缺失都不会改记为通过，但不会单独阻止这些独立步骤。构建、安装或打包失败仍会停止依赖它的步骤，取消任务后不再启动这些步骤。测试步骤保持非零失败，完整 job、四平台聚合和发行门禁仍然失败。失败 job 上传的包只用于继续开发验收。
+
+本地 `check full` 保留遇到失败即停止后续组合步骤的契约，原报告明确保留失败和 `notRun`。需要补齐独立验收时，使用现有 `install`、`package`、`verify-package`、`installers`、`sources` 单阶段入口，分别保存新报告，不改写原 full 结论。符号包由 `package` 自动生成。
+
 快速 artifact 使用 `qcs-fast-<platform>-<sha>-attempt<N>` 与 `qcs-fast-aggregate-<sha>-attempt<N>`，完整 artifact 使用相同结构的 `qcs-native` 前缀。每次重试生成独立名称，明确禁用覆盖，旧失败材料继续保留。平台原始快速报告位于 `reports/fast-acceptance.json`、`fast-evidence.json` 和 `fast-gate.json`，聚合 artifact 包含 `aggregate.json`、`selection.json` 与原始 API 快照目录 `selection-inputs/`。快速证据可以记录 `testsComplete: true`，但 `releaseComplete` 始终为 false，不能代替完整发行验收。
 
 聚合先读取当前 workflow run 的完整 job 与 artifact 清单，逐平台锁定最新执行，再按候选 SHA、范围、平台和实际 `sourceAttempt` 选择精确 artifact ID。GitHub 为未重跑平台复制的 job 记录必须与原执行的 runner、时间和步骤证据唯一匹配，才可沿用原执行的材料。最新执行失败、未完成、缺件或身份有歧义都使聚合失败，不回退到旧成功记录。只重跑 Windows 时，其他平台可沿用同 run、同候选的已验证执行，不要求无关平台重复构建。旧无 attempt 名称的历史材料可继续读取调查，但缺少严格选择与 API 执行链时不能获得新的聚合或发行通过资格。
