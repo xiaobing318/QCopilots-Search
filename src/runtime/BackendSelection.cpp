@@ -47,9 +47,13 @@ BackendSelection selectBackend(BackendMode mode, const QString& packagedBackend,
     int gpuIndex = -1;
     for (qsizetype index = 0; index < devices.size(); ++index) {
         const auto& device = devices[index];
+        const auto backend = canonicalBackendName(device.backend);
+        // The pinned Metal backend returns an unnamed wrapper when no MTLDevice
+        // is available. Real devices receive MTL<n> before backend initialization.
+        const bool missingMetalDevice = backend == QStringLiteral("metal") && device.name.isEmpty();
         if (device.cpu && cpuIndex < 0) cpuIndex = int(index);
-        if (device.gpu && gpuIndex < 0 && packaged != QStringLiteral("cpu")
-            && canonicalBackendName(device.backend) == packaged) gpuIndex = int(index);
+        if (device.gpu && !missingMetalDevice && gpuIndex < 0 && packaged != QStringLiteral("cpu")
+            && backend == packaged) gpuIndex = int(index);
     }
     // ggml still needs its CPU backend for unsupported operations even when all
     // model layers are offloaded. A broken CPU installation is not a GPU fallback.

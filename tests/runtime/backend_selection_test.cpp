@@ -95,7 +95,7 @@ private slots:
     }
 
     void metalRegistryDoesNotBypassCpuOrFailurePolicy() {
-        const QVector<BackendDevice> devices{cpu(), gpu(QStringLiteral("MTL"))};
+        const QVector<BackendDevice> devices{cpu(), gpu(QStringLiteral("MTL"), QStringLiteral("MTL0"))};
         const auto forcedCpu = selectBackend(BackendMode::Cpu, QStringLiteral("metal"), devices);
         QCOMPARE(forcedCpu.deviceIndex, 0);
         QVERIFY(!forcedCpu.gpu);
@@ -111,6 +111,59 @@ private slots:
         QCOMPARE(strict.deviceIndex, -1);
         QVERIFY(!strict.gpu);
         QVERIFY(strict.error.contains(failure));
+    }
+
+    void metalNilWrapperIsUnavailable_data() {
+        QTest::addColumn<QString>("registry");
+        QTest::newRow("upstream") << QStringLiteral("MTL");
+        QTest::newRow("canonical") << QStringLiteral("metal");
+        QTest::newRow("case-and-space") << QStringLiteral(" mTl ");
+    }
+
+    void metalNilWrapperIsUnavailable() {
+        QFETCH(QString, registry);
+        const BackendDevice missing{registry, {}, {}, false, true};
+        const QVector<BackendDevice> devices{missing, cpu()};
+        const auto automatic = selectBackend(BackendMode::Auto, QStringLiteral("metal"), devices);
+        QVERIFY(automatic.error.isEmpty());
+        QCOMPARE(automatic.deviceIndex, 1);
+        QCOMPARE(automatic.backend, QStringLiteral("cpu"));
+        QVERIFY(!automatic.gpu);
+        QVERIFY(automatic.fallbackReason.contains(QStringLiteral("metal")));
+        const auto strict = selectBackend(BackendMode::Gpu, QStringLiteral("metal"), devices);
+        QCOMPARE(strict.deviceIndex, -1);
+        QVERIFY(strict.backend.isEmpty());
+        QVERIFY(!strict.gpu);
+        QVERIFY(strict.error.contains(QStringLiteral("Strict GPU")));
+        QVERIFY(strict.error.contains(QStringLiteral("metal")));
+    }
+
+    void namedMetalDeviceRemainsAvailableWithoutDescription() {
+        const BackendDevice missing{QStringLiteral("MTL"), {}, {}, false, true};
+        const BackendDevice named{QStringLiteral("MTL"), QStringLiteral("MTL0"), {}, false, true};
+        const QVector<BackendDevice> devices{cpu(), missing, named};
+        for (const auto mode : {BackendMode::Auto, BackendMode::Gpu}) {
+            const auto selected = selectBackend(mode, QStringLiteral("metal"), devices);
+            QVERIFY(selected.error.isEmpty());
+            QCOMPARE(selected.deviceIndex, 2);
+            QCOMPARE(selected.backend, QStringLiteral("metal"));
+            QVERIFY(selected.gpu);
+            QVERIFY(selected.fallbackReason.isEmpty());
+        }
+    }
+
+    void emptyNamesDoNotChangeOtherBackendPolicies() {
+        for (const auto& registry : {QStringLiteral("CUDA"), QStringLiteral("ROCm"), QStringLiteral("Vulkan")}) {
+            const BackendDevice unnamed{registry, {}, {}, false, true};
+            const auto packaged = canonicalBackendName(registry);
+            for (const auto mode : {BackendMode::Auto, BackendMode::Gpu}) {
+                const auto selected = selectBackend(mode, packaged, {cpu(), unnamed});
+                QVERIFY(selected.error.isEmpty());
+                QCOMPARE(selected.deviceIndex, 1);
+                QCOMPARE(selected.backend, packaged);
+                QVERIFY(selected.gpu);
+            }
+        }
     }
 
     void cpuPackagesHaveNoAutomaticGpuSelection() {
