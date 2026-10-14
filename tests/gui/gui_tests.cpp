@@ -11,6 +11,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QGraphicsPixmapItem>
@@ -37,6 +38,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QStandardPaths>
+#include <QTabWidget>
 #include <QTextBrowser>
 #include <QtTest>
 #include <QtEndian>
@@ -501,6 +503,90 @@ private slots:
         auto *arguments = dialog.findChild<QPlainTextEdit *>("pdfOpenerArguments"); QVERIFY(arguments);
         arguments->setPlainText("--page\n{page}\n{file}");
         QCOMPARE(dialog.settings().pdfOpener.arguments, QStringList({"--page", "{page}", "{file}"}));
+    }
+    void languageChangePreservesDirectoryPathSpellings() {
+        TestEnvironment env("gui-settings-path-spelling"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        AppSettings settings; settings.language = "en"; settings.includeCode = true;
+        const auto originalPath = [&env](const QString &name) {
+            return QDir::toNativeSeparators(env.path(name) + "/./");
+        };
+        for (const auto &name : {"ordinary", "excluded", "code", "code-excluded"})
+            QVERIFY(QDir().mkpath(env.path(name)));
+        settings.roots = {originalPath("ordinary")};
+        settings.excludes = {originalPath("excluded")};
+        settings.codeRoots = {originalPath("code")};
+        settings.codeExcludes = {originalPath("code-excluded")};
+        AppSettings parsed; QString error;
+        QVERIFY2(AppSettings::fromJson(settings.toJson(), &parsed, &error), qPrintable(error));
+        QCOMPARE(parsed.fingerprint(), settings.fingerprint());
+        QVERIFY(settings.roots.first() != QDir::cleanPath(settings.roots.first()));
+
+        SettingsDialog dialog(parsed, false, false); dialog.show();
+        auto *tabs = dialog.findChild<QTabWidget *>("settingsTabs"); QVERIFY(tabs);
+        tabs->setCurrentIndex(tabs->count() - 1);
+        auto *language = dialog.findChild<QComboBox *>("languageCombo"); QVERIFY(language);
+        language->setCurrentIndex(language->findData("zh_CN"));
+        QSignalSpy accepted(&dialog, &QDialog::accepted);
+        QTest::mouseClick(dialog.findChild<QPushButton *>("saveSettingsButton"), Qt::LeftButton);
+        QCOMPARE(accepted.count(), 1);
+        const auto saved = dialog.settings();
+        QCOMPARE(saved.language, QString("zh_CN"));
+        QCOMPARE(saved.roots, settings.roots);
+        QCOMPARE(saved.excludes, settings.excludes);
+        QCOMPARE(saved.codeRoots, settings.codeRoots);
+        QCOMPARE(saved.codeExcludes, settings.codeExcludes);
+        QCOMPARE(saved.fingerprint(), settings.fingerprint());
+        QVERIFY2(AppSettings::fromJson(saved.toJson(), &parsed, &error), qPrintable(error));
+        QCOMPARE(parsed.fingerprint(), settings.fingerprint());
+    }
+    void folderEditsPreserveExistingSpellings_data() {
+        QTest::addColumn<QString>("listName");
+        QTest::addColumn<QString>("settingsKey");
+        QTest::addColumn<int>("tabIndex");
+        QTest::newRow("roots") << QString("rootFolders") << QString("roots") << 0;
+        QTest::newRow("excludes") << QString("excludedFolders") << QString("excludes") << 0;
+        QTest::newRow("code-roots") << QString("codeRootFolders") << QString("codeRoots") << 1;
+        QTest::newRow("code-excludes") << QString("codeExcludedFolders") << QString("codeExcludes") << 1;
+    }
+    void folderEditsPreserveExistingSpellings() {
+        QFETCH(QString, listName);
+        QFETCH(QString, settingsKey);
+        QFETCH(int, tabIndex);
+        TestEnvironment env("gui-settings-folder-edits"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        const QString existing = env.path("existing");
+        const QString added = env.path("added");
+        QVERIFY(QDir().mkpath(existing)); QVERIFY(QDir().mkpath(added));
+        const QString spelling = QDir::toNativeSeparators(QFileInfo(existing).canonicalFilePath() + "/./");
+        AppSettings settings; settings.language = "en"; settings.includeCode = true;
+        auto json = settings.toJson(); json.insert(settingsKey, QJsonArray{spelling});
+        QString error;
+        QVERIFY2(AppSettings::fromJson(json, &settings, &error), qPrintable(error));
+        const QString fingerprint = settings.fingerprint();
+        SettingsDialog dialog(settings, false, false); dialog.show();
+        auto *tabs = dialog.findChild<QTabWidget *>("settingsTabs"); QVERIFY(tabs);
+        tabs->setCurrentIndex(tabIndex);
+        auto *list = dialog.findChild<QListWidget *>(listName); QVERIFY(list);
+        auto *remove = dialog.findChild<QPushButton *>(listName + "Remove"); QVERIFY(remove);
+        QCOMPARE(list->count(), 1);
+        QCOMPARE(list->item(0)->text(), spelling);
+        QCOMPARE(dialog.settings().fingerprint(), fingerprint);
+
+        // Model the normalized item returned by the picker without opening
+        // QFileDialog, which reads and writes native QtProject user settings.
+        const QString canonicalAdded = QDir::cleanPath(QFileInfo(added).canonicalFilePath());
+        list->addItem(canonicalAdded);
+        QCOMPARE(list->count(), 2);
+        QCOMPARE(dialog.settings().toJson().value(settingsKey).toArray(), QJsonArray({spelling, canonicalAdded}));
+        QVERIFY(dialog.settings().fingerprint() != fingerprint);
+        list->setCurrentRow(1);
+        QTest::mouseClick(remove, Qt::LeftButton);
+        QCOMPARE(list->count(), 1);
+        QCOMPARE(dialog.settings().toJson().value(settingsKey).toArray(), QJsonArray({spelling}));
+        QCOMPARE(dialog.settings().fingerprint(), fingerprint);
+        list->setCurrentRow(0);
+        QTest::mouseClick(remove, Qt::LeftButton);
+        QVERIFY(dialog.settings().toJson().value(settingsKey).toArray().isEmpty());
+        QVERIFY(dialog.settings().fingerprint() != fingerprint);
     }
     void inputMethodPreeditDoesNotSearch() {
         TestEnvironment env("gui-ime"); QVERIFY(env.isValid());
@@ -1396,6 +1482,82 @@ private slots:
         QCOMPARE(button->text(), QString("Play"));
         QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), document.text);
         QVERIFY(QFileInfo::exists(audio.path));
+        QTRY_VERIFY(!QFileInfo::exists(audio.path) || QFile::remove(audio.path));
+    }
+    void savingLanguagePreservesPausedMediaAndSelectedRoot() {
+        TestEnvironment env("gui-media-settings-save"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        QVERIFY(QDir().mkpath(env.path("other")));
+        QVERIFY(env.writeFile("selected/audio 中文.wav", silentPcmWave(65)));
+        FakeBackend backend; backend.autoStatus = false;
+        backend.settings.roots = {QDir::toNativeSeparators(env.path("other") + "/./"),
+            QDir::toNativeSeparators(env.path("selected") + "/./")};
+        const auto originalSettings = backend.settings;
+        const QString selectedRoot = originalSettings.roots.at(1);
+        SearchHit audio; audio.segmentId = 7; audio.path = env.path("selected/audio 中文.wav");
+        audio.title = "Paused audio"; audio.kind = "audio"; audio.startMs = 50000;
+        audio.sourceVersion = "unchanged-audio";
+        backend.hits = {audio};
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        auto *root = window.findChild<QComboBox *>("rootFilter"); QVERIFY(root);
+        QTRY_COMPARE(root->count(), 3);
+        root->setCurrentIndex(2);
+        window.findChild<SearchEdit *>("searchInput")->setText("media moment");
+        QTRY_COMPARE(backend.last("search").params.value("root").toString(), selectedRoot);
+        auto *results = window.findChild<QListWidget *>("searchResults"); QVERIFY(results);
+        QTRY_COMPARE(results->count(), 1);
+        auto *preview = window.findChild<PreviewPanel *>("previewPanel"); QVERIFY(preview);
+        QTRY_COMPARE(preview->currentHit().toJson(), audio.toJson());
+        auto *player = window.findChild<QMediaPlayer *>("previewMediaPlayer"); QVERIFY(player);
+        auto *play = window.findChild<QPushButton *>("mediaPlayButton"); QVERIFY(play);
+        QTRY_COMPARE_WITH_TIMEOUT(player->duration(), qint64(65000), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(player->position(), audio.startMs, 15000);
+        QTest::mouseClick(play, Qt::LeftButton);
+        QTRY_COMPARE(player->playbackState(), QMediaPlayer::PlayingState);
+        QTest::mouseClick(play, Qt::LeftButton);
+        QTRY_COMPARE(player->playbackState(), QMediaPlayer::PausedState);
+        // A reset to the hit start must be observable even when the same hit remains selected.
+        player->setPosition(13824);
+        QTRY_COMPARE(player->position(), qint64(13824));
+        const auto source = player->source();
+        const qint64 position = player->position();
+        const int searches = backend.count("search");
+        const int browses = backend.count("files.list");
+        QSignalSpy sourceChanges(player, &QMediaPlayer::sourceChanged);
+        QSignalSpy stateChanges(player, &QMediaPlayer::playbackStateChanged);
+        for (const auto &language : {QString("zh_CN"), QString("en")}) {
+            auto *settingsButton = window.findChild<QPushButton *>("settingsButton"); QVERIFY(settingsButton);
+            QTest::mouseClick(settingsButton, Qt::LeftButton);
+            auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
+            auto *tabs = dialog->findChild<QTabWidget *>("settingsTabs"); QVERIFY(tabs);
+            tabs->setCurrentIndex(tabs->count() - 1);
+            auto *languageCombo = dialog->findChild<QComboBox *>("languageCombo"); QVERIFY(languageCombo);
+            languageCombo->setCurrentIndex(languageCombo->findData(language));
+            const int saves = backend.count("settings.set");
+            QTest::mouseClick(dialog->findChild<QPushButton *>("saveSettingsButton"), Qt::LeftButton);
+            QTRY_COMPARE(backend.count("settings.set"), saves + 1);
+            QTRY_COMPARE(backend.settings.language, language);
+            QTRY_COMPARE(settingsButton->text(), language == "en" ? QString("Settings") : QString::fromUtf8("设置"));
+            QTRY_VERIFY(window.findChild<SettingsDialog *>() == nullptr);
+            // Observe beyond MainWindow's 250 ms debounce after the settings response.
+            QTest::qWait(500);
+            QCOMPARE(backend.settings.roots, originalSettings.roots);
+            QCOMPARE(backend.settings.fingerprint(), originalSettings.fingerprint());
+            QCOMPARE(backend.last("settings.set").params.value("roots").toArray(), QJsonArray::fromStringList(originalSettings.roots));
+            QCOMPARE(root->currentIndex(), 2);
+            QCOMPARE(root->currentData().toString(), selectedRoot);
+            QCOMPARE(results->currentRow(), 0);
+            QCOMPARE(preview->currentHit().toJson(), audio.toJson());
+            QCOMPARE(player->source(), source);
+            QCOMPARE(player->position(), position);
+            QCOMPARE(player->playbackState(), QMediaPlayer::PausedState);
+            QCOMPARE(play->text(), language == "en" ? QString("Play") : QString::fromUtf8("播放"));
+            QCOMPARE(sourceChanges.count(), 0);
+            QCOMPARE(stateChanges.count(), 0);
+            QCOMPARE(backend.count("search"), searches);
+            QCOMPARE(backend.count("files.list"), browses);
+        }
+        preview->clear();
         QTRY_VERIFY(!QFileInfo::exists(audio.path) || QFile::remove(audio.path));
     }
     void mediaClockTracksDurationBeforePlaybackAndClears() {

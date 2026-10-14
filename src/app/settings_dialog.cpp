@@ -56,7 +56,9 @@ SettingsDialog::SettingsDialog(const AppSettings &settings, bool firstRun, bool 
             if (path.isEmpty()) return;
             const QFileInfo info(path);
             const QString canonical = QDir::cleanPath(info.canonicalFilePath().isEmpty() ? info.absoluteFilePath() : info.canonicalFilePath());
-            if (target->findItems(canonical, Qt::MatchExactly).isEmpty()) target->addItem(canonical);
+            for (int i = 0; i < target->count(); ++i)
+                if (QDir::cleanPath(target->item(i)->text()) == canonical) return;
+            target->addItem(canonical);
         });
         connect(remove, &QPushButton::clicked, this, [target] { delete target->takeItem(target->currentRow()); });
         pageLayout->addWidget(group);
@@ -274,10 +276,12 @@ AppSettings SettingsDialog::settings() const {
     result.excludes.clear();
     result.codeRoots.clear();
     result.codeExcludes.clear();
-    for (int i = 0; i < roots_->count(); ++i) result.roots << QDir::cleanPath(roots_->item(i)->text());
-    for (int i = 0; i < excludes_->count(); ++i) result.excludes << QDir::cleanPath(excludes_->item(i)->text());
-    for (int i = 0; i < codeRoots_->count(); ++i) result.codeRoots << QDir::cleanPath(codeRoots_->item(i)->text());
-    for (int i = 0; i < codeExcludes_->count(); ++i) result.codeExcludes << QDir::cleanPath(codeExcludes_->item(i)->text());
+    // Unchanged paths must retain their spelling so preference-only saves do not
+    // change the indexing fingerprint, selected folder, or preview context.
+    for (int i = 0; i < roots_->count(); ++i) result.roots << roots_->item(i)->text();
+    for (int i = 0; i < excludes_->count(); ++i) result.excludes << excludes_->item(i)->text();
+    for (int i = 0; i < codeRoots_->count(); ++i) result.codeRoots << codeRoots_->item(i)->text();
+    for (int i = 0; i < codeExcludes_->count(); ++i) result.codeExcludes << codeExcludes_->item(i)->text();
     result.language = language_->currentData().toString();
     result.includeCode = code_->isChecked();
     result.editorCommand = editor_->text().trimmed();
