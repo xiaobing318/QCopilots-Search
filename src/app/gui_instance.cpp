@@ -175,10 +175,15 @@ public:
                 }
                 if (!incoming->endsWith('\n')) return;
                 *complete = true;
-                deadline->stop();
                 emit q->showRequested();
-                socket->write(shownReply);
-                socket->disconnectFromServer();
+                if (socket->write(shownReply) != shownReply.size()) {
+                    socket->abort();
+                    return;
+                }
+                // Let the client close after consuming its ACK. On Windows,
+                // disconnectFromServer can discard unread named-pipe bytes
+                // once Qt's write buffer is empty. Bound abandoned clients.
+                deadline->start();
             };
             QObject::connect(socket, &QLocalSocket::readyRead, socket, read);
             read();
@@ -258,7 +263,10 @@ GuiInstance::Result GuiInstance::start(QString *error, int timeoutMs)
                 reply += socket.readAll();
                 if (reply.size() > maxRequestBytes) break;
             }
-            if (reply == shownReply) return Result::ActivatedExisting;
+            if (reply == shownReply) {
+                socket.disconnectFromServer();
+                return Result::ActivatedExisting;
+            }
             if (error) *error = QStringLiteral("The existing GUI did not acknowledge window activation. %1").arg(socket.errorString());
             return Result::Failed;
         }

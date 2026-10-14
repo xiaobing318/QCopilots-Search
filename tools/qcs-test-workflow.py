@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Safety and relocation contracts for the developer workflow."""
 import argparse
+from contextlib import contextmanager, ExitStack
 import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -249,6 +251,90 @@ finally:
                 self.assertRaisesRegex(RuntimeError, "current candidate package"):
             workflow.package_generator(self.root, build, "Release", "ZIP", {})
         self.assertEqual(list(packages.iterdir()), [])
+
+    @contextmanager
+    def package_link_fixture(self):
+        """Use real POSIX links, or only link metadata on unprivileged Windows."""
+        links = {}
+        original_lstat, original_resolve, original_readlink = Path.lstat, Path.resolve, os.readlink
+
+        def create(path, target):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                path.write_bytes(b"synthetic symlink entry")
+                links[path] = str(target)
+            else:
+                path.symlink_to(target, target_is_directory=True)
+
+        def lstat(path, *args, **kwargs):
+            info = original_lstat(path, *args, **kwargs)
+            if path in links:
+                fields = list(info)
+                fields[0] = stat.S_IFLNK | 0o777
+                return os.stat_result(fields)
+            return info
+
+        def resolve(path, *args, **kwargs):
+            return original_resolve(Path(links[path]) if path in links else path, *args, **kwargs)
+
+        def readlink(path, *args, **kwargs):
+            return links[Path(path)] if Path(path) in links else original_readlink(path, *args, **kwargs)
+
+        with ExitStack() as stack:
+            if os.name == "nt":
+                stack.enter_context(patch.object(Path, "lstat", lstat))
+                stack.enter_context(patch.object(Path, "resolve", resolve))
+                stack.enter_context(patch.object(os, "readlink", readlink))
+            yield create
+
+    def test_dmg_cleanup_unlinks_only_standard_applications_shortcut(self):
+        build, packages = self.root / "Release", self.root / "pkg/Release"
+        build.mkdir()
+        packages.mkdir(parents=True)
+        (build / "CPackConfig.cmake").write_text('set(CPACK_PACKAGE_FILE_NAME "qcs-current")\n', encoding="utf-8")
+        historical = packages / "_CPack_Packages/Darwin/DragNDrop/qcs-old/Applications"
+        stage_paths = []
+        with self.package_link_fixture() as link:
+            link(historical, "/Applications")
+            def generate(command, **options):
+                stage = command[command.index("-B") + 1]
+                stage_paths.append(stage)
+                link(stage / "_CPack_Packages/Darwin/DragNDrop/qcs-current/Applications", "/Applications")
+                (stage / "qcs-current.dmg").write_bytes(b"synthetic DMG")
+            with patch.object(workflow, "run", side_effect=generate):
+                package = workflow.package_generator(self.root, build, "Release", "DragNDrop", {})
+            self.assertEqual(package.read_bytes(), b"synthetic DMG")
+            self.assertFalse(stage_paths[0].exists())
+            self.assertEqual(os.readlink(historical), "/Applications")
+            historical.unlink()
+
+    def test_package_cleanup_rejects_other_external_links(self):
+        build, packages = self.root / "Release", self.root / "pkg/Release"
+        build.mkdir()
+        packages.mkdir(parents=True)
+        (build / "CPackConfig.cmake").write_text('set(CPACK_PACKAGE_FILE_NAME "qcs-current")\n', encoding="utf-8")
+        outside = self.root / "outside"
+        outside.mkdir()
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"preserve")
+        for generator, relative, target, diagnostic in (
+                ("DragNDrop", "_CPack_Packages/Darwin/DragNDrop/qcs-current/Applications", str(outside), "external generated symlink"),
+                ("DragNDrop", "_CPack_Packages/Darwin/DragNDrop/qcs-current/Other", "/Applications", "external generated symlink"),
+                ("DragNDrop", "_CPack_Packages/Darwin/DragNDrop/qcs-other/Applications", "/Applications", "external generated symlink"),
+                ("ZIP", "_CPack_Packages/Darwin/DragNDrop/qcs-current/Applications", "/Applications", "external generated symlink"),
+                ("DragNDrop", "_CPack_Packages/Darwin", str(outside), "redirected CPack Applications parent")):
+            with self.subTest(generator=generator, relative=relative, target=target), self.package_link_fixture() as link:
+                stage_paths = []
+                def generate(command, **options):
+                    stage = command[command.index("-B") + 1]
+                    stage_paths.append(stage)
+                    link(stage / relative, target)
+                    (stage / ("qcs-current.zip" if generator == "ZIP" else "qcs-current.dmg")).write_bytes(b"synthetic package")
+                with patch.object(workflow, "run", side_effect=generate), self.assertRaisesRegex(RuntimeError, diagnostic):
+                    workflow.package_generator(self.root, build, "Release", generator, {})
+                self.assertTrue(stage_paths[0].is_dir(), "Rejected cleanup must retain the owned stage for inspection")
+                self.assertEqual(sentinel.read_bytes(), b"preserve")
+                (stage_paths[0] / relative).unlink()
 
     def test_cpack_matches_full_install_before_final_bundle_hook(self):
         import contextlib

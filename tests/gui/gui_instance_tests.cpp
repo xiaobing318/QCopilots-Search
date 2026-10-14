@@ -195,8 +195,47 @@ private slots:
         auto &secondary = first.process.state() == QProcess::NotRunning ? first : second;
         QVERIFY2(owner.waitFor("ready\n"), qPrintable(owner.diagnostics()));
         QVERIFY2(owner.waitFor("shown\n"), qPrintable(owner.diagnostics()));
-        QCOMPARE(secondary.process.exitCode(), 0);
+        QVERIFY2(secondary.process.exitCode() == 0, qPrintable(secondary.diagnostics()));
         QVERIFY2(secondary.waitFor("forwarded\n"), qPrintable(secondary.diagnostics()));
+    }
+
+    void activationReplyRemainsAvailableUntilClientReadsIt()
+    {
+        TestEnvironment env(QStringLiteral("gui-reply"));
+        QVERIFY2(env.isValid(), qPrintable(env.error()));
+        const auto paths = env.runtimePaths();
+        GuiInstance primary(paths);
+        QString error;
+        QCOMPARE(primary.start(&error), GuiInstance::Result::Primary);
+        QSignalSpy shown(&primary, &GuiInstance::showRequested);
+        QFile secret(tokenPath(paths, primary));
+        QVERIFY(secret.open(QIODevice::ReadOnly));
+        const auto token = secret.readAll();
+        secret.close();
+        QCOMPARE(token.size(), 64);
+        const auto request = QByteArrayLiteral("qcs-gui/1 show ") + token + '\n';
+        const auto expectedReply = QByteArrayLiteral("qcs-gui/1 shown\n");
+
+        // Hold all but the first reply byte in the OS pipe while the owner
+        // finishes handling show. The owner must leave the connection open
+        // until the client consumes its ACK and closes the connection.
+        QLocalSocket socket;
+        socket.setReadBufferSize(1);
+        socket.connectToServer(primary.endpointName());
+        QVERIFY(socket.waitForConnected(1000));
+        QCOMPARE(socket.write(request), request.size());
+        QTRY_COMPARE_WITH_TIMEOUT(shown.count(), 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(socket.bytesAvailable() > 0, 1000);
+
+        QByteArray reply;
+        QObject::connect(&socket, &QLocalSocket::readyRead, &socket,
+                         [&] { reply += socket.readAll(); });
+        reply += socket.readAll();
+        QTRY_COMPARE_WITH_TIMEOUT(reply, expectedReply, 1000);
+        QCOMPARE(socket.state(), QLocalSocket::ConnectedState);
+        socket.disconnectFromServer();
+        QTRY_COMPARE_WITH_TIMEOUT(socket.state(), QLocalSocket::UnconnectedState, 1000);
+        QCOMPARE(shown.count(), 1);
     }
 
     void liveLockWithoutEndpointFailsExplicitly()

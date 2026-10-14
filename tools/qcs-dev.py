@@ -572,6 +572,24 @@ def package_generator(root, build, config, generator, environment):
         # Never enumerate historical CPack roots or another invocation's stage.
         # Framework/library symlinks may be unlinked but must not redirect cleanup.
         check_owned_directory()
+        if generator == "DragNDrop":
+            # CPack adds this one drag-install shortcut outside the app bundle.
+            # Remove only the link itself before applying the unchanged general
+            # tree guard. Never traverse Applications or a redirected ancestor.
+            parent = temporary
+            for component in ("_CPack_Packages", "Darwin", "DragNDrop", destination.stem):
+                parent /= component
+                if not parent.exists() and not parent.is_symlink():
+                    break
+                if is_redirect(parent) or not parent.is_dir() or parent.resolve() != parent:
+                    raise RuntimeError("Refusing redirected CPack Applications parent: " + str(parent))
+            else:
+                shortcut = parent / "Applications"
+                if shortcut.is_symlink() and os.readlink(shortcut) == "/Applications":
+                    check_owned_directory()
+                    if parent.resolve() != parent:
+                        raise RuntimeError("CPack Applications parent changed before unlink: " + str(parent))
+                    shortcut.unlink()
         verify_plain_tree(temporary)
         shutil.rmtree(temporary, onerror=remove_readonly)
 
