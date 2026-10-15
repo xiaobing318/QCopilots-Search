@@ -421,6 +421,7 @@ include(CPack)
                 self.assertTrue((analysis / "libcuda.so.1").is_file(),
                                 "Production DEB hook must create its analysis-only driver alias")
                 run([*configure, "-DQCS_FIXTURE_UNRESOLVED=ON"])
+                run([cmake, "--build", build, "--parallel", "2"])
                 _, failure = run([*pack, "-B", directory / "missing-packages"], success=False)
                 self.assertIn("libqcs-unrelated-fixture.so.1", failure)
                 self.assertIn("cannot find library", failure)
