@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
@@ -183,13 +184,30 @@ class TestRunner(unittest.TestCase):
             'qcopilots_search_add_test(NAME qcs-tests-kept EVIDENCE_KIND program KEEP_SUCCESS_ARTIFACTS COMMAND "${CMAKE_COMMAND}" -E true)\n',
             encoding="utf-8")
         build = self.base / "cmake build"
-        configured = subprocess.run(["cmake", "-S", str(project), "-B", str(build)],
-                                    cwd=self.base, env=self.env, capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace", timeout=30)
+        selectors = {"CMAKE_GENERATOR", "CMAKE_GENERATOR_PLATFORM", "CMAKE_GENERATOR_TOOLSET",
+                     "CMAKE_GENERATOR_INSTANCE", "CMAKE_TOOLCHAIN_FILE"}
+        fixture_env = {name: value for name, value in self.env.items() if name.upper() not in selectors}
+        programs = {}
+        for name in ("cmake", "ctest", "ninja"):
+            resolved = shutil.which(name, path=fixture_env.get("PATH"))
+            self.assertIsNotNone(resolved, f"The registration fixture requires an installed {name}")
+            programs[name] = str(Path(resolved).resolve())
+
+        def run_fixture(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(command, cwd=self.base, env=fixture_env, capture_output=True,
+                                      text=True, encoding="utf-8", errors="replace", timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                def output_text(value: str | bytes | None) -> str:
+                    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+                self.fail(f"Registration fixture timed out after {timeout} seconds\n"
+                          f"Resolved command: {command!r}\nWorking directory: {self.base}\n"
+                          f"stdout:\n{output_text(error.stdout)}\nstderr:\n{output_text(error.stderr)}")
+
+        configured = run_fixture([programs["cmake"], "-S", str(project), "-B", str(build), "-G", "Ninja",
+                                  f"-DCMAKE_MAKE_PROGRAM:FILEPATH={programs['ninja']}"], 60)
         self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
-        listing = subprocess.run(["ctest", "--test-dir", str(build), "-C", "Release", "--show-only=json-v1"],
-                                 cwd=self.base, env=self.env, capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace", timeout=30)
+        listing = run_fixture([programs["ctest"], "--test-dir", str(build), "-C", "Release", "--show-only=json-v1"], 30)
         self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
         commands = {test["name"]: test["command"] for test in json.loads(listing.stdout)["tests"]}
         self.assertNotIn("--keep-success", commands["qcs-tests-default"])
