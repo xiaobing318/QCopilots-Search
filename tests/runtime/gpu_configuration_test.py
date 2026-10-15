@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Exercise the real CMake variant contract and Windows PE ABI verification."""
+"""Exercise CMake variants, native package dependency analysis and Windows PE ABI."""
 import argparse
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path, PureWindowsPath
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import time
 import unittest
 
 sys.dont_write_bytecode = True
@@ -191,6 +195,235 @@ qcopilots_search_install_gpu_dependencies(qcs-gpu-fixture)
             expected = stage / ("bin" if os.name == "nt" else "lib") / module_name
             self.assertEqual(expected.resolve(), Path(args["--backend-library"]).resolve())
             self.assertEqual(sdk_manifest.resolve(), Path(args["--sdk-manifest"]).resolve())
+
+
+if sys.platform.startswith("linux"):
+    class LinuxDebDriverTests(unittest.TestCase):
+        def test_linked_ancestors_of_new_analysis_or_payload_paths_are_rejected_before_helper(self):
+            cmake = shutil.which(OPTIONS.cmake)
+            self.assertIsNotNone(cmake, "Linux DEB boundary fixture requires CMake")
+            boundaries = ("CPACK_QCS_INSTALL_PREFIX", "CPACK_PACKAGE_DIRECTORY",
+                          "CPACK_TOPLEVEL_DIRECTORY", "CPACK_TEMPORARY_DIRECTORY")
+            tail = Path("qcs-deb-analysis/linux-x64-cuda-12.8/Release")
+            deadline = time.monotonic() + 20
+            with tempfile.TemporaryDirectory(prefix="qcs-deb-boundary-", dir=temporary_root()) as root:
+                directory = Path(root)
+                source = directory / "source"
+                (source / "tools").mkdir(parents=True)
+                marker = directory / "helper-was-called"
+                # The real CPack integration must reject the path before
+                # invoking this sentinel in place of its SDK preparation tool.
+                (source / "tools/qcs-gpu-runtime.py").write_text(
+                    "from pathlib import Path\n"
+                    f"Path({str(marker)!r}).write_text('unexpected helper call', encoding='utf-8')\n"
+                    "raise SystemExit('boundary fixture helper must not execute')\n", encoding="utf-8")
+                manifest = directory / "gpu-sdk.json"
+                manifest.write_text("{}", encoding="utf-8")
+                for boundary in boundaries:
+                    for linked_side in ("analysis", "payload"):
+                        with self.subTest(boundary=boundary, linked_side=linked_side):
+                            case = directory / f"{boundary}-{linked_side}"
+                            case.mkdir()
+                            physical = case / "physical"
+                            physical.mkdir()
+                            alias = case / "alias"
+                            alias.symlink_to(physical, target_is_directory=True)
+                            self.assertTrue(alias.is_symlink())
+                            if linked_side == "analysis":
+                                build, payload = alias, physical
+                            else:
+                                build, payload = physical, alias / tail / "payload"
+                            analysis = build / tail
+                            if linked_side == "analysis":
+                                self.assertTrue(analysis.resolve().is_relative_to(payload.resolve()))
+                            else:
+                                self.assertTrue(payload.resolve().is_relative_to(analysis.resolve()))
+                                self.assertFalse(payload.exists())
+                            self.assertFalse(analysis.exists())
+                            self.assertFalse((physical / tail).exists())
+                            script = case / "boundary.cmake"
+                            script.write_text(f'''
+cmake_minimum_required(VERSION 3.28)
+set(CPACK_GENERATOR DEB)
+set(CPACK_QCS_SOURCE_DIR "{source.as_posix()}")
+set(CPACK_QCS_PYTHON_EXECUTABLE "{Path(sys.executable).as_posix()}")
+set(CPACK_QCS_VARIANT linux-x64-cuda-12.8)
+set(CPACK_QCS_SYSTEM_NAME Linux)
+set(CPACK_QCS_GPU_BACKEND cuda)
+set(CPACK_QCS_GPU_SDK_MANIFEST "{manifest.as_posix()}")
+set(CPACK_QCS_BUILD_DIR "{build.as_posix()}")
+set(CPACK_QCS_BUILD_TYPE Release)
+set({boundary} "{payload.as_posix()}")
+include("{(ROOT / 'cmake/qcs-cpack.cmake').as_posix()}")
+''', encoding="utf-8")
+                            remaining = deadline - time.monotonic()
+                            self.assertGreater(remaining, 0, "DEB boundary fixture exhausted its 20-second watchdog")
+                            command = [cmake, "-P", str(script)]
+                            try:
+                                result = subprocess.run(command, cwd=case, capture_output=True,
+                                                        timeout=min(5, remaining))
+                            except subprocess.TimeoutExpired as error:
+                                streams = [part.decode("utf-8", errors="replace") if isinstance(part, bytes)
+                                           else part or "" for part in (error.stdout, error.stderr)]
+                                self.fail(f"Boundary command timed out: {command!r}\ncwd={case}\n"
+                                          f"stdout:\n{streams[0]}\nstderr:\n{streams[1]}")
+                            output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+                            self.assertNotEqual(0, result.returncode, output)
+                            self.assertIn(f"CUDA driver analysis directory overlaps {boundary}",
+                                          " ".join(output.split()))
+                            self.assertFalse(marker.exists(), "Overlapping paths reached SDK preparation")
+                            self.assertFalse(analysis.exists(), "Rejected analysis path was created")
+                            self.assertFalse((physical / tail).exists())
+
+        def test_driver_analysis_does_not_ship_driver_or_hide_other_missing_dependencies(self):
+            # These tiny native libraries are packaging fixtures. No CUDA code
+            # is loaded or executed, and no GPU execution is claimed.
+            required = {name: shutil.which(name) for name in
+                        (OPTIONS.cmake, "ninja", "cc", "readelf", "dpkg-deb", "dpkg-shlibdeps", "file")}
+            for name, executable in required.items():
+                self.assertIsNotNone(executable, f"Linux DEB fixture requires {name}")
+            cmake = Path(required[OPTIONS.cmake]).resolve()
+            cpack = cmake.with_name("cpack")
+            self.assertTrue(cpack.is_file(), f"CPack must accompany the selected CMake: {cpack}")
+            environment = {key: value for key, value in os.environ.items()
+                           if key.upper() not in {"CMAKE_GENERATOR", "CMAKE_GENERATOR_PLATFORM",
+                                                  "CMAKE_GENERATOR_TOOLSET", "CMAKE_GENERATOR_INSTANCE",
+                                                  "CMAKE_TOOLCHAIN_FILE", "DESTDIR"}}
+            environment["LC_ALL"] = "C"
+            # Keep this fixture inside the existing 120-second suite watchdog.
+            # Individual commands remain bounded, including a failing CPack.
+            deadline = time.monotonic() + 80
+
+            with tempfile.TemporaryDirectory(prefix="qcs-deb-driver-", dir=temporary_root()) as root:
+                directory = Path(root)
+
+                def run(command, *, success=True):
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0, "Linux DEB fixture exhausted its 80-second watchdog")
+                    try:
+                        result = subprocess.run([str(part) for part in command], cwd=directory,
+                                                env=environment, capture_output=True,
+                                                timeout=min(30, remaining))
+                    except subprocess.TimeoutExpired as error:
+                        streams = [part.decode("utf-8", errors="replace") if isinstance(part, bytes)
+                                   else part or "" for part in (error.stdout, error.stderr)]
+                        self.fail(f"Fixture command timed out: {command!r}\ncwd={directory}\n"
+                                  f"stdout:\n{streams[0]}\nstderr:\n{streams[1]}")
+                    output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+                    if success:
+                        self.assertEqual(0, result.returncode, f"{command!r}\n{output}")
+                    else:
+                        self.assertNotEqual(0, result.returncode, f"{command!r}\n{output}")
+                    return result, output
+
+                source, build, sdk = (directory / name for name in ("source", "build", "sdk"))
+                source.mkdir()
+                (sdk / "lib64/stubs").mkdir(parents=True)
+                variant = next(row for row in json.loads(
+                    (ROOT / "config/build-variants.json").read_text(encoding="utf-8"))["variants"]
+                               if row["id"] == "linux-x64-cuda-12.8")
+                manifest = directory / "gpu-sdk.json"
+                manifest.write_text(json.dumps({
+                    "schemaVersion": 1, "variant": variant["id"], "backend": "cuda", "os": "linux",
+                    "toolkitVersion": variant["toolkitVersion"], "gpuTargets": variant["gpuTargets"],
+                    "cmakeCache": {"CUDAToolkit_ROOT": str(sdk)}, "runtimeRoots": [str(sdk)],
+                }), encoding="utf-8")
+                (source / "driver.c").write_text(
+                    "/* Synthetic link/analysis stub, never executed. */\n"
+                    "int cuInit(unsigned int flags) { return (int)flags; }\n", encoding="utf-8")
+                (source / "backend.c").write_text(
+                    "#include <stdio.h>\nextern int cuInit(unsigned int);\n"
+                    "int qcs_backend_fixture(void) { puts(\"packaging fixture\"); return cuInit(0); }\n",
+                    encoding="utf-8")
+                (source / "unrelated.c").write_text(
+                    "int qcs_unrelated_fixture(void) { return 7; }\n", encoding="utf-8")
+                (source / "unresolved.c").write_text(
+                    "#include <stdio.h>\nextern int cuInit(unsigned int);\n"
+                    "extern int qcs_unrelated_fixture(void);\n"
+                    "int qcs_unresolved_fixture(void) { puts(\"missing dependency fixture\"); "
+                    "return cuInit(0) + qcs_unrelated_fixture(); }\n", encoding="utf-8")
+                (source / "CMakeLists.txt").write_text(f'''
+cmake_minimum_required(VERSION 3.28)
+project(qcs_deb_driver_fixture VERSION 1.0.0 LANGUAGES C)
+add_library(qcs-driver-fixture SHARED driver.c)
+set_target_properties(qcs-driver-fixture PROPERTIES OUTPUT_NAME cuda NO_SONAME TRUE
+  LIBRARY_OUTPUT_DIRECTORY "{(sdk / 'lib64/stubs').as_posix()}")
+target_link_options(qcs-driver-fixture PRIVATE "-Wl,-soname,libcuda.so.1")
+add_library(qcs-backend-fixture SHARED backend.c)
+target_link_libraries(qcs-backend-fixture PRIVATE qcs-driver-fixture)
+add_library(qcs-unrelated-fixture SHARED unrelated.c)
+set_target_properties(qcs-unrelated-fixture PROPERTIES SOVERSION 1)
+add_library(qcs-unresolved-fixture SHARED unresolved.c)
+target_link_libraries(qcs-unresolved-fixture PRIVATE qcs-driver-fixture qcs-unrelated-fixture)
+set_target_properties(qcs-backend-fixture qcs-unresolved-fixture PROPERTIES
+  INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
+option(QCS_FIXTURE_UNRESOLVED "Install the negative dependency fixture" OFF)
+if(QCS_FIXTURE_UNRESOLVED)
+  install(TARGETS qcs-unresolved-fixture LIBRARY DESTINATION lib)
+else()
+  install(TARGETS qcs-backend-fixture LIBRARY DESTINATION lib)
+endif()
+set(CPACK_GENERATOR DEB)
+set(CPACK_PACKAGE_NAME qcs-deb-driver-fixture)
+set(CPACK_PACKAGE_VERSION 1.0.0)
+set(CPACK_PACKAGE_FILE_NAME qcs-deb-driver-fixture)
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Synthetic CUDA driver analysis fixture")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "QCS test fixture")
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_QCS_SOURCE_DIR "{ROOT.as_posix()}")
+set(CPACK_QCS_PYTHON_EXECUTABLE "{Path(sys.executable).as_posix()}")
+set(CPACK_QCS_VARIANT "{variant['id']}")
+set(CPACK_QCS_SYSTEM_NAME Linux)
+set(CPACK_QCS_GPU_BACKEND cuda)
+set(CPACK_QCS_GPU_SDK_MANIFEST "{manifest.as_posix()}")
+set(CPACK_QCS_BUILD_DIR "${{CMAKE_BINARY_DIR}}")
+set(CPACK_QCS_INSTALL_PREFIX "${{CMAKE_INSTALL_PREFIX}}")
+set(CPACK_QCS_BUILD_TYPE Release)
+set(CPACK_PROJECT_CONFIG_FILE "{(ROOT / 'cmake/qcs-cpack.cmake').as_posix()}")
+include(CPack)
+''', encoding="utf-8")
+                configure = [cmake, "-S", source, "-B", build, "-G", "Ninja",
+                             f"-DCMAKE_MAKE_PROGRAM={required['ninja']}",
+                             f"-DCMAKE_C_COMPILER={required['cc']}", "-DCMAKE_BUILD_TYPE=Release",
+                             f"-DCMAKE_INSTALL_PREFIX={directory / 'stage'}"]
+                run(configure)
+                run([cmake, "--build", build, "--parallel", "2"])
+                _, dynamic = run([required["readelf"], "--dynamic", build / "libqcs-backend-fixture.so"])
+                self.assertRegex(dynamic, r"\(NEEDED\).*\[libcuda\.so\.1\]")
+                self.assertRegex(dynamic, r"\(NEEDED\).*\[libc\.so\.6\]")
+                packages = directory / "packages"
+                pack = [cpack, "--config", build / "CPackConfig.cmake", "-G", "DEB", "-C", "Release"]
+                run([*pack, "-B", packages])
+                archives = list(packages.glob("*.deb"))
+                self.assertEqual(1, len(archives))
+                _, depends = run([required["dpkg-deb"], "--field", archives[0], "Depends"])
+                self.assertRegex(depends, r"\blibc6\b")
+                self.assertNotRegex(depends.lower(), r"cuda|nvidia|sdk")
+                payload, _ = run([required["dpkg-deb"], "--fsys-tarfile", archives[0]])
+                packaged_backend = directory / "packaged-backend.so"
+                with tarfile.open(fileobj=io.BytesIO(payload.stdout), mode="r:") as archive:
+                    members = archive.getmembers()
+                    backend_members = [item for item in members
+                                       if Path(item.name).name == "libqcs-backend-fixture.so"]
+                    self.assertEqual(1, len(backend_members))
+                    self.assertTrue(backend_members[0].isfile())
+                    packaged_backend.write_bytes(archive.extractfile(backend_members[0]).read())
+                    self.assertFalse(any("libcuda" in item.name.lower() or "stubs" in Path(item.name).parts
+                                         or "sdk" in Path(item.name).parts for item in members))
+                    for item in members:
+                        if item.isfile():
+                            self.assertNotIn(str(sdk).encode(), archive.extractfile(item).read(),
+                                             f"SDK path leaked into package member {item.name}")
+                _, dynamic = run([required["readelf"], "--dynamic", packaged_backend])
+                self.assertRegex(dynamic, r"\(NEEDED\).*\[libcuda\.so\.1\]")
+                self.assertRegex(dynamic, r"\(NEEDED\).*\[libc\.so\.6\]")
+                analysis = build / "qcs-deb-analysis" / variant["id"] / "Release"
+                self.assertTrue((analysis / "libcuda.so.1").is_file(),
+                                "Production DEB hook must create its analysis-only driver alias")
+                run([*configure, "-DQCS_FIXTURE_UNRESOLVED=ON"])
+                _, failure = run([*pack, "-B", directory / "missing-packages"], success=False)
+                self.assertIn("libqcs-unrelated-fixture.so.1", failure)
+                self.assertIn("cannot find library", failure)
 
 
 class FakeImage:

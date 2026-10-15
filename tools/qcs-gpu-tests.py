@@ -10,7 +10,9 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -343,6 +345,406 @@ class GpuTests(unittest.TestCase):
             for component in version["components"]:
                 self.assertRegex(component["sha256"], r"^[a-f0-9]{64}$")
                 self.assertTrue(component["url"].startswith("https://developer.download.nvidia.com/compute/cuda/redist/"))
+
+
+class DebDriverTests(unittest.TestCase):
+    """Synthetic ELF metadata and DEB streams, never CUDA execution."""
+
+    def setUp(self):
+        parent = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
+        if parent:
+            Path(parent).mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix="qcs-deb-driver-", dir=parent)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.variant = sdk.variant_by_id("linux-x64-cuda-12.8")
+        self.toolkit = self.root / "fixture-cuda"
+        self.toolkit.mkdir()
+        self.manifest = {
+            "schemaVersion": 1, "variant": self.variant["id"], "backend": "cuda", "os": "linux",
+            "toolkitVersion": self.variant["toolkitVersion"], "gpuTargets": [],
+            "cmakeCache": {"CUDAToolkit_ROOT": str(self.toolkit)},
+            "runtimeRoots": [str(self.toolkit)],
+        }
+        self.source = self.toolkit / "lib64/stubs/libcuda.so"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_bytes(self.elf())
+        self.destination = self.root / "analysis"
+
+    @staticmethod
+    def elf(*, machine=62, elf_class=2, data=1, elf_type=3):
+        # Deliberately synthetic ELF header. readelf output is separately
+        # injected in these portable unit tests. Linux integration compiles
+        # and inspects a real ELF instead.
+        header = bytearray(64)
+        header[:7] = b"\x7fELF" + bytes((elf_class, data, 1))
+        struct.pack_into("<HHI", header, 16, elf_type, machine, 1)
+        return bytes(header) + b"QCS synthetic CUDA analysis fixture\n"
+
+    def reader(self, soname="libcuda.so.1"):
+        stack = ExitStack()
+        stack.enter_context(patch.object(runtime.shutil, "which", return_value="fixture-readelf"))
+        execute = stack.enter_context(patch.object(runtime.subprocess, "run", return_value=
+            subprocess.CompletedProcess([], 0, f" 0x000000000000000e (SONAME) Library soname: [{soname}]\n", "")))
+        return stack, execute
+
+    def test_deb_driver_copy_is_independent_and_analysis_only(self):
+        with self.reader()[0]:
+            result = runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        copied = self.destination / "libcuda.so.1"
+        self.assertEqual(self.source.read_bytes(), copied.read_bytes())
+        self.assertFalse(copied.is_symlink())
+        self.assertNotEqual((self.source.stat().st_dev, self.source.stat().st_ino),
+                            (copied.stat().st_dev, copied.stat().st_ino))
+        self.assertEqual(str(self.source.resolve()), result["source"])
+        self.assertEqual(str(copied.resolve()), result["library"])
+        self.assertEqual(str(self.destination.resolve()), result["directory"])
+        self.assertEqual(hashlib.sha256(copied.read_bytes()).hexdigest(), result["sha256"])
+        self.assertEqual(copied.stat().st_size, result["size"])
+        self.assertIs(result["analysisOnly"], True)
+        old_bytes = copied.read_bytes()
+        self.source.write_bytes(b"changed SDK fixture")
+        self.assertEqual(old_bytes, copied.read_bytes())
+        self.assertEqual(["libcuda.so.1"], [item.name for item in self.destination.iterdir()])
+
+    def test_deb_driver_supports_both_locked_linux_cuda_variants(self):
+        for identifier in ("linux-x64-cuda-12.8", "linux-x64-cuda-13.4"):
+            with self.subTest(variant=identifier):
+                selected = sdk.variant_by_id(identifier)
+                manifest = {**self.manifest, "variant": identifier, "toolkitVersion": selected["toolkitVersion"]}
+                with self.reader()[0]:
+                    report = runtime.prepare_deb_driver_analysis(selected, manifest, self.root / identifier)
+                self.assertEqual(identifier, report["variant"])
+                self.assertEqual(selected["toolkitVersion"], report["toolkitVersion"])
+
+    def test_deb_driver_accepts_only_reviewed_stub_layouts(self):
+        self.source.unlink()
+        for index, relative in enumerate(("lib/stubs/libcuda.so", "targets/x86_64-linux/lib/stubs/libcuda.so")):
+            with self.subTest(layout=relative):
+                source = self.toolkit / relative
+                source.parent.mkdir(parents=True)
+                source.write_bytes(self.elf())
+                with self.reader()[0]:
+                    report = runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.root / f"analysis-{index}")
+                self.assertEqual(str(source.resolve()), report["source"])
+                source.unlink()
+        unexpected = self.toolkit / "compat/libcuda.so"
+        unexpected.parent.mkdir()
+        unexpected.write_bytes(self.elf())
+        with self.reader()[0], self.assertRaises(RuntimeError):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+
+    def test_deb_driver_rejects_mismatched_sdk_provenance(self):
+        mutations = (
+            {"schemaVersion": 0}, {"variant": "linux-x64-cuda-13.4"}, {"backend": "hip"},
+            {"os": "windows"}, {"toolkitVersion": "13.4.1"}, {"gpuTargets": ["unexpected"]},
+            {"runtimeRoots": [str(self.root / "other-sdk")]},
+            {"cmakeCache": {"CUDAToolkit_ROOT": "relative-sdk"}},
+        )
+        for fields in mutations:
+            with self.subTest(fields=fields), self.reader()[0], self.assertRaises(RuntimeError):
+                runtime.prepare_deb_driver_analysis(self.variant, {**self.manifest, **fields}, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_deb_driver_rejects_other_platforms_and_backends(self):
+        for identifier in ("linux-x64-cpu", "linux-x64-rocm", "windows-x64-cuda-12.4", "macos-arm64-metal"):
+            with self.subTest(variant=identifier), self.assertRaises(RuntimeError):
+                runtime.prepare_deb_driver_analysis(sdk.variant_by_id(identifier), self.manifest, self.destination)
+        with self.assertRaises(RuntimeError):
+            runtime.prepare_deb_driver_analysis({**self.variant, "arch": "arm64"}, self.manifest, self.destination)
+
+    def test_deb_driver_rejects_sdk_or_source_tree_destinations(self):
+        checkout = self.root / "synthetic-checkout"
+        checkout.mkdir()
+        for destination in (self.toolkit / "analysis", self.toolkit, self.root, checkout / "analysis"):
+            with self.subTest(destination=destination), patch.object(runtime.sdk, "SOURCE", checkout), \
+                    self.reader()[0], self.assertRaises(RuntimeError):
+                runtime.prepare_deb_driver_analysis(self.variant, self.manifest, destination)
+        self.assertEqual([], list(checkout.iterdir()))
+        self.assertTrue(self.source.is_file())
+
+    def test_deb_driver_rejects_foreign_destination_contents(self):
+        self.destination.mkdir()
+        foreign = self.destination / "keep-me.txt"
+        foreign.write_bytes(b"preserve this existing file")
+        with self.reader()[0], self.assertRaises(RuntimeError):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        self.assertEqual(b"preserve this existing file", foreign.read_bytes())
+        self.assertFalse((self.destination / "libcuda.so.1").exists())
+
+    def test_deb_driver_rejects_wrong_elf_header_before_readelf(self):
+        malformed = (b"MZ not ELF", self.elf(elf_class=1), self.elf(data=2),
+                     self.elf(machine=183), self.elf(elf_type=2))
+        for data in malformed:
+            with self.subTest(header=data[:24]):
+                self.source.write_bytes(data)
+                context, execute = self.reader()
+                with context, self.assertRaises(RuntimeError):
+                    runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+                execute.assert_not_called()
+
+    def test_deb_driver_rejects_wrong_or_missing_soname(self):
+        for soname in ("", "libcuda.so", "libcuda.so.2", "libcudart.so.12", "../libcuda.so.1"):
+            with self.subTest(soname=soname), self.reader(soname)[0], self.assertRaises(RuntimeError):
+                runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        self.assertFalse((self.destination / "libcuda.so.1").exists())
+
+    def test_deb_driver_propagates_reader_failure(self):
+        with patch.object(runtime.shutil, "which", return_value="fixture-readelf"), \
+                patch.object(runtime.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["fixture-readelf"])), \
+                self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+
+    def test_deb_driver_rejects_ambiguous_sdk_stubs(self):
+        other = self.toolkit / "targets/x86_64-linux/lib/stubs/libcuda.so"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(self.elf() + b"different SDK build")
+        with self.reader()[0], self.assertRaises(RuntimeError):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_deb_driver_rejects_source_link_and_canonical_escape(self):
+        original_is_symlink = Path.is_symlink
+        with patch.object(Path, "is_symlink", lambda path: path == self.source or original_is_symlink(path)), \
+                self.reader()[0], self.assertRaises(RuntimeError):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        outside = self.root / "unrelated/stubs/libcuda.so"
+        outside.parent.mkdir(parents=True)
+        outside.write_bytes(self.elf())
+        original_resolve = Path.resolve
+        with patch.object(Path, "resolve", lambda path, *a, **k: outside if path == self.source else original_resolve(path, *a, **k)), \
+                self.reader()[0], self.assertRaises(RuntimeError):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_deb_driver_rejects_redirected_destination(self):
+        original_is_symlink = Path.is_symlink
+        with patch.object(Path, "is_symlink", lambda path: path == self.destination or original_is_symlink(path)), \
+                self.reader()[0], self.assertRaises(RuntimeError):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_deb_driver_does_not_overwrite_a_hardlinked_target(self):
+        self.destination.mkdir()
+        alias = self.destination / "libcuda.so.1"
+        os.link(self.source, alias)
+        before = self.source.read_bytes()
+        with self.reader()[0], self.assertRaises(RuntimeError):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        self.assertEqual(before, self.source.read_bytes())
+        self.assertEqual(before, alias.read_bytes())
+
+    def test_deb_driver_changed_sdk_during_copy_fails_without_publishing(self):
+        copy = runtime.shutil.copyfileobj
+
+        def changed(input_stream, output_stream, length):
+            copy(input_stream, output_stream, length)
+            self.source.write_bytes(self.elf() + b"SDK changed while preparing analysis")
+
+        with self.reader()[0], patch.object(runtime.shutil, "copyfileobj", side_effect=changed), \
+                self.assertRaisesRegex(RuntimeError, "changed"):
+            runtime.prepare_deb_driver_analysis(self.variant, self.manifest, self.destination)
+        self.assertFalse((self.destination / "libcuda.so.1").exists())
+        self.assertEqual([], list(self.destination.iterdir()))
+
+    @staticmethod
+    def control(*, depends="libc6 (>= 2.34), libstdc++6 (>= 12)", pre_depends="", recommends="", arch="amd64"):
+        fields = ["Package: qcs", "Version: 0.1.0", f"Architecture: {arch}", f"Depends: {depends}"]
+        if pre_depends:
+            fields.append("Pre-Depends: " + pre_depends)
+        if recommends:
+            fields.append("Recommends: " + recommends)
+        return "\n".join(fields) + "\n"
+
+    @staticmethod
+    def payload(entries=None):
+        data = io.BytesIO()
+        if entries is None:
+            entries = [("./usr/bin/qcs-cli", tarfile.REGTYPE, ""),
+                       ("./usr/lib/libggml-cuda.so", tarfile.REGTYPE, ""),
+                       ("./usr/lib/libcudart.so.12", tarfile.REGTYPE, ""),
+                       ("./usr/lib/libcublas.so.12", tarfile.REGTYPE, "")]
+        with tarfile.open(fileobj=data, mode="w") as archive:
+            for name, kind, link in entries:
+                item = tarfile.TarInfo(name)
+                item.type = kind
+                item.linkname = link
+                item.size = 0
+                archive.addfile(item, io.BytesIO())
+        return data.getvalue()
+
+    def deb_stream(self, *, control=None, payload=None, exit_code=0):
+        package = self.root / "fixture.deb"
+        package.write_bytes(b"Synthetic DEB identity. dpkg output is injected, no DEB is executed.\n")
+
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO(payload if payload is not None else DebDriverTests.payload())
+                self.returncode = None
+                self.killed = False
+
+            def wait(self):
+                if self.returncode is None:
+                    self.returncode = exit_code
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        process = Process()
+        stack = ExitStack()
+        stack.enter_context(patch.object(runtime.shutil, "which", return_value="fixture-dpkg-deb"))
+        field = stack.enter_context(patch.object(runtime.subprocess, "run", return_value=
+            subprocess.CompletedProcess([], 0, control if control is not None else self.control(), "")))
+        stream = stack.enter_context(patch.object(runtime.subprocess, "Popen", return_value=process))
+        return stack, package, process, field, stream
+
+    def test_deb_policy_retains_normal_dependencies_and_binds_actual_bytes(self):
+        expected = "libc6 (>= 2.34), libstdc++6 (>= 12) | libstdc++6:amd64"
+        context, package, process, field, stream = self.deb_stream(
+            control=self.control(depends=expected, pre_depends="zlib1g (>= 1.2)", recommends="fonts-noto-cjk"))
+        with context:
+            report = runtime.verify_deb_driver_policy(self.variant, package)
+        self.assertEqual(expected, report["depends"])
+        self.assertEqual("zlib1g (>= 1.2)", report["preDepends"])
+        self.assertEqual("fonts-noto-cjk", report["recommends"])
+        self.assertEqual(hashlib.sha256(package.read_bytes()).hexdigest(), report["packageSha256"])
+        self.assertEqual(4, report["payloadEntries"])
+        self.assertEqual("verified", report["driverPolicy"])
+        self.assertEqual(["fixture-dpkg-deb", "--field", str(package)], field.call_args.args[0])
+        self.assertEqual(["fixture-dpkg-deb", "--fsys-tarfile", str(package)], stream.call_args.args[0])
+        self.assertTrue(process.stdout.closed)
+        self.assertFalse(process.killed)
+
+    def test_deb_policy_rejects_driver_and_sdk_dependencies_in_all_install_fields(self):
+        forbidden = ("nvidia-driver-580", "libnvidia-compute-580", "linux-modules-nvidia-580-generic",
+                     "cuda-compat-12-8", "cuda-toolkit-12-8", "cuda-cudart-dev-12-8", "libcuda1",
+                     "libcublas-12-8", "libcufft-12-8", "libcurand-12-8", "libcusolver-12-8",
+                     "libcusparse-12-8", "libnpp-12-8", "libnvjitlink-12-8", "libnvjpeg-12-8", "nsight-compute",
+                     "libnvrtc12", "libnvvm4", "libnvfatbin12", "libcupti12", "libcufile-12-8")
+        for field in ("depends", "pre_depends", "recommends"):
+            for dependency in forbidden:
+                with self.subTest(field=field, dependency=dependency):
+                    values = {field: "libc6 (>= 2.34), " + dependency + ":amd64 (>= 1)"}
+                    context, package, process, _, stream = self.deb_stream(control=self.control(**values))
+                    with context, self.assertRaisesRegex(RuntimeError, "driver|SDK"):
+                        runtime.verify_deb_driver_policy(self.variant, package)
+                    stream.assert_not_called()
+                    process.stdout.close()
+
+    def test_deb_policy_rejects_driver_alternative_and_folded_dependency(self):
+        for control in (self.control(depends="libc6, harmless | nvidia-driver-580"),
+                        self.control(depends="libc6,\n cuda-toolkit-12-8"),
+                        self.control(depends="libc6, nvidia-driver-580").lower(),
+                        self.control(recommends="nvidia-driver-580").replace("Recommends:", "rEcOmMeNdS:")):
+            context, package, process, _, stream = self.deb_stream(control=control)
+            with context, self.assertRaisesRegex(RuntimeError, "driver|SDK"):
+                runtime.verify_deb_driver_policy(self.variant, package)
+            stream.assert_not_called()
+            process.stdout.close()
+
+    def test_deb_policy_rejects_bad_control_and_missing_normal_dependency(self):
+        for control in (self.control(arch="arm64"), self.control(depends="libstdc++6"),
+                        self.control() + "Architecture: amd64\n", self.control(depends="libc6, !!!"),
+                        self.control() + "malformed field\n", self.control() + "aRcHiTeCtUrE: amd64\n"):
+            with self.subTest(control=control):
+                context, package, process, _, stream = self.deb_stream(control=control)
+                with context, self.assertRaises(RuntimeError):
+                    runtime.verify_deb_driver_policy(self.variant, package)
+                stream.assert_not_called()
+                process.stdout.close()
+
+    def test_deb_policy_rejects_driver_stub_paths_and_link_targets(self):
+        forbidden = ("./usr/lib/libcuda.so", "./usr/lib/libcuda.so.1", "./usr/lib/libnvidia-ptxjitcompiler.so.1",
+                     "./usr/share/qcs/stubs/libcuda.so", "./usr/lib/STUBS/renamed.so")
+        cases = [(name, tarfile.REGTYPE, "") for name in forbidden]
+        cases += [("./usr/lib/renamed.so", kind, "../driver/libcuda.so.1")
+                  for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE)]
+        for entry in cases:
+            with self.subTest(entry=entry):
+                context, package, process, _, _ = self.deb_stream(payload=self.payload([entry]))
+                with context, self.assertRaisesRegex(RuntimeError, "payload.*driver|SDK stub"):
+                    runtime.verify_deb_driver_policy(self.variant, package)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.killed)
+
+    def test_deb_policy_rejects_corrupt_empty_or_failed_payload_stream(self):
+        for payload, code in ((b"not a tar archive", 0), (self.payload([]), 0), (self.payload(), 7)):
+            with self.subTest(exit_code=code, length=len(payload)):
+                context, package, process, _, _ = self.deb_stream(payload=payload, exit_code=code)
+                with context, self.assertRaises((RuntimeError, tarfile.TarError)):
+                    runtime.verify_deb_driver_policy(self.variant, package)
+                self.assertTrue(process.stdout.closed)
+
+    def test_deb_policy_rejects_other_variant_or_non_deb_input(self):
+        context, package, process, field, stream = self.deb_stream()
+        with context:
+            for identifier in ("linux-x64-cpu", "linux-x64-rocm", "windows-x64-cuda-12.4"):
+                with self.subTest(variant=identifier), self.assertRaises(RuntimeError):
+                    runtime.verify_deb_driver_policy(sdk.variant_by_id(identifier), package)
+            for invalid in (self.root / "missing.deb", self.root, self.source):
+                with self.subTest(input=invalid), self.assertRaises(RuntimeError):
+                    runtime.verify_deb_driver_policy(self.variant, invalid)
+        field.assert_not_called()
+        stream.assert_not_called()
+        process.stdout.close()
+
+    def test_deb_analysis_cli_requires_manifest_without_stage_root(self):
+        manifest = self.root / "gpu-sdk.json"
+        manifest.write_text(json.dumps(self.manifest), encoding="utf-8")
+        report = self.root / "analysis-report.json"
+        args = ["qcs-gpu-runtime.py", "--variant", self.variant["id"], "--sdk-manifest", str(manifest),
+                "--deb-analysis-directory", str(self.destination), "--report", str(report)]
+        with self.reader()[0], patch.object(sys, "argv", args), patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(0, runtime.main())
+        output = json.loads(report.read_text(encoding="utf-8"))
+        self.assertIs(output["analysisOnly"], True)
+        self.assertEqual(str(self.destination / "libcuda.so.1"), output["library"])
+        self.assertFalse((self.destination / "bin/qcs-gpu-runtime.json").exists())
+
+    def test_deb_verify_cli_needs_neither_sdk_nor_stage_root(self):
+        context, package, _, _, _ = self.deb_stream()
+        report = self.root / "deb-policy.json"
+        args = ["qcs-gpu-runtime.py", "--variant", self.variant["id"], "--verify-deb", str(package),
+                "--report", str(report)]
+        with context, patch.object(sys, "argv", args), patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(0, runtime.main())
+        output = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual("verified", output["driverPolicy"])
+        self.assertEqual(hashlib.sha256(package.read_bytes()).hexdigest(), output["packageSha256"])
+
+    def test_deb_cli_rejects_conflicting_or_incomplete_modes(self):
+        invalid = (
+            ["--deb-analysis-directory", str(self.destination)],
+            ["--verify-deb", "fixture.deb", "--sdk-manifest", "gpu-sdk.json"],
+            ["--verify-deb", "fixture.deb", "--stage-root", str(self.destination)],
+            ["--verify-deb", "fixture.deb", "--backend-library", "libggml-cuda.so"],
+            ["--deb-analysis-directory", str(self.destination), "--verify-deb", "fixture.deb"],
+        )
+        for options in invalid:
+            args = ["qcs-gpu-runtime.py", "--variant", self.variant["id"], *options]
+            with self.subTest(options=options), patch.object(sys, "argv", args), \
+                    patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+                runtime.main()
+            self.assertEqual(2, error.exception.code)
+
+    def test_existing_cpu_stage_cli_still_writes_runtime_manifest(self):
+        selected = sdk.variant_by_id("windows-x64-cpu")
+        manifest = self.root / "cpu-sdk.json"
+        manifest.write_text(json.dumps({"schemaVersion": 1, "variant": selected["id"], "backend": "cpu",
+                                        "os": "windows", "toolkitVersion": "", "gpuTargets": []}), encoding="utf-8")
+        stage = self.root / "cpu-stage"
+        args = ["qcs-gpu-runtime.py", "--variant", selected["id"], "--sdk-manifest", str(manifest),
+                "--stage-root", str(stage)]
+        with patch.object(sys, "argv", args), patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(0, runtime.main())
+        report = json.loads((stage / "bin/qcs-gpu-runtime.json").read_text(encoding="utf-8"))
+        self.assertEqual("cpu", report["backend"])
+        self.assertFalse(report["verification"]["gpuExecution"])
 
 
 if __name__ == "__main__":

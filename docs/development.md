@@ -8,6 +8,8 @@ Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。两者�
 
 Linux CUDA 的 CI 容器单独固定 CMake 3.31.10，通过版本与 SHA-256 锁定的官方 wheel 安装，并验证 `cmake`、`ctest`、`cpack` 来自同一套工具。这避免旧版 CMake 在含空格的外置对象路径下丢失 Ninja 头文件依赖。本机 MSVC 的 CMake 3.28 基线保持不变。
 
+Linux DEB 打包需要 `dpkg-dev` 和 `file`。CUDA DEB 使用锁定的无 NVIDIA 驱动容器生成。CPack 在外置构建目录中使用 SDK 驱动 stub 的独立副本解析可选的 `libcuda.so.1`，该目录只供静态依赖分析使用，不加入运行路径或用户包。最终包继续检查普通系统依赖，并拒绝驱动 stub、驱动库或强制安装 NVIDIA 驱动和 CUDA SDK 的依赖。若带有真实驱动的开发机产生此类依赖，应改用锁定容器打包，不能删除依赖字段来绕过检查。
+
 `config/build-variants.json` 是平台、后端、SDK 和包类型的共同清单。`--variant` 对应 CMake 的 `QCOPILOTS_SEARCH_VARIANT`，完整 11 项矩阵见 [发布指南](releasing.md)。默认变体为 Windows / Linux 的 CPU 或 macOS arm64 Metal。其他主机架构不能被默认值伪装成支持的平台。
 
 Windows CUDA 和 HIP 后端使用外置子构建，主程序及 Qt 仍由 MSVC 构建。最终部署使用主构建的唯一 `ggml-base`，后端 ABI、导入导出和运行库必须一致。SDK 和编译配方按锁定的 llama.cpp 提交引用，升级必须同时更新锁、配方及验证结果。

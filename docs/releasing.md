@@ -28,6 +28,8 @@ llama.cpp 固定为 b11461，提交 `4d756bc72bf00a4aacf410ae15a2d315f3db400d`�
 
 CUDA 部署对应运行库，ROCm 部署 HIP、BLAS 和两个 RDNA4 目标实际需要的资源，Vulkan 只携带运行必需组件。模型经首次使用下载或离线导入后校验，不内置到各个安装包。实际许可证和 notices 随用户包部署。
 
+CUDA DEB 保留 CPack 的共享库依赖分析。SDK 驱动 stub 仅以独立副本放入外置分析目录，供打包工具解析可选驱动，不能进入安装器或便携包。最终 DEB 检查安装内容和依赖字段，拒绝驱动 stub、驱动库及强制安装 NVIDIA 驱动或 CUDA SDK 的声明。正常系统依赖仍须保留，无驱动环境应能安装并使用 CPU，真实 GPU 能力另行验证。
+
 Windows 默认单 EXE 安装器。若 ROCm 包实际触及 NSIS 单 EXE 容量限制，仅该安装器改为 `setup.zip`，内含小型 `setup.exe` 和完整 `payload/`。用户解压后离线安装，独立 portable ZIP 仍保留。安装器核对载荷清单、磁盘空间和路径，按清单安装与卸载，不能在线补齐缺失运行库。容量边界见 [NSIS 文档](https://nsis.sourceforge.io/Docs/Chapter1.html)。
 
 ROCm 编译与打包分阶段进行，只提取目标资源。Windows 完整检查先生成 NSIS 安装器，再生成便携 ZIP。每个 CPack 生成器使用本次调用的独立工作目录，完成后只清理本次生成的受控 stage，避免多份完整载荷同时驻留，保留已有历史产物与用户安装 stage。所有平台卸载均保留用户模型、索引和配置。

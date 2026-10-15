@@ -12,7 +12,7 @@ Qt / NSIS bootstrap、许可证、源码材料、部署、路径预算、临时�
 
 下表按当前源树逐文件登记，新增或删除脚本时应同步更新。数量由下面列出的实际文件计算，不把原定精简数量当作包含新增 GPU 工具后的最终数字。
 
-当前登记 **67 个 Python / PowerShell / Shell 脚本**和 **24 个 `.cmake` 模块**。
+当前登记 **67 个 Python / PowerShell / Shell 脚本**和 **25 个 `.cmake` 模块**。
 
 ## 开发、CI 与运行器脚本
 
@@ -58,9 +58,9 @@ Qt / NSIS bootstrap、许可证、源码材料、部署、路径预算、临时�
 | `tools/qcs-bootstrap-qt.py` | 下载并校验锁定 Qt SDK，供 bootstrap 使用 |
 | `tools/qcs-dev.py` | 统一变体、外置目录、完整 check、独立构建测试及发行命令 |
 | `tools/qcs-gpu-abi.py` | 核验独立 GPU 模块与主构建的 ABI、导入导出及依赖 |
-| `tools/qcs-gpu-runtime.py` | 从 SDK 构造 GPU 运行依赖闭包与 RDNA4 数据布局，缺依赖、许可或资源明确失败 |
+| `tools/qcs-gpu-runtime.py` | 构造 GPU 运行依赖闭包与 RDNA4 数据布局，提供 CUDA DEB 的独立驱动分析副本及最终包依赖检查，缺依赖、许可或资源明确失败 |
 | `tools/qcs-gpu-sdk.py` | 按锁定上游配方准备 GPU SDK、后端构建和运行资源 |
-| `tools/qcs-gpu-tests.py` | 无 GPU、网络、模型或真实 SDK 的部署契约回归，验证依赖闭包、资源和 ABI 失败边界 |
+| `tools/qcs-gpu-tests.py` | 无 GPU、网络、模型或真实 SDK 的部署契约回归，验证依赖闭包、资源、ABI 与 CUDA DEB 可选驱动边界 |
 | `tools/qcs-license-materials.py` | 收集并校验实际部署依赖许可和 notices |
 | `tools/qcs-msvc-response.py` | MSVC response file 编码与长路径适配 |
 | `tools/qcs-package-symbols.py` | 独立生成符号材料，不由普通 package 自动调用 |
@@ -92,6 +92,7 @@ Qt / NSIS bootstrap、许可证、源码材料、部署、路径预算、临时�
 | --- | --- |
 | `cmake/qcs-checked-deploy.cmake` | 部署前置条件及失败传播 |
 | `cmake/qcs-cpack.cmake` | 生成器专属打包配置 |
+| `cmake/qcs-deb-verify.cmake` | CUDA DEB 生成后的驱动与 SDK 依赖、载荷检查，由 CPack post-build 接入 |
 | `cmake/qcs-dev-deploy.cmake` | 开发构建的运行依赖部署 |
 | `cmake/qcs-ffmpeg.cmake` | 锁定 Qt 配套 FFmpeg 的导入与 ABI 校验 |
 | `cmake/qcs-gpu-backend.cmake` | 独立 GPU backend 子构建与主程序集成 |
