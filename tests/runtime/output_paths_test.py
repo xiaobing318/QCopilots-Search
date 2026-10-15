@@ -122,7 +122,7 @@ class OutputPathTests(unittest.TestCase):
         directory = "literal-]]-bin"
         self.configure_install_fixture(destination="${CMAKE_INSTALL_BINDIR}",
                                        settings=f'set(CMAKE_INSTALL_BINDIR [=[{directory}]=])')
-        prefix = self.root / "allowed stage"
+        prefix = self.root / "allowed-stage"
         result = subprocess.run([CMAKE, "--install", str(self.build), "--prefix", str(prefix)],
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

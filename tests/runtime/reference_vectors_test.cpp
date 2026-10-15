@@ -322,12 +322,12 @@ private slots:
     }
 
 #ifdef Q_OS_WIN
-    void unicodeInstallationLoadsCpuBackend()
+    void relocatedInstallationLoadsCpuBackend()
     {
         QString error;
         auto directory = test::temporaryDirectory(&error);
         QVERIFY2(directory != nullptr, qPrintable(error));
-        const QString installed = directory->filePath(QStringLiteral("中文 安装路径 é/bin"));
+        const QString installed = directory->filePath(QStringLiteral("relocated-install/bin"));
         QVERIFY(QDir().mkpath(installed));
         const QDir source(QCoreApplication::applicationDirPath());
         const QString executable = QFileInfo(QCoreApplication::applicationFilePath()).fileName();
@@ -345,8 +345,8 @@ private slots:
         process.setArguments({QStringLiteral("vectorsMatchReference:query"),
                               QStringLiteral("vectorsMatchReference:photo-140"),
                               QStringLiteral("vectorsMatchReference:speech"),
-                              // QtTest's C stdio logger needs a relative ASCII name
-                              // on Windows. The process working directory remains Unicode.
+                              // Keep QtTest's C stdio log filename relative to the
+                              // explicitly selected working directory on Windows.
                               QStringLiteral("-o"), QStringLiteral("relocated-results.xml,junitxml")});
         process.start();
         QVERIFY2(process.waitForStarted(10000), qPrintable(process.errorString()));

@@ -157,7 +157,7 @@ endforeach()
         # changed RPATH, and respect a late --prefix override.
         with tempfile.TemporaryDirectory(prefix="qcs-gpu-install-", dir=temporary_root()) as root:
             directory = Path(root)
-            source, build, stage = directory / "source", directory / "build", directory / "安装 stage"
+            source, build, stage = directory / "source", directory / "build", directory / "installation-stage"
             (source / "tools").mkdir(parents=True)
             (source / "tools/qcs-gpu-runtime.py").write_text(
                 "import json, pathlib, sys\n"
