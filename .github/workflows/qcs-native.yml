@@ -84,10 +84,16 @@ jobs:
         run: |
           qcs_sudo=()
           if [ "$(id -u)" != 0 ]; then qcs_sudo=(sudo); fi
+          . /etc/os-release
+          case "${ID}:${VERSION_ID}" in
+            ubuntu:22.04) qcs_gtk_runtime=libgtk-3-0 ;;
+            ubuntu:24.04) qcs_gtk_runtime=libgtk-3-0t64 ;;
+            *) printf 'Unsupported Linux dependency baseline: %s:%s\n' "$ID" "$VERSION_ID" >&2; exit 1 ;;
+          esac
           "${qcs_sudo[@]}" apt-get update
           "${qcs_sudo[@]}" apt-get install --no-install-recommends -y build-essential ninja-build pkg-config dbus-daemon libxcb1-dev \
             libgl1-mesa-dev libxkbcommon-dev libfontconfig1-dev libfreetype6-dev \
-            libglib2.0-dev libdbus-1-dev libx11-xcb-dev libxcb-cursor0 \
+            libglib2.0-dev libdbus-1-dev libx11-xcb-dev libxcb-cursor0 "${qcs_gtk_runtime}" \
             libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-shape0 \
             libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxkbcommon-x11-0 \
             libpulse0 xvfb xauth dpkg-dev file patchelf fonts-noto-cjk fonts-dejavu-core

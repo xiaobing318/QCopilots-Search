@@ -14,7 +14,9 @@ Linux DEB 打包需要 `dpkg-dev` 和 `file`。CUDA DEB 使用锁定的无 NVIDI
 
 Windows CUDA 和 HIP 后端使用外置子构建，主程序及 Qt 仍由 MSVC 构建。最终部署使用主构建的唯一 `ggml-base`，后端 ABI、导入导出和运行库必须一致。SDK 和编译配方按锁定的 llama.cpp 提交引用，升级必须同时更新锁、配方及验证结果。
 
-Linux CPU / Vulkan 使用 Ubuntu 22.04 基线，CUDA / ROCm 使用 Ubuntu 24.04 基线。Qt 的图形、字体、XCB、DBus 和多媒体依赖需要由操作系统提供，包含 `libxcb-shape0` 和 `libpulse0`。无显示服务器的 CI 使用 Xvfb。DEB 安装验证需要 Docker，Windows 安装验证需要 NSIS。Windows 完整测试包含安装器回归时，入口会先准备 NSIS，PowerShell 包装也会查找 Visual Studio 自带 Ninja。macOS 最低版本为 14.4，默认 ad-hoc 签名。
+Linux CPU / Vulkan 使用 Ubuntu 22.04 基线，CUDA / ROCm 使用 Ubuntu 24.04 基线。Qt 的图形、字体、XCB、DBus 和多媒体依赖需要由操作系统提供，包含 `libxcb-shape0` 和 `libpulse0`。CI 根据实际 `/etc/os-release` 安装 GTK3 运行包，22.04 使用 [`libgtk-3-0`](https://packages.ubuntu.com/jammy/libgtk-3-0)，24.04 使用 [`libgtk-3-0t64`](https://packages.ubuntu.com/noble/libgtk-3-0t64)，未知基线在安装前报错。这两个包的必需依赖同时提供 Wayland cursor / EGL、Pango、Harfbuzz、ATK、Cairo 和 GdkPixbuf，使用 `--no-install-recommends` 仍会安装，因此不单独维护 Qt 插件所需的全部底层库清单。CPack 保留系统依赖分析并生成实际 DEB 依赖，Qt 插件继续完整部署。
+
+无显示服务器的 CI 使用 Xvfb。DEB 安装验证需要 Docker，Windows 安装验证需要 NSIS。Windows 完整测试包含安装器回归时，入口会先准备 NSIS，PowerShell 包装也会查找 Visual Studio 自带 Ninja。macOS 最低版本为 14.4，默认 ad-hoc 签名。
 
 ## 外置目录
 

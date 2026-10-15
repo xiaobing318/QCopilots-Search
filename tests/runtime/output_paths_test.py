@@ -45,6 +45,30 @@ class OutputPathTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, (result.stdout or "") + (result.stderr or ""))
         self.assertIn("must be outside the source tree", result.stderr or "")
 
+    def run_cmake_fixture(self, arguments, *, configure=False, environment=None):
+        selectors = {"CMAKE_GENERATOR", "CMAKE_GENERATOR_PLATFORM", "CMAKE_GENERATOR_TOOLSET",
+                     "CMAKE_GENERATOR_INSTANCE", "CMAKE_TOOLCHAIN_FILE"}
+        inherited = os.environ if environment is None else environment
+        fixture_env = {name: value for name, value in inherited.items() if name.upper() not in selectors}
+        cmake = shutil.which(CMAKE, path=fixture_env.get("PATH"))
+        self.assertIsNotNone(cmake, "Output path fixture requires CMake")
+        command = [str(Path(cmake).resolve()), *arguments]
+        if configure:
+            ninja = shutil.which("ninja", path=fixture_env.get("PATH"))
+            self.assertIsNotNone(ninja, "Output path fixture requires Ninja")
+            command.extend(["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM:FILEPATH={Path(ninja).resolve()}"])
+        timeout = 60 if configure else 30
+        try:
+            return subprocess.run(command, cwd=self.root, env=fixture_env, capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            def output_text(value):
+                return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+            self.fail(
+                f"Output path fixture timed out after {timeout} seconds\n"
+                f"Resolved command: {command!r}\nWorking directory: {self.root}\n"
+                f"stdout:\n{output_text(error.stdout)}\nstderr:\n{output_text(error.stderr)}")
+
     def test_external_and_same_prefix_sibling_are_allowed(self):
         for output in (self.root / "runs", self.root / (self.source.name + "-build")):
             result = self.probe(f'qcopilots_search_require_external_path(test "{output.as_posix()}")')
@@ -107,14 +131,12 @@ class OutputPathTests(unittest.TestCase):
             'qcopilots_search_install_output_guard("${CMAKE_SOURCE_DIR}")\n'
             'file(WRITE "${CMAKE_BINARY_DIR}/payload.txt" "fixture")\n'
             f'install(FILES "${{CMAKE_BINARY_DIR}}/payload.txt" DESTINATION "{destination}")\n', encoding="utf-8")
-        result = subprocess.run([CMAKE, "-S", str(self.source), "-B", str(self.build)],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        result = self.run_cmake_fixture(["-S", str(self.source), "-B", str(self.build)], configure=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_install_prefix_override_is_checked_before_payload(self):
         self.configure_install_fixture()
-        result = subprocess.run([CMAKE, "--install", str(self.build), "--prefix", str(self.source / "forbidden")],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        result = self.run_cmake_fixture(["--install", str(self.build), "--prefix", str(self.source / "forbidden")])
         self.assert_rejected(result)
         self.assertFalse((self.source / "forbidden/payload.txt").exists())
 
@@ -123,8 +145,7 @@ class OutputPathTests(unittest.TestCase):
         self.configure_install_fixture(destination="${CMAKE_INSTALL_BINDIR}",
                                        settings=f'set(CMAKE_INSTALL_BINDIR [=[{directory}]=])')
         prefix = self.root / "allowed-stage"
-        result = subprocess.run([CMAKE, "--install", str(self.build), "--prefix", str(prefix)],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        result = self.run_cmake_fixture(["--install", str(self.build), "--prefix", str(prefix)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((prefix / directory / "payload.txt").read_text(), "fixture")
 
@@ -134,8 +155,8 @@ class OutputPathTests(unittest.TestCase):
                                        settings=f'set(CMAKE_INSTALL_BINDIR "{directory}")')
         environment = os.environ.copy()
         environment["DESTDIR"] = self.root.as_posix()
-        result = subprocess.run([CMAKE, "--install", str(self.build), "--prefix", "/outside-prefix"],
-                                env=environment, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        result = self.run_cmake_fixture(["--install", str(self.build), "--prefix", "/outside-prefix"],
+                                        environment=environment)
         self.assert_rejected(result)
         self.assertIn("DESTDIR/CMAKE_INSTALL_BINDIR", result.stderr)
         self.assertFalse((self.source / "forbidden").exists())
@@ -166,8 +187,7 @@ class OutputPathTests(unittest.TestCase):
             'file(WRITE "${CMAKE_BINARY_DIR}/payload.txt" "fixture")\n'
             'install(FILES "${CMAKE_BINARY_DIR}/payload.txt" DESTINATION bin)\n'
             'include(CPack)\n', encoding="utf-8")
-        result = subprocess.run([CMAKE, "-S", str(self.source), "-B", str(self.build)],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        result = self.run_cmake_fixture(["-S", str(self.source), "-B", str(self.build)], configure=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         parse = self.build / "parse-config.cmake"
         parse.write_text(
@@ -175,8 +195,7 @@ class OutputPathTests(unittest.TestCase):
             f'include("{(self.build / "CPackConfig.cmake").as_posix()}")\n'
             f'file(WRITE "{(self.build / "decoded-icon.txt").as_posix()}" "${{CPACK_NSIS_INSTALLED_ICON_NAME}}")\n',
             encoding="utf-8")
-        result = subprocess.run([CMAKE, "-P", str(parse)], capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=30)
+        result = self.run_cmake_fixture(["-P", str(parse)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.build / "decoded-icon.txt").read_text(encoding="utf-8"), r"bin\qcs-gui.exe")
         cpack = Path(CMAKE).with_name("cpack.exe" if os.name == "nt" else "cpack")

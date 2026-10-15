@@ -2174,6 +2174,13 @@ class NativeStageDependencyTests(unittest.TestCase):
         step = next(item for item in self.steps if item.startswith("Install Linux host libraries"))
         for package in ("libvulkan-dev", "glslc", "spirv-headers"):
             self.assertNotIn(package, step)
+        self.assertIn(". /etc/os-release", step)
+        self.assertIn("ubuntu:22.04) qcs_gtk_runtime=libgtk-3-0 ;;", step)
+        self.assertIn("ubuntu:24.04) qcs_gtk_runtime=libgtk-3-0t64 ;;", step)
+        self.assertIn("Unsupported Linux dependency baseline:", step)
+        self.assertIn('>&2; exit 1 ;;', step)
+        self.assertIn('apt-get install --no-install-recommends -y', step)
+        self.assertIn('"${qcs_gtk_runtime}"', step)
         self.assertIn("fonts-noto-cjk fonts-dejavu-core\n", step)
 
     def test_upload_is_only_after_all_real_model_and_package_checks(self):

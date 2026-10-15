@@ -31,6 +31,29 @@ OPTIONS, REST = PARSER.parse_known_args()
 
 
 class VariantTests(unittest.TestCase):
+    def run_cmake_fixture(self, arguments, *, cwd, configure=False):
+        selectors = {"CMAKE_GENERATOR", "CMAKE_GENERATOR_PLATFORM", "CMAKE_GENERATOR_TOOLSET",
+                     "CMAKE_GENERATOR_INSTANCE", "CMAKE_TOOLCHAIN_FILE"}
+        fixture_env = {name: value for name, value in os.environ.items() if name.upper() not in selectors}
+        cmake = shutil.which(OPTIONS.cmake, path=fixture_env.get("PATH"))
+        self.assertIsNotNone(cmake, "GPU configuration fixture requires CMake")
+        command = [str(Path(cmake).resolve()), *arguments]
+        if configure:
+            ninja = shutil.which("ninja", path=fixture_env.get("PATH"))
+            self.assertIsNotNone(ninja, "GPU configuration fixture requires Ninja")
+            command.extend(["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM:FILEPATH={Path(ninja).resolve()}"])
+        timeout = 60 if configure else 30
+        try:
+            return subprocess.run(command, cwd=cwd, env=fixture_env, capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            def output_text(value):
+                return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+            self.fail(
+                f"GPU configuration fixture timed out after {timeout} seconds\n"
+                f"Resolved command: {command!r}\nWorking directory: {cwd}\n"
+                f"stdout:\n{output_text(error.stdout)}\nstderr:\n{output_text(error.stderr)}")
+
     def configure(self, variant, os_name=None, arch=None):
         selected_os = os_name or variant["os"]
         selected_arch = arch or variant["arch"]
@@ -118,10 +141,10 @@ endforeach()
                 for config in ("Debug", "Release"):
                     with self.subTest(variant=variant["id"], config=config):
                         build = directory / variant["id"] / config
-                        result = subprocess.run(
-                            [OPTIONS.cmake, "-S", str(source), "-B", str(build),
+                        result = self.run_cmake_fixture(
+                            ["-S", str(source), "-B", str(build),
                              f"-DQCOPILOTS_SEARCH_VARIANT={variant['id']}", f"-DCMAKE_BUILD_TYPE={config}"],
-                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                            cwd=directory, configure=True)
                         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
                         contract = dict(line.split("=", 1) for line in (build / "contract.txt").read_text().splitlines())
                         binary = Path(contract["binary"]).resolve()
@@ -184,11 +207,10 @@ set_target_properties(qcs-gpu-fixture PROPERTIES IMPORTED_LOCATION "{dummy.as_po
 include("{(ROOT / 'cmake/qcs-gpu-backend.cmake').as_posix()}")
 qcopilots_search_install_gpu_dependencies(qcs-gpu-fixture)
 ''', encoding="utf-8")
-            for command in ([OPTIONS.cmake, "-S", str(source), "-B", str(build),
-                             f"-DCMAKE_INSTALL_PREFIX={directory / 'unused-configure-prefix'}"],
-                            [OPTIONS.cmake, "--install", str(build), "--prefix", str(stage)]):
-                result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
-                                        errors="replace", timeout=30)
+            for arguments, configure in ((["-S", str(source), "-B", str(build),
+                                          f"-DCMAKE_INSTALL_PREFIX={directory / 'unused-configure-prefix'}"], True),
+                                         (["--install", str(build), "--prefix", str(stage)], False)):
+                result = self.run_cmake_fixture(arguments, cwd=directory, configure=configure)
                 self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             args = json.loads((stage / "share/qcs/gpu-runtime.json").read_text())
             self.assertEqual(stage.resolve(), Path(args["--stage-root"]).resolve())
