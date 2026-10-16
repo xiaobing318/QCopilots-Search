@@ -1,0 +1,51 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {"major": 3, "minor": 28, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "qcs-release",
+      "displayName": "QCopilots Search external Release build",
+      "generator": "Ninja",
+      "binaryDir": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_PREFIX_PATH": "$env{QCOPILOTS_SEARCH_QT_PREFIX}",
+        "CMAKE_INSTALL_PREFIX": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/stage/Release",
+        "CPACK_PACKAGE_DIRECTORY": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/pkg/Release",
+        "QCOPILOTS_SEARCH_VARIANT": "$env{QCOPILOTS_SEARCH_VARIANT}",
+        "QCOPILOTS_SEARCH_DEPENDENCY_ROOT": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/deps/Release",
+        "QCOPILOTS_SEARCH_TEST_ROOT": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/runs/Release",
+        "QCOPILOTS_SEARCH_MODEL_DIR": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/models",
+        "QCOPILOTS_SEARCH_BUILD_TESTS": "ON"
+      },
+      "condition": {"type": "allOf", "conditions": [
+        {"type": "notEquals", "lhs": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}", "rhs": ""},
+        {"type": "notEquals", "lhs": "$env{QCOPILOTS_SEARCH_VARIANT}", "rhs": ""}
+      ]}
+    },
+    {
+      "name": "qcs-debug",
+      "inherits": "qcs-release",
+      "binaryDir": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_INSTALL_PREFIX": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/stage/Debug",
+        "CPACK_PACKAGE_DIRECTORY": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/pkg/Debug",
+        "QCOPILOTS_SEARCH_DEPENDENCY_ROOT": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/deps/Debug",
+        "QCOPILOTS_SEARCH_TEST_ROOT": "$env{QCOPILOTS_SEARCH_BUILD_ROOT}/$env{QCOPILOTS_SEARCH_VARIANT}/runs/Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "qcs-release", "configurePreset": "qcs-release"},
+    {"name": "qcs-debug", "configurePreset": "qcs-debug"}
+  ],
+  "testPresets": [
+    {"name": "qcs-release", "displayName": "Release complete tests", "description": "Run every registered test. Prepare the locked models first or use qcs-dev check.", "configurePreset": "qcs-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "qcs-debug", "displayName": "Debug complete tests", "description": "Run every registered test. Missing models are a failure.", "configurePreset": "qcs-debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
+  ],
+  "workflowPresets": [
+    {"name": "qcs-release", "steps": [{"type": "configure", "name": "qcs-release"}, {"type": "build", "name": "qcs-release"}, {"type": "test", "name": "qcs-release"}]},
+    {"name": "qcs-debug", "steps": [{"type": "configure", "name": "qcs-debug"}, {"type": "build", "name": "qcs-debug"}, {"type": "test", "name": "qcs-debug"}]}
+  ]
+}

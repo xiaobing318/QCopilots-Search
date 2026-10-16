@@ -1,0 +1,2 @@
+// One shared application identity for every QCopilots Search executable.
+1 ICON "@QCOPILOTS_SEARCH_ICON_FILE@"

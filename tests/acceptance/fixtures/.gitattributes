@@ -1,0 +1,5 @@
+# Hash-locked fixture bytes must survive checkout on every platform unchanged.
+media/* -text
+media/NOTICE.md text eol=lf
+assets.json text eol=lf
+*.md text eol=lf

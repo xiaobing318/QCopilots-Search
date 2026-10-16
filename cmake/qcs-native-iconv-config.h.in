@@ -1,0 +1,14 @@
+#pragma once
+#define ENABLE_EXTRA 0
+#define ENABLE_RELOCATABLE 0
+#define HAVE_ICONV 1
+#define ICONV_CONST
+#define HAVE_STDDEF_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_STRING_H 1
+#cmakedefine HAVE_LANGINFO_CODESET 1
+#cmakedefine HAVE_MBRTOWC 1
+#cmakedefine HAVE_WCRTOMB 1
+#cmakedefine HAVE_SETLOCALE 1
+#cmakedefine WORDS_LITTLEENDIAN 1
+#define HAVE_VISIBILITY 0

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=QCopilots Search
+Exec=qcs-gui
+Icon=com.qcopilots.qcopilots-search
+Terminal=false
+Categories=Utility;Filesystem;
