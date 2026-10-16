@@ -24,10 +24,6 @@ for stream in (sys.stdout, sys.stderr):
 SOURCE = Path(__file__).resolve().parent.parent
 PRODUCT = "qcs"
 FETCH = re.compile(r'qcopilots_search_fetch\(\s*([A-Za-z0-9_]+)\s+"(https://[^"]+)"\s+"([0-9a-f]{64})"\s*\)', re.MULTILINE)
-LLAMA = {"name": "llama.cpp", "version": "b11461", "kind": "upstream-source",
-         "url": "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/4d756bc72bf00a4aacf410ae15a2d315f3db400d",
-         "filename": "llama.cpp-b11461.tar.gz",
-         "sha256": "778ee590ec7447075e08f2daf6301311ae7f8d9bf810a0b849f26af3f6d10867"}
 
 
 def digest(path: Path) -> str:
@@ -98,6 +94,18 @@ def guard(path: Path, reserve: int, additional: int = 0):
         raise RuntimeError(f"Source materials would breach the free-space reserve: available={available}, required={reserve + additional}")
 
 
+def llama_entry():
+    """Use the same immutable upstream archive as the runtime build."""
+    llama = json.loads((SOURCE / "dependencies.lock.json").read_text(encoding="utf-8"))["llama.cpp"]
+    if (not re.fullmatch(r"[0-9a-f]{40}", llama["commit"])
+            or not re.fullmatch(r"[0-9a-f]{64}", llama["sha256"])
+            or llama["url"] != "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/" + llama["commit"]):
+        raise RuntimeError("Invalid pinned llama.cpp source contract")
+    return {"name": "llama.cpp", "version": llama["tag"], "kind": "upstream-source",
+            "url": llama["url"], "filename": "llama.cpp-" + llama["commit"] + ".tar.gz",
+            "sha256": llama["sha256"], "recipe": "dependencies.lock.json"}
+
+
 def entries():
     found = {}
     for source in sorted((SOURCE / "cmake").glob("*.cmake")):
@@ -115,7 +123,7 @@ def entries():
             if name in found and found[name] != value:
                 raise RuntimeError(f"Conflicting source locks for {name}")
             found[name] = value
-    for required in ("sqlite", "hnswlib", "cppjieba", "limonp", "miniz", "libgit2", "leptonica", "tesseract", "libde265", "libheif", "libraw", "ffmpeg", "calligra"):
+    for required in ("sqlite", "hnswlib", "cppjieba", "limonp", "miniz", "libgit2", "leptonica", "tesseract", "libde265", "libheif", "libraw", "ffmpeg", "calligra", "libiconv"):
         if "qcs_" + required not in found:
             raise RuntimeError(f"Cannot establish pinned source contract for {required}")
     qt_lock = SOURCE / "tools/qcs-source-packages.lock.json"
@@ -141,14 +149,18 @@ def entries():
                     or Path(package["filename"]).name != package["filename"]):
                 raise RuntimeError(f"Invalid or duplicate GPU source package: {name}")
             found[name] = package
-    found["llama.cpp"] = LLAMA
+    found["llama.cpp"] = llama_entry()
     return [found[name] for name in sorted(found)]
 
 
-def get_archive(entry, root: Path, cache: Path, reserve: int, download: bool) -> Path:
+def get_archive(entry, root: Path, cache: Path, reserve: int, download: bool,
+                *, dependency_root: Path | None = None) -> Path:
+    dependency_root = dependency_root or root / "deps/Release"
     target = cache / entry["filename"]
-    candidates = [target, root / "deps/llama-b11461.tar.gz"] if entry["name"] == "llama.cpp" else [target]
-    cached_directory = root / "deps/dl" / entry["name"].removeprefix("qcs_")
+    candidates = [target]
+    if entry["name"] == "llama.cpp":
+        candidates.append(dependency_root / "downloads" / ("llama-" + entry["sha256"][:12] + ".tar.gz"))
+    cached_directory = dependency_root / "dl" / entry["name"].removeprefix("qcs_") / entry["sha256"][:12]
     if cached_directory.is_dir():
         candidates.extend(sorted(path for path in cached_directory.iterdir() if path.is_file()))
     for candidate in candidates:
@@ -187,7 +199,11 @@ def project_files():
     result = subprocess.run(["git", "-C", str(SOURCE), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
                             capture_output=True, check=True)
     paths = sorted(set(item.decode("utf-8") for item in result.stdout.split(b"\0") if item))
+    deleted = subprocess.check_output(["git", "-C", str(SOURCE), "ls-files", "--deleted", "-z"])
+    removed = {item.decode("utf-8") for item in deleted.split(b"\0") if item}
     for relative in paths:
+        if relative in removed:
+            continue
         path = SOURCE / relative
         if path.is_symlink() or not path.is_file() or SOURCE not in path.resolve().parents:
             raise RuntimeError(f"Unexpected source file type: {relative}")
@@ -333,6 +349,8 @@ def verify_bundle(path: Path, expected_sha256: str | None = None, candidate_comm
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-root", type=Path)
+    parser.add_argument("--dependency-root", type=Path,
+                        help="CMake dependency cache, defaults to <build-root>/deps/Release")
     parser.add_argument("--qt-root", type=Path)
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -352,6 +370,7 @@ def main():
     if not args.build_root:
         parser.error("--build-root is required when collecting sources")
     root = external(args.build_root)
+    dependency_root = external(args.dependency_root or root / "deps/Release")
     cache = external(args.cache_dir or root / "deps/sources")
     output = external(args.output_dir or root / "pkg")
     if args.reserve_gib < 0:
@@ -367,7 +386,7 @@ def main():
     packages = entries()
     archives = []
     for entry in packages:
-        path = get_archive(entry, root, cache, reserve, args.download)
+        path = get_archive(entry, root, cache, reserve, args.download, dependency_root=dependency_root)
         archives.append((entry, path))
     application = list(project_files())
     source_files = [{"path": relative, "sha256": digest(path), "size": path.stat().st_size} for relative, path in application]
@@ -378,7 +397,7 @@ def main():
                 "dependencyLocks": dependency_locks(source_files),
                 "archiveFormat": "ZIP_STORED with fixed timestamps, upstream source archives remain compressed",
                 "modelsIncluded": False,
-                "scope": "Sources for configured runtime dependencies, project recipes, patches, notices and SDK build metadata"}
+                "scope": "Unmodified upstream dependency sources, project build recipes, notices and optional SDK build metadata"}
     sdk_metadata = []
     if args.qt_root:
         qt_root = args.qt_root.expanduser().resolve()
@@ -403,7 +422,7 @@ def main():
     try:
         with zipfile.ZipFile(temporary, "w", allowZip64=True) as archive:
             add_text(archive, "source-manifest.json", content)
-            add_text(archive, "README.txt", "QCopilots Search corresponding source materials\n\nUpstream archives are intentionally retained compressed. Verify source-manifest.json before extraction.\nProject recipes and patches: project/cmake, project/third_party/patches and project/tools.\nBuild instructions: project/docs/development.md and project/docs/source-materials.md.\nIndividual licenses are retained in upstream archives and project/THIRD_PARTY_NOTICES.md.\nThis archive does not claim that a modified working tree is an immutable release commit.\n")
+            add_text(archive, "README.txt", "QCopilots Search corresponding source materials\n\nUpstream archives are retained compressed and unchanged. Verify source-manifest.json before extraction.\nProject build recipes: project/cmake and project/tools.\nBuild instructions: project/docs/development.md and project/docs/source-materials.md.\nIndividual licenses are retained in upstream archives and project/THIRD_PARTY_NOTICES.md.\nThe manifest records the source commit and whether local changes are included.\n")
             # Copy checked project files promptly. Large immutable archives are
             # streamed afterwards, retaining change detection for every entry.
             for (relative, path), entry in zip(application, source_files):

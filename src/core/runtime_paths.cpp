@@ -22,6 +22,37 @@
 #endif
 
 namespace qcopilots_search {
+bool RuntimePaths::isAbsoluteFilesystemPath(const QString &value)
+{
+    if (value.contains(QChar::Null))
+        return false;
+#ifdef Q_OS_WIN
+    // Qt also calls drive-relative paths and resource names absolute. Runtime
+    // paths must identify a filesystem location independently of the cwd.
+    QString path = QDir::fromNativeSeparators(value);
+    if (path.startsWith(QStringLiteral("//?/"))) {
+        path.remove(0, 4);
+        if (path.startsWith(QStringLiteral("UNC/"), Qt::CaseInsensitive))
+            path = QStringLiteral("//") + path.mid(4);
+    }
+    if (path.size() >= 3 && path.at(1) == u':' && path.at(2) == u'/') {
+        const ushort drive = path.at(0).unicode();
+        return (drive >= u'A' && drive <= u'Z') || (drive >= u'a' && drive <= u'z');
+    }
+    if (!path.startsWith(QStringLiteral("//")))
+        return false;
+    const qsizetype serverEnd = path.indexOf(u'/', 2);
+    if (serverEnd <= 2)
+        return false;
+    const QString server = path.mid(2, serverEnd - 2);
+    const QString share = path.mid(serverEnd + 1).section(u'/', 0, 0);
+    return server != QStringLiteral(".") && server != QStringLiteral("?")
+        && !share.isEmpty() && share != QStringLiteral(".") && share != QStringLiteral("..");
+#else
+    return QDir::isAbsolutePath(value) && !value.startsWith(u':');
+#endif
+}
+
 namespace {
 QString canonicalWithMissingTail(const QString &value)
 {
@@ -149,17 +180,35 @@ bool detail::preparePrivateIpcDirectory(const QString &directory, bool create, Q
 #endif
 }
 
+QString RuntimePaths::defaultProfileDirectory()
+{
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    return base.isEmpty() ? QString{} : QDir::cleanPath(QDir(base).filePath(QStringLiteral("qcs")));
+}
+
 RuntimePaths RuntimePaths::resolve(const QString &profile, const QString &models)
 {
     RuntimePaths paths;
     QString selectedProfile = profile;
     if (selectedProfile.isEmpty())
-        selectedProfile = qEnvironmentVariable("QCOPILOTS_SEARCH_PROFILE_DIR");
+        selectedProfile = qEnvironmentVariable("QCS_HOME");
     if (selectedProfile.isEmpty()) {
-        const QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
-        if (base.isEmpty())
-            return paths; // ensure() reports the unavailable platform directory.
-        selectedProfile = QDir(base).filePath(QStringLiteral("qcs"));
+        if (!qEnvironmentVariableIsEmpty("QCOPILOTS_SEARCH_PROFILE_DIR")) {
+            paths.resolutionError = QStringLiteral("QCOPILOTS_SEARCH_PROFILE_DIR is no longer supported. "
+                                                    "Set QCS_HOME to an absolute data directory or use --profile-dir.");
+            return paths;
+        }
+        selectedProfile = defaultProfileDirectory();
+        if (selectedProfile.isEmpty()) {
+            paths.resolutionError = QStringLiteral("The platform data directory is unavailable. "
+                                                    "Set QCS_HOME to an absolute data directory or use --profile-dir.");
+            return paths;
+        }
+    }
+    if (!isAbsoluteFilesystemPath(selectedProfile)) {
+        paths.resolutionError = QStringLiteral("An absolute profile directory without NUL characters is required "
+                                               "for --profile-dir or QCS_HOME: %1").arg(selectedProfile);
+        return paths;
     }
     paths.profileDir = canonicalWithMissingTail(selectedProfile);
     QString selectedModels = models;
@@ -195,6 +244,10 @@ RuntimePaths RuntimePaths::resolve(const QString &profile, const QString &models
 bool RuntimePaths::ensureIpcDirectory(QString *error) const
 {
     if (error) error->clear();
+    if (!resolutionError.isEmpty()) {
+        if (error) *error = resolutionError;
+        return false;
+    }
 #ifdef Q_OS_WIN
     return true;
 #else
@@ -206,6 +259,10 @@ bool RuntimePaths::ensureIpcDirectory(QString *error) const
 bool RuntimePaths::validateIpcDirectory(QString *error) const
 {
     if (error) error->clear();
+    if (!resolutionError.isEmpty()) {
+        if (error) *error = resolutionError;
+        return false;
+    }
 #ifdef Q_OS_WIN
     return true;
 #else
@@ -267,7 +324,11 @@ bool RuntimePaths::validateProfileLayout(QString *error) const
 {
     if (error)
         error->clear();
-    if (profileDir.isEmpty() || !QDir::isAbsolutePath(profileDir)) {
+    if (!resolutionError.isEmpty()) {
+        if (error) *error = resolutionError;
+        return false;
+    }
+    if (!isAbsoluteFilesystemPath(profileDir)) {
         if (error)
             *error = QStringLiteral("An absolute runtime directory is required: %1").arg(profileDir);
         return false;
@@ -275,6 +336,20 @@ bool RuntimePaths::validateProfileLayout(QString *error) const
     if (indexDir.isEmpty() || !QDir::isAbsolutePath(indexDir)) {
         if (error)
             *error = QStringLiteral("An absolute runtime directory is required: %1").arg(indexDir);
+        return false;
+    }
+    // Reject a regular file anywhere in the selected path before any runtime
+    // directory is created. A bad selection never falls back to another root.
+    QString existingParent = profileDir;
+    while (!QFileInfo::exists(existingParent)) {
+        const QString parent = QFileInfo(existingParent).absolutePath();
+        if (parent == existingParent)
+            break;
+        existingParent = parent;
+    }
+    const QFileInfo existing(existingParent);
+    if (existing.exists() && !existing.isDir()) {
+        if (error) *error = QStringLiteral("Profile path is not a directory: %1").arg(existingParent);
         return false;
     }
 

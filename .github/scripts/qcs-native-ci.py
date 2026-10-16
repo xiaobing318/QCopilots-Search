@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
@@ -34,13 +33,6 @@ CONTAINER_CMAKE_VERSION = "3.31.10"
 CONTAINER_CMAKE_WHEEL_SHA256 = "2f766bb46367e5e0559fa33184653754bce044583a06014dcaebf8e6dff8a1f1"
 
 
-def release_evidence():
-    spec = importlib.util.spec_from_file_location("qcopilots_search_release_evidence",
-                                                SOURCE / "tools/qcs-release-evidence.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
 def developer_workflow():
     """Share the developer tool's ownership contract before creating outputs."""
     spec = importlib.util.spec_from_file_location("qcopilots_search_dev",
@@ -55,22 +47,14 @@ def candidate_head():
     return event.get("pull_request", {}).get("head", {}).get("sha") or os.environ.get("GITHUB_SHA")
 
 def build():
-    evidence = release_evidence()
-    identity = evidence.source_identity(SOURCE, candidate_head())
-    errors = evidence.valid_identity(identity)
-    if identity.get("checkoutCommit") != identity.get("candidateHead"):
-        errors.append("Checkout must be the exact candidate head, not a merge or stale commit")
-    if errors:
-        raise RuntimeError("Native build requires clean immutable source: " + ", ".join(errors))
-    started = datetime.now(timezone.utc).isoformat()
-    evidence.write_json(REPORTS / "build-begin.json", {"identity": identity, "startedAt": started, "action": "build"})
+    """CI builds the exact event commit from a clean checkout."""
+    head = subprocess.check_output(["git", "-C", str(SOURCE), "rev-parse", "HEAD"], text=True).strip()
+    if head != candidate_head():
+        raise RuntimeError("Checkout must match the workflow source commit")
+    status = subprocess.check_output(["git", "-C", str(SOURCE), "status", "--porcelain"], text=True)
+    if status.strip():
+        raise RuntimeError("Native CI build requires a clean checkout")
     dev("build")
-    if evidence.source_identity(SOURCE, candidate_head()) != identity:
-        raise RuntimeError("Source changed during native build")
-    programs = {name: {"sha256": evidence.digest(find_program(name, installed=False))}
-                for name in sorted(evidence.APPLICATIONS)}
-    evidence.write_json(REPORTS / "build-provenance.json", {"identity": identity, "completed": True,
-                        "startedAt": started, "finishedAt": datetime.now(timezone.utc).isoformat(), "programs": programs})
 
 def environment_path(name: str) -> Path:
     value = os.environ.get(name)
@@ -507,9 +491,9 @@ def initialize_runner():
         raise RuntimeError("Runner temporary directory is missing or invalid")
     head = candidate_head()
     if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
-        raise RuntimeError("Candidate head must be a complete Git commit SHA")
+        raise RuntimeError("Source commit must be a complete Git commit SHA")
     if os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD", head) != head:
-        raise RuntimeError("Workflow candidate differs from event candidate")
+        raise RuntimeError("Workflow source differs from event commit")
     attempt = os.environ["GITHUB_RUN_ATTEMPT"]
     if not re.fullmatch(r"[1-9][0-9]*", attempt):
         raise RuntimeError("Run attempt must be a positive integer")
@@ -600,7 +584,7 @@ def package_files(directory: Path, selected: dict, head: str, attempt: str):
     if set(found) not in alternatives:
         raise RuntimeError(f"Package formats differ: expected one of {[sorted(item) for item in alternatives]}, found {sorted(found)}")
     if len(stems) != 1:
-        raise RuntimeError("Package files must have the same version and candidate identity")
+        raise RuntimeError("Package files must have the same version and source commit")
     return [found[extension] for extension in sorted(found)]
 
 

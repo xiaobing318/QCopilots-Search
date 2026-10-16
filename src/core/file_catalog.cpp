@@ -9,13 +9,13 @@
 #include <QHash>
 #include <QRegularExpression>
 #include <QSet>
+#include <QTemporaryFile>
 #include <algorithm>
 #include <git2.h>
 #include <memory>
 #include <string>
 
 #ifdef Q_OS_WIN
-#include <git2/sys/config.h>
 #include <git2/sys/repository.h>
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -323,7 +323,12 @@ bool gitIgnored(const QString &repository, const QList<FileRecord> &files,
 {
     git_repository *rawRepository = nullptr;
     if (git_repository_open_ext(&rawRepository, repository.toUtf8().constData(), GIT_REPOSITORY_OPEN_NO_SEARCH, nullptr) < 0) {
-        error = QStringLiteral("Cannot open Git repository %1: %2").arg(repository, gitError());
+        const QString details = gitError();
+        error = QStringLiteral("Cannot open Git repository %1 with upstream libgit2: %2").arg(repository, details);
+#ifdef Q_OS_WIN
+        if (details.contains(QStringLiteral("too long"), Qt::CaseInsensitive))
+            error += QStringLiteral(" Move the repository metadata to a shorter path.");
+#endif
         return false;
     }
     std::unique_ptr<git_repository, decltype(&git_repository_free)> repo(rawRepository, git_repository_free);
@@ -337,23 +342,23 @@ bool gitIgnored(const QString &repository, const QList<FileRecord> &files,
         return false;
     }
     std::unique_ptr<git_config, decltype(&git_config_free)> config(rawConfig, git_config_free);
+    QTemporaryFile applicationConfiguration(QDir::temp().filePath(QStringLiteral("qcs-git-config-XXXXXX")));
     static constexpr char longPaths[] = "[core]\nlongpaths = true\n";
-    git_config_backend *rawBackend = nullptr;
-    if (git_config_backend_from_string(&rawBackend, longPaths, sizeof(longPaths) - 1, nullptr) < 0) {
-        error = QStringLiteral("Cannot create Git path configuration for %1: %2").arg(repository, gitError());
+    if (!applicationConfiguration.open()
+        || applicationConfiguration.write(longPaths, sizeof(longPaths) - 1) != sizeof(longPaths) - 1
+        || !applicationConfiguration.flush()) {
+        error = QStringLiteral("Cannot create Git path configuration for %1: %2")
+            .arg(repository, applicationConfiguration.errorString());
         return false;
     }
-    const auto freeBackend = [](git_config_backend *backend) { if (backend) backend->free(backend); };
-    std::unique_ptr<git_config_backend, decltype(freeBackend)> backend(rawBackend, freeBackend);
-    if (git_config_add_backend(config.get(), backend.get(), GIT_CONFIG_LEVEL_APP, repo.get(), 0) < 0) {
+    applicationConfiguration.close();
+    if (git_config_add_file_ondisk(config.get(), applicationConfiguration.fileName().toUtf8().constData(),
+            GIT_CONFIG_LEVEL_APP, repo.get(), 0) < 0) {
         error = QStringLiteral("Cannot apply Git path configuration for %1: %2").arg(repository, gitError());
         return false;
     }
-    backend.release(); // The config owns an added backend.
-    // libgit2 1.9.1's memory backend does not retain entries returned by get.
-    // Freeze via its deep-copy iterator before any lookup can release that
-    // backend's list. Only snapshot backends with safe entry ownership are
-    // exposed to repository config lookups and their later destruction.
+    // Repository lookups use an immutable snapshot. The temporary APP file
+    // never changes repository or user settings and is removed on return.
     git_config *rawSnapshot = nullptr;
     if (git_config_snapshot(&rawSnapshot, config.get()) < 0) {
         error = QStringLiteral("Cannot snapshot Git path configuration for %1: %2").arg(repository, gitError());

@@ -5,7 +5,8 @@
 tests/runtime/fixtures/** -text -whitespace
 tests/extraction/fixtures/** -text -whitespace
 tests/acceptance/fixtures/** -text -whitespace
-third_party/patches/*.patch text eol=lf -whitespace
+*.ico -text
+*.icns -text
 *.png -text
 *.jpg -text
 *.jpeg -text

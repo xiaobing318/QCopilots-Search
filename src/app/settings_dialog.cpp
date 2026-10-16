@@ -1,5 +1,4 @@
 #include "settings_dialog.h"
-#include "platform_integration.h"
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -19,7 +18,7 @@
 #include <QVBoxLayout>
 
 namespace qcopilots_search {
-SettingsDialog::SettingsDialog(const AppSettings &settings, bool firstRun, bool allowStartup, QWidget *parent)
+SettingsDialog::SettingsDialog(const AppSettings &settings, bool firstRun, const StartupOptions &startup, QWidget *parent)
     : QDialog(parent), original_(settings) {
     setObjectName("settingsDialog");
     const bool chinese = (settings.language == "system" ? QLocale::system().name() : settings.language).startsWith("zh");
@@ -205,22 +204,25 @@ SettingsDialog::SettingsDialog(const AppSettings &settings, bool firstRun, bool 
     form->addRow(tray_);
     startup_ = new QCheckBox(text("Start when I sign in", "登录系统时启动"), preferences);
     startup_->setChecked(settings.startAtLogin);
-    startup_->setEnabled(allowStartup && PlatformIntegration::supportsStartAtLogin());
+    startup_->setEnabled(startup.allowed && startup.state.status != LoginStartupStatus::Unavailable);
     startup_->setObjectName("startAtLoginCheck");
     form->addRow(startup_);
     auto *startupStatus = new QLabel(preferences);
     startupStatus->setObjectName("startAtLoginStatus");
     startupStatus->setWordWrap(true);
-    auto *repairStartup = new QPushButton(text("Apply startup setting", "应用启动设置"), preferences);
-    repairStartup->setObjectName("applyStartupSettingButton");
-    repairStartup->setToolTip(text("Apply the selected startup setting when you save.", "保存时应用所选的登录启动设置。"));
-    repairStartup->hide();
-    if (!allowStartup) {
-        startupStatus->setText(text("Login startup is managed only by the default application profile and model directory. This independent profile cannot change it.", "只有使用默认应用配置和模型目录时才能管理登录启动，当前独立配置不会更改系统启动项。"));
+    auto *useCurrentStartup = new QPushButton(text("Use current directories at sign-in", "使用当前目录登录启动"), preferences);
+    useCurrentStartup->setObjectName("useCurrentStartupDirectoriesButton");
+    useCurrentStartup->setToolTip(text("Save the current data and model directories as the single startup target for this user.", "保存当前数据和模型目录，作为此用户唯一的登录启动目标。"));
+    useCurrentStartup->hide();
+    bool registeredDifferentTarget = false;
+    if (!startup.allowed) {
+        startupStatus->setText(text("Login startup cannot be managed in test sessions or when --profile-dir or --model-dir is supplied. Start normally with QCS_HOME to manage it.", "测试会话或使用 --profile-dir、--model-dir 参数时不能管理登录启动。请使用 QCS_HOME 正常启动应用后设置。"));
     } else if (!startup_->isEnabled()) {
         startupStatus->setText(text("Login startup management is unavailable here. Use the system login or startup settings.", "当前环境无法在应用内管理登录启动，请使用系统的登录项或启动项设置。"));
     } else {
-        const auto state = PlatformIntegration::startAtLoginState();
+        const auto &state = startup.state;
+        startupStatusKnown_ = state.status == LoginStartupStatus::Disabled
+            || state.status == LoginStartupStatus::Enabled || state.status == LoginStartupStatus::ApprovalRequired;
         switch (state.status) {
         case LoginStartupStatus::Disabled:
             startup_->setChecked(false);
@@ -239,22 +241,66 @@ SettingsDialog::SettingsDialog(const AppSettings &settings, bool firstRun, bool 
             startupStatus->setText(text("System status: unavailable. Use the system login or startup settings.", "系统状态：不可用。请使用系统的登录项或启动项设置。"));
             break;
         case LoginStartupStatus::Error:
+            startup_->setChecked(false);
+            startup_->setEnabled(false);
             startupStatus->setText(text("Could not read the system login startup status.", "无法读取系统登录启动状态。"));
-            repairStartup->show();
+            useCurrentStartup->show();
             break;
+        }
+        const auto sameDirectory = [](const QString &left, const QString &right) {
+            const auto normalized = [](const QString &path) {
+                const QString canonical = QFileInfo(path).canonicalFilePath();
+                return QDir::cleanPath(canonical.isEmpty() ? path : canonical);
+            };
+#ifdef Q_OS_WIN
+            constexpr Qt::CaseSensitivity pathCase = Qt::CaseInsensitive;
+#else
+            constexpr Qt::CaseSensitivity pathCase = Qt::CaseSensitive;
+#endif
+            return normalized(left).compare(normalized(right), pathCase) == 0;
+        };
+        const bool registered = state.status == LoginStartupStatus::Enabled
+            || state.status == LoginStartupStatus::ApprovalRequired;
+        if (registered) {
+            const QString target = text("Registered data directory: %1\nRegistered model directory: %2", "已注册的数据目录：%1\n已注册的模型目录：%2")
+                .arg(QDir::toNativeSeparators(state.profileDir), QDir::toNativeSeparators(state.modelDir));
+            registeredDifferentTarget = !sameDirectory(state.profileDir, startup.profileDir)
+                || !sameDirectory(state.modelDir, startup.modelDir);
+            if (registeredDifferentTarget) {
+                startup_->setChecked(false);
+                startup_->setEnabled(false);
+                startupStatus->setText(text("Another data or model directory is registered for sign-in. Use the button below to switch the startup target when you save.", "登录启动已注册其他数据或模型目录。点击下方按钮后保存，可切换启动目标。") + QLatin1Char('\n') + target);
+                useCurrentStartup->show();
+            } else {
+                startupStatus->setText(startupStatus->text() + QLatin1Char('\n') + target);
+            }
         }
         if (!state.message.isEmpty()) startupStatus->setToolTip(state.message);
     }
     if (!startup_->isEnabled()) startup_->setToolTip(startupStatus->text());
     form->addRow(startupStatus);
-    form->addRow(repairStartup);
-    connect(startup_, &QCheckBox::toggled, this, [this] {
-        if (startup_->isEnabled()) startupChangeRequested_ = true;
-    });
-    connect(repairStartup, &QPushButton::clicked, this, [this, startupStatus, repairStartup, text] {
+    form->addRow(useCurrentStartup);
+    const QString initialStartupStatus = startupStatus->text();
+    connect(startup_, &QCheckBox::toggled, this, [this, registeredDifferentTarget, startupStatus, useCurrentStartup, initialStartupStatus](bool checked) {
+        if (!startup_->isEnabled()) return;
+        if (registeredDifferentTarget && !checked) {
+            // Cancelling a pending takeover must not disable the other profile.
+            startupChangeRequested_ = false;
+            startup_->setEnabled(false);
+            startupStatus->setText(initialStartupStatus);
+            useCurrentStartup->setEnabled(true);
+            return;
+        }
         startupChangeRequested_ = true;
-        startupStatus->setText(text("The selected startup setting will be applied when you save.", "所选登录启动设置将在保存时应用。"));
-        repairStartup->setEnabled(false);
+    });
+    connect(useCurrentStartup, &QPushButton::clicked, this, [this, startupStatus, useCurrentStartup, startup, text] {
+        startup_->setEnabled(true);
+        startup_->setChecked(true);
+        startup_->setToolTip({});
+        startupChangeRequested_ = true;
+        startupStatus->setText(text("These directories will be used at sign-in after you save.\nData: %1\nModels: %2", "保存后将使用以下目录登录启动。\n数据：%1\n模型：%2")
+            .arg(QDir::toNativeSeparators(startup.profileDir), QDir::toNativeSeparators(startup.modelDir)));
+        useCurrentStartup->setEnabled(false);
     });
     updates_ = new QCheckBox(text("Check for updates after startup", "启动后检查新版本"), preferences);
     updates_->setChecked(settings.checkUpdates);
@@ -299,7 +345,7 @@ AppSettings SettingsDialog::settings() const {
     result.mediaOpener = readOpener(original_.mediaOpener, mediaPreset_, mediaProgram_, mediaArguments_);
     result.minimizeToTray = tray_->isChecked();
     result.checkUpdates = updates_->isChecked();
-    if (startup_->isEnabled()) result.startAtLogin = startup_->isChecked();
+    if (startupStatusKnown_ || startupChangeRequested_) result.startAtLogin = startup_->isChecked();
     return result;
 }
 }

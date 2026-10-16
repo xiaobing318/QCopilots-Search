@@ -23,7 +23,7 @@
 #include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
-#include <QPainter>
+#include <QResource>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -37,6 +37,12 @@
 #include <QSystemTrayIcon>
 #include <QVersionNumber>
 #include <QVBoxLayout>
+
+// Force the icon collection into programs that link the static app component
+// library, including GUI tests. Resource initialization must be at global scope.
+static void initializeQcsIcons() {
+    Q_INIT_RESOURCE(qcs_icons);
+}
 
 namespace qcopilots_search {
 namespace {
@@ -75,18 +81,15 @@ void SearchEdit::inputMethodEvent(QInputMethodEvent *event) {
     if (wasComposing && !composing_) emit compositionFinished();
 }
 QIcon MainWindow::applicationIcon() {
-    QPixmap pixmap(64, 64);
-    pixmap.fill(Qt::transparent);
-    QPainter painter(&pixmap);
-    painter.setRenderHint(QPainter::Antialiasing);
-    painter.setBrush(QColor("#2856cf"));
-    painter.setPen(Qt::NoPen);
-    painter.drawRoundedRect(QRectF(2, 2, 60, 60), 15, 15);
-    painter.setBrush(Qt::NoBrush);
-    painter.setPen(QPen(Qt::white, 5, Qt::SolidLine, Qt::RoundCap));
-    painter.drawEllipse(QPointF(28, 28), 14, 14);
-    painter.drawLine(QPointF(39, 39), QPointF(49, 49));
-    return QIcon(pixmap);
+    static const QIcon icon = [] {
+        initializeQcsIcons();
+        QIcon result;
+        for (const int size : {16, 20, 24, 32, 40, 48, 64, 128, 256, 512, 1024}) {
+            result.addFile(QStringLiteral(":/qcs/icons/qcs-%1.png").arg(size), QSize(size, size));
+        }
+        return result;
+    }();
+    return icon;
 }
 MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useTray, bool onboarding, QWidget *parent)
     : QMainWindow(parent), paths_(paths), backend_(backend), platform_(new PlatformIntegration(this)),
@@ -717,12 +720,17 @@ void MainWindow::updateProgress(const QJsonObject &value) {
 }
 void MainWindow::showSettings(bool firstRun) {
     if (auto *existing = findChild<SettingsDialog *>()) { existing->raise(); existing->activateWindow(); return; }
-    const bool defaultProfile = PlatformIntegration::canSetStartAtLogin(paths_.profileDir, paths_.modelDir);
-    auto *dialog = new SettingsDialog(settings_, firstRun, defaultProfile, this);
+    const bool allowStartup = PlatformIntegration::canSetStartAtLogin(paths_.profileDir, paths_.modelDir);
+    SettingsDialog::StartupOptions startup;
+    startup.allowed = allowStartup;
+    startup.profileDir = paths_.profileDir;
+    startup.modelDir = paths_.modelDir;
+    if (allowStartup) startup.state = PlatformIntegration::startAtLoginState();
+    auto *dialog = new SettingsDialog(settings_, firstRun, startup, this);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
-    connect(dialog, &QDialog::accepted, this, [this, dialog, defaultProfile] {
+    connect(dialog, &QDialog::accepted, this, [this, dialog, allowStartup] {
         const auto settings = dialog->settings();
-        if (defaultProfile && dialog->startupChangeRequested()) {
+        if (allowStartup && dialog->startupChangeRequested()) {
             QString error;
             if (!PlatformIntegration::setStartAtLogin(settings.startAtLogin, paths_.profileDir, paths_.modelDir, &error)) { showError(error); return; }
         }

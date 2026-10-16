@@ -93,12 +93,11 @@ def install_and_verify(package, report_root, work, source, models, user_id, grou
     """Only callers that established a disposable container may enter this phase."""
     profile = work / "user-profile"
     report = {"schemaVersion": 1, "scenario": "deb-install-uninstall", "passed": False,
-              "releaseComplete": False,
+              "verificationScope": "full", "fullVerificationPassed": False,
               "containerImage": image, "packageSha256": digest(package),
               "variantId": variant,
               "commit": os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_COMMIT") or
-                        os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD") or
-                        os.environ.get("QCOPILOTS_SEARCH_CI_COMMIT"), "checks": []}
+                        os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD"), "checks": []}
     installed = False
     user_created = False
     group_created = False
@@ -152,16 +151,17 @@ def install_and_verify(package, report_root, work, source, models, user_id, grou
              "--installed-manifest", manifest, "--profile-dir", profile,
              "--model-dir", models, "--report-dir", report_root / "smoke", *variant_arguments], env=environment)
         smoke = json.loads((report_root / "smoke/report.json").read_text(encoding="utf-8"))
-        if (smoke.get("passed") is not True or smoke.get("releaseComplete") is not True
+        if (smoke.get("passed") is not True or smoke.get("verificationScope") != "full"
+                or smoke.get("fullVerificationPassed") is not True
                 or smoke.get("modelSmoke", {}).get("passed") is not True):
             raise RuntimeError("The installed DEB failed the complete package and real-model smoke")
         verified_commit = smoke.get("commit")
-        if not isinstance(verified_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", verified_commit):
-            raise RuntimeError("The installed DEB smoke has no verified candidate commit")
+        if verified_commit is not None and (
+                not isinstance(verified_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", verified_commit)):
+            raise RuntimeError("The installed DEB smoke has an invalid source commit")
         if smoke.get("buildIdentity", {}).get("candidateCommit") != verified_commit:
-            raise RuntimeError("The installed DEB embedded candidate differs from its verified smoke commit")
-        for name in ("QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD",
-                     "QCOPILOTS_SEARCH_CI_COMMIT"):
+            raise RuntimeError("The installed DEB embedded commit differs from its verified smoke commit")
+        for name in ("QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD"):
             if os.environ.get(name) and os.environ[name] != verified_commit:
                 raise RuntimeError(f"{name} differs from the installed DEB verified smoke commit")
         if smoke.get("packageSha256") != report["packageSha256"]:
@@ -181,7 +181,7 @@ def install_and_verify(package, report_root, work, source, models, user_id, grou
             raise RuntimeError("DEB removal left package payload files: " + ", ".join(remaining[:10]))
         report["retainedProfileFiles"] = len(after)
         report["checks"].append("dpkg removed all owned payload files and preserved every user profile file hash")
-        report["releaseComplete"] = True
+        report["fullVerificationPassed"] = True
         report["passed"] = True
     except Exception as error:
         report["error"] = str(error)
@@ -190,12 +190,12 @@ def install_and_verify(package, report_root, work, source, models, user_id, grou
             cleanup = run(["dpkg", "--remove", PRODUCT], check=False)
             if cleanup.returncode:
                 report["cleanupError"] = "dpkg removal failed inside the disposable container"
-                report["passed"] = report["releaseComplete"] = False
+                report["passed"] = report["fullVerificationPassed"] = False
         if isolated_home and user_created:
             cleanup = run(["userdel", user], check=False)
             if cleanup.returncode:
                 report["cleanupError"] = "Could not remove the isolated container test account"
-                report["passed"] = report["releaseComplete"] = False
+                report["passed"] = report["fullVerificationPassed"] = False
         if isolated_home and group_created:
             # Some distributions remove the user's matching group as part of
             # userdel. Do not turn that successful cleanup into a failure.
@@ -207,7 +207,7 @@ def install_and_verify(package, report_root, work, source, models, user_id, grou
                 cleanup = run(["groupdel", user], check=False)
                 if cleanup.returncode:
                     report["cleanupError"] = "Could not remove the isolated container test group"
-                    report["passed"] = report["releaseComplete"] = False
+                    report["passed"] = report["fullVerificationPassed"] = False
         (report_root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(report, ensure_ascii=False, indent=2))
     if not report["passed"]:
@@ -377,13 +377,8 @@ apt-get install --yes --no-install-recommends python3 git xvfb xauth ca-certific
 exec python3 /source/.github/scripts/qcs-deb-ci.py --inside-container
 """
     candidate_environment = {name: os.environ[name] for name in
-        ("QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD", "QCOPILOTS_SEARCH_CI_COMMIT")
+        ("QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD")
         if os.environ.get(name)}
-    if "QCOPILOTS_SEARCH_CI_COMMIT" not in candidate_environment:
-        candidate = (candidate_environment.get("QCOPILOTS_SEARCH_CANDIDATE_COMMIT") or
-                     candidate_environment.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD"))
-        if candidate:
-            candidate_environment["QCOPILOTS_SEARCH_CI_COMMIT"] = candidate
     command = ["docker", "run", "--rm", "--platform", "linux/amd64",
                "--env", "QCOPILOTS_SEARCH_DEB_CONTAINER=1",
                "--env", "QCOPILOTS_SEARCH_VARIANT=" + variant["id"],

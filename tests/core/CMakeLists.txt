@@ -1,4 +1,4 @@
-foreach(test_name IN ITEMS core file_catalog model_files)
+foreach(test_name IN ITEMS core file_catalog model_files utf8_locale)
     string(REPLACE "_" "-" target_suffix "${test_name}")
     set(target_name "qcs-tests-${target_suffix}")
     add_executable("${target_name}" "${test_name}_test.cpp")

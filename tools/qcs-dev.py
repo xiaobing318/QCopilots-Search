@@ -340,14 +340,16 @@ def qt_prefix(root: Path):
     return candidates[1].resolve()
 
 
-def executable(directory: Path, name: str):
+def executable(directory: Path, name: str, *, required=False):
     suffix = ".exe" if os.name == "nt" else ""
     candidates = [directory / "bin" / (name + suffix),
                   directory / f"bin/{GUI_EXECUTABLE}.app/Contents/MacOS" / name,
                   directory / f"{GUI_EXECUTABLE}.app/Contents/MacOS" / name]
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.is_file():
             return candidate
+    if required:
+        raise RuntimeError(f"Executable is missing: {candidates[0]}. Run configure and build for this variant and configuration first.")
     return candidates[0]
 
 
@@ -412,7 +414,7 @@ def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
                  "labelFilter": args.test_label, "filters": filters,
                  "registeredTests": [], "selectedTests": [], "excludedTests": [],
                  "commands": [], "status": "preparing", "passed": False,
-                 "fullSuitePassed": False, "releaseComplete": False, "exitCode": None}
+                 "fullSuitePassed": False, "exitCode": None}
 
     def save():
         (run_report / "test-selection.json").write_text(
@@ -462,7 +464,7 @@ def run_tests(args, root: Path, build: Path, reports: Path, environment: dict):
         selection["status"] = "running"
         save()
         print(f"CTest: {len(selected)} selected, "
-              f"{len(selection['excludedTests'])} excluded. Release acceptance is incomplete.", flush=True)
+              f"{len(selection['excludedTests'])} excluded.", flush=True)
         run(command, cwd=root, env=environment)
         cases = list(ET.parse(run_report / "ctest.xml").getroot().iter("testcase"))
         actual_names = [case.get("name") for case in cases]
@@ -608,7 +610,7 @@ def ensure_nsis(root, environment):
 
 def nsis_contract(root, reports, environment):
     """Run the real compiler/install contract only in the NSIS package stage."""
-    command = [sys.executable, "-B", SOURCE / "tools/qcs-test-workflow.py", "--suite", "native"]
+    command = [sys.executable, "-B", SOURCE / "tests/tooling/qcs-test-workflow.py", "--suite", "native"]
     result = subprocess.run([str(item) for item in command], cwd=root, env=environment,
                             capture_output=True, text=True, encoding="utf-8", errors="replace")
     output = result.stdout + result.stderr
@@ -694,7 +696,9 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
             # Installation deploys the GPU manifest and its complete runtime dependencies.
             run(["cmake", "--install", build, "--config", args.config, "--prefix", stage], cwd=root, env=environment)
             runtime_root = stage
-        run([executable(runtime_root, GUI_EXECUTABLE), "--profile-dir", root / "development-profile", *args.program_arg], cwd=root, env=runtime_environment)
+        models = (getattr(args, "model_dir", None) or root.parent / "models").expanduser().resolve()
+        run([executable(runtime_root, GUI_EXECUTABLE, required=True), "--profile-dir", root / "development-profile",
+             "--model-dir", models, *args.program_arg], cwd=root, env=runtime_environment)
     elif action == "install":
         run(["cmake", "--install", build, "--config", args.config, "--prefix", stage], cwd=root, env=environment)
     elif action == "package":
@@ -738,11 +742,14 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
         command.extend(["--report-dir", report_dir])
         package_environment = dict(environment, QCOPILOTS_SEARCH_TEST_ROOT=str(root / "runs" / args.config))
         run(command, cwd=root, env=package_environment)
+        report = json.loads((report_dir / "report.json").read_text(encoding="utf-8"))
+        if report.get("passed") is not True or (not args.keyword_only and report.get("fullVerificationPassed") is not True):
+            raise RuntimeError("Package verification did not complete the requested checks. See " + str(report_dir / "report.json"))
     elif action == "models":
         models = (args.model_dir or root.parent / "models").expanduser().resolve()
         assert_external(models)
         models.mkdir(parents=True, exist_ok=True)
-        common = [executable(build, "qcs-cli"), "--model-dir", models,
+        common = [executable(build, "qcs-cli", required=True), "--model-dir", models,
                   "--profile-dir", root / "runs" / args.config / "model-management"]
         manifest = subprocess.run([str(item) for item in [*common, "models", "manifest"]], cwd=root,
                                   env=environment, capture_output=True, check=True)
@@ -755,12 +762,13 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
         if result.returncode:
             raise subprocess.CalledProcessError(result.returncode, common, result.stdout, result.stderr)
     elif action == "sources":
+        dependency_root = root / "deps" / args.config
         run([sys.executable, SOURCE / "tools/qcs-source-bundle.py", "--build-root", root,
-             "--qt-root", sdk_root, "--output-dir", root / "sources" / args.config, "--download"], cwd=root, env=environment)
-        archives = [root / "deps/sources/llama.cpp-b11461.tar.gz", root / "deps" / args.config / "llama-b11461.tar.gz"]
-        archive = next((path for path in archives if path.is_file()), None)
-        if archive is None:
-            raise RuntimeError("Collected llama source archive is unavailable for rebuild verification")
+             "--qt-root", sdk_root, "--dependency-root", dependency_root,
+             "--output-dir", root / "sources" / args.config, "--download"], cwd=root, env=environment)
+        source_tool = helper_module("tools/qcs-source-bundle.py", "qcs_source_archives")
+        archive = source_tool.get_archive(source_tool.llama_entry(), root, root / "deps/sources", 0, False,
+                                          dependency_root=dependency_root)
         run([sys.executable, SOURCE / "tests/runtime/source_integrity_test.py", "--archive", archive,
              "--report", reports / "source-integrity.json"], cwd=root, env=environment)
         if json.loads((reports / "source-integrity.json").read_text(encoding="utf-8")).get("passed") is not True:
@@ -772,12 +780,8 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
             installer_args.report_dir = reports / "package-nsis"
             execute_action("verify-package", installer_args, root, build, stage, reports, sdk_root, prefix, environment)
         elif platform.system() == "Linux":
-            evidence = helper_module("tools/qcs-release-evidence.py", "qcs_installer_identity")
-            identity = evidence.source_identity(SOURCE)
-            candidate = environment.get("QCOPILOTS_SEARCH_CANDIDATE_HEAD")
-            if candidate and candidate != identity["checkoutCommit"]:
-                raise RuntimeError("Installer candidate differs from the current source checkout")
-            installer_environment = dict(environment, QCOPILOTS_SEARCH_CANDIDATE_HEAD=identity["checkoutCommit"])
+            commit = working_tree_state()["commit"]
+            installer_environment = dict(environment, QCOPILOTS_SEARCH_CANDIDATE_HEAD=commit)
             run([sys.executable, SOURCE / ".github/scripts/qcs-deb-ci.py", "--build-root", root,
                  "--package-file", package_for_suffix(root, ".deb", args.config), "--model-dir", args.model_dir or root.parent / "models",
                  "--report-dir", reports / "package-deb"], cwd=root, env=installer_environment)
@@ -812,60 +816,43 @@ def source_snapshot():
     return file_snapshot({name: SOURCE / name for name in names if (SOURCE / name).is_file()})
 
 
-def executable_snapshot(build):
-    return file_snapshot({name: executable(build, name) for name in (GUI_EXECUTABLE, "qcs-service", "qcs-worker", "qcs-cli")})
+def working_tree_state():
+    """Record source status without requiring developers to commit their work."""
+    def git(*arguments):
+        return subprocess.check_output(["git", "-C", str(SOURCE), *arguments]).decode("utf-8", errors="replace").strip()
+    status = git("status", "--porcelain=v1", "--untracked-files=all")
+    return {"commit": git("rev-parse", "HEAD"), "workingTreeModified": bool(status),
+            "status": status.splitlines()}
 
 
-def runtime_snapshot(build):
-    paths = {}
-    for folder in (build / "bin", build / "lib"):
-        if folder.is_dir():
-            for path in folder.rglob("*"):
-                if path.is_file() and (path.suffix.lower() in (".dll", ".dylib") or re.search(r"\.so(?:\.\d+)*$", path.name)):
-                    paths[path.relative_to(build).as_posix()] = path
-    return file_snapshot(paths)
+def write_json(path, document):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
+    """Run the complete local workflow and retain a concise diagnostic report."""
     global _ACTIVE_LOG
     if args.test_label or args.keyword_only or args.generator or args.package_file:
         raise ValueError("check requires the entire test suite. Use individual actions for filtered work.")
-    evidence = helper_module("tools/qcs-release-evidence.py", "qcs_check_release")
-    identity = evidence.source_identity(SOURCE)
-    identity_errors = evidence.valid_identity(identity)
-    if identity.get("candidateHead") != identity.get("checkoutCommit"):
-        identity_errors.append("The candidate differs from the current checkout")
-    if identity_errors:
-        raise ValueError("check requires a clean immutable source checkout: " + "; ".join(identity_errors))
-    declarations = {name: environment[name] for name in (
-        "QCOPILOTS_SEARCH_CANDIDATE_COMMIT", "QCOPILOTS_SEARCH_CANDIDATE_HEAD", "QCOPILOTS_SEARCH_SOURCE_COMMIT")
-        if name in environment}
-    if getattr(args, "candidate_commit", None) is not None:
-        declarations["--candidate-commit"] = args.candidate_commit
-    for argument in getattr(args, "cmake_arg", []):
-        declaration = re.fullmatch(r"-DQCOPILOTS_SEARCH_CANDIDATE_COMMIT(?::[^=]+)?=(.+)", argument)
-        if declaration:
-            declarations[argument] = declaration.group(1)
-    for name, commit in declarations.items():
-        if commit != identity["checkoutCommit"]:
-            raise ValueError(f"check candidate differs from the current checkout: {name}")
     directory = args.report_dir.expanduser().resolve() if args.report_dir else Path(tempfile.mkdtemp(prefix="check-", dir=reports))
     assert_external(directory)
     if root not in directory.parents:
-        raise ValueError("check report directory must be inside this external build root for portable evidence")
+        raise ValueError("check report directory must be inside this external build root")
     if directory.exists() and any(directory.iterdir()):
         raise RuntimeError("check requires an empty, unique report directory")
     directory.mkdir(parents=True, exist_ok=True)
     original_sources = source_snapshot()
-    document = {"schemaVersion": 2, "kind": "developer-check", "variant": args.variant, "config": args.config,
-                "system": platform.system(), "buildRoot": str(root), "identity": identity,
-                "passed": False, "releaseComplete": False, "startedAt": datetime.now(timezone.utc).isoformat(),
+    document = {"schemaVersion": 3, "kind": "developer-check", "variant": args.variant, "config": args.config,
+                "system": platform.system(), "buildRoot": str(root), "source": working_tree_state(),
+                "passed": False, "fullVerificationPassed": False,
+                "startedAt": datetime.now(timezone.utc).isoformat(),
                 "stages": [{"action": action, "generator": generator, "status": "notRun"}
-                           for action, generator in check_plan(platform.system())], "files": [],
-                "sourceFiles": original_sources, "executables": {}, "runtimeFiles": {}, "packages": {}, "stability": {}}
+                           for action, generator in check_plan(platform.system())]}
     report_path = directory / "check-report.json"
-    document["reportPath"] = report_path.relative_to(root).as_posix()
-    evidence.write_json(reports / "latest-check.json", {"report": str(report_path), "variant": args.variant})
+    write_json(reports / "latest-check.json", {"report": str(report_path), "variant": args.variant})
     local_args = copy.copy(args)
     local_args.model_dir = args.model_dir or root.parent / "models"
     environment = dict(environment, QCOPILOTS_SEARCH_MODEL_DIR=str(local_args.model_dir.resolve()),
@@ -876,179 +863,38 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
             local_args.report_dir = directory / ("tests" if record["action"] == "test" else "package")
             log = directory / f"{index + 1:02d}-{record['action']}.log"
             log.write_text("", encoding="utf-8")
-            record.update(status="running", startedAt=datetime.now(timezone.utc).isoformat(),
-                          log=log.relative_to(root).as_posix())
-            evidence.write_json(report_path, document)
+            record.update(status="running", startedAt=datetime.now(timezone.utc).isoformat(), log=log.name)
+            write_json(report_path, document)
             started = time.monotonic()
             _ACTIVE_LOG = log
             try:
                 execute_action(record["action"], local_args, root, build, stage, directory, sdk_root, prefix, environment)
-                if record["action"] == "build":
-                    document["executables"] = executable_snapshot(build)
-                    document["runtimeFiles"] = runtime_snapshot(build)
-                if record["action"] == "package":
-                    suffix = {"ZIP": ".zip", "NSIS": ".exe", "TGZ": ".tar.gz", "DEB": ".deb", "DragNDrop": ".dmg"}[record["generator"]]
-                    package = package_for_suffix(root, suffix, args.config)
-                    paths = {name: root / name for name in document["packages"]}
-                    paths[package.relative_to(root).as_posix()] = package
-                    for name, fingerprint in file_snapshot(paths).items():
-                        if name in document["packages"] and document["packages"][name] != fingerprint:
-                            raise RuntimeError("An earlier package changed during a later packaging stage: " + name)
-                        document["packages"].setdefault(name, fingerprint)
                 record.update(status="passed", exitCode=0)
             except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, ET.ParseError) as error:
                 record.update(status="failed", error=str(error),
                               exitCode=error.returncode if isinstance(error, subprocess.CalledProcessError) else 1)
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write(str(error) + "\n")
                 raise
             finally:
                 _ACTIVE_LOG = None
                 record.update(elapsedSeconds=round(time.monotonic() - started, 3),
                               finishedAt=datetime.now(timezone.utc).isoformat())
-                evidence.write_json(report_path, document)
-        if evidence.source_identity(SOURCE) != identity:
-            raise RuntimeError("Source identity changed during the developer check")
-        document["stability"] = {
-            "sourceUnchanged": source_snapshot() == original_sources,
-            "binariesUnchanged": executable_snapshot(build) == document["executables"],
-            "runtimeUnchanged": runtime_snapshot(build) == document["runtimeFiles"],
-            "packagesUnchanged": file_snapshot({name: root / name for name in document["packages"]}) == document["packages"],
-        }
-        if not all(document["stability"].values()):
-            raise RuntimeError("Source, executable or package bytes changed during the developer check")
-        document["passed"] = True
+                write_json(report_path, document)
+        document["sourceUnchanged"] = source_snapshot() == original_sources
+        if not document["sourceUnchanged"]:
+            raise RuntimeError("Source files changed during check. Run check again for the updated code.")
+        document.update(passed=True, fullVerificationPassed=True)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, ET.ParseError) as error:
+        document["error"] = str(error)
+        raise
     finally:
         _ACTIVE_LOG = None
         document["finishedAt"] = datetime.now(timezone.utc).isoformat()
-        paths = [path for path in directory.rglob("*") if path.is_file() and path != report_path]
-        paths.extend(root / name for name in document["packages"] if (root / name).is_file())
-        sdk_manifest = root / "reports" / args.config / "gpu-sdk.json"
-        if sdk_manifest.is_file():
-            paths.append(sdk_manifest)
-        if (package_directory(root, args.config) / "SHA256SUMS").is_file():
-            paths.append(package_directory(root, args.config) / "SHA256SUMS")
-        document["files"] = [evidence.file_record(root, path) for path in sorted(set(paths))]
-        evidence.write_json(report_path, document)
+        document["sourceAfter"] = working_tree_state()
+        write_json(report_path, document)
         print(f"Developer check report: {report_path}")
-    try:
-        inspection = inspect_check(report_path, identity["checkoutCommit"])
-        validation_errors = inspection["errors"]
-        if inspection["passed"] is not True and not validation_errors:
-            validation_errors = ["The final report validator did not confirm success"]
-    except Exception as error:
-        validation_errors = [f"Cannot validate the final developer check report: {error}"]
-    if validation_errors:
-        document["passed"] = False
-        document["validationErrors"] = validation_errors
-        evidence.write_json(report_path, document)
-        raise RuntimeError("Developer check report validation failed: " + "; ".join(validation_errors))
     return report_path
-
-
-def inspect_check(report_path: Path, expected_head: str):
-    """Revalidate the original complete developer check and bound evidence."""
-    evidence = helper_module("tools/qcs-release-evidence.py", "qcs_check_release")
-    result = {"passed": False, "errors": [], "files": []}
-    try:
-        document = evidence.read_json(report_path)
-        relative_report = Path(document["reportPath"])
-        if relative_report.is_absolute() or ".." in relative_report.parts:
-            raise ValueError("Local check report path is not relative")
-        root = report_path.resolve().parents[len(relative_report.parts) - 1]
-        if root.joinpath(relative_report).resolve() != report_path.resolve():
-            raise ValueError("Local check report was moved without its evidence tree")
-        errors = evidence.verify_manifest(root, document)
-        result.update(identity=document["identity"], files=document["files"], buildRoot=str(root))
-        if (document.get("kind") != "developer-check" or document.get("schemaVersion") != 2
-                or document.get("passed") is not True or document.get("releaseComplete") is not False
-                or document["identity"].get("candidateHead") != expected_head
-                or document["identity"].get("checkoutCommit") != expected_head):
-            errors.append("Local check is not a successful complete check of the immutable candidate")
-        errors.extend(evidence.valid_identity(document["identity"]))
-        if (not document.get("sourceFiles") or set(document.get("executables", {})) != {GUI_EXECUTABLE, "qcs-service", "qcs-worker", "qcs-cli"}
-                or not document.get("packages")
-                or "runtimeFiles" not in document
-                or document.get("stability") != {"sourceUnchanged": True, "binariesUnchanged": True, "runtimeUnchanged": True, "packagesUnchanged": True}):
-            errors.append("Local check source, executable and package stability evidence is incomplete")
-        expected = check_plan(document["system"])
-        stages = document.get("stages", [])
-        if [(item.get("action"), item.get("generator")) for item in stages] != expected:
-            errors.append("Local check stages are incomplete or changed")
-        bound = {item["path"] for item in document["files"]}
-        required = [report_path.parent / "tests" / name for name in (
-            "test-selection.json", "test-inventory.json", "test-selected-inventory.json", "ctest.xml", "qt-test-cases.json")]
-        required += [report_path.parent / name for name in (
-            "models.json", "models-manifest.json", "semantic-functional.json", "package/report.json")]
-        if document["system"] == "Windows":
-            required += [report_path.parent / name for name in ("nsis-contract.json", "nsis-contract.log", "package-nsis/report.json")]
-        if document["system"] == "Linux":
-            required.append(report_path.parent / "package-deb/report.json")
-        if not {path.relative_to(root).as_posix() for path in required}.issubset(bound):
-            errors.append("Local check omits required bound original evidence")
-        for item in stages:
-            if (item.get("status") != "passed" or item.get("exitCode") != 0
-                    or item.get("log") not in bound or item.get("elapsedSeconds", -1) < 0):
-                errors.append("Local stage failed, did not run, or lacks its bound raw log")
-        selected = evidence.read_json(report_path.parent / "tests/test-selection.json")
-        if selected.get("fullSuitePassed") is not True or selected.get("excludedTests"):
-            errors.append("Local CTest selection is incomplete")
-        parser = helper_module(".github/scripts/qcs-ctest-evidence.py", "qcs_complete_cases")
-        cases = parser.inspect_junit(report_path.parent / "tests/ctest.xml", document["system"],
-                                     report_path.parent / "tests/test-inventory.json")
-        errors.extend(cases["errors"])
-        models = evidence.read_json(report_path.parent / "models.json")
-        model_manifest = evidence.read_json(report_path.parent / "models-manifest.json")
-        actual_models = models.get("result", {}).get("artifacts", [])
-        expected_models = model_manifest.get("result", {}).get("artifacts", [])
-        pins = evidence.package_contract()[0]
-        if (models.get("ok") is not True or models.get("result", {}).get("valid") is not True
-                or len(actual_models) != len(pins) or len(expected_models) != len(pins)
-                or {item.get("name") for item in actual_models} != set(pins)):
-            errors.append("Local model verification is incomplete")
-        for item in actual_models:
-            if item.get("present") is not True or (item.get("bytes"), item.get("sha256")) != pins.get(item.get("name")):
-                errors.append("Local model bytes differ from the immutable model lock")
-        for item in expected_models:
-            if (item.get("size"), item.get("sha256")) != pins.get(item.get("name")):
-                errors.append("Local model manifest differs from the immutable model lock")
-        semantic = evidence.read_json(report_path.parent / "semantic-functional.json")
-        errors.extend(evidence.validate_semantic(semantic))
-        package_reports = [report_path.parent / "package/report.json"]
-        if document["system"] == "Windows":
-            package_reports.append(report_path.parent / "package-nsis/report.json")
-        elif document["system"] == "Linux":
-            package_reports.append(report_path.parent / "package-deb/report.json")
-        package_hashes = {item["sha256"] for item in document["files"] if item["path"].startswith("pkg/")}
-        for package_path in package_reports:
-            package = evidence.read_json(package_path)
-            if (package.get("passed") is not True or package.get("releaseComplete") is not True
-                    or package.get("commit") != expected_head or package.get("workingTreeModified", False) is not False
-                    or package.get("packageSha256") not in package_hashes
-                    or len(package.get("checks", [])) < (3 if "package-deb" in str(package_path) else 9)):
-                errors.append("Local package result is incomplete, stale or unbound")
-            smoke_path = package_path.parent / "smoke/report.json" if "package-deb" in str(package_path) else package_path
-            if smoke_path.relative_to(root).as_posix() not in bound:
-                errors.append("Local package smoke report is not bound")
-            smoke = evidence.read_json(smoke_path)
-            for name in evidence.package_evidence_paths(smoke, smoke_path.parent):
-                if (smoke_path.parent / name).relative_to(root).as_posix() not in bound:
-                    errors.append("Local package raw reply, program inventory or license material is not bound")
-            # RPATH, stripping and signing can rewrite deployed Linux/macOS workers.
-            # Their installed inventory remains bound to this exact package.
-            errors.extend(evidence.validate_package_release(smoke, smoke_path.parent,
-                model_fingerprint=semantic.get("modelFingerprint"),
-                extraction_fingerprint=semantic.get("extractionFingerprint"), platform_id=document["variant"],
-                package_sha256=package.get("packageSha256"),
-                worker_sha256=(document.get("executables", {}).get("qcs-worker", {}).get("sha256")
-                               if document["system"] == "Windows" else None)))
-        if document["system"] == "Windows":
-            native = evidence.read_json(report_path.parent / "nsis-contract.json")
-            raw = (report_path.parent / "nsis-contract.log").read_text(encoding="utf-8")
-            errors.extend(evidence.validate_nsis_contract(native, raw))
-        result["errors"] = errors
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError, ET.ParseError) as error:
-        result["errors"].append(f"Cannot inspect local check: {error}")
-    result["passed"] = not result["errors"]
-    return result
 
 
 def main():

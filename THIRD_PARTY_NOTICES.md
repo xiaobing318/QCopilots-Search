@@ -1,10 +1,10 @@
 # 第三方声明
 
-QCopilots Search 的自有代码使用根目录的 MIT 许可证，Copyright (c) 2026 xbyang。下列依赖和参考内容保留原许可证。此清单用于说明归属，最终发行材料必须包括与实际二进制对应的完整许可证、版权声明、源码和必要补丁。
+QCopilots Search 的自有代码使用根目录的 MIT 许可证，Copyright (c) 2026 xbyang。下列依赖和参考内容保留原许可证。此清单用于说明归属，最终发行材料必须包括与实际二进制对应的完整许可证、版权声明、源码和构建配置。
 
 ## DigUp
 
-项目参考 [DigUp](https://github.com/ARahim3/DigUp)，参考提交为 `6faa29e4c315a3a591de1b41bd78751bdf39588d`。推理契约、图像预处理、no-logits 补丁和参考向量的改编保留原作者归属。黄金夹具的原始许可证同时保存在 `tests/runtime/fixtures/LICENSE-DigUp`。
+项目参考 [DigUp](https://github.com/ARahim3/DigUp)，参考提交为 `6faa29e4c315a3a591de1b41bd78751bdf39588d`。推理契约、图像预处理和参考向量的改编保留原作者归属。黄金夹具的原始许可证同时保存在 `tests/runtime/fixtures/LICENSE-DigUp`。
 
 ```text
 MIT License
@@ -36,7 +36,7 @@ SOFTWARE.
 | --- | --- | --- |
 | Qt Core、Gui、Widgets、Network、XML、SVG、Core5Compat、Multimedia 等 | 对应模块的 LGPLv3 / GPL / 商业许可选项，发行使用适用的 LGPL 模块，另含第三方组件 | 动态库与插件，保留 Qt 许可及 SBOM |
 | Qt PDF / PDFium | Qt PDF 模块许可及 PDFium 所含第三方许可 | 动态库及实际随附资源 |
-| llama.cpp / ggml | MIT | 固定版本，应用 no-logits 补丁 |
+| llama.cpp / ggml | MIT | 锁定的原始上游源码 |
 | EmbeddingGemma 2 GGUF | 固定模型卡标注 Apache-2.0 | 下载或离线导入，不嵌入安装包 |
 | SQLite | Public domain，上游声明 | FTS5 构建 |
 | hnswlib | Apache-2.0 | 头文件库 |
@@ -50,8 +50,9 @@ SOFTWARE.
 | libde265 | LGPL-3.0-or-later | 动态 HEVC 解码库 |
 | LibRaw | LGPL-2.1 或 CDDL 1.0 双许可，本项目采用 LGPL 路径 | 动态库，不启用 GPL demosaic pack |
 | libgit2 | GPLv2 加链接例外 | 只使用本地仓库和 ignore 能力 |
-| wv2 | 上游 COPYING.LIB 及逐文件 LGPL 声明 | 动态库，保留适配补丁 |
+| wv2 | 上游 COPYING.LIB 及逐文件 LGPL 声明 | 原样源码与项目自有 CMake wrapper 构建的动态库 |
 | POLE | BSD 3-Clause | Calligra 的 OLE 读取实现，保留 pole.h 声明 |
+| GNU libiconv / libcharset | LGPL-2.1-or-later，完整发行源包另含 GPL 许可的命令行工具 | 应用只部署动态库，保留 COPYING.LIB、COPYING 和 libcharset 的许可 |
 | zlib | zlib license | 压缩依赖 |
 | libjpeg-turbo | IJG、BSD-style 及 zlib 声明，以上游 LICENSE.md 为准 | 图像依赖 |
 | libpng | libpng 许可证及源包内逐项声明 | OCR PNG 读写 |
@@ -66,10 +67,10 @@ Windows 包中的 `msvcp140`、`vcruntime140` 和 `vcomp140` 等编译器运行�
 
 参考来源：[Qt 许可与 SBOM](https://doc.qt.io/qt-6/licensing.html)、[LibRaw 许可说明](https://www.libraw.org/about)、[tessdata_fast](https://github.com/tesseract-ocr/tessdata_fast)、[固定模型卡](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/blob/bfcd298762cc34d0357ece5ebdd31791a3a374d8/README.md)。
 
-## 对应源码与修改
+## 对应源码与构建
 
-依赖锁记录上游版本、下载位置和 SHA-256。项目对第三方依赖的构建适配位于 `cmake`，llama.cpp 补丁位于 `third_party/patches`。发行材料应包含锁定源码归档、这些适配、构建脚本和工具链说明，以便重建对应动态库。
+依赖锁记录上游版本、下载位置和 SHA-256。所有第三方源码保持上游原样，项目自有构建配置位于 `cmake`，生成头写入外置构建目录。发行材料包含锁定源码归档、这些配置、构建脚本和工具链说明，以便重建对应动态库。GNU libiconv 的许可证安装到 `share/qcs/licenses/libiconv`，libcharset 许可单独安装到 `share/qcs/licenses/libcharset`。
 
 Qt 使用官方二进制 SDK，需要提供与 SDK 对应的源码材料及适用许可证。FFmpeg 必须记录配套构建的配置与源码，不把任意系统 FFmpeg 当作对应版本。保留用户按许可证替换动态库的能力，发布签名状态不能改写组件原有许可。
 
-新增夹具、数据集、图标或媒体样本时必须记录来源与可再分发条件。当前实际验收与发行材料是否齐全见 `docs/implementation-status.md`。
+新增夹具、数据集、图标或媒体样本时必须记录来源与可再分发条件。应用图标为本项目通过 ImageGen 生成并选定的蓝青 Q 标识，PNG、ICO 和 ICNS 均来自同一主资源，随项目提供。构建与源码材料范围见 [对应源码说明](docs/source-materials.md)，实际执行结果由对应测试与 CI 报告说明。

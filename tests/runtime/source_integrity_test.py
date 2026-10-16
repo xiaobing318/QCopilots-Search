@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the actual locked llama source archive without writable source fixtures."""
+"""Exercise locked llama.cpp source verification using isolated temporary copies."""
 from __future__ import annotations
 
 import argparse
@@ -19,42 +19,44 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "support"))
 from temp_paths import temporary_root
 
-ARCHIVE_SHA = "778ee590ec7447075e08f2daf6301311ae7f8d9bf810a0b849f26af3f6d10867"
-PATCHED_SHA = {
-    "src/llama-context.cpp": "513f5cc789180f4f094217c7397a53aa6cbda7c0a7c2aa239fe1cd0b19a2c025",
-    "ggml/src/ggml-backend-reg.cpp": "bfb21d94932be91e243e2746f0d19e8822a6ad91502c67b408e0d1d4d29828c9",
-}
 REPO = Path(__file__).resolve().parents[2]
+LOCK = json.loads((REPO / "dependencies.lock.json").read_text(encoding="utf-8"))["llama.cpp"]
+ARCHIVE_SHA = LOCK["sha256"]
 OPTIONS: argparse.Namespace
 
 
 class SourceIntegrityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        archive = Path(OPTIONS.archive).resolve(strict=True)
-        if hashlib.sha256(archive.read_bytes()).hexdigest() != ARCHIVE_SHA:
-            raise AssertionError("Input archive differs from the locked llama b11461 SHA256")
         temp_root = temporary_root()
         cls.temporary = tempfile.TemporaryDirectory(prefix="qcs-source-", dir=temp_root)
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name).resolve()
         cls.source = cls.root / "source 中文 archive"
-        cls.source.mkdir()
-        with tarfile.open(archive, "r:gz") as packed:
-            for entry in packed:
-                if entry.isdir():
-                    continue
-                if not entry.isfile():
-                    raise AssertionError("Locked archive unexpectedly contains a link")
-                parts = PurePosixPath(entry.name).parts[1:]
-                if not parts or any(part in ("..", ".") for part in parts):
-                    raise AssertionError("Invalid archive member path")
-                destination = cls.source.joinpath(*parts)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                with packed.extractfile(entry) as source, destination.open("wb") as output:
-                    shutil.copyfileobj(source, output)
+        if OPTIONS.source:
+            source = Path(OPTIONS.source).resolve(strict=True)
+            shutil.copytree(source, cls.source, symlinks=True,
+                            ignore=lambda directory, names: [".git"] if Path(directory) == source else [])
+        else:
+            archive = Path(OPTIONS.archive).resolve(strict=True)
+            if hashlib.sha256(archive.read_bytes()).hexdigest() != ARCHIVE_SHA:
+                raise AssertionError("Input archive differs from the locked llama.cpp SHA256")
+            cls.source.mkdir()
+            with tarfile.open(archive, "r:gz") as packed:
+                for entry in packed:
+                    if entry.isdir():
+                        continue
+                    if not entry.isfile():
+                        raise AssertionError("Locked archive unexpectedly contains a link")
+                    parts = PurePosixPath(entry.name).parts[1:]
+                    if not parts or any(part in ("..", ".") for part in parts):
+                        raise AssertionError("Invalid archive member path")
+                    destination = cls.source.joinpath(*parts)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with packed.extractfile(entry) as source, destination.open("wb") as output:
+                        shutil.copyfileobj(source, output)
         # The archive lives in an unrelated Git repository with no commit.
-        # Neither verification nor git apply may accidentally use this repo.
+        # Verification must not accidentally use this repository.
         subprocess.run([OPTIONS.git, "init", "--quiet", str(cls.root)], check=True)
         cls.git_config = cls.root / "isolated.gitconfig"
         cls.git_config.write_text("[core]\n\tautocrlf = true\n", encoding="utf-8")
@@ -67,21 +69,25 @@ class SourceIntegrityTests(unittest.TestCase):
             'cmake_minimum_required(VERSION 3.28)\n'
             'find_package(Git REQUIRED)\n'
             'include("${VERIFIER}")\n'
-            'if(ACTION STREQUAL "prepare")\n'
-            '  qcopilots_search_prepare_llama_source("${SOURCE}" "${PATCHES}")\n'
-            'else()\n'
-            '  qcopilots_search_verify_llama_source("${SOURCE}")\n'
-            'endif()\n', encoding="utf-8")
+            'qcopilots_search_verify_llama_source("${SOURCE}")\n', encoding="utf-8")
 
-    def check_cmake(self, *, action="verify", source=None, verifier=None,
-                    patches=None, failure=None) -> None:
+    def copy_verifier(self, name):
+        project = self.root / name
+        directory = project / "src/runtime"
+        directory.mkdir(parents=True)
+        for filename in ("verify_llama_source.cmake", "verify_llama_source.py", "llama-source-manifest.sha256"):
+            shutil.copyfile(REPO / "src/runtime" / filename, directory / filename)
+        shutil.copyfile(REPO / "dependencies.lock.json", project / "dependencies.lock.json")
+        return project, directory / "verify_llama_source.cmake"
+
+    def check_cmake(self, *, source=None, verifier=None, failure=None) -> None:
         result = subprocess.run([
             OPTIONS.cmake,
             f"-DGIT_EXECUTABLE={OPTIONS.git}",
+            f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DSOURCE={source or self.source}",
             f"-DVERIFIER={verifier or REPO / 'src/runtime/verify_llama_source.cmake'}",
-            f"-DPATCHES={patches or REPO / 'third_party/patches'}",
-            f"-DACTION={action}", "-P", str(self.driver),
+            "-P", str(self.driver),
         ], cwd=self.root, env=self.environment, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=180)
         details = result.stdout + result.stderr
@@ -92,18 +98,26 @@ class SourceIntegrityTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, details)
 
     def test_01_pristine_archive(self):
+        if OPTIONS.source:
+            self.check_cmake(source=Path(OPTIONS.source).resolve(strict=True))
         self.check_cmake()
 
-    def test_02_patches_in_unrelated_repository_and_autocrlf_true(self):
-        self.check_cmake(action="prepare")
-        for relative, expected in PATCHED_SHA.items():
-            self.assertEqual(hashlib.sha256((self.source / relative).read_bytes()).hexdigest(), expected)
-
-    def test_03_repeated_prepare_and_autocrlf_false(self):
-        self.git_config.write_text("[core]\n\tautocrlf = false\n", encoding="utf-8")
-        self.check_cmake(action="prepare")
-        for relative, expected in PATCHED_SHA.items():
-            self.assertEqual(hashlib.sha256((self.source / relative).read_bytes()).hexdigest(), expected)
+    def test_02_repeated_verification_does_not_write_source(self):
+        files = sorted(path for path in self.source.rglob("*") if path.is_file())
+        before = {path: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+                  for path in files}
+        try:
+            for path in files:
+                path.chmod(0o444)
+            self.check_cmake()
+            self.git_config.write_text("[core]\n\tautocrlf = false\n", encoding="utf-8")
+            self.check_cmake()
+            after = {path: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+                     for path in self.source.rglob("*") if path.is_file()}
+            self.assertEqual(before, after)
+        finally:
+            for path in files:
+                path.chmod(0o644)
 
     def test_04_reject_modified_source(self):
         path = self.source / "CMakeLists.txt"
@@ -114,7 +128,7 @@ class SourceIntegrityTests(unittest.TestCase):
         finally:
             path.write_bytes(original)
 
-    def test_05_reject_modified_patched_source(self):
+    def test_05_reject_modified_backend_source(self):
         path = self.source / "ggml/src/ggml-backend-reg.cpp"
         original = path.read_bytes()
         try:
@@ -139,24 +153,66 @@ class SourceIntegrityTests(unittest.TestCase):
             path.write_bytes(original)
 
     def test_07_reject_modified_manifest(self):
-        directory = self.root / "changed verifier"
-        directory.mkdir()
-        for name in ("verify_llama_source.cmake", "llama-source-manifest.sha256"):
-            shutil.copyfile(REPO / "src/runtime" / name, directory / name)
-        with (directory / "llama-source-manifest.sha256").open("ab") as output:
+        _, verifier = self.copy_verifier("changed verifier")
+        with (verifier.parent / "llama-source-manifest.sha256").open("ab") as output:
             output.write(b"\n")
-        self.check_cmake(verifier=directory / "verify_llama_source.cmake",
-                         failure="source manifest differs from its reviewed hash")
+        self.check_cmake(verifier=verifier, failure="source manifest differs from its reviewed hash")
 
-    def test_08_reject_modified_patch(self):
-        directory = self.root / "changed patches"
-        directory.mkdir()
-        for path in (REPO / "third_party/patches").glob("*.patch"):
-            shutil.copyfile(path, directory / path.name)
-        with (directory / "llama.cpp-no-logits.patch").open("ab") as output:
-            output.write(b"\n")
-        self.check_cmake(action="prepare", patches=directory,
-                         failure="differs from its reviewed hash")
+    def test_08_build_checks_the_actual_compiler_source_before_and_after(self):
+        fixture = self.root / "build guard"
+        fixture.mkdir()
+        build = self.root / "guard-build"
+        compiled = build / "compiled-source.txt"
+        source_file = self.source / "src/llama-context.cpp"
+        original = source_file.read_bytes()
+        (fixture / "consume.cmake").write_text(
+            'file(COPY_FILE "${SOURCE_FILE}" "${OUTPUT_FILE}")\n'
+            'if(MUTATE_SOURCE)\n'
+            '  file(APPEND "${SOURCE_FILE}" "\\n// build changed upstream source\\n")\n'
+            'endif()\n', encoding="utf-8")
+        (fixture / "CMakeLists.txt").write_text(
+            'cmake_minimum_required(VERSION 3.28)\n'
+            'project(source_guard NONE)\n'
+            f'include("{(REPO / "src/runtime/guard_llama_source.cmake").as_posix()}")\n'
+            'add_custom_target(source_consumer\n'
+            f'  COMMAND "${{CMAKE_COMMAND}}" "-DSOURCE_FILE={source_file.as_posix()}"\n'
+            '    "-DOUTPUT_FILE=${CMAKE_BINARY_DIR}/compiled-source.txt"\n'
+            '    "-DMUTATE_SOURCE=${MUTATE_SOURCE}" -P "${CMAKE_CURRENT_SOURCE_DIR}/consume.cmake" VERBATIM)\n'
+            'add_custom_target(application ALL)\n'
+            f'qcopilots_search_guard_llama_source("{self.source.as_posix()}"\n'
+            '  SOURCE_TARGETS source_consumer BUILT_TARGETS source_consumer CONSUMER_TARGETS application)\n',
+            encoding="utf-8")
+        configure = [OPTIONS.cmake, "-S", str(fixture), "-B", str(build),
+                     f"-DPython3_EXECUTABLE={sys.executable}", f"-DGIT_EXECUTABLE={OPTIONS.git}"]
+        if OPTIONS.generator:
+            configure += ["-G", OPTIONS.generator]
+        if OPTIONS.make_program:
+            configure += [f"-DCMAKE_MAKE_PROGRAM={OPTIONS.make_program}"]
+        environment = {key: value for key, value in self.environment.items()
+                       if not key.startswith("CMAKE_GENERATOR")}
+
+        def run(arguments, expected_success):
+            result = subprocess.run(arguments, env=environment, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=180)
+            details = result.stdout + result.stderr
+            self.assertEqual(result.returncode == 0, expected_success, details)
+            return details
+
+        command = [OPTIONS.cmake, "--build", str(build), "--config", "Release", "--target", "application"]
+        run(configure, True)
+        run(command, True)
+        self.assertEqual(compiled.read_bytes(), original)
+        compiled.unlink()
+        try:
+            source_file.write_bytes(original + b"\n// changed after configure\n")
+            self.assertIn("differs from its locked hash", run(command, False))
+            self.assertFalse(compiled.exists(), "The source consumer ran before integrity verification")
+            source_file.write_bytes(original)
+            run(configure + ["-DMUTATE_SOURCE=ON"], True)
+            self.assertIn("differs from its locked hash", run(command, False))
+            self.assertTrue(compiled.exists(), "The fixture did not reach the source-consuming build")
+        finally:
+            source_file.write_bytes(original)
 
     def test_09_reject_directory_link(self):
         link = self.source / "outside-source"
@@ -182,7 +238,7 @@ class SourceIntegrityTests(unittest.TestCase):
                            check=True, env=environment, capture_output=True, text=True)
             junction = True
         try:
-            self.check_cmake(failure="archive source contains a symlink")
+            self.check_cmake(failure="source contains a symlink")
         finally:
             if junction:
                 link.rmdir()
@@ -200,6 +256,40 @@ class SourceIntegrityTests(unittest.TestCase):
                         "-c", "user.email=test@example.invalid", "commit", "--quiet", "--allow-empty",
                         "-m", "Unrelated source"], check=True, env=self.environment)
         self.check_cmake(source=source, failure="does not match the locked commit")
+
+    def test_11_matching_git_commit_still_verifies_every_file(self):
+        # Use an isolated local commit and lock fixture to exercise the same Git
+        # path without a network clone or modifying the reviewed production lock.
+        project, verifier = self.copy_verifier("git verifier")
+        subprocess.run([OPTIONS.git, "init", "--quiet", str(self.source)], check=True, env=self.environment)
+        subprocess.run([OPTIONS.git, "-C", str(self.source), "-c", "core.autocrlf=false",
+                        "-c", "core.longpaths=true", "add", "--all"],
+                       check=True, env=self.environment, capture_output=True)
+        subprocess.run([OPTIONS.git, "-C", str(self.source), "-c", "user.name=Source integrity test",
+                        "-c", "core.longpaths=true",
+                        "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "Pristine archive"],
+                       check=True, env=self.environment, capture_output=True)
+        commit = subprocess.check_output([OPTIONS.git, "-C", str(self.source), "rev-parse", "HEAD"],
+                                         env=self.environment, text=True).strip()
+        lock_path = project / "dependencies.lock.json"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock["llama.cpp"]["commit"] = commit
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+        self.check_cmake(verifier=verifier)
+        path = self.source / "src/llama-context.cpp"
+        original = path.read_bytes()
+        try:
+            path.write_bytes(original + b"\n// unreviewed source modification\n")
+            self.check_cmake(verifier=verifier, failure="differs from its locked hash: src/llama-context.cpp")
+        finally:
+            path.write_bytes(original)
+        extra = self.source / "untracked.cmake"
+        try:
+            extra.write_text("# untracked build logic\n", encoding="utf-8")
+            self.check_cmake(verifier=verifier, failure="source file set differs")
+        finally:
+            extra.unlink()
+
 
 
 class RecordedResult(unittest.TextTestResult):
@@ -238,9 +328,13 @@ if __name__ == "__main__":
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", required=True, help="Locked llama-b11461.tar.gz")
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--archive", help="Locked llama-v0.7.0.tar.gz")
+    inputs.add_argument("--source", help="Pristine upstream directory copied into an isolated test root")
     parser.add_argument("--cmake", default=shutil.which("cmake"))
     parser.add_argument("--git", default=shutil.which("git"))
+    parser.add_argument("--generator", help="CMake generator for the build-order regression")
+    parser.add_argument("--make-program", help="Generator's build tool, when explicitly configured")
     parser.add_argument("--report", type=Path, help="Optional JSON evidence path outside the source tree")
     OPTIONS = parser.parse_args()
     if not OPTIONS.cmake or not OPTIONS.git:
@@ -249,7 +343,7 @@ if __name__ == "__main__":
         unittest.defaultTestLoader.loadTestsFromTestCase(SourceIntegrityTests))
     if OPTIONS.report:
         OPTIONS.report.parent.mkdir(parents=True, exist_ok=True)
-        OPTIONS.report.write_text(json.dumps({"archive_sha256": ARCHIVE_SHA,
+        OPTIONS.report.write_text(json.dumps({"archive_sha256": ARCHIVE_SHA, "input": "source" if OPTIONS.source else "archive",
             "tests_run": result.testsRun, "successful": result.wasSuccessful(),
             "passed": result.wasSuccessful() and result.testsRun > 0 and not result.skipped,
             "skipped": len(result.skipped), "cases": result.records}, ensure_ascii=False, indent=2) + "\n",

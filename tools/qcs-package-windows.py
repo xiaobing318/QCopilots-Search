@@ -152,6 +152,7 @@ def render_script(manifest: dict, output: Path, license_path: Path,
         uninstall.append('  RMDir "$INSTDIR\\' + nsis_literal(directory.replace("/", "\\")) + '"')
     template = (SOURCE / "cmake/nsis/ExternalPayload.nsi.in").read_text(encoding="utf-8")
     values = {"OUTPUT": nsis_literal(str(output)), "LICENSE": nsis_literal(str(license_path)),
+              "ICON": nsis_literal(str(SOURCE / "resources/icons/qcs.ico")),
               "VERSION": version, "PRODUCT_ID": product_id, "MENU": nsis_literal(menu),
               "REQUIRED_BYTES": str(manifest["totalBytes"] + 64 * 1024**2),
               "REQUIRED_KIB": str((manifest["totalBytes"] + 1023) // 1024),

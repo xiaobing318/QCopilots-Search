@@ -63,29 +63,13 @@ WINDOWS_NATIVE_PROGRAM_CASES = {
         "__main__.NativeInstallerTests." + name: "The native NSIS installer runs on Windows"
         for name in (
             "test_install_uninstall_preserves_unowned_file",
+            "test_installer_and_uninstaller_embed_product_icon",
+            "test_standard_installer_and_uninstaller_embed_product_icon",
             "test_missing_payload_fails_before_installing",
             "test_overlapping_payload_destination_is_rejected",
             "test_same_length_corruption_fails_before_installing")
     },
 }
-ACCEPTANCE_TEST = "qcs-tests-acceptance-runners"
-ACCEPTANCE_NATIVE_TEST = "qcs-tests-acceptance-native"
-ACCEPTANCE_WINDOWS_SKIP_REASON = "Windows native PowerShell and NTFS ACL contract"
-ACCEPTANCE_WINDOWS_CASES = {
-    "qcs_test_portability_runners.PortabilityContracts." + name for name in (
-        "test_windows_powershell_bridge_preserves_developer_arguments",
-        "test_windows_acl_restoration_restores_effective_access",
-        "test_windows_acl_comparison_rejects_semantic_changes")
-}
-ACCEPTANCE_WINDOWS_TOKEN_CASE = (
-    "qcs_test_token_context.TokenContextContracts."
-    "test_windows_owned_child_preserves_parent_and_contains_descendants")
-ACCEPTANCE_WINDOWS_TOKEN_SKIP_REASON = "Windows native process token and Job Object contract"
-ACCEPTANCE_WINDOWS_SKIP_REASONS = {
-    **{case: ACCEPTANCE_WINDOWS_SKIP_REASON for case in ACCEPTANCE_WINDOWS_CASES},
-    ACCEPTANCE_WINDOWS_TOKEN_CASE: ACCEPTANCE_WINDOWS_TOKEN_SKIP_REASON,
-}
-ACCEPTANCE_WINDOWS_CASES = set(ACCEPTANCE_WINDOWS_SKIP_REASONS)
 UNITTEST_CASE = re.compile(r"^(test\S+) \((\S+)\) \.\.\. (ok|FAIL|ERROR|expected failure|unexpected success|skipped [^\r\n]*)\r?$", re.MULTILINE)
 UNITTEST_TOTAL = re.compile(r"^Ran (\d+) tests? in [\d.]+s\r?$", re.MULTILINE)
 UNITTEST_RESULT = re.compile(r"^(OK(?: \(skipped=\d+\))?|FAILED(?: \([^\r\n]*\))?)\r?$", re.MULTILINE)
@@ -184,17 +168,12 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
                 or (program == RUNNER_TEST and operating_system in ("Linux", "Darwin")
                     and identifier == RUNNER_WINDOWS_HANDLE_CASE and reason == RUNNER_WINDOWS_HANDLE_SKIP_REASON)
                 or (operating_system in ("Linux", "Darwin")
-                    and WINDOWS_NATIVE_PROGRAM_CASES.get(program, {}).get(identifier) == reason)
-                or (program == ACCEPTANCE_NATIVE_TEST and operating_system in ("Linux", "Darwin")
-                    and identifier in ACCEPTANCE_WINDOWS_CASES
-                    and reason == ACCEPTANCE_WINDOWS_SKIP_REASONS[identifier]))
+                    and WINDOWS_NATIVE_PROGRAM_CASES.get(program, {}).get(identifier) == reason))
             entry = {"program": program, "case": identifier, "reason": reason,
                      "classification": "notApplicable" if applicable else "requiredNotRun"}
             if applicable and program == WORKFLOW_TEST and identifier in WORKFLOW_POSIX_LINK_CASES:
                 entry["requiredNativePlatforms"] = ["Linux", "Darwin"]
             if applicable and program == RUNNER_TEST and identifier == RUNNER_WINDOWS_HANDLE_CASE:
-                entry["requiredNativePlatforms"] = ["Windows"]
-            if applicable and program == ACCEPTANCE_NATIVE_TEST and identifier in ACCEPTANCE_WINDOWS_CASES:
                 entry["requiredNativePlatforms"] = ["Windows"]
             if applicable and identifier in WINDOWS_NATIVE_PROGRAM_CASES.get(program, {}):
                 entry["requiredNativePlatforms"] = ["Windows"]
@@ -233,15 +212,6 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
     if program == RUNNER_TEST and operating_system == "Windows":
         if not any(record["case"] == RUNNER_WINDOWS_HANDLE_CASE and record["status"] == "ok" for record in records):
             errors.append(f"Required native cleanup case did not pass: {RUNNER_WINDOWS_HANDLE_CASE}")
-    if program == ACCEPTANCE_NATIVE_TEST:
-        for identifier in sorted(ACCEPTANCE_WINDOWS_CASES - set(identifiers)):
-            errors.append(f"Required native portability case is missing: {identifier}")
-        if operating_system == "Windows":
-            executed = {record["case"] for record in records if record["status"] == "ok"}
-            for identifier in sorted(ACCEPTANCE_WINDOWS_CASES - executed):
-                errors.append(f"Required native portability case did not pass: {identifier}")
-    if program == ACCEPTANCE_TEST and ACCEPTANCE_WINDOWS_CASES & set(identifiers):
-        errors.append("Pure acceptance suite unexpectedly executed native portability cases")
     native_cases = set(WINDOWS_NATIVE_PROGRAM_CASES.get(program, {}))
     for identifier in sorted(native_cases - set(identifiers)):
         errors.append(f"Required Windows case is missing: {identifier}")
@@ -254,7 +224,7 @@ def inspect_signing_unittest(output, operating_system, program=SIGNING_TEST):
 
 def inspect_junit(path: Path, operating_system: str, inventory: Path | None = None) -> dict:
     document = {"schemaVersion": 1, "platform": operating_system, "source": str(path),
-                "testsComplete": False, "releaseComplete": False,
+                "testsComplete": False,
                 "ctestPrograms": [], "qtTestSkips": [], "pythonTestSkips": [], "pythonRegisteredNotApplicable": [],
                 "pythonTestTotals": {"run": 0, "passed": 0, "failed": 0, "skipped": 0, "notApplicable": 0},
                 "inventoryVerified": False, "expectedPrograms": [],
@@ -368,7 +338,6 @@ def inspect_junit(path: Path, operating_system: str, inventory: Path | None = No
         document["ctestPrograms"].append(summary)
         document["errors"].extend(f"{name}: {error}" for error in errors)
     document["testsComplete"] = not document["errors"]
-    document["releaseComplete"] = document["testsComplete"]
     return document
 
 

@@ -23,11 +23,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 target_sources(qcs-tests-extraction-legacy_doc PRIVATE qcs-doc.qrc)
 set_target_properties(qcs-tests-extraction-legacy_doc PROPERTIES AUTORCC ON)
-target_link_libraries(qcs-tests-extraction-legacy_doc PRIVATE Qt6::Core5Compat)
-if(APPLE)
-    # This test exercises the private inline adapter as well as the wv2 DLL.
-    target_link_libraries(qcs-tests-extraction-legacy_doc PRIVATE "${QCOPILOTS_SEARCH_COREFOUNDATION_LIBRARY}")
-endif()
+target_link_libraries(qcs-tests-extraction-legacy_doc PRIVATE qcs::iconv)
+
 target_sources(qcs-tests-extraction-image PRIVATE image_fixtures.qrc)
 set_target_properties(qcs-tests-extraction-image PROPERTIES AUTORCC ON)
 add_executable(qcs-tests-jpeg-probe jpeg_probe.cpp)

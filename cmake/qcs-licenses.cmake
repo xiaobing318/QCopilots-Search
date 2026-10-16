@@ -58,7 +58,7 @@ install(DIRECTORY "${_qcopilots_license_output}/"
 
 if(QCOPILOTS_SEARCH_BUILD_TESTS)
   qcopilots_search_add_test(NAME qcs-tests-license-materials COMMAND "${Python3_EXECUTABLE}" -X utf8 -B
-    "${PROJECT_SOURCE_DIR}/tools/qcs-test-license-materials.py")
+    "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-license-materials.py")
   set_tests_properties(qcs-tests-license-materials PROPERTIES
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" LABELS "unit;portability;package"
     ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")

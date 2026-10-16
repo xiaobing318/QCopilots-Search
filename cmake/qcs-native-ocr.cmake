@@ -231,37 +231,6 @@ function(qcopilots_search_add_ocr_dependencies)
     set(CURL_FOUND FALSE)
     set(PACKAGE_VERSION "5.5.3")
 
-    # Disable Tesseract's filename-based TIFF entry point. Its Leptonica memory
-    # decoder remains enabled above. Skip the upstream configure-time TIFF
-    # executable before the in-tree Leptonica has been built. This idempotent
-    # patch changes only fetched files in the external dependency build tree.
-    set(tesseract_cmake "${qcs_tesseract_SOURCE_DIR}/CMakeLists.txt")
-    set(tesseract_patch_lock "${qcs_tesseract_SOURCE_DIR}/.qcs-cmake-patch.lock")
-    file(LOCK "${tesseract_patch_lock}" GUARD FUNCTION TIMEOUT 120
-        RESULT_VARIABLE tesseract_patch_lock_result)
-    if(NOT tesseract_patch_lock_result STREQUAL "0")
-        message(FATAL_ERROR "Cannot lock the Tesseract CMake patch: ${tesseract_patch_lock_result}")
-    endif()
-    file(READ "${tesseract_cmake}" tesseract_source)
-    set(tiff_probe "\ncheck_leptonica_tiff_support()\n")
-    set(tiff_legacy_guard "\n# QCopilots Search: memory-only Leptonica has no TIFF codec.\nif(DISABLE_TIFF)\n  set(LEPT_TIFF_RESULT 1)\n  set(LEPT_TIFF_COMPILE_SUCCESS TRUE)\nelse()\n  check_leptonica_tiff_support()\nendif()\n")
-    set(tiff_guard "\n# QCopilots Search: the pinned in-tree Leptonica enables its TIFF memory codec.\nif(DISABLE_TIFF)\n  set(LEPT_TIFF_RESULT 0)\n  set(LEPT_TIFF_COMPILE_SUCCESS TRUE)\nelse()\n  check_leptonica_tiff_support()\nendif()\n")
-    string(FIND "${tesseract_source}" "${tiff_probe}" tiff_probe_position)
-    string(FIND "${tesseract_source}" "${tiff_legacy_guard}" tiff_legacy_guard_position)
-    if(NOT tiff_probe_position EQUAL -1)
-        string(REPLACE "${tiff_probe}" "${tiff_guard}" tesseract_source "${tesseract_source}")
-        file(WRITE "${tesseract_cmake}" "${tesseract_source}")
-    elseif(NOT tiff_legacy_guard_position EQUAL -1)
-        string(REPLACE "${tiff_legacy_guard}" "${tiff_guard}" tesseract_source "${tesseract_source}")
-        file(WRITE "${tesseract_cmake}" "${tesseract_source}")
-    else()
-        string(FIND "${tesseract_source}" "${tiff_guard}" tiff_guard_position)
-        if(tiff_guard_position EQUAL -1)
-            message(FATAL_ERROR "Pinned Tesseract TIFF-probe patch no longer applies")
-        endif()
-    endif()
-    file(LOCK "${tesseract_patch_lock}" RELEASE)
-
     # Upstream creates a CLI unconditionally. EXCLUDE_FROM_ALL keeps it and its
     # install rules out of the application. The caller installs only the two
     # shared-library runtime artifacts alongside the application worker.

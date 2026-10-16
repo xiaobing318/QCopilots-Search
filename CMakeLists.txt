@@ -42,6 +42,11 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 if(MSVC)
+  if(DEFINED CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRARY STREQUAL ""
+      AND NOT CMAKE_MSVC_RUNTIME_LIBRARY STREQUAL "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    message(FATAL_ERROR "QCS and its dependencies require the shared MSVC runtime (/MD or /MDd).")
+  endif()
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   add_compile_options(/utf-8 /permissive- /Zc:__cplusplus)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
@@ -62,7 +67,7 @@ endif()
 qcopilots_search_install_output_guard("${CMAKE_SOURCE_DIR}")
 include(CTest)
 # CTest defaults to only 1 KiB for passing tests, which removes QtTest's case
-# totals and can hide internal skips from the release evidence.
+# totals and can hide skipped functional checks.
 file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
   "set(CTEST_CUSTOM_MAXIMUM_PASSED_TEST_OUTPUT_SIZE 16777216)\nset(CTEST_CUSTOM_MAXIMUM_FAILED_TEST_OUTPUT_SIZE 16777216)\n")
 option(QCOPILOTS_SEARCH_BUILD_TESTS "Build application tests" ON)
@@ -110,6 +115,14 @@ foreach(_module core runtime extraction storage service app cli worker)
     add_subdirectory("src/${_module}")
   endif()
 endforeach()
+if(WIN32)
+  enable_language(RC)
+  set(QCOPILOTS_SEARCH_ICON_FILE "${PROJECT_SOURCE_DIR}/resources/icons/qcs.ico")
+  configure_file(resources/qcs_icon.rc.in "${CMAKE_BINARY_DIR}/qcs_icon.rc" @ONLY)
+  foreach(_qcs_program qcs-gui qcs-cli qcs-service qcs-worker)
+    target_sources(${_qcs_program} PRIVATE "${CMAKE_BINARY_DIR}/qcs_icon.rc")
+  endforeach()
+endif()
 include(qcs-symbols)
 if(QCOPILOTS_SEARCH_BUILD_TESTS AND EXISTS "${PROJECT_SOURCE_DIR}/tests/CMakeLists.txt")
   enable_testing()
@@ -118,20 +131,31 @@ endif()
 if(QCOPILOTS_SEARCH_BUILD_TESTS)
   find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
   qcopilots_search_add_test(NAME qcs-tests-workflow COMMAND "${Python3_EXECUTABLE}"
-    "${PROJECT_SOURCE_DIR}/tools/qcs-test-workflow.py")
+    "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-workflow.py")
   set_tests_properties(qcs-tests-workflow PROPERTIES
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" LABELS "unit;portability;workflow"
     ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
   qcopilots_search_add_test(NAME qcs-tests-macos-signing COMMAND "${Python3_EXECUTABLE}" -B
-    "${PROJECT_SOURCE_DIR}/tools/qcs-test-macos-signing.py")
+    "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-macos-signing.py")
   set_tests_properties(qcs-tests-macos-signing PROPERTIES
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" LABELS "unit;portability;package"
     ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
   qcopilots_search_add_test(NAME qcs-tests-release-tool COMMAND "${Python3_EXECUTABLE}" -B
-    "${PROJECT_SOURCE_DIR}/tools/qcs-test-release.py")
+    "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-release.py")
   set_tests_properties(qcs-tests-release-tool PROPERTIES
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" LABELS "unit;tooling;package" TIMEOUT 120
     ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+  set(_qcs_icon_check --resources "${PROJECT_SOURCE_DIR}/resources/icons")
+  if(WIN32)
+    foreach(_qcs_program qcs-gui qcs-cli qcs-service qcs-worker)
+      list(APPEND _qcs_icon_check --executable "$<TARGET_FILE:${_qcs_program}>")
+    endforeach()
+  elseif(APPLE)
+    list(APPEND _qcs_icon_check --bundle "$<TARGET_BUNDLE_DIR:qcs-gui>")
+  endif()
+  qcopilots_search_add_test(NAME qcs-tests-app-icons EVIDENCE_KIND program
+    COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/runtime/app_icons_test.py" ${_qcs_icon_check})
+  set_tests_properties(qcs-tests-app-icons PROPERTIES LABELS "unit;package" TIMEOUT 60)
 endif()
 include(qcs-dev-deploy)
 include(qcs-package)

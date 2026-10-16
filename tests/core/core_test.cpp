@@ -14,6 +14,7 @@
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QScopeGuard>
+#include <QStandardPaths>
 #include <QtTest>
 #include <limits>
 #ifdef Q_OS_WIN
@@ -48,6 +49,14 @@ private slots:
     void symbolicLinkCleanupRejectsReplacement();
 #endif
     void environmentOverrides();
+    void absoluteFilesystemPaths();
+    void defaultProfileDirectoryIgnoresOverrides();
+    void legacyProfileEnvironmentRejected();
+    void invalidProfileSelection_data();
+    void invalidProfileSelection();
+#ifdef Q_OS_WIN
+    void absoluteWindowsProfilePaths();
+#endif
     void workingDirectoryIndependence();
     void longAndUnicodePaths();
     void runtimeCreationFailure();
@@ -328,15 +337,187 @@ void CoreTest::environmentOverrides()
 {
     TestEnvironment env(QStringLiteral("environment"));
     QVERIFY2(env.isValid(), qPrintable(env.error()));
-    ScopedEnvironment profile("QCOPILOTS_SEARCH_PROFILE_DIR", env.path("env profile").toUtf8());
+    ScopedEnvironment profile("QCS_HOME", env.path("环境 profile").toUtf8());
+    ScopedEnvironment legacy("QCOPILOTS_SEARCH_PROFILE_DIR", env.path("ignored legacy profile").toUtf8());
     ScopedEnvironment model("QCOPILOTS_SEARCH_MODEL_DIR", env.path("env model").toUtf8());
     const auto fromEnvironment = RuntimePaths::resolve();
-    QCOMPARE(fromEnvironment.profileDir, env.path("env profile"));
+    QVERIFY(fromEnvironment.resolutionError.isEmpty());
+    QCOMPARE(fromEnvironment.profileDir, env.path("环境 profile"));
     QCOMPARE(fromEnvironment.modelDir, env.path("env model"));
     const auto fromArguments = RuntimePaths::resolve(env.path("explicit profile"), env.path("explicit model"));
     QCOMPARE(fromArguments.profileDir, env.path("explicit profile"));
     QCOMPARE(fromArguments.modelDir, env.path("explicit model"));
+    {
+        ScopedEnvironment noModel("QCOPILOTS_SEARCH_MODEL_DIR", {});
+        const auto defaultModels = RuntimePaths::resolve();
+        QCOMPARE(defaultModels.modelDir, QDir(defaultModels.profileDir).filePath("models"));
+    }
+    {
+        ScopedEnvironment invalidHome("QCS_HOME", "relative-home");
+        const auto explicitProfile = RuntimePaths::resolve(env.path("explicit profile"));
+        QVERIFY(explicitProfile.resolutionError.isEmpty());
+        QCOMPARE(explicitProfile.profileDir, fromArguments.profileDir);
+        QCOMPARE(explicitProfile.modelDir, fromEnvironment.modelDir);
+    }
+    QVERIFY(!QFileInfo::exists(env.path("环境 profile")));
+    QVERIFY(!QFileInfo::exists(env.path("ignored legacy profile")));
 }
+
+void CoreTest::defaultProfileDirectoryIgnoresOverrides()
+{
+    TestEnvironment env("default-profile-path");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    ScopedEnvironment profile("QCS_HOME", env.path("selected-profile").toUtf8());
+    ScopedEnvironment legacy("QCOPILOTS_SEARCH_PROFILE_DIR", env.path("legacy-profile").toUtf8());
+    // Check only the computed name. Do not resolve, inspect or create the real
+    // platform profile while exercising the default-location contract.
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    const QString expected = base.isEmpty() ? QString{} : QDir::cleanPath(QDir(base).filePath("qcs"));
+    QCOMPARE(RuntimePaths::defaultProfileDirectory(), expected);
+    QVERIFY(RuntimePaths::defaultProfileDirectory() != env.path("selected-profile"));
+}
+
+void CoreTest::absoluteFilesystemPaths()
+{
+    QVERIFY(!RuntimePaths::isAbsoluteFilesystemPath({}));
+    QVERIFY(!RuntimePaths::isAbsoluteFilesystemPath(QStringLiteral("relative/path")));
+    QVERIFY(!RuntimePaths::isAbsoluteFilesystemPath(QStringLiteral(":/resource")));
+#ifdef Q_OS_WIN
+    for (const QString &path : {QStringLiteral("C:/root"), QStringLiteral("C:\\root"),
+                                QStringLiteral("C:/"), QStringLiteral("//server/share"),
+                                QStringLiteral("\\\\server\\share\\profile"),
+                                QStringLiteral("\\\\?\\C:\\root"),
+                                QStringLiteral("\\\\?\\UNC\\server\\share\\profile")})
+        QVERIFY2(RuntimePaths::isAbsoluteFilesystemPath(path), qPrintable(path));
+    for (const QString &path : {QStringLiteral("/root"), QStringLiteral("\\root"),
+                                QStringLiteral("C:relative"), QStringLiteral("C:"),
+                                QStringLiteral("//server"), QStringLiteral("//server//share"),
+                                QStringLiteral("//?/UNC/server"), QStringLiteral("//./pipe/qcs")})
+        QVERIFY2(!RuntimePaths::isAbsoluteFilesystemPath(path), qPrintable(path));
+    const QString absolute = QStringLiteral("C:/root");
+#else
+    const QString absolute = QStringLiteral("/root");
+    QVERIFY(RuntimePaths::isAbsoluteFilesystemPath(absolute));
+    QVERIFY(RuntimePaths::isAbsoluteFilesystemPath(QStringLiteral("/")));
+    QVERIFY(!RuntimePaths::isAbsoluteFilesystemPath(QStringLiteral("C:/root")));
+#endif
+    QVERIFY(!RuntimePaths::isAbsoluteFilesystemPath(absolute + QChar::Null + QStringLiteral("tail")));
+}
+
+void CoreTest::legacyProfileEnvironmentRejected()
+{
+    TestEnvironment env("legacy-profile-environment");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    ScopedEnvironment profile("QCS_HOME", {});
+    ScopedEnvironment legacy("QCOPILOTS_SEARCH_PROFILE_DIR", env.path("legacy-profile").toUtf8());
+    const auto paths = RuntimePaths::resolve();
+    QVERIFY(paths.resolutionError.contains("QCS_HOME"));
+    QVERIFY(paths.resolutionError.contains("QCOPILOTS_SEARCH_PROFILE_DIR"));
+    QVERIFY(paths.profileDir.isEmpty());
+    QVERIFY(paths.modelDir.isEmpty());
+    QVERIFY(paths.configFile.isEmpty());
+    QVERIFY(paths.ipcName.isEmpty());
+    QString error;
+    QVERIFY(!paths.validateProfileLayout(&error));
+    QCOMPARE(error, paths.resolutionError);
+    QVERIFY(!paths.ensure(&error));
+    QCOMPARE(error, paths.resolutionError);
+    QVERIFY(!paths.ensureIpcDirectory(&error));
+    QCOMPARE(error, paths.resolutionError);
+    QVERIFY(!paths.validateIpcDirectory(&error));
+    QCOMPARE(error, paths.resolutionError);
+    QVERIFY(!QFileInfo::exists(env.path("legacy-profile")));
+    const auto explicitProfile = RuntimePaths::resolve(env.path("explicit-profile"));
+    QVERIFY(explicitProfile.resolutionError.isEmpty());
+    QCOMPARE(explicitProfile.profileDir, env.path("explicit-profile"));
+}
+
+void CoreTest::invalidProfileSelection_data()
+{
+    QTest::addColumn<bool>("fromEnvironment");
+    QTest::addColumn<QString>("kind");
+    for (bool fromEnvironment : {false, true}) {
+        for (const char *kind : {"relative", "file", "child-of-file"
+#ifdef Q_OS_WIN
+                                , "drive-relative", "drive-only", "current-drive-root",
+                                "current-drive-backslash", "resource", "unc-server-only",
+                                "device", "incomplete-extended"
+#endif
+                               }) {
+            const QByteArray name = QByteArray(fromEnvironment ? "environment-" : "argument-") + kind;
+            QTest::newRow(name.constData()) << fromEnvironment << QString::fromLatin1(kind);
+        }
+    }
+    QTest::newRow("argument-nul") << false << QStringLiteral("nul");
+}
+
+void CoreTest::invalidProfileSelection()
+{
+    QFETCH(bool, fromEnvironment);
+    QFETCH(QString, kind);
+    TestEnvironment env("invalid-profile");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    QVERIFY(env.writeFile("occupied", "original data"));
+    QString selected;
+    if (kind == "relative") selected = QStringLiteral("relative-profile");
+    else if (kind == "file") selected = env.path("occupied");
+    else if (kind == "child-of-file") selected = env.path("occupied/profile");
+    else if (kind == "drive-relative") selected = QStringLiteral("C:relative");
+    else if (kind == "drive-only") selected = QStringLiteral("C:");
+    else if (kind == "current-drive-root") selected = QStringLiteral("/root");
+    else if (kind == "current-drive-backslash") selected = QStringLiteral("\\root");
+    else if (kind == "resource") selected = QStringLiteral(":/root");
+    else if (kind == "unc-server-only") selected = QStringLiteral("//server");
+    else if (kind == "device") selected = QStringLiteral("\\\\.\\pipe\\qcs");
+    else if (kind == "incomplete-extended") selected = QStringLiteral("\\\\?\\C:relative");
+    else selected = env.path("bad") + QChar::Null + QStringLiteral("profile");
+    ScopedEnvironment profile("QCS_HOME", fromEnvironment ? selected.toUtf8() : env.path("unused-profile").toUtf8());
+    ScopedEnvironment legacy("QCOPILOTS_SEARCH_PROFILE_DIR", {});
+    ScopedEnvironment model("QCOPILOTS_SEARCH_MODEL_DIR", env.path("unused-models").toUtf8());
+    const QString previous = QDir::currentPath();
+    const auto restoreDirectory = qScopeGuard([&] { QDir::setCurrent(previous); });
+    QVERIFY(QDir::setCurrent(env.root()));
+    const auto paths = RuntimePaths::resolve(fromEnvironment ? QString{} : selected);
+    QString error;
+    QVERIFY(!paths.validateProfileLayout(&error));
+    QVERIFY(!error.isEmpty());
+    QVERIFY(!paths.ensure(&error));
+    QVERIFY(!error.isEmpty());
+    if (kind != "file" && kind != "child-of-file") {
+        QVERIFY(!paths.resolutionError.isEmpty());
+        QCOMPARE(error, paths.resolutionError);
+        QVERIFY(paths.profileDir.isEmpty());
+        QVERIFY(paths.configFile.isEmpty());
+        QVERIFY(paths.ipcName.isEmpty());
+    } else {
+        QVERIFY(error.contains("not a directory"));
+        QCOMPARE(paths.profileDir, selected);
+    }
+    QCOMPARE(QDir(env.root()).entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot),
+             QStringList{QStringLiteral("occupied")});
+    QFile original(env.path("occupied"));
+    QVERIFY(original.open(QIODevice::ReadOnly));
+    QCOMPARE(original.readAll(), QByteArray("original data"));
+}
+
+#ifdef Q_OS_WIN
+void CoreTest::absoluteWindowsProfilePaths()
+{
+    TestEnvironment env("absolute-profile");
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    const QString profile = env.path("absolute profile");
+    const auto expected = RuntimePaths::resolve(profile);
+    for (const QString &value : {profile, QDir::toNativeSeparators(profile),
+                                 nativeLockFilePath(profile)}) {
+        ScopedEnvironment home("QCS_HOME", value.toUtf8());
+        const auto selected = RuntimePaths::resolve();
+        QVERIFY2(selected.resolutionError.isEmpty(), qPrintable(selected.resolutionError));
+        QCOMPARE(selected.profileDir, expected.profileDir);
+        QCOMPARE(selected.ipcName, expected.ipcName);
+    }
+    QVERIFY(!QFileInfo::exists(profile));
+}
+#endif
 
 void CoreTest::workingDirectoryIndependence()
 {
@@ -953,8 +1134,8 @@ void CoreTest::pipelineContracts()
     QCOMPARE(embedding.value("mediaSha256").toString().toLatin1(), manifest.at(1).sha256);
     QVERIFY(manifest.at(0).url.toString().contains(embedding.value("modelRevision").toString()));
     QVERIFY(embeddingPipelineFingerprint().startsWith("qcopilots-search-embedding-v1:"));
-    QCOMPARE(embeddingPipelineFingerprint(), QStringLiteral("qcopilots-search-embedding-v1:58b7ec0f5d1971431488b9899d8f1eccb8e54b3e37e42d14810dc5732ac7d9b1"));
-    QCOMPARE(extractionPipelineFingerprint(), QStringLiteral("qcopilots-search-extraction-v6:00bbcdbeeddbe3f7af89b6155cf627f607365500eb6bf9493f539a0675c81a55"));
+    QCOMPARE(embeddingPipelineFingerprint(), QStringLiteral("qcopilots-search-embedding-v1:e2eb31c724adc082a252eede5996a4d1edf435ad72538a2e9d9372a3b8f9560e"));
+    QCOMPARE(extractionPipelineFingerprint(), QStringLiteral("qcopilots-search-extraction-v7:ee56376c71b1fa8a085547d7d4a77da6a55efbfa121c0a1c1dd576040b5393af"));
     auto changed = embedding;
     changed["queryPrompt"] = "different prompt";
     QVERIFY(pipelineContractFingerprint("qcopilots-search-embedding-v1", changed)

@@ -5,6 +5,7 @@ add_library(qcs-core STATIC
     model_files.cpp model_files.h
     runtime_paths.cpp runtime_paths.h
     pipeline_manifest.h
+    utf8_locale.h
     types.cpp types.h
 )
 target_compile_features(qcs-core PUBLIC cxx_std_20)

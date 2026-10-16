@@ -10,7 +10,6 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QGuiApplication>
-#include <QStandardPaths>
 #include <QUrl>
 #ifdef Q_OS_WIN
 #ifndef WIN32_LEAN_AND_MEAN
@@ -141,40 +140,28 @@ bool PlatformIntegration::revealFile(const QString &path, QString *error) {
     return failure(error, QStringLiteral("Could not reveal the file in the file manager."));
 }
 bool PlatformIntegration::supportsStartAtLogin() {
-    return loginStartupSupported();
+    return loginStartupSessionAllowed() && loginStartupSupported();
 }
 bool PlatformIntegration::setStartAtLogin(bool enabled, QString *error) {
-    for (const QString &argument : QCoreApplication::arguments()) {
-        if (argument == QStringLiteral("--profile-dir") || argument.startsWith(QStringLiteral("--profile-dir="))
-            || argument == QStringLiteral("--model-dir") || argument.startsWith(QStringLiteral("--model-dir=")))
-            return failure(error, QStringLiteral("Login startup can only be changed from the default profile and model directory."));
-    }
+    if (!loginStartupSessionAllowed())
+        return failure(error, QStringLiteral("Login startup cannot be changed from a test session or a session with explicit directory arguments."));
     const auto paths = RuntimePaths::resolve();
+    if (!paths.validateProfileLayout(error)) return false;
     return setStartAtLogin(enabled, paths.profileDir, paths.modelDir, error);
 }
 bool PlatformIntegration::canSetStartAtLogin(const QString &profileDirectory, const QString &modelsDirectory) {
-    if (QStandardPaths::isTestModeEnabled()
-        || qEnvironmentVariableIsSet("QCOPILOTS_SEARCH_PROFILE_DIR")
-        || qEnvironmentVariableIsSet("QCOPILOTS_SEARCH_MODEL_DIR")
-        || profileDirectory.isEmpty() || modelsDirectory.isEmpty()) return false;
-    const QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
-    if (base.isEmpty()) return false;
-    const QString defaultProfile = QDir(base).filePath(QStringLiteral("qcs"));
-    const auto defaults = RuntimePaths::resolve(defaultProfile, QDir(defaultProfile).filePath(QStringLiteral("models")));
-    const auto actual = RuntimePaths::resolve(profileDirectory, modelsDirectory);
-#ifdef Q_OS_WIN
-    constexpr Qt::CaseSensitivity pathCase = Qt::CaseInsensitive;
-#else
-    constexpr Qt::CaseSensitivity pathCase = Qt::CaseSensitive;
-#endif
-    return actual.profileDir.compare(defaults.profileDir, pathCase) == 0
-        && actual.modelDir.compare(defaults.modelDir, pathCase) == 0;
+    return RuntimePaths::isAbsoluteFilesystemPath(profileDirectory)
+        && RuntimePaths::isAbsoluteFilesystemPath(modelsDirectory) && supportsStartAtLogin();
 }
 bool PlatformIntegration::setStartAtLogin(bool enabled, const QString &profileDirectory,
                                          const QString &modelsDirectory, QString *error) {
     if (!canSetStartAtLogin(profileDirectory, modelsDirectory))
-        return failure(error, QStringLiteral("Login startup can only be changed from the default profile and model directory."));
-    return loginStartupSetEnabled(enabled, error);
+        return failure(error, QStringLiteral("Login startup requires a supported normal session and absolute profile and model directories."));
+    return loginStartupSetEnabled(enabled, profileDirectory, modelsDirectory, error);
 }
-LoginStartupState PlatformIntegration::startAtLoginState() { return loginStartupState(); }
+LoginStartupState PlatformIntegration::startAtLoginState() {
+    if (!loginStartupSessionAllowed())
+        return {LoginStartupStatus::Unavailable, QStringLiteral("Login startup is unavailable for test sessions and explicit directory arguments.")};
+    return loginStartupState();
+}
 }

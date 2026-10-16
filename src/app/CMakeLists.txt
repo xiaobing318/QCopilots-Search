@@ -5,9 +5,11 @@ add_library(qcs-app-components STATIC
     model_dialog.cpp model_dialog.h
     platform_integration.cpp platform_integration.h
     login_startup.cpp login_startup.h
+    login_startup_target.cpp login_startup_target.h
     platform_external_open.cpp platform_external_open.h
     preview_panel.cpp preview_panel.h
     settings_dialog.cpp settings_dialog.h
+    "${PROJECT_SOURCE_DIR}/resources/qcs_icons.qrc"
 )
 target_link_libraries(qcs-app-components PUBLIC
     qcs-client qcs-extraction Qt6::Widgets Qt6::Network Qt6::Concurrent
@@ -50,3 +52,9 @@ set_target_properties(qcs-gui PROPERTIES
     MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
 )
+if(APPLE)
+    set(_qcs_bundle_icon "${PROJECT_SOURCE_DIR}/resources/icons/qcs.icns")
+    target_sources(qcs-gui PRIVATE "${_qcs_bundle_icon}")
+    set_source_files_properties("${_qcs_bundle_icon}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    set_target_properties(qcs-gui PROPERTIES MACOSX_BUNDLE_ICON_FILE qcs.icns)
+endif()

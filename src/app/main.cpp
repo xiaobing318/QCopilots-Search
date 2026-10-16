@@ -11,6 +11,7 @@
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <cstdio>
+#include <memory>
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #endif
@@ -55,6 +56,9 @@ int main(int argc, char **argv) {
     parser.addOption({QStringLiteral("no-tray"), QStringLiteral("Disable tray and global shortcut integration.")});
     parser.addOption({QStringLiteral("no-onboarding"), QStringLiteral("Do not open first-run setup automatically.")});
     parser.addOption({QStringLiteral("background"), QStringLiteral("Start in the tray when a system tray is available.")});
+    QCommandLineOption loginStartupOption(QStringLiteral("login-startup"), QStringLiteral("Launch the registered sign-in target."));
+    loginStartupOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(loginStartupOption);
     // QCommandLineParser::process uses native message boxes for Windows GUI
     // programs. Explicit output keeps CLI/package probes deterministic.
     if (!parser.parse(application.arguments())) {
@@ -69,40 +73,50 @@ int main(int argc, char **argv) {
         writeCommandLineOutput(QCoreApplication::applicationName() + QLatin1Char(' ') + QCoreApplication::applicationVersion() + QLatin1Char('\n'));
         return 0;
     }
-    const auto paths = qcopilots_search::RuntimePaths::resolve(parser.value("profile-dir"), parser.value("model-dir"));
-    QString error;
-    if (!paths.ensure(&error)) {
-        std::fprintf(stderr, "%s\n", error.toUtf8().constData());
-        QMessageBox prompt(QMessageBox::Critical, QStringLiteral("QCopilots Search"), error, QMessageBox::Ok);
-        prompt.button(QMessageBox::Ok)->setText(QLocale::system().language() == QLocale::Chinese ? QStringLiteral("确定") : QStringLiteral("OK"));
-        prompt.exec();
-        return 2;
-    }
-    qcopilots_search::GuiInstance instance(paths);
-    const auto instanceResult = instance.start(&error);
-    if (instanceResult == qcopilots_search::GuiInstance::Result::ActivatedExisting) return 0;
-    if (instanceResult == qcopilots_search::GuiInstance::Result::Failed) {
-        writeCommandLineOutput(error + QLatin1Char('\n'), true);
-        QMessageBox::critical(nullptr, QStringLiteral("QCopilots Search"), error);
-        return 2;
-    }
-    qcopilots_search::ServiceBackend backend(paths);
-    qcopilots_search::MainWindow window(paths, &backend, !parser.isSet("no-tray"), !parser.isSet("no-onboarding"));
-    QObject::connect(&instance, &qcopilots_search::GuiInstance::showRequested,
-                     &window, &qcopilots_search::MainWindow::showSearch);
+    // AppKit delivers the login-item source during its first event-loop turn.
+    // Defer every profile lookup, lock and service until that source is known.
     application.setQuitOnLastWindowClosed(false);
-    const bool explicitBackground = parser.isSet("background");
-    const bool disableTray = parser.isSet("no-tray");
-    auto *startup = new QTimer(&window);
+    std::unique_ptr<qcopilots_search::GuiInstance> instance;
+    std::unique_ptr<qcopilots_search::ServiceBackend> backend;
+    std::unique_ptr<qcopilots_search::MainWindow> window;
+    auto *startup = new QTimer(&application);
     startup->setInterval(10);
-    QObject::connect(startup, &QTimer::timeout, &window, [&window, startup, explicitBackground, disableTray] {
-        const bool background = explicitBackground || qcopilots_search::isLoginStartupLaunch();
-        const bool showForeground = !background || disableTray || !QSystemTrayIcon::isSystemTrayAvailable();
+    QObject::connect(startup, &QTimer::timeout, &application, [&] {
+        const bool loginLaunch = qcopilots_search::isLoginStartupLaunch();
+        const bool background = parser.isSet("background") || loginLaunch;
+        const bool showForeground = !background || parser.isSet("no-tray") || !QSystemTrayIcon::isSystemTrayAvailable();
         if (!qcopilots_search::completeLoginStartupDetection(showForeground)) return;
         startup->stop();
         startup->deleteLater();
-        if (showForeground) window.show();
-        window.start();
+        const auto paths = qcopilots_search::resolveLoginStartupPaths(
+            parser.value("profile-dir"), parser.value("model-dir"), loginLaunch);
+        QString error;
+        if (!paths.ensure(&error)) {
+            writeCommandLineOutput(error + QLatin1Char('\n'), true);
+            QMessageBox prompt(QMessageBox::Critical, QStringLiteral("QCopilots Search"), error, QMessageBox::Ok);
+            prompt.button(QMessageBox::Ok)->setText(QLocale::system().language() == QLocale::Chinese ? QStringLiteral("确定") : QStringLiteral("OK"));
+            prompt.exec();
+            application.exit(2);
+            return;
+        }
+        instance = std::make_unique<qcopilots_search::GuiInstance>(paths);
+        const auto instanceResult = instance->start(&error);
+        if (instanceResult == qcopilots_search::GuiInstance::Result::ActivatedExisting) {
+            application.exit(0);
+            return;
+        }
+        if (instanceResult == qcopilots_search::GuiInstance::Result::Failed) {
+            writeCommandLineOutput(error + QLatin1Char('\n'), true);
+            QMessageBox::critical(nullptr, QStringLiteral("QCopilots Search"), error);
+            application.exit(2);
+            return;
+        }
+        backend = std::make_unique<qcopilots_search::ServiceBackend>(paths);
+        window = std::make_unique<qcopilots_search::MainWindow>(paths, backend.get(), !parser.isSet("no-tray"), !parser.isSet("no-onboarding"));
+        QObject::connect(instance.get(), &qcopilots_search::GuiInstance::showRequested,
+                         window.get(), &qcopilots_search::MainWindow::showSearch);
+        if (showForeground) window->show();
+        window->start();
     });
     startup->start();
     return application.exec();

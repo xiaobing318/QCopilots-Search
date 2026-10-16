@@ -1275,9 +1275,12 @@ private slots:
         QFETCH(bool, longPath);
         TestEnvironment environment("service-code-toggle");
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        QString relativeRoot = QStringLiteral("repository");
-        if (longPath) while (environment.path(relativeRoot).size() < 320)
-            relativeRoot += QStringLiteral("/中文 空格 nested");
+        const QString relativeRoot = QStringLiteral("repository");
+        // Upstream libgit2 supports long working-tree paths through the APP
+        // configuration, while repository metadata retains its own path limit.
+        QString relativeWorkTree = relativeRoot;
+        if (longPath) while (environment.path(relativeWorkTree).size() < 320)
+            relativeWorkTree += QStringLiteral("/中文 空格 nested 🔍");
         const QString repository = environment.path(relativeRoot);
         const QString excludesPath = repository + "/.git/qcs-empty-excludes";
         QString escapedExcludesPath = QDir::fromNativeSeparators(excludesPath);
@@ -1291,12 +1294,12 @@ private slots:
         QVERIFY(environment.writeFile(relativeRoot + "/.git/config", config));
         QVERIFY(QDir().mkpath(repository + "/.git/objects"));
         QVERIFY(QDir().mkpath(repository + "/.git/refs/heads"));
-        QVERIFY(environment.writeFile(relativeRoot + "/README.md", "classificationtoggleword documentation"));
-        QVERIFY(environment.writeFile(relativeRoot + "/untracked.cpp", "int untrackedcodetoken = 1;\n"));
+        QVERIFY(environment.writeFile(relativeWorkTree + "/README.md", "classificationtoggleword documentation"));
+        QVERIFY(environment.writeFile(relativeWorkTree + "/untracked.cpp", "int untrackedcodetoken = 1;\n"));
         QVERIFY(environment.writeFile(relativeRoot + "/.gitignore", "ignored.cpp\n"));
-        QVERIFY(environment.writeFile(relativeRoot + "/ignored.cpp", "int ignoredcodetoken = 1;\n"));
+        QVERIFY(environment.writeFile(relativeWorkTree + "/ignored.cpp", "int ignoredcodetoken = 1;\n"));
         QVERIFY(environment.writeFile("ordinary/README.md", "classificationtoggleword ordinary documentation"));
-        const QString path = repository + "/README.md";
+        const QString path = environment.path(relativeWorkTree + "/README.md");
         const QString ordinaryPath = environment.path("ordinary/README.md");
         ServiceProcess service(environment.runtimePaths());
         QVERIFY2(service.start(), qPrintable(service.error));

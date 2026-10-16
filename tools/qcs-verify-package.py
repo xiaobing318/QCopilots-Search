@@ -93,6 +93,16 @@ def write_verification_report(report, report_dir):
     print(encoded.replace("::", r"\u003a\u003a").replace("##[", r"\u0023\u0023["), flush=True)
 
 
+def full_verification_passed(report):
+    """Functional completeness is independent of whether the source is publishable."""
+    return (report.get("passed") is True and report.get("verificationScope") == "full"
+            and report.get("licenseMaterials", {}).get("passed") is True
+            and report.get("modelSmoke", {}).get("passed") is True
+            and report.get("programInventory", {}).get("stable") is True
+            and report.get("backendVerification", {}).get("cpu", {}).get("passed") is True
+            and report.get("backendVerification", {}).get("strictGpu", {}).get("passed") is True)
+
+
 def installed_program_inventory(binary, application, identity, package_sha256, installed_files=None):
     """Read final installed files independently of any application response."""
     application = application.resolve()
@@ -513,7 +523,7 @@ def mapped_macos_paths(output):
 
 
 def verify_library_origins(process, application, installed_files=None):
-    names = ("qt6", "qtcore", "qtgui", "qtwidgets", "qtmultimedia", "qtpdf", "avcodec", "avformat", "avutil", "swscale", "swresample", "tesseract", "leptonica", "heif", "libraw", "de265", "ggml", "llama", "mtmd", "git2",
+    names = ("qt6", "qtcore", "qtgui", "qtwidgets", "qtmultimedia", "qtpdf", "avcodec", "avformat", "avutil", "swscale", "swresample", "tesseract", "leptonica", "heif", "libraw", "de265", "ggml", "llama", "mtmd", "git2", "qcs-native-wv2", "qcs-native-iconv",
              "cudart", "cublas", "nvrtc", "nvjitlink", "amdhip", "hipblas", "rocblas", "rocm_kpack", "amd_comgr")
     checked = []
     for library in loaded_libraries(process):
@@ -534,7 +544,7 @@ def isolated_environment():
     environment = os.environ.copy()
     for key in tuple(environment):
         if (key.startswith(("QT_", "QML_", "QML2_", "QCOPILOTS_SEARCH_", "CUDA_", "CUDACXX", "HIP_", "HIPCXX", "ROCM_", "ROCBLAS_", "HIPBLASLT_", "VULKAN_", "VK_"))
-                or key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_INSERT_LIBRARIES", "LIBRARY_PATH", "LIB", "INCLUDE")):
+                or key in ("QCS_HOME", "LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_INSERT_LIBRARIES", "LIBRARY_PATH", "LIB", "INCLUDE")):
             environment.pop(key, None)
     environment["PATH"] = os.pathsep.join((str(Path(os.environ["SystemRoot"]) / "System32"), os.environ["SystemRoot"])) if os.name == "nt" else "/usr/bin:/bin"
     return environment
@@ -830,7 +840,7 @@ def package_source_identity(source=None, environment=None):
     """Report this checkout, never a PR workflow's synthetic merge commit.
 
     Standalone/archive verification remains usable without Git. Its provenance
-    is explicitly unavailable and cannot satisfy the native release gate.
+    is explicitly unavailable. Release preparation validates CI provenance separately.
     A declared source or candidate commit always requires real Git validation.
     """
     source = (Path(source) if source is not None else SOURCE).resolve()
@@ -887,8 +897,8 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     work = Path(tempfile.mkdtemp(prefix="qcs-pkg-", dir=run_root))
     report = {"package":str(package) if package else None, "installedRoot":str(installed_root) if installed_root else None,
               "runId":run_id, "workingDirectory":str(work), "checks":[], "passed":False,
-              "verificationScope": "keyword-only" if keyword_only else "release",
-              "realModelRequired": not keyword_only, "releaseComplete": False}
+              "verificationScope": "keyword-only" if keyword_only else "full",
+              "realModelRequired": not keyword_only, "fullVerificationPassed": False}
     report.update(source_identity)
     if package:
         package_hash = hashlib.sha256()
@@ -924,7 +934,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         return result["result"]
     try:
         if not keyword_only and (model_dir is None or not model_dir.is_dir()):
-            raise RuntimeError("Release package verification requires --model-dir with both locked GGUF files. Use --keyword-only only for an explicitly partial developer check.")
+            raise RuntimeError("Full package verification requires --model-dir with both locked GGUF files. Use --keyword-only only for an explicitly partial developer check.")
         validate_installed_package_source(package, installed_root, installed_manifest)
         model_arguments = ["--model-dir", str(model_dir)] if model_dir and not keyword_only else []
         if installed_root:
@@ -1141,12 +1151,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
             except OSError as error:
                 report["cleanupError"] = str(error)
                 report["passed"] = False
-        report["releaseComplete"] = (report["passed"] and not keyword_only and
-            report.get("licenseMaterials", {}).get("passed") is True and report.get("modelSmoke", {}).get("passed") is True
-            and report.get("buildIdentity", {}).get("workingTreeModified") is False
-            and report.get("programInventory", {}).get("stable") is True
-            and report.get("backendVerification", {}).get("cpu", {}).get("passed") is True
-            and report.get("backendVerification", {}).get("strictGpu", {}).get("passed") is True)
+        report["fullVerificationPassed"] = full_verification_passed(report)
         write_verification_report(report, report_dir)
     if not report["passed"]:
         raise RuntimeError(report.get("error", report.get("cleanupError", "Package verification failed")))
@@ -1160,8 +1165,8 @@ def main():
     parser.add_argument("--installed-root",type=Path,help="Verify an already installed package in place, without deleting it")
     parser.add_argument("--installed-manifest",type=Path,help="Absolute file list from the OS package manager, such as dpkg -L")
     parser.add_argument("--profile-dir",type=Path,help="Fresh dedicated test profile retained after verification")
-    parser.add_argument("--model-dir",type=Path,help="Read-only cache of both locked GGUF artifacts, required for release verification")
-    parser.add_argument("--keyword-only",action="store_true",help="Explicit partial developer verification without real model inference, insufficient for release")
+    parser.add_argument("--model-dir",type=Path,help="Read-only cache of both locked GGUF artifacts, required for full verification")
+    parser.add_argument("--keyword-only",action="store_true",help="Explicit partial developer verification without real model inference, insufficient for full verification")
     parser.add_argument("--model-timeout",type=int,default=600,help="Seconds allowed for each real-model worker request (default 600)")
     parser.add_argument("--variant", help="Require the downloaded package to match this build variant")
     args=parser.parse_args()

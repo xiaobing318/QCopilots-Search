@@ -131,10 +131,6 @@ install(FILES "${PROJECT_SOURCE_DIR}/config/build-variants.json"
   "${PROJECT_SOURCE_DIR}/config/gpu-sdk.lock.json"
   "${PROJECT_SOURCE_DIR}/config/gpu-license-sources.lock.json"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs")
-if(EXISTS "${PROJECT_SOURCE_DIR}/third_party")
-  install(DIRECTORY "${PROJECT_SOURCE_DIR}/third_party/"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs/source-materials")
-endif()
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/docs/" DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/qcs")
 if(APPLE AND DEFINED _qcopilots_checked_deploy)
   # Deploy and sign only after every program and resource has been installed.
@@ -147,7 +143,7 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Local multilingual multimodal desktop sea
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "qcs")
 set(CPACK_RESOURCE_FILE_LICENSE "${PROJECT_SOURCE_DIR}/LICENSE")
-# Checksums belong to the frozen release manifest. Ordinary CPack invocations
+# Checksums belong to the release manifest. Ordinary CPack invocations
 # produce only the downloadable installer or portable archive.
 unset(CPACK_PACKAGE_CHECKSUM)
 set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/pkg" CACHE PATH "External distribution output directory")
@@ -171,6 +167,8 @@ set(CPACK_PROJECT_CONFIG_FILE "${PROJECT_SOURCE_DIR}/cmake/qcs-cpack.cmake")
 if(WIN32)
   set(CPACK_GENERATOR "NSIS;ZIP")
   set(CPACK_NSIS_DISPLAY_NAME "QCopilots Search")
+  set(CPACK_NSIS_MUI_ICON "${PROJECT_SOURCE_DIR}/resources/icons/qcs.ico")
+  set(CPACK_NSIS_MUI_UNIICON "${PROJECT_SOURCE_DIR}/resources/icons/qcs.ico")
   # CMake parses this value again from the generated CPackConfig.cmake.
   set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\qcs-gui.exe")
   set(CPACK_NSIS_EXECUTABLES_DIRECTORY bin)

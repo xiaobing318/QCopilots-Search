@@ -81,40 +81,32 @@ endfunction()
 cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL
   qcopilots_search_configure_test_directory "${PROJECT_SOURCE_DIR}")
 
-qcopilots_search_add_test(NAME qcs-tests-acceptance-runners
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py" --suite pure)
-set_tests_properties(qcs-tests-acceptance-runners PROPERTIES LABELS "unit;tooling;acceptance" TIMEOUT 240)
-if(WIN32)
-  qcopilots_search_add_test(NAME qcs-tests-acceptance-native
-    COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/acceptance/qcs-test-runners.py" --suite native)
-  # Real ACL restoration, process token recovery and owned timeout cleanup.
-  set_tests_properties(qcs-tests-acceptance-native PROPERTIES LABELS "tooling;acceptance;native;slow" TIMEOUT 240)
-endif()
-
-qcopilots_search_add_test(NAME qcs-tests-ci-evidence
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-ci-evidence.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-native-ci
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-tests-native-ci.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-deb-ci
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-deb-ci.py" -v)
-qcopilots_search_add_test(NAME qcs-tests-release-evidence
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-release-evidence.py" -v)
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-tests-deb-ci.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-test-policy
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-policy-tests.py" -v)
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-policy-tests.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-check
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-check.py" -v)
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-check.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-artifact-selection
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/.github/scripts/qcs-tests-artifact-selection.py" -v)
-set_tests_properties(qcs-tests-ci-evidence qcs-tests-deb-ci qcs-tests-release-evidence qcs-tests-test-policy qcs-tests-check
-  qcs-tests-artifact-selection
-  PROPERTIES LABELS "unit;tooling;evidence" TIMEOUT 240)
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-tests-artifact-selection.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-source-bundle
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-source-bundle.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-package-verification
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-package-verification.py" -v)
+set_tests_properties(qcs-tests-native-ci qcs-tests-deb-ci qcs-tests-test-policy qcs-tests-check
+  qcs-tests-artifact-selection qcs-tests-source-bundle qcs-tests-package-verification
+  PROPERTIES LABELS "unit;tooling" TIMEOUT 240)
 
 qcopilots_search_add_test(NAME qcs-tests-runner
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-runner-tests.py")
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-runner-tests.py")
 qcopilots_search_add_test(NAME qcs-tests-path-budget
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-path-budget.py")
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-path-budget.py")
 qcopilots_search_add_test(NAME qcs-tests-windows-package
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-package-windows-tests.py" -v)
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-package-windows-tests.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-package-variants
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-test-package-variants.py")
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-package-variants.py")
 set_tests_properties(qcs-tests-windows-package qcs-tests-package-variants PROPERTIES
   LABELS "unit;tooling;package" TIMEOUT 240)
 if(CMAKE_GENERATOR MATCHES "Ninja")

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tarfile
 import time
@@ -60,10 +61,18 @@ def check_linux_deployment(options, source, repo, root):
         desktop_content.optionxform = str
         desktop_content.read_string(desktop.read_text(encoding="utf-8"))
         expected_entry = {"Type": "Application", "Name": "QCopilots Search",
-                          "Exec": "qcs-gui", "Terminal": "false",
+                          "Exec": "qcs-gui", "Icon": "com.qcopilots.qcopilots-search", "Terminal": "false",
                           "Categories": "Utility;Filesystem;"}
         if desktop_content.sections() != ["Desktop Entry"] or dict(desktop_content["Desktop Entry"]) != expected_entry:
             raise RuntimeError(f"Invalid installed Linux desktop entry: {desktop_content.items()}")
+        for size in (16, 20, 24, 32, 40, 48, 64, 128, 256, 512):
+            icon = stage / f"share/icons/hicolor/{size}x{size}/apps/com.qcopilots.qcopilots-search.png"
+            original = repo / f"resources/icons/qcs-{size}.png"
+            if not icon.is_file() or icon.read_bytes() != original.read_bytes():
+                raise RuntimeError(f"Missing or changed installed Linux icon: {icon}")
+            data = icon.read_bytes()
+            if data[:8] != b"\x89PNG\r\n\x1a\n" or struct.unpack(">II", data[16:24]) != (size, size):
+                raise RuntimeError(f"Incorrect installed Linux icon dimensions: {icon}")
         for name in (owner, module, transitive):
             if not (stage / "lib" / name).is_file():
                 raise RuntimeError(f"Missing deployed transitive/owned library: {name}")
@@ -78,7 +87,7 @@ def check_linux_deployment(options, source, repo, root):
             raise RuntimeError(f"Deployed process escaped its installation: {mapped}")
         records.append({"case": label, "passed": True, "mappedLibraries": mapped,
                         "desktopEntry": desktop.relative_to(stage).as_posix()})
-        print(f"PASS {label}: desktop entry, installed RPATH and indirect dependencies verified", flush=True)
+        print(f"PASS {label}: desktop entry, icons, installed RPATH and indirect dependencies verified", flush=True)
 
     for label, strip in (("linux-install", False), ("linux-install-strip", True)):
         stage = root / "linux-deploy" / f"{label}-stage"

@@ -6,7 +6,7 @@
 
 Windows 使用 `qcs-<用户和规范化配置目录摘要>` 管道名。Unix 使用 `/tmp/qcs-<有效UID>/qcs-<同一摘要>` 的短绝对 socket 路径，与 `TMPDIR`、配置目录长度和当前工作目录无关。路径按本机 `sockaddr_un` 的编码字节上限检查。私有 UID 目录以 `0700` 创建，已有目录必须属于当前用户且权限相同，符号链接和宽权限目录会被拒绝。macOS 系统 `/tmp` 指向 `/private/tmp` 的别名只在父目录解析时处理。
 
-macOS 使用 `getpeereid`、Linux 使用 `SO_PEERCRED` 双向验证对端有效 UID，随后仍执行配置 token 认证。服务只有取得对应 profile 的锁后才清理同名旧 socket，且拒绝移除普通文件、符号链接或异用户节点。停止时不删除共享的 UID 父目录，也不触碰其他配置的 socket。首次升级到此 Unix endpoint 布局时，需要退出旧版服务后再启动新版。
+macOS 使用 `getpeereid`、Linux 使用 `SO_PEERCRED` 双向验证对端有效 UID，随后仍执行配置 token 认证。服务只有取得对应 profile 的锁后才清理同名旧 socket，且拒绝移除普通文件、符号链接或异用户节点。停止时不删除共享的 UID 父目录，也不触碰其他配置的 socket。
 
 消息由四字节大端长度和 UTF-8 JSON 对象组成，单帧上限为 16 MiB。所有消息带 `protocol: 1`。请求包含字符串 `id`、`token`、`method` 和对象 `params`。成功响应包含 `ok: true` 与 `result`，失败响应包含 `ok: false` 与 `error.code`、`error.message`。进度广播使用 `event` 与 `data`。
 
@@ -16,6 +16,7 @@ macOS 使用 `getpeereid`、Linux 使用 `SO_PEERCRED` 双向验证对端有效 
 | `settings.get` | 空对象 | 版本化设置对象 |
 | `settings.set` | 要修改的设置字段 | 验证、原子保存后的完整设置 |
 | `search` | `query`、`kind`、`root`、`code`、`limit`、`semantic` | `hits`、是否执行语义查询及降级原因 |
+| `files.list` | `code`、`kind`、`root`、`limit`、可选 `cursor`，每页最多 100 项 | `files`、`nextCursor`、`hasMore`、`browseGeneration`、`metadataPending`、`visibilityEpoch` |
 | `document.preview` | `path`、`code`、`start`、`maxSegments`，最多 100 个片段 | `segments`、`text`、`partial`、`next`、`state` |
 | `index.start`、`index.reconcile` | 空对象 | 索引进度 |
 | `index.pause`、`index.resume` | 空对象 | 持久化暂停状态及索引进度 |

@@ -5,6 +5,7 @@
 #include "BackendLoader.h"
 #include "ImageSizing.h"
 #include "core/pipeline_manifest.h"
+#include "core/utf8_locale.h"
 
 #include <QCryptographicHash>
 #include <QCoreApplication>
@@ -69,6 +70,9 @@ QStringList backendSearchRoots() {
 }
 
 void initializeBackend() {
+    const ScopedUtf8Locale utf8Locale;
+    if (!utf8Locale.isValid())
+        throw std::runtime_error("Cannot initialize thread-local UTF-8 locale for backend loading");
     // Load only an explicitly known CPU backend from the installation. Upstream's
     // generic loader also consults cwd and GGML_BACKEND_PATH, which we don't use.
 #ifdef QCOPILOTS_SEARCH_CPU_DISPATCH
@@ -123,6 +127,9 @@ QString initializeGpuBackend() {
     }
     // Metal can be linked statically. Never invoke ggml's cwd/environment loader.
     if (backend == QStringLiteral("cpu") || gpuBackendRegistered(backend)) return {};
+    const ScopedUtf8Locale utf8Locale;
+    if (!utf8Locale.isValid())
+        return QStringLiteral("Cannot initialize thread-local UTF-8 locale for backend loading");
 #ifdef Q_OS_WIN
     const auto name = QStringLiteral("ggml-%1.dll").arg(backend);
 #else

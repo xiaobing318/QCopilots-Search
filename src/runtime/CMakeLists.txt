@@ -4,6 +4,12 @@ find_package(Git REQUIRED)
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 include("${PROJECT_SOURCE_DIR}/cmake/qcs-gpu-variants.cmake")
 qcopilots_search_select_variant()
+file(READ "${PROJECT_SOURCE_DIR}/dependencies.lock.json" _qcs_dependency_lock)
+string(JSON _qcs_llama_commit GET "${_qcs_dependency_lock}" "llama.cpp" commit)
+string(JSON _qcs_llama_url GET "${_qcs_dependency_lock}" "llama.cpp" url)
+string(JSON _qcs_llama_sha GET "${_qcs_dependency_lock}" "llama.cpp" sha256)
+string(SUBSTRING "${_qcs_llama_sha}" 0 12 _qcs_llama_cache_id)
+set(LLAMA_BUILD_COMMIT "${_qcs_llama_commit}" CACHE STRING "Locked upstream source identity" FORCE)
 set(QCOPILOTS_SEARCH_GPU_BACKEND "${QCOPILOTS_SEARCH_GPU_BACKEND}" CACHE INTERNAL "Backend selected by the product variant" FORCE)
 
 set(BUILD_SHARED_LIBS ON)
@@ -67,18 +73,19 @@ if(FETCHCONTENT_SOURCE_DIR_QCS_LLAMA)
   set(_qcopilots_llama_lock "${FETCHCONTENT_SOURCE_DIR_QCS_LLAMA}.qcs.lock")
 else()
   file(MAKE_DIRECTORY "${FETCHCONTENT_BASE_DIR}")
-  set(_qcopilots_llama_lock "${FETCHCONTENT_BASE_DIR}/qcs-llama.lock")
+  set(_qcopilots_llama_lock "${FETCHCONTENT_BASE_DIR}/qcs-llama-${_qcs_llama_cache_id}.lock")
 endif()
 file(LOCK "${_qcopilots_llama_lock}" GUARD FILE TIMEOUT 300 RESULT_VARIABLE _qcopilots_llama_lock_result)
 if(NOT _qcopilots_llama_lock_result STREQUAL "0")
   message(FATAL_ERROR "Cannot lock shared llama.cpp dependency: ${_qcopilots_llama_lock_result}")
 endif()
 FetchContent_Declare(qcs_llama
-  GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-  GIT_TAG b11461
-  GIT_SHALLOW TRUE
-  GIT_PROGRESS TRUE
-  UPDATE_DISCONNECTED TRUE
+  URL "${_qcs_llama_url}"
+  URL_HASH "SHA256=${_qcs_llama_sha}"
+  DOWNLOAD_DIR "${FETCHCONTENT_BASE_DIR}/downloads"
+  DOWNLOAD_NAME "llama-${_qcs_llama_cache_id}.tar.gz"
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  SOURCE_DIR "${FETCHCONTENT_BASE_DIR}/qcs-llama-${_qcs_llama_cache_id}-src"
   BINARY_DIR "${QCOPILOTS_SEARCH_LLAMA_BINARY_DIR}"
   SUBBUILD_DIR "${CMAKE_BINARY_DIR}/sb/llama")
 FetchContent_GetProperties(qcs_llama)
@@ -86,9 +93,7 @@ if(NOT qcs_llama_POPULATED)
   FetchContent_Populate(qcs_llama)
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/verify_llama_source.cmake")
-qcopilots_search_prepare_llama_source("${qcs_llama_SOURCE_DIR}"
-  "${PROJECT_SOURCE_DIR}/third_party/patches")
-file(LOCK "${_qcopilots_llama_lock}" RELEASE)
+qcopilots_search_verify_llama_source("${qcs_llama_SOURCE_DIR}")
 # EXCLUDE_FROM_ALL prevents upstream developer headers/tools from entering application packages.
 # Inference has no Qt sources. Keep this scope local so our runtime below still
 # gets Qt autogen, without generating *_autogen trees for every CPU variant.
@@ -96,8 +101,13 @@ block(SCOPE_FOR VARIABLES)
   set(CMAKE_AUTOMOC OFF)
   set(CMAKE_AUTORCC OFF)
   set(CMAKE_AUTOUIC OFF)
+  # ggml's optional Git lookup overwrites the parent-supplied commit for source
+  # archives. Keep the verified lock identity instead of probing an absent .git.
+  set(GIT_EXE OFF)
   add_subdirectory("${qcs_llama_SOURCE_DIR}" "${qcs_llama_BINARY_DIR}" EXCLUDE_FROM_ALL)
 endblock()
+qcopilots_search_verify_llama_source("${qcs_llama_SOURCE_DIR}")
+file(LOCK "${_qcopilots_llama_lock}" RELEASE)
 
 add_library(qcs-runtime STATIC EmbeddingRuntime.cpp EmbeddingRuntime.h ImageSizing.cpp ImageSizing.h BackendPaths.h
   BackendSelection.cpp BackendSelection.h BackendLoader.cpp BackendLoader.h)
@@ -132,6 +142,19 @@ else()
   set(_qcopilots_runtime_libraries llama mtmd ggml ggml-base)
   set(_qcopilots_cpu_libraries ggml-cpu)
 endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/guard_llama_source.cmake")
+qcopilots_search_llama_build_targets("${qcs_llama_SOURCE_DIR}" _qcopilots_source_targets)
+set(_qcopilots_built_targets ${_qcopilots_runtime_libraries} ${_qcopilots_cpu_libraries})
+if(_qcopilots_external_gpu)
+  list(APPEND _qcopilots_source_targets qcs-gpu-backend-build)
+  list(APPEND _qcopilots_built_targets qcs-gpu-backend-build)
+else()
+  list(APPEND _qcopilots_built_targets ${_qcopilots_gpu_libraries})
+endif()
+qcopilots_search_guard_llama_source("${qcs_llama_SOURCE_DIR}"
+  SOURCE_TARGETS ${_qcopilots_source_targets}
+  BUILT_TARGETS ${_qcopilots_built_targets}
+  CONSUMER_TARGETS qcs-runtime)
 set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_RUNTIME_TARGETS "${_qcopilots_runtime_libraries};${_qcopilots_cpu_libraries};${_qcopilots_gpu_libraries}")
 set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_CPU_RUNTIME_TARGETS "${_qcopilots_cpu_libraries}")
 set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_INFERENCE_GPU_RUNTIME_TARGETS "${_qcopilots_gpu_libraries}")

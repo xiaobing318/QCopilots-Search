@@ -7,6 +7,7 @@ include(FetchContent)
 include(GNUInstallDirs)
 include(qcs-output-paths)
 include("${CMAKE_CURRENT_LIST_DIR}/qcs-write-if-different.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/qcs-native-source-integrity.cmake")
 
 function(qcopilots_search_fetch name url sha256)
     # Short stable keys keep source caches readable and build trees bounded.
@@ -40,23 +41,28 @@ function(qcopilots_search_fetch name url sha256)
         message(FATAL_ERROR "QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT must be outside the source tree")
     endif()
     file(MAKE_DIRECTORY "${FETCHCONTENT_BASE_DIR}")
-    # Source archives can be shared by Release, Debug and parallel checkouts.
-    # Their object files and generated headers must never share a build tree.
-    # Serialize first population, then reuse a completed source tree without
-    # re-extracting it while another configuration may be compiling its files.
-    file(LOCK "${FETCHCONTENT_BASE_DIR}/${name}.lock" GUARD FUNCTION TIMEOUT 300)
-    set(cached_source "${FETCHCONTENT_BASE_DIR}/${name}-src")
-    set(source_marker "${cached_source}/.qcs-source-sha256")
+    # A digest-specific source path cannot reuse a previously patched cache.
+    string(SUBSTRING "${sha256}" 0 12 source_key)
+    set(metadata_root "${FETCHCONTENT_BASE_DIR}/.qcs-metadata")
+    file(MAKE_DIRECTORY "${metadata_root}")
+    file(LOCK "${metadata_root}/${name}-${source_key}.lock" GUARD FUNCTION TIMEOUT 300)
+    set(cached_source "${FETCHCONTENT_BASE_DIR}/${name}-${source_key}-src")
+    set(source_manifest "${metadata_root}/${name}-${sha256}.manifest")
     string(TOUPPER "${name}" upper_name)
     set(explicit_source_override "${FETCHCONTENT_SOURCE_DIR_${upper_name}}")
     if(explicit_source_override)
         qcopilots_search_require_external_path("FETCHCONTENT_SOURCE_DIR_${upper_name}" "${explicit_source_override}")
     endif()
-    if(NOT explicit_source_override AND EXISTS "${source_marker}")
-        file(READ "${source_marker}" cached_hash)
-        string(STRIP "${cached_hash}" cached_hash)
-        if(cached_hash STREQUAL sha256)
-            set(FETCHCONTENT_SOURCE_DIR_${upper_name} "${cached_source}")
+    # Always obtain a verified archive baseline, even when a caller supplies an
+    # external source override. The override must contain exactly those bytes.
+    set(FETCHCONTENT_SOURCE_DIR_${upper_name} "")
+    if(EXISTS "${source_manifest}")
+        qcopilots_search_verify_source("${cached_source}" "${source_manifest}")
+        set(FETCHCONTENT_SOURCE_DIR_${upper_name} "${cached_source}")
+    elseif(EXISTS "${cached_source}")
+        file(GLOB cache_entries "${cached_source}/*")
+        if(cache_entries)
+            message(FATAL_ERROR "Unverified dependency cache: ${cached_source}. Select a fresh FETCHCONTENT_BASE_DIR.")
         endif()
     endif()
     FetchContent_Declare(${name}
@@ -65,23 +71,29 @@ function(qcopilots_search_fetch name url sha256)
         TLS_VERIFY TRUE
         TIMEOUT 300
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_DIR "${cached_source}"
         BINARY_DIR "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/${dependency_key}"
         SUBBUILD_DIR "${CMAKE_BINARY_DIR}/sb/${dependency_key}"
-        DOWNLOAD_DIR "${FETCHCONTENT_BASE_DIR}/dl/${dependency_key}")
+        DOWNLOAD_DIR "${FETCHCONTENT_BASE_DIR}/dl/${dependency_key}/${source_key}")
     FetchContent_GetProperties(${name})
     if(NOT ${name}_POPULATED)
-        # Populate only: upstream projects with examples, downloads or native CPU
-        # flags are added explicitly below with controlled options.
         FetchContent_Populate(${name})
     endif()
-    file(REAL_PATH "${${name}_SOURCE_DIR}" populated_source)
-    cmake_path(IS_PREFIX source_root "${populated_source}" NORMALIZE populated_inside_source)
-    if(populated_inside_source)
-        message(FATAL_ERROR "Dependency ${name} source must be outside the application source tree")
+    if(NOT EXISTS "${source_manifest}")
+        qcopilots_search_source_manifest("${${name}_SOURCE_DIR}" manifest_content)
+        if(manifest_content STREQUAL "")
+            message(FATAL_ERROR "Pinned source archive was not populated for ${name}. Provide the verified dependency cache before using offline configuration.")
+        endif()
+        qcopilots_search_write_if_different("${source_manifest}" "${manifest_content}")
     endif()
-    if(NOT explicit_source_override AND EXISTS "${${name}_SOURCE_DIR}" AND NOT cached_hash STREQUAL sha256)
-        file(WRITE "${source_marker}" "${sha256}\n")
+    if(explicit_source_override)
+        qcopilots_search_verify_source("${explicit_source_override}" "${source_manifest}")
+        set(${name}_SOURCE_DIR "${explicit_source_override}")
+        FetchContent_SetPopulated(${name} SOURCE_DIR "${explicit_source_override}"
+            BINARY_DIR "${${name}_BINARY_DIR}")
     endif()
+    set_property(GLOBAL APPEND PROPERTY QCOPILOTS_SEARCH_UPSTREAM_SOURCE_RECORDS
+        "qcopilots_search_verify_source([==[${${name}_SOURCE_DIR}]==] [==[${source_manifest}]==])\n")
     set(${name}_SOURCE_DIR "${${name}_SOURCE_DIR}" PARENT_SCOPE)
     set(${name}_BINARY_DIR "${${name}_BINARY_DIR}" PARENT_SCOPE)
 endfunction()
@@ -174,12 +186,8 @@ function(qcopilots_search_add_git_dependency)
         return()
     endif()
     qcopilots_search_fetch(qcs_libgit2
-        "https://codeload.github.com/libgit2/libgit2/tar.gz/refs/tags/v1.9.1"
-        "14cab3014b2b7ad75970ff4548e83615f74d719afe00aa479b4a889c1e13fc00")
-    include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcs-native-git-patch.cmake")
-    qcopilots_search_prepare_git_source("${qcs_libgit2_SOURCE_DIR}"
-        "${qcs_libgit2_BINARY_DIR}" patched_git_source)
-    set(qcs_libgit2_SOURCE_DIR "${patched_git_source}")
+        "https://codeload.github.com/libgit2/libgit2/tar.gz/refs/tags/v1.9.7"
+        "1a4fbe7589e814777ae76b64734ad80f4ecad22cd33a22682a2aaea4ae5375e7")
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
     set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
     set(BUILD_SHARED_LIBS ON)
@@ -210,7 +218,7 @@ function(qcopilots_search_add_git_dependency)
     set(CMAKE_C_STANDARD 90)
     set(CMAKE_C_EXTENSIONS OFF)
     if(UNIX)
-        # libgit2 1.9.1 probes struct stat before DefaultCFlags adds _GNU_SOURCE
+        # libgit2 probes struct stat before DefaultCFlags adds _GNU_SOURCE
         # to its real compilation. Match that feature-test environment, so
         # strict C90 does not hide glibc's nanosecond fields from the probes.
         list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
@@ -254,6 +262,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/qcs-native-images.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/qcs-native-data.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/qcs-native-doc.cmake")
 
+function(qcopilots_search_finalize_native_source_records)
+    get_property(source_records GLOBAL PROPERTY QCOPILOTS_SEARCH_UPSTREAM_SOURCE_RECORDS)
+    set(source_records_file "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/qcs-source-records.cmake")
+    qcopilots_search_write_if_different("${source_records_file}" ${source_records})
+    include("${source_records_file}")
+endfunction()
+
 function(qcopilots_search_add_native_dependencies)
     get_property(already_added GLOBAL PROPERTY QCOPILOTS_SEARCH_NATIVE_DEPENDENCIES_ADDED)
     if(already_added)
@@ -290,5 +305,23 @@ function(qcopilots_search_add_native_dependencies)
             DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs/licenses/${dependency}" COMPONENT qcs-runtime)
     endforeach()
     set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_NATIVE_RUNTIME_TARGETS "libgit2package;${runtime_targets}")
+    set(source_records_file "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/qcs-source-records.cmake")
+    # Later modules also fetch pinned sources, including FFmpeg's public headers.
+    # Collect and check the complete set after the top-level configure has ended.
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
+        CALL qcopilots_search_finalize_native_source_records)
+    add_custom_target(qcs-check-native-sources
+        COMMAND "${CMAKE_COMMAND}" "-DQCOPILOTS_SEARCH_SOURCE_RECORDS=${source_records_file}"
+            -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcs-native-source-integrity.cmake"
+        COMMENT "Checking pinned upstream native sources" VERBATIM)
+    foreach(native_target IN ITEMS libgit2package qcs-native-sqlite qcs-native-miniz
+            qcs-native-zlib qcs-build-jpeg ${runtime_targets})
+        add_dependencies(${native_target} qcs-check-native-sources)
+    endforeach()
+    add_custom_target(qcs-verify-native-sources ALL
+        COMMAND "${CMAKE_COMMAND}" "-DQCOPILOTS_SEARCH_SOURCE_RECORDS=${source_records_file}"
+            -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcs-native-source-integrity.cmake"
+        DEPENDS libgit2package qcs-native-sqlite qcs-native-miniz ${runtime_targets}
+        COMMENT "Verifying unmodified upstream native sources" VERBATIM)
     set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_NATIVE_DEPENDENCIES_ADDED TRUE)
 endfunction()

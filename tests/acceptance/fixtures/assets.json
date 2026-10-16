@@ -66,7 +66,7 @@
     }
   ],
   "generatedFixtures": {
-    "source": "tests/semantic/semantic_acceptance.cpp and tools/acceptance/qcs-copy-cu-fixtures.py",
+    "source": "tests/semantic/semantic_acceptance.cpp",
     "license": "MIT, original QCopilots Search test data",
     "contents": "Small original documents, code, PDF pages, illustrations, OCR notices, sound signals and moving-shape video fixtures generated for functional tests",
     "filenamePolicy": "Functional inference tests use opaque names. Descriptions and transcripts are never added to indexed content."

@@ -3,6 +3,11 @@ include_guard(GLOBAL)
 function(qcopilots_search_install_linux_desktop)
   install(FILES "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../resources/com.qcopilots.qcopilots-search.desktop"
     DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/applications")
+  foreach(_size 16 20 24 32 40 48 64 128 256 512)
+    install(FILES "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../resources/icons/qcs-${_size}.png"
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/${_size}x${_size}/apps"
+      RENAME "com.qcopilots.qcopilots-search.png")
+  endforeach()
 endfunction()
 
 function(qcopilots_search_linux_deploy_arguments output)

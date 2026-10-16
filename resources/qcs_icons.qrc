@@ -1,0 +1,15 @@
+<RCC>
+  <qresource prefix="/qcs/icons">
+    <file alias="qcs-16.png">icons/qcs-16.png</file>
+    <file alias="qcs-20.png">icons/qcs-20.png</file>
+    <file alias="qcs-24.png">icons/qcs-24.png</file>
+    <file alias="qcs-32.png">icons/qcs-32.png</file>
+    <file alias="qcs-40.png">icons/qcs-40.png</file>
+    <file alias="qcs-48.png">icons/qcs-48.png</file>
+    <file alias="qcs-64.png">icons/qcs-64.png</file>
+    <file alias="qcs-128.png">icons/qcs-128.png</file>
+    <file alias="qcs-256.png">icons/qcs-256.png</file>
+    <file alias="qcs-512.png">icons/qcs-512.png</file>
+    <file alias="qcs-1024.png">icons/qcs.png</file>
+  </qresource>
+</RCC>

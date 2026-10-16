@@ -1,4 +1,4 @@
-name: qcs native acceptance
+name: qcs native builds
 
 on:
   pull_request:
@@ -59,7 +59,7 @@ jobs:
         run: |
           apt-get update
           apt-get install --no-install-recommends -y ca-certificates git curl tar gzip unzip python3 python3-venv passwd
-      - name: Checkout candidate source
+      - name: Checkout source commit
         timeout-minutes: 10
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -104,7 +104,7 @@ jobs:
       - name: Reuse the pinned upstream Windows CUDA SDK setup
         if: runner.os == 'Windows' && matrix.backend == 'cuda'
         timeout-minutes: 45
-        uses: ggml-org/llama.cpp/.github/actions/windows-setup-cuda@4d756bc72bf00a4aacf410ae15a2d315f3db400d
+        uses: ggml-org/llama.cpp/.github/actions/windows-setup-cuda@620d2225cc436ab0b001e3200e590e3b286ef9ab
         with:
           cuda_version: ${{ matrix.toolkitVersion }}
           cuda_arch: x64
@@ -117,7 +117,7 @@ jobs:
       - name: Reuse the pinned upstream Windows ROCm SDK setup
         if: runner.os == 'Windows' && matrix.backend == 'hip'
         timeout-minutes: 45
-        uses: ggml-org/llama.cpp/.github/actions/windows-setup-rocm@4d756bc72bf00a4aacf410ae15a2d315f3db400d
+        uses: ggml-org/llama.cpp/.github/actions/windows-setup-rocm@620d2225cc436ab0b001e3200e590e3b286ef9ab
         env:
           PIP_NO_CACHE_DIR: '1'
         with:
@@ -196,7 +196,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - name: Checkout candidate artifact selector
+      - name: Checkout artifact selector
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}

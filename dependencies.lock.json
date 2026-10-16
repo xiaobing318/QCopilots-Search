@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "qt": {"version": "6.12.0", "pdfVersion": "6.140.0", "packagesLock": "tools/qt-packages.lock.json"},
   "ffmpeg": {"version": "9.0.1", "url": "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz", "sha256": "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635", "runtime": "Qt 6.12.0 official runtime"},
-  "llama.cpp": {"tag": "b11461", "commit": "4d756bc72bf00a4aacf410ae15a2d315f3db400d", "patch": "DigUp no-logits embedding patch"},
+  "llama.cpp": {"tag": "v0.7.0", "commit": "620d2225cc436ab0b001e3200e590e3b286ef9ab", "url": "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/620d2225cc436ab0b001e3200e590e3b286ef9ab", "sha256": "1d4a987d9bd048f6e93107e838026438df70fbde237fc0c69c63d600512b4bd9", "sourceManifest": "src/runtime/llama-source-manifest.sha256", "sourceManifestSha256": "d8cc2c4f417b12ac7ed78a711a5abf904282535ec44b88683ac32d667a4ec202"},
   "embeddinggemma2": {"repository": "ggml-org/embeddinggemma-2-GGUF", "revision": "bfcd298762cc34d0357ece5ebdd31791a3a374d8"},
-  "nativeDependencies": {"cmakeLock": "cmake/qcs-native-deps.cmake", "patches": ["cmake/qcs-native-git-patch.cmake"]},
+  "nativeDependencies": {"cmakeLock": "cmake/qcs-native-deps.cmake"},
   "nsis": {"version": "3.12", "packagesLock": "tools/nsis-package.lock.json"}
 }

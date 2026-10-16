@@ -490,7 +490,7 @@ private slots:
         settings.codeRoots = {"code"}; settings.codeExcludes = {"code/build"}; settings.includeCode = false;
         settings.pdfOpener.preset = "custom"; settings.pdfOpener.program = "custom-pdf";
         settings.pdfOpener.arguments = {"--page", "{page}", "", "{file}"};
-        SettingsDialog dialog(settings, false, false);
+        SettingsDialog dialog(settings, false, {});
         QVERIFY(!dialog.startupChangeRequested());
         QCOMPARE(dialog.settings().pdfOpener.arguments, settings.pdfOpener.arguments);
         QCOMPARE(dialog.settings().codeRoots, settings.codeRoots);
@@ -503,6 +503,82 @@ private slots:
         auto *arguments = dialog.findChild<QPlainTextEdit *>("pdfOpenerArguments"); QVERIFY(arguments);
         arguments->setPlainText("--page\n{page}\n{file}");
         QCOMPARE(dialog.settings().pdfOpener.arguments, QStringList({"--page", "{page}", "{file}"}));
+    }
+    void customStartupTargetRequiresExplicitTakeover() {
+        TestEnvironment env("gui-startup-target"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        AppSettings settings; settings.language = "en"; settings.startAtLogin = true;
+        SettingsDialog::StartupOptions startup;
+        startup.allowed = true;
+        startup.profileDir = env.path("current data");
+        startup.modelDir = env.path("current models");
+        startup.state.status = LoginStartupStatus::Enabled;
+        startup.state.profileDir = env.path("registered data");
+        startup.state.modelDir = env.path("registered models");
+        SettingsDialog dialog(settings, false, startup);
+        auto *check = dialog.findChild<QCheckBox *>("startAtLoginCheck"); QVERIFY(check);
+        auto *useCurrent = dialog.findChild<QPushButton *>("useCurrentStartupDirectoriesButton"); QVERIFY(useCurrent);
+        auto *status = dialog.findChild<QLabel *>("startAtLoginStatus"); QVERIFY(status);
+        QVERIFY(!check->isEnabled());
+        QVERIFY(!check->isChecked());
+        QVERIFY(!dialog.startupChangeRequested());
+        QVERIFY(!useCurrent->isHidden());
+        QVERIFY(!dialog.settings().startAtLogin);
+        QVERIFY(status->text().contains(QDir::toNativeSeparators(startup.state.profileDir)));
+        QVERIFY(status->text().contains(QDir::toNativeSeparators(startup.state.modelDir)));
+        useCurrent->click();
+        QVERIFY(check->isEnabled());
+        QVERIFY(check->isChecked());
+        QVERIFY(dialog.startupChangeRequested());
+        QVERIFY(dialog.settings().startAtLogin);
+        QVERIFY(status->text().contains(QDir::toNativeSeparators(startup.profileDir)));
+        QVERIFY(status->text().contains(QDir::toNativeSeparators(startup.modelDir)));
+        check->setChecked(false);
+        QVERIFY(!dialog.startupChangeRequested());
+        QVERIFY(!check->isEnabled());
+        QVERIFY(useCurrent->isEnabled());
+        QVERIFY(!dialog.settings().startAtLogin);
+    }
+    void matchingStartupTargetCanBeDisabled() {
+        TestEnvironment env("gui-startup-owned"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        AppSettings settings; settings.language = "en";
+        SettingsDialog::StartupOptions startup;
+        startup.allowed = true;
+        startup.profileDir = env.path("data");
+        startup.modelDir = env.path("models");
+        startup.state.status = LoginStartupStatus::ApprovalRequired;
+        startup.state.profileDir = startup.profileDir;
+        startup.state.modelDir = startup.modelDir;
+        SettingsDialog dialog(settings, false, startup);
+        auto *check = dialog.findChild<QCheckBox *>("startAtLoginCheck"); QVERIFY(check);
+        QVERIFY(check->isEnabled());
+        QVERIFY(check->isChecked());
+        QVERIFY(dialog.findChild<QPushButton *>("useCurrentStartupDirectoriesButton")->isHidden());
+        QVERIFY(!dialog.startupChangeRequested());
+        QVERIFY(dialog.findChild<QLabel *>("startAtLoginStatus")->text().contains("approval required"));
+        check->setChecked(false);
+        QVERIFY(dialog.startupChangeRequested());
+        QVERIFY(!dialog.settings().startAtLogin);
+    }
+    void startupReadErrorCanBeRepairedWithCurrentDirectories() {
+        TestEnvironment env("gui-startup-repair"); QVERIFY2(env.isValid(), qPrintable(env.error()));
+        AppSettings settings; settings.language = "zh_CN"; settings.startAtLogin = true;
+        SettingsDialog::StartupOptions startup;
+        startup.allowed = true;
+        startup.profileDir = env.path("data");
+        startup.modelDir = env.path("models");
+        startup.state.status = LoginStartupStatus::Error;
+        startup.state.message = "Invalid startup locator";
+        SettingsDialog dialog(settings, false, startup);
+        auto *useCurrent = dialog.findChild<QPushButton *>("useCurrentStartupDirectoriesButton"); QVERIFY(useCurrent);
+        QVERIFY(!useCurrent->isHidden());
+        QCOMPARE(useCurrent->text(), QString::fromUtf8("使用当前目录登录启动"));
+        QCOMPARE(dialog.findChild<QLabel *>("startAtLoginStatus")->toolTip(), startup.state.message);
+        QVERIFY(!dialog.startupChangeRequested());
+        QVERIFY(!dialog.findChild<QCheckBox *>("startAtLoginCheck")->isEnabled());
+        QVERIFY(dialog.settings().startAtLogin);
+        useCurrent->click();
+        QVERIFY(dialog.startupChangeRequested());
+        QVERIFY(dialog.settings().startAtLogin);
     }
     void languageChangePreservesDirectoryPathSpellings() {
         TestEnvironment env("gui-settings-path-spelling"); QVERIFY2(env.isValid(), qPrintable(env.error()));
@@ -521,7 +597,7 @@ private slots:
         QCOMPARE(parsed.fingerprint(), settings.fingerprint());
         QVERIFY(settings.roots.first() != QDir::cleanPath(settings.roots.first()));
 
-        SettingsDialog dialog(parsed, false, false); dialog.show();
+        SettingsDialog dialog(parsed, false, {}); dialog.show();
         auto *tabs = dialog.findChild<QTabWidget *>("settingsTabs"); QVERIFY(tabs);
         tabs->setCurrentIndex(tabs->count() - 1);
         auto *language = dialog.findChild<QComboBox *>("languageCombo"); QVERIFY(language);
@@ -562,7 +638,7 @@ private slots:
         QString error;
         QVERIFY2(AppSettings::fromJson(json, &settings, &error), qPrintable(error));
         const QString fingerprint = settings.fingerprint();
-        SettingsDialog dialog(settings, false, false); dialog.show();
+        SettingsDialog dialog(settings, false, {}); dialog.show();
         auto *tabs = dialog.findChild<QTabWidget *>("settingsTabs"); QVERIFY(tabs);
         tabs->setCurrentIndex(tabIndex);
         auto *list = dialog.findChild<QListWidget *>(listName); QVERIFY(list);
@@ -867,7 +943,7 @@ private slots:
     void chineseDialogButtonsUseApplicationLanguage() {
         TestEnvironment env("gui-chinese-buttons"); QVERIFY(env.isValid());
         AppSettings settings; settings.language = "zh_CN";
-        SettingsDialog preferences(settings, false, false);
+        SettingsDialog preferences(settings, false, {});
         auto *preferenceButtons = preferences.findChild<QDialogButtonBox *>(); QVERIFY(preferenceButtons);
         QCOMPARE(preferenceButtons->button(QDialogButtonBox::Save)->text(), QString::fromUtf8("保存"));
         QCOMPARE(preferenceButtons->button(QDialogButtonBox::Cancel)->text(), QString::fromUtf8("取消"));
@@ -944,11 +1020,9 @@ private slots:
         QCOMPARE(backend.count("index.resume"), 0);
         QCOMPARE(backend.count("index.start"), 0);
     }
-    void environmentProfileCannotEnableOperatingSystemStartup() {
+    void testSessionWithCustomHomeCannotManageOperatingSystemStartup() {
         TestEnvironment env("gui-startup-profile"); QVERIFY(env.isValid());
-        qcopilots_search::test::ScopedEnvironment overrideProfile("QCOPILOTS_SEARCH_PROFILE_DIR", env.path("environment profile").toUtf8());
-        struct RestoreTestMode { ~RestoreTestMode() { QStandardPaths::setTestModeEnabled(true); } } restore;
-        QStandardPaths::setTestModeEnabled(false);
+        qcopilots_search::test::ScopedEnvironment overrideProfile("QCS_HOME", env.path("environment profile").toUtf8());
         FakeBackend backend;
         MainWindow window(RuntimePaths::resolve(), &backend, false, false);
         window.show(); window.start();

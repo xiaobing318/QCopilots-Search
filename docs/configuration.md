@@ -1,0 +1,89 @@
+# 配置与数据目录
+
+`QCS_HOME` 指定 QCopilots Search 的用户数据根。GUI、CLI、服务和工作进程使用同一套 `RuntimePaths` 规则，数据位置不随安装目录、仓库目录或当前工作目录变化。
+
+## 目录选择
+
+| 内容 | 优先级，从高到低 |
+| --- | --- |
+| 用户数据根（profile） | `--profile-dir` → 非空 `QCS_HOME` → 平台默认目录 |
+| 模型目录 | `--model-dir` → `QCOPILOTS_SEARCH_MODEL_DIR` → `<profile>/models` |
+
+| 平台 | 默认数据根 |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\qcs`，例如 `C:\Users\xiaob\AppData\Local\qcs` |
+| macOS | `~/Library/Application Support/qcs` |
+| Linux | `$XDG_DATA_HOME/qcs`，未设置时为 `~/.local/share/qcs` |
+
+`QCS_HOME` 就是最终数据根，不会再追加一层 `qcs`。它和 `--profile-dir` 必须使用绝对路径。空变量等同未设置，相对路径、普通文件或不可用目录会明确报错，不会回退到默认数据根。仅设置 `QCOPILOTS_SEARCH_PROFILE_DIR` 会提示改用 `QCS_HOME`，该变量不参与目录选择。
+
+Windows 当前 PowerShell 会话示例：
+
+```powershell
+$env:QCS_HOME = 'D:\QCS'
+& "$env:LOCALAPPDATA\Programs\qcs\bin\qcs-gui.exe"
+```
+
+可在 Windows 用户环境变量中持久设置 `QCS_HOME`。修改后新启动的进程才会读取新值，已运行实例继续使用原目录。上例中的程序路径应替换为实际安装位置。
+
+macOS / Linux 示例：
+
+```bash
+export QCS_HOME="$HOME/qcs-data"
+/path/to/qcs-gui
+```
+
+开发和测试可以直接选择独立实例：
+
+```powershell
+& '<qcs-cli 的绝对路径>' --profile-dir 'D:\qcs-test-profile' --model-dir 'D:\qcs-models' status
+```
+
+父进程会把解析后的绝对路径显式传给服务与 worker。同一规范化 profile 只运行一个 GUI 主实例和一个服务，不同 profile 可以并行。开发脚本与自动测试使用独立 profile，不访问正常用户数据。
+
+## 数据布局与备份
+
+```text
+<QCS_HOME 或平台默认数据根>/
+  qcs-settings.json           目录规则与应用设置
+  qcs-service.lock            服务实例锁
+  qcs-ipc-token               当前服务的 IPC 认证信息
+  index/                     SQLite、向量索引与进度
+  models/                    默认模型缓存
+  cache/                     可重新生成的缓存
+  logs/                      日志
+  tmp/                       临时文件
+```
+
+更换 `QCS_HOME` 只选择另一份数据，不自动搬迁、合并或删除原目录，也不会改变已经保存的搜索范围。应用只索引设置中选定的目录，数据根本身不是默认搜索目录。
+
+备份前退出该 profile 的 GUI、服务和 worker，避免复制正在写入的数据库。保留设置和完整 `index` 目录，需要时同时备份模型。使用独立模型目录时另行保存。锁、IPC token 和临时文件不作为可恢复业务数据。恢复后使用原目录规则，应用会检查来源文件与管线指纹，必要时重建对应索引。
+
+## 登录自动启动
+
+每个用户只保存一个产品登录启动目标。设置页启用登录启动时，保存当前 profile 与 model 的绝对路径。普通启动按当前环境解析目录，系统登录启动则恢复启用时保存的目录，不依赖登录进程是否继承 `QCS_HOME`。
+
+定位文件固定为 `<平台默认数据根>/qcs-login-startup.json`，与 `QCS_HOME` 无关。它只保存版本和目录定位信息。使用自定义数据根时，默认位置仅用于这个文件、短期操作锁和更新事务标记，不创建模型、索引等业务数据。
+
+| 平台 | 系统机制 |
+| --- | --- |
+| Windows | 当前用户 Run 项，程序参数为内部选项 `--login-startup` |
+| Linux | XDG autostart desktop entry，使用相同启动参数和应用图标 |
+| macOS | `SMAppService.mainApp`，在系统确认登录启动后恢复目录 |
+
+Windows Run 命令受到 260 字符限制，程序安装路径过长时会要求选择较短安装目录。数据目录保存在定位文件中，不拼入启动命令。
+
+更换 `QCS_HOME` 不会自动更改登录目标。设置页会显示现有目标，选择“使用当前目录登录启动”可明确切换。其他 profile 的旧窗口不能关闭后来由新 profile 接管的目标。保存无关设置不会修改启动项。
+
+注册失败时恢复原目标。macOS 等待系统批准时保留目标并显示待授权状态。定位文件损坏、目标缺失或不可用时明确报错，不回退到默认 profile。修复目录后正常启动应用，重新应用登录设置即可。若上次更新因崩溃或回滚失败未完成，程序会拒绝使用未确认目标。手动以目标 `QCS_HOME` 启动，在设置页选择“使用当前目录登录启动”并保存可明确修复，不需要手动删除定位文件。
+
+显式传入 `--profile-dir`、`--model-dir` 的开发会话和 Qt test mode 不访问真实登录配置。`--background` 只控制窗口显示，不读取定位文件。登录启动若没有可用托盘，会显示主窗口，避免产生无法打开的隐藏应用。
+
+## 其他运行设置
+
+- `QCOPILOTS_SEARCH_BACKEND=auto` 默认选择当前包可用的 GPU，失败时报告原因并回退 CPU。`cpu` 强制 CPU，`gpu` 要求 GPU 初始化成功。
+- `QCOPILOTS_SEARCH_CPU_BASELINE=1` 强制使用通用 x64 CPU 后端，便于兼容性排查。
+- `QCOPILOTS_SEARCH_THREADS` 设置默认推理线程数，实例设置可覆盖它。
+- 搜索目录、排除目录、代码空间、外部查看器和语言在设置页管理。删除索引配置不会删除源文件。
+
+模型缺失时仍可使用文件名及已提取正文的关键词搜索。模型下载或离线导入均验证锁定大小和 SHA-256，详细契约见[依赖说明](dependencies.md)。

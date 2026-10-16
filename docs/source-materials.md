@@ -1,59 +1,71 @@
 # 对应源码材料
 
-安装包的许可材料需要对应实际部署的库。`tools/qcs-source-bundle.py` 收集锁定源码归档、项目源码、补丁和构建适配，生成可独立保存的平台无关源码材料包。它不会只生成下载链接，也不会为未准备的源码作承诺。正式发布准备从同一干净候选生成一份对应源码材料，普通打包和 CI package artifacts 只包含用户安装器或便携包，不重复生成或上传源码与符号。
+`tools/qcs-source-bundle.py` 收集项目源码、锁定的原始上游归档、构建配置和许可证，生成可独立保存的源码材料。所有归档保持原样，项目的 CMake wrapper 与生成头模板随源码提供。普通打包与 CI artifact 只包含用户包，源码和符号通过独立动作生成。
+
+## 生成与验证
+
+日常开发可以使用统一入口的 `sources`。正式发布由 `release-prepare` 自动从指定干净提交生成材料，流程见[发布指南](releasing.md)。也可单独调用：
 
 ```powershell
+$buildRoot = 'C:\Dev\github-repos-compilations\qcs'
+$qcsCommit = '<完整40位提交SHA>'
 python tools/qcs-source-bundle.py `
-  --build-root $buildRoot --candidate-commit $candidateCommit --download
+  --build-root $buildRoot --candidate-commit $qcsCommit --download
 ```
 
-输出位于 `<build-root>/pkg`：
+使用本机真实 Python，或将命令中的 `python` 替换为已配置解释器。默认输出位于 `<build-root>/pkg`：
 
 - `qcs-source-materials-<commit12>.zip`
-- `qcs-source-materials-<commit12>.zip.sha256`
+- 同名 `.zip.sha256`
 - `qcs-source-manifest.json`
 - `SHA256SUMS`
 
-可通过 `--output-dir` 调整输出目录，通过 `--cache-dir` 指定已校验的源码缓存。下载文件优先复用已经校验过的 CMake 缓存。Qt 源码由 `tools/qcs-source-packages.lock.json` 锁定，其他原生库从实际 CMake 依赖声明读取 URL 和 SHA-256。文件大小和哈希校验通过后才能进入材料包。`--manifest-only` 可以查看待收集清单，`--download` 允许补齐缺失归档，不传该参数时缺失归档导致明确失败。
+`--output-dir` 调整输出位置，`--cache-dir` 指定外置归档缓存。`--dependency-root` 指向 CMake 的 `QCOPILOTS_SEARCH_DEPENDENCY_ROOT`，用于复用已下载的依赖归档，默认是 `<build-root>/deps/Release`。统一 `sources` 动作按当前配置自动传入该目录，直接调用工具复用 Debug 或自定义依赖目录时需要显式指定。`--manifest-only` 列出待收集内容，`--download` 允许下载缺失归档，不允许下载时缺项会明确失败。归档进入材料包前校验大小与 SHA-256。
 
-`--candidate-commit` 使用完整提交 SHA，生成前后均核对干净工作区与该提交一致。正式候选不接受 `--qt-root`，不要求本机安装 Qt SDK，也不将本机 SDK 元数据混入公共源码材料。manifest 使用 schema 2，平台标识为 `source`，架构为 `any`。
+正式材料使用 `--candidate-commit` 绑定完整提交，生成前后确认工作区干净且 HEAD 相同，不接受 `--qt-root`。它不要求本机已安装 Qt，也不混入某一台机器的 SDK 元数据。
 
-`--verify-bundle FILE --candidate-commit SHA --expected-sha256 HASH` 会检查整个材料包的外部哈希及候选身份，并逐项读取包内源归档和项目源码，核对 manifest 中的大小与哈希，不展开源码到磁盘。开发者仍可在未指定候选的独立材料任务中使用 `--qt-root` 收集所选 SDK 的公共元数据，这类材料不用于替代正式平台无关源码包。
+```powershell
+python tools/qcs-source-bundle.py `
+  --verify-bundle '<源码包的绝对路径>' `
+  --candidate-commit $qcsCommit --expected-sha256 '<源码包SHA-256>'
+```
+
+验证会检查外部包哈希、提交身份和内部每项大小及哈希，不把源码展开到磁盘。包内 `source-manifest.json` 使用 schema 2，包含项目文件、依赖归档、源码树和工作区状态。开发材料可包含未提交修改，但不能作为干净发行提交的证明。
 
 ## 包含范围
 
-材料包保留上游归档的压缩形式，不展开体积较大的 Qt WebEngine / PDF 源码。它包含实际使用的 Qt base、SVG、Core5Compat、Image Formats、Multimedia、translations 和配套 PDF 源码。Qt PDF 的源归档名称为 Qt WebEngine，因为两个模块共用该源码仓库。
+源码材料以实际清单为准，主要包括：
 
-当前锁定清单包含 45 份上游归档，覆盖范围以 `source-manifest.json` 的实际条目为准。ROCm 部分包含 18 份系统依赖源码和一份 TheRock 构建配方归档。`rocm-libraries`、`rocm-systems`、`llvm-project` 的精确提交已锁定，但完整源码归档未收录，TheRock 归档不包含 Git submodules。CUDA 构建使用的 CCCL `v3.4.3` 也没有独立源码归档条目。因此本材料不构成完整离线 GPU SDK 源码集。源码归档完整性与用户包中实际 runtime license 材料分别验证，不以其中一个通过替代另一个。
+- `project/` 中的应用源码、测试、图标、CMake wrapper、开发脚本、依赖锁和重建说明。
+- Qt base、SVG、Core5Compat、Image Formats、Multimedia、translations 和配套 PDF 源码。PDF 与 WebEngine 共用源码仓库，因此归档名称包含 WebEngine。
+- 锁定的 llama.cpp、原生提取与存储依赖、GNU libiconv，以及相关 OCR 数据归档。
+- FFmpeg 9.0.1 源码。Qt 的 Windows FFmpeg 所用 zlib 1.3.1 与应用所用 zlib 1.3.2 分别保留。
+- GPU 许可锁指定的开源组件与构建配方，保留归档内许可证和逐文件归属。
 
-FFmpeg 使用固定 9.0.1 源码。Windows 配套 FFmpeg 使用的 zlib 1.3.1 源码与应用自身使用的 zlib 1.3.2 分开保留。第三方源归档内部包含其原始许可证和版权声明。开发者指定 `--qt-root` 时，附加元数据记录该 SDK 的真实 `avcodec_configuration()`、许可证及运行库 SHA-256。
+GPU 材料不构成完整离线 SDK 源码集。ROCm 的 TheRock 构建配方归档不包含 Git submodules，锁中部分精确提交没有完整源码归档，CUDA 的部分开发组件也没有独立归档条目。按 `source-manifest.json` 的实际内容判断覆盖范围，不能以构建配方代替其所有依赖源码。
 
-开发材料在 Linux 读取 Qt SDK 的 FFmpeg 元数据时，先从选中的 `libavcodec.so.63` 所在目录以 `RTLD_LOCAL` 加载 `libavformat.so.63` 及其依赖组，再以相同方式加载 avcodec，并在元数据读取期间保留依赖组句柄。缺少同目录的 avformat、动态加载失败或元数据符号读取失败都会明确失败，不跨 SDK 寻找替代库。Windows 和 macOS 保留原有加载路径，FFmpeg ABI 及 GPL / nonfree 配置拒绝规则保持不变。
+开发者在独立材料任务中指定 `--qt-root` 时，可以附加实际 SDK 的公共构建元数据、原始 SPDX、FFmpeg 配置及运行库哈希。这类机器相关信息不混入正式平台无关源码包。FFmpeg 元数据只从所选 SDK 的匹配库读取，加载失败或 ABI 不匹配明确报错。
 
-项目源码放入 `project/`，其中 `cmake/` 是原生依赖构建适配，`third_party/patches/` 保存 llama.cpp 补丁，`tools/` 保存 SDK、部署及材料生成流程。源文件清单逐项记录哈希。若打包期间文件发生变化，脚本拒绝继续发布该材料包。
+Microsoft Visual C++ CRT/OpenMP 依据适用再分发条款部署，不属于开源对应源码收集对象。模型权重由独立下载或离线导入提供，不包含在源码材料中。
 
-指定 `--qt-root` 时，`sdk-metadata/` 同时保留该 SDK 的公共构建配置和原始 SPDX JSON，包含第三方版权及自定义许可全文。运行包中的 `qcs-runtime` 许可目录由 `tools/qcs-license-materials.py` 自动生成。它使用上述源码锁和外置许可证源码缓存，默认位于 `deps/licenses`，收集 Qt base、SVG、Image Formats、Multimedia 的原始许可和 attribution 引用文件，并按实际 SDK SPDX 检查标准许可全文是否齐全。对应源码材料工具的默认归档缓存位于 `deps/sources`。PDF / Chromium 的自定义许可来自实际 SDK SPDX 的原始 `extractedText`。任何平台新增未覆盖的许可 ID 都会明确阻止配置。
+## 运行包的许可材料
 
-离线配置可设置 `QCOPILOTS_SEARCH_DOWNLOAD_LICENSE_SOURCES=OFF`，并通过 `QCOPILOTS_SEARCH_LICENSE_SOURCE_CACHE` 指定预先准备的锁定归档目录。这里的缓存和生成目录均位于源码树外，安装步骤和包级测试会重新验证生成材料的文件集合、大小与哈希。
+安装包通过构建规则自动收集实际部署组件的许可证和 notices，通常位于 `share/qcs/licenses`，macOS 位于应用 bundle 的 `Contents/Resources/qcs/licenses`。
 
-材料包使用固定 ZIP 时间戳和稳定排序。清单记录 `commit` 与 `workingTreeModified`，有未提交修改的材料包用于开发验证，不能作为不可变发行提交的证明。正式发布准备把干净候选生成的源码材料与该候选的 CI 用户包绑定，冻结各文件 SHA-256，上传前再次核对字节。发布准备与上传阶段检查源码材料和每个 Release 附件均小于 2 GiB，超限明确失败，不自动分卷。独立源码生成入口不执行这项 Release 大小检查。
+Qt 材料包含所选 SDK 的模块 SPDX、版权声明、自定义许可全文和源码锁指定的 attribution 引用原文。SDK SPDX 可能包含未部署功能，不将其描述为整个应用的精确运行依赖图。GNU libiconv 包含 `COPYING.LIB`、`COPYING` 和 libcharset 的 `COPYING.LIB`。项目和 DigUp 的 MIT 归属同样保留。
 
-Windows 另外部署的 Microsoft Visual C++ CRT / OpenMP 是按适用许可再分发的运行库，不属于开源对应源码收集范围。它们的归属和部署方式见 [第三方声明](../THIRD_PARTY_NOTICES.md)。
+`QCOPILOTS_SEARCH_DOWNLOAD_LICENSE_SOURCES=OFF` 可禁止许可源归档下载，配合 `QCOPILOTS_SEARCH_LICENSE_SOURCE_CACHE` 使用预先准备的锁定缓存。缓存和生成文件均在源码树外。安装和包级验证重新核对材料的文件集合、大小与哈希。完整组件归属见[第三方声明](../THIRD_PARTY_NOTICES.md)。
 
 ## 重建与替换动态库
 
-先验证外部 SHA-256，再检查包内 `source-manifest.json`。在源码树外展开所需上游归档，保留它们的许可证。应用的一般构建流程见 [开发指南](development.md)。
+先验证外部 SHA-256 和包内清单，在源码树外展开需要的上游归档。按[开发指南](development.md)准备匹配架构的编译器、Qt kit 和外置构建根。
 
-原生库由项目 CMake 配置控制。开发者可以将已校验的归档放入外置依赖缓存，或使用标准 `FETCHCONTENT_SOURCE_DIR_<DEPENDENCY>` 选项指向匹配的已展开源码。llama.cpp 也接受没有 `.git` 的官方归档展开目录，通过 `QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR` 或 `FETCHCONTENT_SOURCE_DIR_QCS_LLAMA` 指定。配置阶段使用自身哈希已锁定的完整文件清单校验该目录，只允许经过审核的 no-logits 和 UTF-8 后端路径补丁对应的精确文件哈希。应用补丁仍需要 Git 程序，不需要网络或上游 Git 元数据。
+原生依赖可使用已校验缓存，或通过 `FETCHCONTENT_SOURCE_DIR_<DEPENDENCY>` 指定匹配的原始源码目录。llama.cpp 也支持 `QCOPILOTS_SEARCH_LLAMA_SOURCE_DIR` 和 `FETCHCONTENT_SOURCE_DIR_QCS_LLAMA`，无需 `.git` 元数据。配置会检查完整源码清单并拒绝额外文件、缺失文件或内容变化，构建完成后再次验证。生成头和校验标记存放在源码目录之外。
 
-`tests/runtime/source_integrity_test.py --archive <locked-archive> --report <report-path>` 在唯一临时目录中实际展开归档，验证无 Git 元数据的源码、位于无关 Git 仓库中的源码、两份补丁、重复应用以及文件、清单和补丁被修改后的拒绝行为。报告逐项记录执行结果与跳过原因，这个检查证明源码准备与完整性规则，不代替完整应用构建及运行测试。CI 报告保留在 job 的临时工作目录并通过原生日志诊断，不上传为用户 package artifacts。
+wv2/POLE 与 GNU libiconv 由项目自有 CMake wrapper 直接编译上游原始文件。Windows 使用共享 CRT，不需要 Cygwin。第三方库的公开 API 调用适配位于应用源码中，不通过重写上游文件实现。
 
-重新构建 Qt 时，使用材料包中对应版本的 Qt base 作为基础，使用平台原生编译器及与应用匹配的架构，以动态库模式配置并安装到独立 prefix。随后使用该 prefix 的 `qt-configure-module` 构建 SVG、Core5Compat、Image Formats、Multimedia 和 PDF 等模块。具体编译依赖以源归档内的构建说明及 [Qt 源码构建文档](https://doc.qt.io/qt-6/build-sources.html) 为准，PDF 的构建依赖多于普通 Widgets 模块。
+重建 Qt 时，先用对应 Qt base 配置动态库安装 prefix，再通过该 prefix 的 `qt-configure-module` 构建需要的模块。PDF 构建有额外依赖，按照归档内说明和[Qt 源码构建指南](https://doc.qt.io/qt-6/build-sources.html)准备工具。
 
-FFmpeg 重建使用对应 Qt 配套构建说明及实际运行库配置作为依据，开发者可使用匹配 SDK 生成附加元数据辅助核对。将上游构建机绝对路径替换为本机依赖路径，保留 ABI、动态链接方式和许可选项。不要开启 GPL / nonfree codec 来生成与原发行声明不同的运行库。项目通过版本与符号检查拒绝不匹配的 FFmpeg ABI。
+FFmpeg 重建以 Qt 配套配置和实际 ABI 为准，保留动态链接与许可选项，不启用与发行声明不同的 GPL/nonfree 扩展。替换动态库后，在独立安装副本及 profile 中重新运行格式、真实模型和最终包验证。编译成功本身不证明运行兼容或数值一致。
 
-替换库后，在单独的安装副本和 profile 中重新运行包级验证。应用采用动态库部署，不阻止符合许可证的库替换。不同编译选项、补丁或系统库可能改变行为，重建成功不自动代表黄金向量和格式回归通过。
-
-## 发布检查
-
-源码材料的最终 SHA-256 与对应运行包一起保存。检查依赖锁、Qt / FFmpeg 配置、上游归档、完整许可证、项目补丁和重建说明均已包含。模型权重按独立下载或离线导入提供，源码材料包不包含模型。
+材料包使用稳定排序与固定 ZIP 时间戳，发布清单绑定其最终 SHA-256。上传前再次验证全部字节，每个 Release 附件必须小于 2 GiB，超限明确失败。

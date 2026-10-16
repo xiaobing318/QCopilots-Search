@@ -1,111 +1,100 @@
 # 开发指南
 
-Windows 使用 `qcs-dev.ps1`，macOS / Linux 使用 `bash qcs-dev.sh`。两者把参数交给公共 Python 入口，按脚本自身位置定位源码，不依赖当前工作目录。应用运行不依赖 Python。
+应用使用 C++20、Qt Widgets 和 CMake。Windows 通过 `qcs-dev.ps1` 开发，macOS / Linux 使用 `bash qcs-dev.sh`。入口按脚本位置定位源码，可以从任意工作目录调用。Python 只用于开发、测试和打包，最终应用不依赖 Python。
 
-## 工具链与变体
+## 1. 准备环境
 
-开发环境需要 Python 3.10+、CMake 3.28+、Ninja 和 C++20 编译器。Windows 主程序使用 MSVC 2022 与 Windows SDK，macOS 使用 Xcode Command Line Tools，Linux 使用 GCC 或 Clang。Qt 固定为 6.12.0，配套独立 Qt PDF 模块为 6.140.0。
-
-Linux CUDA 的 CI 容器单独固定 CMake 3.31.10，通过版本与 SHA-256 锁定的官方 wheel 安装，并验证 `cmake`、`ctest`、`cpack` 来自同一套工具。这避免旧版 CMake 在含空格的外置对象路径下丢失 Ninja 头文件依赖。本机 MSVC 的 CMake 3.28 基线保持不变。
-
-Linux DEB 打包需要 `dpkg-dev` 和 `file`。CUDA DEB 使用锁定的无 NVIDIA 驱动容器生成。CPack 在外置构建目录中使用 SDK 驱动 stub 的独立副本解析可选的 `libcuda.so.1`，该目录只供静态依赖分析使用，不加入运行路径或用户包。最终包继续检查普通系统依赖，并拒绝驱动 stub、驱动库或强制安装 NVIDIA 驱动和 CUDA SDK 的依赖。若带有真实驱动的开发机产生此类依赖，应改用锁定容器打包，不能删除依赖字段来绕过检查。
-
-`config/build-variants.json` 是平台、后端、SDK 和包类型的共同清单。`--variant` 对应 CMake 的 `QCOPILOTS_SEARCH_VARIANT`，完整 11 项矩阵见 [发布指南](releasing.md)。默认变体为 Windows / Linux 的 CPU 或 macOS arm64 Metal。其他主机架构不能被默认值伪装成支持的平台。
-
-Windows CUDA 和 HIP 后端使用外置子构建，主程序及 Qt 仍由 MSVC 构建。最终部署使用主构建的唯一 `ggml-base`，后端 ABI、导入导出和运行库必须一致。SDK 和编译配方按锁定的 llama.cpp 提交引用，升级必须同时更新锁、配方及验证结果。
-
-Linux CPU / Vulkan 使用 Ubuntu 22.04 基线，CUDA / ROCm 使用 Ubuntu 24.04 基线。Qt 的图形、字体、XCB、DBus 和多媒体依赖需要由操作系统提供，包含 `libxcb-shape0` 和 `libpulse0`。CI 根据实际 `/etc/os-release` 安装 GTK3 运行包，22.04 使用 [`libgtk-3-0`](https://packages.ubuntu.com/jammy/libgtk-3-0)，24.04 使用 [`libgtk-3-0t64`](https://packages.ubuntu.com/noble/libgtk-3-0t64)，未知基线在安装前报错。这两个包的必需依赖同时提供 Wayland cursor / EGL、Pango、Harfbuzz、ATK、Cairo 和 GdkPixbuf，使用 `--no-install-recommends` 仍会安装，因此不单独维护 Qt 插件所需的全部底层库清单。CPack 保留系统依赖分析并生成实际 DEB 依赖，Qt 插件继续完整部署。
-
-无显示服务器的 CI 使用 Xvfb。DEB 安装验证需要 Docker，Windows 安装验证需要 NSIS。Windows 完整测试包含安装器回归时，入口会先准备 NSIS，PowerShell 包装也会查找 Visual Studio 自带 Ninja。macOS 最低版本为 14.4，默认 ad-hoc 签名。
-
-## 外置目录
-
-`--build-root` 指定父根，`--qt-root` 指定 Qt SDK 根。所有生成目录必须位于源码树之外，路径参数应作为单独参数正常引用。CI 检出目录使用 `qcs-src`，受控安装包解包、安装、搬移、验收 profile 和 Windows CU 运行目录统一采用英文且无空格的路径。中文内容及样本文件的路径回归继续保留。
-
-```text
-<build-root>/
-  sdk/                            未指定 Qt 根时的 SDK 位置
-  models/                         经大小和 SHA-256 校验的共享模型
-  gpu-sdk/                        GPU SDK 默认根，可显式覆盖
-  <variant>/
-    Release/                      CMake 构建树
-    Debug/                        独立的调试构建树
-    RelWithDebInfo/                可选带符号配置
-    stage/<Config>/               安装布局
-    pkg/<Config>/                 用户安装包及便携包
-    reports/<Config>/             本机测试与打包记录
-    runs/<Config>/                独立测试实例
-    deps/<Config>/                本配置依赖及子构建
-    symbols/<Config>/             独立生成的符号材料
-    sources/<Config>/             独立生成的开发源码材料
-```
-
-本机可以使用 `C:\Dev\github-repos-compilations\qcs` 和 `C:\Softwares\Qt`。这些只是可替换的本地参数，不写入可复用代码。默认构建父根根据仓库上级推导为外置的 `<仓库父目录名>-compilations/qcs`，也可用 `QCOPILOTS_SEARCH_BUILD_ROOT` 覆盖。
-
-编译缓存不能跨不同变体、SDK 或配置复用。已验证的下载与模型缓存可共享，模型不复制进每个包。旧的不含变体身份的构建缓存不原地改名，重新配置新的构建树。已有历史构建、模型、SDK 和用户配置不属于本轮清理范围。
-
-程序真实用户数据使用平台标准目录。`--profile-dir` 为 GUI、服务、CLI 选择独立实例，`--model-dir` 选择模型缓存，stage 或当前工作目录不会成为默认用户数据目录。
-
-## 动作与参数
-
-| 动作 | 用途 |
+| 工具 | 要求 |
 | --- | --- |
-| `bootstrap` | 下载、验证并安装锁定 Qt SDK |
-| `doctor` | 检查工具链、SDK、变体、路径和必要环境 |
-| `configure`、`build` | 配置外置 CMake 树并编译应用与测试 |
-| `models` | 下载或复用模型并校验大小和 SHA-256 |
-| `test` | 执行全部注册测试，缺少必需模型明确失败 |
-| `check` | 执行完整开发与包验证流程 |
-| `run` | 启动当前变体与配置的 GUI，GPU 变体先安装到 stage 再运行 |
-| `install`、`package` | 生成 stage，再生成该变体的用户包 |
-| `verify-package`、`installers` | 验证最终包及平台安装卸载生命周期 |
-| `symbols`、`sources` | 独立生成调试符号或对应源码材料 |
-| `release-prepare` | 按 CI run、attempt 和候选下载验证包并冻结发行材料 |
-| `release-upload-draft` | 显式创建或续传草稿，不公开发布 |
-| `clean` | 核验归属后清理当前变体与配置的受控生成物 |
+| 编译器 | Windows 使用 MSVC 2022 和 Windows SDK，macOS 使用 Xcode Command Line Tools，Linux 使用 GCC 或 Clang |
+| Qt SDK | Qt 6.12.0，配套 Qt PDF 6.140.0，安装与目标架构匹配的 kit |
+| 构建工具 | CMake 3.28+、Ninja、Git |
+| 脚本运行环境 | Python 3.10+，Windows 需要 PowerShell 5.1+ |
+| 平台打包 | Windows 使用 NSIS，Linux 使用 `dpkg-dev` 和 `file`，macOS 使用系统 DMG 与签名工具 |
 
-| 参数 | 含义 |
-| --- | --- |
-| `--variant ID` | 共同清单中的构建变体 |
-| `--build-root PATH`、`--qt-root PATH` | 外置父根与 Qt 安装根 |
-| `--config Release\|Debug\|RelWithDebInfo` | 独立构建配置，默认 Release |
-| `--gpu-sdk-root PATH` | 已准备的 GPU SDK 根，支持对应环境变量覆盖 |
-| `--jobs N` | 编译并发数 |
-| `--model-dir PATH` | 已校验或待准备的模型缓存 |
-| `--test-label LABEL` | 仅用于排查的 CTest 标签筛选，不能代表完整验收 |
-| `--generator NAME` | 独立打包时指定 ZIP、NSIS、TGZ、DEB 或 DragNDrop |
-| `--cmake-arg=-DNAME=VALUE` | 额外 CMake 配置参数 |
-| `--report-dir PATH` | 本次独立报告目录 |
-| `--keep-failed-tests` | 保留失败测试的独立产物 |
-| `--scope generated`、`--dry-run` | 显式清理范围与只列出不删除 |
+Windows 包装脚本自动查找 Visual Studio 2022、初始化 x64 编译环境，并查找其自带 Ninja。如果 `python` 只是 Microsoft Store 占位入口，请安装真实 Python，或将 `QCOPILOTS_SEARCH_PYTHON` 设置为已有解释器的绝对路径。不要将某台机器的私有 Python 路径写进仓库。
 
-## 日常修改与完整检查
-
-已有 Qt 时直接运行 `doctor`。未安装 SDK 时先运行 `bootstrap`。`check` 顺序执行环境诊断、配置、构建、模型准备、全部保留测试、安装、平台打包、最终包验证，以及 Windows / Linux 安装器验证。源码和符号使用独立动作，不在普通打包中重复生成。`check` 的本地记录包含 `semantic-functional.json`，并核对执行前后源码、四个程序、运行库和用户包的字节稳定性。Windows 完整检查按 NSIS → ZIP 顺序打包。每个生成器使用本次调用的独立 CPack 工作目录，生成后只清理本次受控 stage，保留用户指定的安装 stage 和已有历史产物。
-
-`check` 要求干净且身份确定的 Git 提交，存在未提交修改或显式候选与当前提交不一致时会在执行阶段前失败。日常 `build`、`test` 可以在有未提交修改的工作树中运行。
+以下示例使用已安装的 Qt。`--qt-root` 指向 SDK 根，脚本从中选择 `6.12.0/msvc2022_64`，不能把根与 kit 目录混用。
 
 ```powershell
+Set-Location C:\Dev\github-repos\QCopilots-Search
 $buildRoot = 'C:\Dev\github-repos-compilations\qcs'
 $qtRoot = 'C:\Softwares\Qt'
 $variant = 'windows-x64-cpu'
-./qcs-dev.ps1 check --variant $variant --build-root $buildRoot --qt-root $qtRoot --jobs 4
-./qcs-dev.ps1 build --variant $variant --build-root $buildRoot --qt-root $qtRoot
-./qcs-dev.ps1 test --variant $variant --build-root $buildRoot --qt-root $qtRoot --model-dir "$buildRoot/models"
-./qcs-dev.ps1 test --variant $variant --build-root $buildRoot --qt-root $qtRoot --test-label unit
+./qcs-dev.ps1 doctor --variant $variant --build-root $buildRoot --qt-root $qtRoot
 ```
 
-完整 `check` 不接受缩小范围的标签或只测关键词选项。局部 `test` 记录实际选择与排除项，空选择失败。较少编译任务可以降低峰值内存和磁盘需求，不能通过减少 GPU 架构或测试范围掩盖资源不足。
+如果尚未安装 Qt，使用相同参数执行 `bootstrap`，下载并校验锁定 SDK。已有 SDK 不需要重复安装。
 
-`check-report.json` 绑定执行时的源码、依赖锁、阶段状态和产物哈希。候选身份绑定 8 项依赖与构建配置文件，包含共同变体清单、GPU SDK 锁和 GPU 许可源码锁。候选来源、程序及包的字节在关键阶段前后重新核对，失败后后续阶段保留为未运行。本机检查成功只说明该主机对应的完整流程通过，跨平台 CI 与 Windows 实际操作需要另行完成。
+```bash
+build_root="$(dirname "$PWD")/qcs-build"
+qt_root="$(dirname "$PWD")/Qt-SDK"
+variant=linux-x64-cpu
+bash ./qcs-dev.sh bootstrap --variant "$variant" --build-root "$build_root" --qt-root "$qt_root"
+bash ./qcs-dev.sh doctor --variant "$variant" --build-root "$build_root" --qt-root "$qt_root"
+```
 
-`verify-package` 使用最终包内的 worker 执行真实文字、图片与音频编码，并由包内服务执行语义搜索。它需要完整、校验通过的模型。独立 `--keyword-only` 仅用于排查，没有完整模型验证的报告不能成为最终包验收。
+macOS 使用 `macos-arm64-metal`。全部 11 个变体、系统基线与 GPU SDK 见[依赖说明](dependencies.md)。Linux 无显示服务器测试需要 Xvfb，DEB 安装验证需要 Docker。GPU 变体按锁定配方准备 SDK，主程序仍使用平台原生 Qt 工具链。
 
-本机 `check` 的包记录证明本机流程通过，相同源码提交的 CI 包仍可能具有不同字节。正式 Windows 操作验收必须等待同一候选的 11 变体 CI 通过并完成 `release-prepare`，对冻结 manifest 中的 Windows CPU ZIP 重新执行完整 `verify-package`，然后通过 `record-ci-package`、CU-01 至 CU-10 和 `validate-local --release-manifest` 绑定来源与实际包。不能复用本地重建包的验证报告，命令见 [候选验收运行器](../tools/acceptance/README.md)。
+## 2. 配置、编译和调试
 
-## 直接使用 CMake
+```powershell
+./qcs-dev.ps1 configure --variant $variant --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 build --variant $variant --build-root $buildRoot --qt-root $qtRoot --jobs 4
+./qcs-dev.ps1 run --variant $variant --build-root $buildRoot --qt-root $qtRoot
+```
 
-可设置 `QCOPILOTS_SEARCH_BUILD_ROOT`、`QCOPILOTS_SEARCH_QT_PREFIX` 和 `QCOPILOTS_SEARCH_VARIANT` 后使用 `qcs-release` 或 `qcs-debug` preset。Qt prefix 指向具体 kit，与开发入口的 Qt SDK 根不同。两个测试 preset 都执行完整注册清单，直接 CTest 也需要准备模型和测试依赖。
+修改 C++ 后重复 `build` 即可增量编译。修改 CMake、依赖锁或构建选项后先重新 `configure`。调试时给三个动作都添加 `--config Debug`，然后将调试器连接到该配置的 `qcs-gui`、`qcs-service` 或 `qcs-worker`。`RelWithDebInfo` 用于带符号的优化构建。
+
+`run` 使用外置的开发 profile 和显式模型目录，不读写正常应用的数据。GPU 变体先安装到 stage 再启动，以便使用完整部署布局。需要检查真实用户目录时，直接启动已安装程序，目录规则见[配置与数据目录](configuration.md)。
+
+所有生成内容必须位于源码树外，且变体与配置相互隔离：
+
+```text
+<build-root>/
+  sdk/                        未指定 Qt 根时的 SDK
+  models/                     校验后的共享模型
+  gpu-sdk/                    GPU SDK 默认根
+  <variant>/
+    Release/                  Release 构建树
+    Debug/                    Debug 构建树
+    RelWithDebInfo/            优化且含符号的构建树
+    deps/<Config>/            依赖缓存与子构建
+    stage/<Config>/           完整安装布局
+    pkg/<Config>/             安装器与便携包
+    reports/<Config>/         测试、检查与包验证记录
+    runs/<Config>/            测试临时实例
+    sources/<Config>/         独立生成的源码材料
+    symbols/<Config>/         独立生成的符号材料
+```
+
+`QCOPILOTS_SEARCH_BUILD_ROOT` 可以设置默认外置根，命令行 `--build-root` 优先。下载和模型缓存可以在校验后共享，编译缓存不能跨变体、SDK 或配置复用。依赖源码保持上游原样，生成头和完整性标记存放在源码目录之外。
+
+## 3. 测试、安装和打包
+
+```powershell
+./qcs-dev.ps1 models --variant $variant --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 test --variant $variant --build-root $buildRoot --qt-root $qtRoot --model-dir "$buildRoot/models"
+./qcs-dev.ps1 install --variant $variant --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 package --variant $variant --build-root $buildRoot --qt-root $qtRoot
+./qcs-dev.ps1 verify-package --variant $variant --build-root $buildRoot --qt-root $qtRoot --model-dir "$buildRoot/models"
+```
+
+`install` 形成完整 stage，`package` 自动部署 Qt、推理库、运行数据、许可证和图标，生成当前变体的用户包，无需手工复制。源码材料和符号分别通过 `sources`、`symbols` 生成，正式发布见[发布指南](releasing.md)。
+
+一次执行完整流程：
+
+```powershell
+./qcs-dev.ps1 check --variant $variant --build-root $buildRoot --qt-root $qtRoot --jobs 4
+```
+
+`check` 允许未提交修改，依次执行 `doctor → configure → build → models → test → install → package → verify-package → installers`，最后一项仅适用于有安装器验证的平台。报告记录阶段、命令、退出码、日志和工作区状态，失败后后续阶段不执行。报告位于 `<build-root>/<variant>/reports/<Config>/check-*/check-report.json`，`reports/<Config>/latest-check.json` 指向最近一次记录。开发检查通过与正式发布的干净提交、CI 来源要求分别判断。
+
+`test --test-label unit` 等筛选用于局部排查，完整 `check` 不接受缩小测试范围。更多测试说明及 GUI 检查清单见[测试指南](testing.md)。
+
+## 4. 直接使用 CMake
+
+CMake presets 接受具体 Qt kit，不接受 SDK 父根。Windows 直接调用前需要进入 MSVC x64 开发环境。
 
 ```bash
 export QCOPILOTS_SEARCH_BUILD_ROOT="/path/outside/source/build"
@@ -116,12 +105,20 @@ cmake --build --preset qcs-release
 ctest --preset qcs-release
 ```
 
-Windows 直接 CMake 必须处于 MSVC 环境，也可以使用负责初始化工具链的 PowerShell 包装。CMake 拒绝源码树内构建。
+Debug 对应 `qcs-debug`。CTest 需要已经准备好的模型与测试依赖。Windows 程序与动态库使用共享 CRT，Release 为 `/MD`，Debug 为 `/MDd`。Linux CUDA CI 使用锁定的 CMake 3.31.10，并保证 `cmake`、`ctest`、`cpack` 来自同一套安装。
 
-## 排查与清理
+## 5. 排查与清理
 
-先保留原始控制台错误、CMake 配置日志、CTest 输出及独立运行根。模型问题核对大小、SHA-256 和 revision。IPC 问题记录脱敏后的 profile 和实例，不发送用户内容。包级问题从重定位后的最终包复现，排除开发 SDK 的 PATH 或当前目录对依赖加载的影响。
+| 现象 | 检查方式 |
+| --- | --- |
+| 找不到 Python、MSVC 或 Qt | 先执行 `doctor`，检查实际解释器、编译环境与 Qt kit |
+| 模型不可用 | 执行模型校验，检查大小和 SHA-256，不能通过重命名其他权重替代 |
+| 第三方源码校验失败 | 使用匹配锁定版本的原始源码和新的外置缓存，不修改源码或关闭校验 |
+| 生成路径过长 | 改用较短的外置构建根，保留中文、空格与长路径功能测试 |
+| 包内缺库 | 从最终包的独立解包目录复现，检查部署日志，排除开发机 PATH 补齐依赖 |
+| Linux DEB 引入驱动依赖 | 使用锁定的无驱动容器，不能删除依赖字段绕过包验证 |
+| 测试失败 | 查看报告目录和构建树 `Testing/Temporary`，必要时加 `--keep-failed-tests` |
 
-Windows 对象路径默认预算为 200 个字符，其他受控生成路径为 240 个 UTF-16 单元。数据库和锁使用长路径适配，但第三方工具和 `CreateProcessW` 工作目录仍有自身限制。外置根过长时选择更短位置，不关闭路径测试或修改全局设置隐藏错误。
+清理前添加 `--dry-run` 查看准确范围。`clean --scope build` 只清理当前变体选定配置的构建树。`clean --scope generated` 清理当前变体的全部配置及其依赖、stage、包、报告和其他受控生成物，包含 Release、Debug 和 RelWithDebInfo，不能用于仅清理一个配置。确认范围后移除 `--dry-run`。源码、共享模型、Qt SDK、开发 profile 和正常用户数据保留。
 
-先用 `clean --dry-run` 查看范围，再清理明确归属的当前变体与配置。校验规范化边界、归属标记和目录链接，结束本次子进程后释放句柄。模型、Qt、源码、Git 历史、未提交修改及正式用户数据始终保留。清理失败必须返回失败，不按进程通用名称终止其他实例，也不因为文件被 Git 忽略就视为可删除。
+完整参数以 `./qcs-dev.ps1 --help` 或 `bash ./qcs-dev.sh --help` 为准。脚本新增或删除时，同时核对 CMake、CI、动态导入、工具测试和相关文档。

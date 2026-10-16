@@ -27,6 +27,10 @@ Unicode true
 !insertmacro QCOPILOTS_SEARCH_COMPILER_PATH INST_DIR "@CPACK_TEMPORARY_DIRECTORY@"
 !insertmacro QCOPILOTS_SEARCH_COMPILER_PATH QCOPILOTS_SEARCH_OUTPUT "@CPACK_TOPLEVEL_DIRECTORY@/@CPACK_OUTPUT_FILE_NAME@"
 !insertmacro QCOPILOTS_SEARCH_COMPILER_PATH QCOPILOTS_SEARCH_LICENSE "@CPACK_RESOURCE_FILE_LICENSE@"
+!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH QCOPILOTS_SEARCH_ICON "@CPACK_NSIS_MUI_ICON@"
+!insertmacro QCOPILOTS_SEARCH_COMPILER_PATH QCOPILOTS_SEARCH_UNINSTALL_ICON "@CPACK_NSIS_MUI_UNIICON@"
+!define MUI_ICON "${QCOPILOTS_SEARCH_ICON}"
+!define MUI_UNICON "${QCOPILOTS_SEARCH_UNINSTALL_ICON}"
 !define PRODUCT_KEY "Software\QCopilots\qcopilots-search"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\qcopilots-search"
 Name "QCopilots Search"
@@ -80,14 +84,14 @@ Section "QCopilots Search"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "@CPACK_PACKAGE_VERSION@"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "QCopilots"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\bin\qcs-gui.exe"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" '$\"$INSTDIR\bin\qcs-gui.exe$\",0'
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
   WriteRegStr HKCU "${UNINSTALL_KEY}" "QuietUninstallString" '$\"$INSTDIR\Uninstall.exe$\" /S'
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
   CreateDirectory "$SMPROGRAMS\QCopilots Search"
-  CreateShortCut "$SMPROGRAMS\QCopilots Search\QCopilots Search.lnk" "$INSTDIR\bin\qcs-gui.exe"
-  CreateShortCut "$SMPROGRAMS\QCopilots Search\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
+  CreateShortCut "$SMPROGRAMS\QCopilots Search\QCopilots Search.lnk" "$INSTDIR\bin\qcs-gui.exe" "" "$INSTDIR\bin\qcs-gui.exe" 0
+  CreateShortCut "$SMPROGRAMS\QCopilots Search\Uninstall.lnk" "$INSTDIR\Uninstall.exe" "" "$INSTDIR\Uninstall.exe" 0
 SectionEnd
 
 Section "Uninstall"

@@ -8,50 +8,22 @@ function(qcopilots_search_add_doc_dependency)
     if(TARGET qcs::wv2)
         return()
     endif()
-    find_package(Qt6 6.12 REQUIRED COMPONENTS Core Core5Compat)
+    find_package(Qt6 6.12 REQUIRED COMPONENTS Core)
     qcopilots_search_fetch(qcs_calligra
-        "https://codeload.github.com/KDE/calligra/tar.gz/88bde0ce71a5c12fb50786017b2e2e07c5ce13e4"
-        "52611a41dc5d3d741f13adfaa5e8c1621a37f2a6fb19e74c038eed64d8e39a19")
+        "https://codeload.github.com/KDE/calligra/tar.gz/72123cc643f6625351139e7df294544255a1056f"
+        "7d2d1c7596f226d4aca6cba64bf2a9f4d16b5aca59245ed2b8dba10900856f38")
     set(wv2_root "${qcs_calligra_SOURCE_DIR}/filters/words/msword-odf/wv2")
     set(wv2_source "${wv2_root}/src")
     set(pole_source "${qcs_calligra_SOURCE_DIR}/filters/libmso")
     set(wv2_binary "${qcs_calligra_BINARY_DIR}/wv2")
     file(MAKE_DIRECTORY "${wv2_binary}/include" "${wv2_binary}/private")
 
-    # Generate only external build-tree copies. Patch anchors are checked so an
-    # upstream update cannot silently discard the Unicode-path adaptations.
-    file(READ "${pole_source}/pole.cpp" pole_content)
-    string(FIND "${pole_content}" "file.open(filename.c_str()," pole_anchor)
-    if(pole_anchor EQUAL -1)
-        message(FATAL_ERROR "Calligra POLE UTF-8 path patch anchor changed")
-    endif()
-    string(REPLACE "#include <fstream>" "#include <fstream>\n#include <filesystem>" pole_content "${pole_content}")
-    string(REPLACE "file.open(filename.c_str()," "file.open(std::filesystem::u8path(filename)," pole_content "${pole_content}")
-    qcopilots_search_write_if_different("${wv2_binary}/pole.cpp" "${pole_content}")
-
-    file(READ "${wv2_source}/parserfactory.cpp" parser_content)
-    string(FIND "${parser_content}" "FILE *file = fopen(fileName.c_str(), \"r\");" parser_anchor)
-    if(parser_anchor EQUAL -1)
-        message(FATAL_ERROR "Calligra ParserFactory UTF-8 path patch anchor changed")
-    endif()
-    string(REPLACE "#include <stdio.h>" "#include <stdio.h>\n#include <QFile>" parser_content "${parser_content}")
-    string(REPLACE "FILE *file = fopen(fileName.c_str(), \"r\");\n        if (!file) {"
-        "QFile file(QString::fromUtf8(fileName.data(), static_cast<qsizetype>(fileName.size())));\n        if (!file.open(QIODevice::ReadOnly)) {"
-        parser_content "${parser_content}")
-    string(REPLACE "unsigned char buffer[4];\n        fread(buffer, 1, 4, file);\n        diagnose(buffer);\n        fclose(file);"
-        "unsigned char buffer[4] = {};\n        if (file.read(reinterpret_cast<char *>(buffer), 4) == 4)\n            diagnose(buffer);"
-        parser_content "${parser_content}")
-    qcopilots_search_write_if_different("${wv2_binary}/parserfactory.cpp" "${parser_content}")
-
-    # wv2's sole iconv consumer converts legacy code pages to UCS-2. A private
-    # adapter uses Qt's strict stateless decoder with Core5Compat fallback for
-    # Qt builds without named ICU codecs. It never links the host iconv ABI.
-    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcs-native-doc-iconv.h"
-        "${wv2_binary}/private/iconv.h" COPYONLY)
+    include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/qcs-native-iconv.cmake")
+    qcopilots_search_add_iconv_dependency()
     include(TestBigEndian)
     test_big_endian(WORDS_BIGENDIAN)
     set(HAVE_ICONV_H 1)
-    set(ICONV_REQUIRES_CONST 1)
+    set(ICONV_REQUIRES_CONST 0)
     set(HAVE_STRING_H 1)
     set(HAVE_MATH_H 1)
     set(HAVE_FLOAT_H 1)
@@ -81,18 +53,14 @@ function(qcopilots_search_add_doc_dependency)
         convert.cpp)
     list(TRANSFORM wv2_sources PREPEND "${wv2_source}/")
     add_library(qcs-native-wv2 SHARED ${wv2_sources}
-        "${wv2_binary}/pole.cpp" "${wv2_binary}/parserfactory.cpp")
+        "${pole_source}/pole.cpp" "${wv2_source}/parserfactory.cpp")
     include(GenerateExportHeader)
     generate_export_header(qcs-native-wv2 BASE_NAME wv2
         EXPORT_FILE_NAME "${wv2_binary}/include/wv2_export.h")
     target_include_directories(qcs-native-wv2 SYSTEM PUBLIC
         "$<BUILD_INTERFACE:${wv2_source}>" "$<BUILD_INTERFACE:${wv2_binary}/include>")
     target_include_directories(qcs-native-wv2 PRIVATE "${pole_source}" "${wv2_binary}/private")
-    target_link_libraries(qcs-native-wv2 PUBLIC Qt6::Core PRIVATE Qt6::Core5Compat)
-    if(APPLE)
-        find_library(QCOPILOTS_SEARCH_COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
-        target_link_libraries(qcs-native-wv2 PRIVATE "${QCOPILOTS_SEARCH_COREFOUNDATION_LIBRARY}")
-    endif()
+    target_link_libraries(qcs-native-wv2 PUBLIC Qt6::Core PRIVATE qcs::iconv)
     target_compile_features(qcs-native-wv2 PRIVATE cxx_std_20)
     target_compile_definitions(qcs-native-wv2 PRIVATE
         HAVE_CONFIG_H MAKE_WV2_LIB UNICODE _UNICODE NOMINMAX
@@ -105,7 +73,7 @@ function(qcopilots_search_add_doc_dependency)
         VERSION 0.9.0 SOVERSION 0
         POSITION_INDEPENDENT_CODE ON)
     add_library(qcs::wv2 ALIAS qcs-native-wv2)
-    set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_DOC_RUNTIME_TARGETS qcs-native-wv2)
+    set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_DOC_RUNTIME_TARGETS "qcs-native-wv2;qcs-native-iconv")
     set_property(GLOBAL PROPERTY QCOPILOTS_SEARCH_DOC_SOURCE_DIR "${qcs_calligra_SOURCE_DIR}")
     install(FILES "${wv2_root}/COPYING.LIB"
         DESTINATION "${CMAKE_INSTALL_DATADIR}/qcs/licenses/wv2" COMPONENT qcs-runtime)

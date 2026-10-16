@@ -23,12 +23,18 @@ foreach(_helper selection loader)
   set_tests_properties(qcs-tests-backend-${_helper} PROPERTIES LABELS "unit;runtime;gpu" TIMEOUT 60)
 endforeach()
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+FetchContent_GetProperties(qcs_llama SOURCE_DIR _qcopilots_llama_source)
+qcopilots_search_add_test(NAME qcs-tests-source-integrity
+  COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/source_integrity_test.py"
+    --source "${_qcopilots_llama_source}" --cmake "${CMAKE_COMMAND}" --git "${GIT_EXECUTABLE}"
+    --generator "${CMAKE_GENERATOR}" --make-program "${CMAKE_MAKE_PROGRAM}")
+set_tests_properties(qcs-tests-source-integrity PROPERTIES LABELS "unit;runtime;workflow" TIMEOUT 300)
 qcopilots_search_add_test(NAME qcs-tests-gpu-configuration
   COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/gpu_configuration_test.py"
     --cmake "${CMAKE_COMMAND}" -v)
 set_tests_properties(qcs-tests-gpu-configuration PROPERTIES LABELS "unit;runtime;workflow;gpu" TIMEOUT 120)
 qcopilots_search_add_test(NAME qcs-tests-gpu-tools
-  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tools/qcs-gpu-tests.py" -v)
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-gpu-tests.py" -v)
 set_tests_properties(qcs-tests-gpu-tools PROPERTIES LABELS "unit;runtime;package;gpu" TIMEOUT 120)
 qcopilots_search_add_test(NAME qcs-tests-output-paths
   COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/output_paths_test.py"

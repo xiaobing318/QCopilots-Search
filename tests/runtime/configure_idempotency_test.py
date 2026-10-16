@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repeated configure must preserve unchanged native inputs and patch copies."""
+"""Repeated configure preserves native source bytes and validates pinned caches."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
 
 sys.dont_write_bytecode = True
@@ -68,38 +69,89 @@ class ConfigureIdempotencyTests(unittest.TestCase):
         self.assertNotEqual(snapshot(paths)[str(paths[0])], before[str(paths[0])])
         self.assertEqual(snapshot(paths)[str(paths[2])], before[str(paths[2])])
 
-    def test_pinned_git_preparation_preserves_all_cached_inputs(self):
+    def test_source_integrity_detects_changes_without_writing_upstream(self):
         self.assertIsNotNone(LIBGIT_SOURCE, "Pass the configured pinned libgit2 source directory")
         source_paths = [LIBGIT_SOURCE / name for name in (
             "src/util/fs_path.h", "src/util/fs_path.c", "src/util/win32/posix_w32.c",
             "include/git2/sys/config.h", "src/libgit2/CMakeLists.txt")]
         original = snapshot(source_paths)
-        # The preparation contract consumes these five pinned files. Keep this
-        # regression fast by copying only its actual inputs, not upstream tests.
         fixture_source = self.root / "pinned-source"
         for path in source_paths:
             destination = fixture_source / path.relative_to(LIBGIT_SOURCE)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
-        script = self.root / "prepare.cmake"
+        manifest = self.root / "metadata" / "source.manifest"
+        script = self.root / "verify.cmake"
         script.write_text(
-            f'include("{(SOURCE / "cmake/qcs-native-git-patch.cmake").as_posix()}")\n'
-            f'qcopilots_search_prepare_git_source("{fixture_source.as_posix()}" '
-            f'"{self.build.as_posix()}" prepared)\n'
-            f'file(WRITE "{(self.root / "prepared.txt").as_posix()}" "${{prepared}}")\n', encoding="utf-8")
+            f'include("{(SOURCE / "cmake/qcs-native-source-integrity.cmake").as_posix()}")\n'
+            f'if(NOT EXISTS "{manifest.as_posix()}")\n'
+            f'  qcopilots_search_source_manifest("{fixture_source.as_posix()}" content)\n'
+            f'  file(WRITE "{manifest.as_posix()}" "${{content}}")\nendif()\n'
+            f'qcopilots_search_verify_source("{fixture_source.as_posix()}" "{manifest.as_posix()}")\n',
+            encoding="utf-8")
         self.run_cmake("-P", script)
-        prepared = Path((self.root / "prepared.txt").read_text(encoding="utf-8"))
-        paths = [prepared / path.relative_to(LIBGIT_SOURCE) for path in source_paths]
-        paths.append(prepared / ".qcs-patch-complete")
-        patched_cmake = paths[-2].read_text(encoding="utf-8")
-        self.assertIn('qcopilots_search_write_if_different("${PROJECT_BINARY_DIR}/include/', patched_cmake)
-        self.assertNotIn('FILE(WRITE "${PROJECT_BINARY_DIR}/include/', patched_cmake)
-        for path in paths:
-            os.utime(path, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
-        before = snapshot(paths)
+        paths = [fixture_source / path.relative_to(LIBGIT_SOURCE) for path in source_paths]
+        before = snapshot(paths + [manifest])
         self.run_cmake("-P", script)
-        self.assertEqual(snapshot(paths), before)
+        self.assertEqual(snapshot(paths + [manifest]), before)
         self.assertEqual(snapshot(source_paths), original)
+        paths[0].write_bytes(paths[0].read_bytes() + b"\nmodified\n")
+        result = subprocess.run([CMAKE, "-P", str(script)], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differs from its pinned archive", result.stdout + result.stderr)
+        shutil.copy2(source_paths[0], paths[0])
+        (fixture_source / "unexpected.h").write_text("addition", encoding="utf-8")
+        result = subprocess.run([CMAKE, "-P", str(script)], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_fetch_uses_digest_cache_and_validates_overrides(self):
+        upstream = self.root / "archive-source"
+        upstream.mkdir()
+        (upstream / "file.h").write_text("pinned bytes\n", encoding="utf-8")
+        archive = self.root / "source.tar.gz"
+        with tarfile.open(archive, "w:gz") as handle:
+            handle.add(upstream, arcname="package")
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        cache = self.root / "cache"
+        old_cache = cache / "qcs_fixture-src"
+        old_cache.mkdir(parents=True)
+        (old_cache / "file.h").write_text("old patched content", encoding="utf-8")
+        # FetchContent can leave an empty source directory after a failed download.
+        (cache / f"qcs_fixture-{digest[:12]}-src").mkdir()
+        (self.source / "CMakeLists.txt").write_text(
+            'cmake_minimum_required(VERSION 3.28)\nproject(fetch_integrity NONE)\n'
+            f'list(PREPEND CMAKE_MODULE_PATH "{(SOURCE / "cmake").as_posix()}")\n'
+            f'set(Python3_EXECUTABLE "{Path(sys.executable).as_posix()}")\n'
+            f'set(FETCHCONTENT_BASE_DIR "{cache.as_posix()}")\n'
+            'include(qcs-native-deps)\n'
+            f'qcopilots_search_fetch(qcs_fixture "{archive.as_posix()}" "{digest}")\n'
+            'cmake_language(DEFER CALL qcopilots_search_finalize_native_source_records)\n'
+            f'qcopilots_search_fetch(qcs_late_fixture "{archive.as_posix()}" "{digest}")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/source.txt" "${qcs_fixture_SOURCE_DIR}")\n',
+            encoding="utf-8")
+        self.run_cmake("-S", self.source, "-B", self.build)
+        cached = Path((self.build / "source.txt").read_text(encoding="utf-8"))
+        self.assertEqual(cached.name, f"qcs_fixture-{digest[:12]}-src")
+        self.assertEqual((cached / "file.h").read_bytes(), (upstream / "file.h").read_bytes())
+        self.assertEqual([p.name for p in cached.iterdir()], ["file.h"])
+        records = (self.build / "nd/qcs-source-records.cmake").read_text(encoding="utf-8")
+        self.assertEqual(records.count("qcopilots_search_verify_source("), 2)
+        self.assertIn(f"qcs_late_fixture-{digest[:12]}-src", records)
+        before = snapshot([cached / "file.h"])
+        self.run_cmake("-S", self.source, "-B", self.build)
+        self.assertEqual(snapshot([cached / "file.h"]), before)
+        override = self.root / "override"
+        shutil.copytree(upstream, override)
+        override_option = f"-DFETCHCONTENT_SOURCE_DIR_QCS_FIXTURE={override.as_posix()}"
+        self.run_cmake("-S", self.source, "-B", self.build, override_option)
+        self.assertEqual(Path((self.build / "source.txt").read_text(encoding="utf-8")), override)
+        (override / "file.h").write_text("modified", encoding="utf-8")
+        result = subprocess.run([CMAKE, "-S", str(self.source), "-B", str(self.build), override_option],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differs from its pinned archive", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 #include "legacy_doc_extractor.h"
+#include "core/utf8_locale.h"
 
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QVector>
@@ -131,8 +133,22 @@ QString extract(const QString &path, QString *error, qsizetype maxCharacters,
         file.close();
 
         TextCollector collector(maxCharacters, cancelled);
-        // The pinned POLE port uses UTF-8 filesystem paths on every platform.
-        const QByteArray utf8Path = QFileInfo(path).absoluteFilePath().toUtf8();
+        // Upstream POLE opens narrow paths. Limit the Windows CRT adaptation to
+        // this thread and keep it alive until the parser closes every stream.
+        ScopedUtf8Locale utf8Locale;
+        if (!utf8Locale.isValid())
+            throw ExtractionError("Cannot initialize UTF-8 locale for DOC extraction");
+        QString absolutePath = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+#ifdef Q_OS_WIN
+        absolutePath = QDir::toNativeSeparators(absolutePath);
+        if (!absolutePath.startsWith(QStringLiteral("\\\\?\\"))) {
+            if (absolutePath.startsWith(QStringLiteral("\\\\")))
+                absolutePath = QStringLiteral("\\\\?\\UNC\\") + absolutePath.mid(2);
+            else
+                absolutePath.prepend(QStringLiteral("\\\\?\\"));
+        }
+#endif
+        const QByteArray utf8Path = absolutePath.toUtf8();
         auto parser = wvWare::ParserFactory::createParser(
             std::string(utf8Path.constData(), size_t(utf8Path.size())));
         if (!parser || !parser->isOk())

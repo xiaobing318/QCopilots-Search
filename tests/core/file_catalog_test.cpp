@@ -748,17 +748,18 @@ private slots:
     }
 
 #ifdef Q_OS_WIN
-    void gitIgnoreWorksInLongWindowsRepositoryWithoutChangingConfiguration()
+    void gitIgnoreWorksWithLongWindowsFilesWithoutChangingConfiguration()
     {
         TestEnvironment temporary("long-git-path");
         QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
-        QString root = temporary.path(QString::fromUtf8("中文 repository with spaces"));
-        for (int depth = 0; root.size() < 320; ++depth)
-            root = QDir(root).filePath(QStringLiteral("portable path component %1").arg(depth));
-        QVERIFY(root.size() >= 320);
+        const QString root = temporary.path(QString::fromUtf8("中文 repository with spaces"));
         QVERIFY(QDir().mkpath(root));
-        QVERIFY2(createRepository(root), git_error_last() ? git_error_last()->message : "Cannot create long-path repository fixture");
+        QVERIFY2(createRepository(root), git_error_last() ? git_error_last()->message : "Cannot create repository fixture");
         QVERIFY(writeFile(root + "/tracked.cpp"));
+        QString nested = root + QString::fromUtf8("/更深 nested directory");
+        for (int depth = 0; nested.size() < 320; ++depth)
+            nested = QDir(nested).filePath(QStringLiteral("portable path component %1").arg(depth));
+        QVERIFY(writeFile(nested + "/tracked-long.cpp"));
         {
             git_repository *rawRepository = nullptr;
             QCOMPARE(git_repository_open(&rawRepository, root.toUtf8().constData()), 0);
@@ -770,6 +771,7 @@ private slots:
             // explicit false value to prove the scanner's override is local.
             QCOMPARE(git_config_set_bool(config.get(), "core.longpaths", 1), 0);
             QVERIFY(trackFile(root, "tracked.cpp"));
+            QVERIFY(trackFile(root, QDir(root).relativeFilePath(nested + "/tracked-long.cpp").toUtf8()));
             QCOMPARE(git_config_set_bool(config.get(), "core.longpaths", 0), 0);
         }
         QVERIFY(writeFile(root + "/.gitignore", "tracked.cpp\nignored/\n*.generated.cpp\n"));
@@ -779,8 +781,8 @@ private slots:
         QVERIFY(writeFile(root + "/info-excluded.cpp"));
         QVERIFY(writeFile(root + "/new.cpp"));
         QVERIFY(writeFile(root + QString::fromUtf8("/中文 source.cpp")));
+        QVERIFY(writeFile(root + QString::fromUtf8("/emoji 🚀 source.cpp")));
         QVERIFY(writeFile(root + "/README.md"));
-        const QString nested = root + QString::fromUtf8("/更深 nested directory/") + QString(48, u'n');
         QVERIFY(writeFile(nested + "/.gitignore", "*.cpp\n!kept.cpp\n"));
         QVERIFY(writeFile(nested + "/hidden-nested.cpp"));
         QVERIFY(writeFile(nested + "/kept.cpp"));
@@ -792,7 +794,8 @@ private slots:
         QVERIFY(index.open(QIODevice::ReadOnly));
         const QByteArray originalIndex = index.readAll(); index.close();
         QVERIFY(!originalConfiguration.isEmpty()); QVERIFY(!originalIndex.isEmpty());
-        const QSet<QString> expected{"tracked.cpp", "new.cpp", QString::fromUtf8("中文 source.cpp"), "README.md", "kept.cpp"};
+        const QSet<QString> expected{"tracked.cpp", "tracked-long.cpp", "new.cpp",
+            QString::fromUtf8("中文 source.cpp"), QString::fromUtf8("emoji 🚀 source.cpp"), "README.md", "kept.cpp"};
         // Every scan opens its own repository, reads the longpaths override
         // during ignore evaluation, and destroys its configuration before it
         // returns. Repeat the full lifecycle to catch premature entry release.
@@ -811,11 +814,33 @@ private slots:
         }
         const auto subtree = FileCatalog::scan({{nested}, {}, true});
         QVERIFY2(subtree.errors.isEmpty(), qPrintable(subtree.errors.join('\n')));
-        QCOMPARE(fileNames(subtree), QSet<QString>{"kept.cpp"});
+        QCOMPARE(fileNames(subtree), QSet<QString>({"tracked-long.cpp", "kept.cpp"}));
         QVERIFY(configuration.open(QIODevice::ReadOnly));
         QCOMPARE(configuration.readAll(), originalConfiguration); configuration.close();
         QVERIFY(index.open(QIODevice::ReadOnly));
         QCOMPARE(index.readAll(), originalIndex); index.close();
+    }
+
+    void longWindowsRepositoryMetadataFailsClosed()
+    {
+        TestEnvironment temporary("long-git-metadata");
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString source = temporary.path("short-repository");
+        QVERIFY(createRepository(source));
+        QVERIFY(writeFile(source + "/source.cpp"));
+        QVERIFY(writeFile(source + "/.gitignore", "ignored.cpp\n"));
+        QVERIFY(writeFile(source + "/ignored.cpp"));
+        QString destination = temporary.path("deep");
+        for (int depth = 0; destination.size() < 320; ++depth)
+            destination = QDir(destination).filePath(QStringLiteral("metadata component %1").arg(depth));
+        QVERIFY(QDir().mkpath(QFileInfo(destination).absolutePath()));
+        QVERIFY(QDir().rename(source, destination));
+        QVERIFY(QFileInfo(destination + "/.git/config").isFile());
+        const auto result = FileCatalog::scan({{destination}, {}, true});
+        QVERIFY(result.files.isEmpty());
+        QCOMPARE(result.errors.size(), 1);
+        QVERIFY(result.errors.constFirst().contains("Git repository"));
+        QVERIFY(result.errors.constFirst().contains("upstream libgit2"));
     }
 #endif
 
@@ -823,10 +848,13 @@ private slots:
     {
         TestEnvironment temporary;
         QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        QVERIFY(createRepository(temporary.root()));
         QVERIFY(writeFile(temporary.root() + "/source.cpp"));
+        QVERIFY(writeFile(temporary.root() + "/.gitignore", "ignored.cpp\n"));
+        QVERIFY(writeFile(temporary.root() + "/ignored.cpp"));
         ScopedEnvironment path("PATH", temporary.root().toUtf8());
         const auto result = FileCatalog::scan({{temporary.root()}, {}, true});
-        QCOMPARE(result.files.size(), 1);
+        QCOMPARE(fileNames(result), QSet<QString>{"source.cpp"});
         QVERIFY(result.errors.isEmpty());
     }
 

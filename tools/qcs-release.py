@@ -25,9 +25,7 @@ sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parents[1]
 REPOSITORY = "xiaobing318/QCopilots-Search"
 MANIFEST = "qcs-release-manifest.json"
-SCHEMA = 2
-CPU_VARIANT = "windows-x64-cpu"
-CI_CPU_ORIGIN = "ci-origin.json"
+SCHEMA = 3
 # GitHub requires every completed release asset to be smaller than 2 GiB.
 MAX_ASSET_BYTES = 2 * 1024**3 - 1
 WORKFLOW_PATH = ".github/workflows/qcs-native.yml"
@@ -95,7 +93,7 @@ def external(path, source, inputs=()):
     for entry in inputs:
         entry = entry.resolve()
         if path == entry or path in entry.parents or entry in path.parents:
-            raise ValueError("Release output must not overlap its input evidence")
+            raise ValueError("Release output must not overlap its inputs")
     return path
 
 
@@ -105,15 +103,19 @@ def require_passed(result, label):
         raise ValueError(label + ": " + " | ".join(str(item) for item in errors))
 
 
-def identity_for(source, candidate, evidence):
+def identity_for(source, candidate):
+    """A release uses one clean source commit, independently of developer checks."""
     if not re.fullmatch(r"[0-9a-f]{40}", candidate):
         raise ValueError("The candidate must be a full immutable Git SHA")
     if source.resolve() != SOURCE.resolve():
-        raise ValueError("Run the release tool from the candidate's own source checkout")
-    identity = evidence.source_identity(source, candidate)
-    errors = evidence.valid_identity(identity)
-    if errors or identity["checkoutCommit"] != candidate:
-        raise ValueError("Release source must be the clean candidate checkout: " + " | ".join(errors))
+        raise ValueError("Run the release tool from the release source checkout")
+    def git(*arguments):
+        return subprocess.check_output(["git", "-C", str(source), *arguments], text=True, encoding="utf-8").strip()
+    identity = {"candidateHead": candidate, "checkoutCommit": git("rev-parse", "HEAD"),
+                "sourceTree": git("rev-parse", "HEAD^{tree}"),
+                "workingTreeModified": bool(git("status", "--porcelain", "--untracked-files=all"))}
+    if identity["checkoutCommit"] != candidate or identity["workingTreeModified"]:
+        raise ValueError("Release preparation and upload require the exact clean source commit")
     return identity
 
 
@@ -333,7 +335,7 @@ def build_sources(source, candidate, work, cache):
 
 
 def prepare(source, candidate, run_id, attempt, output, source_cache=None, api=None):
-    identity = identity_for(source, candidate, module("qcs-release-evidence"))
+    identity = identity_for(source, candidate)
     output = external(output, source)
     cache = external(source_cache or output.parent / "qcs-source-cache", source, (output,))
     if output.exists():
@@ -346,17 +348,18 @@ def prepare(source, candidate, run_id, attempt, output, source_cache=None, api=N
         work, assets = Path(temporary), []
         stage = work / "candidate"
         (stage / "assets").mkdir(parents=True)
-        (stage / "provenance/artifacts").mkdir(parents=True)
-        write_json(stage / "provenance/github.json", collected)
+        downloads = work / "downloads"
+        downloads.mkdir()
         version, packages = project_version(source), {}
         for configuration, selected in sorted(selection["selected"].items()):
-            artifact = stage / "provenance/artifacts" / f"{selected['artifactId']}.zip"
+            artifact = downloads / f"{selected['artifactId']}.zip"
             api.download_artifact(selected["artifactId"], artifact, selected["artifactDigest"],
                                   max_bytes=len(variants()[configuration]["generators"]) * MAX_ASSET_BYTES + 16 * 1024**2)
             if digest(artifact) != selected["artifactDigest"].removeprefix("sha256:"):
                 raise ValueError("Downloaded CI artifact SHA-256 differs from GitHub")
             expected = package_name_options(configuration, version, candidate, selected["sourceAttempt"])
             contents = inspect_packages(artifact, expected, stage / "assets")
+            artifact.unlink()
             packages[configuration] = {**selected, "packages": []}
             for name, metadata in sorted(contents.items()):
                 assets.append(record(stage, stage / "assets" / name, name=name, role="user-package", configuration=configuration))
@@ -370,13 +373,12 @@ def prepare(source, candidate, run_id, attempt, output, source_cache=None, api=N
         checksum = stage / "assets/SHA256SUMS"
         checksum.write_text("".join(f"{item['sha256']}  {item['name']}\n" for item in sorted(assets, key=lambda item: item["name"])), encoding="utf-8")
         assets.append(record(stage, checksum, name=checksum.name, role="checksums", configuration="all"))
-        if identity_for(source, candidate, module("qcs-release-evidence")) != identity:
+        if identity_for(source, candidate) != identity:
             raise ValueError("Source identity changed during release preparation")
-        document = {"schemaVersion": SCHEMA, "kind": "release-freeze", "repository": REPOSITORY,
+        document = {"schemaVersion": SCHEMA, "kind": "release", "repository": REPOSITORY,
                     "identity": identity, "createdAtUtc": datetime.now(timezone.utc).isoformat(),
                     "runId": str(run_id), "requestedAttempt": attempt, "version": version,
                     "configurations": packages, "assets": assets,
-                    "files": [record(stage, path) for path in sorted(stage.rglob("*")) if path.is_file()],
                     "published": False, "draftOnly": True}
         write_json(stage / MANIFEST, document)
         verify_freeze(stage / MANIFEST, source)
@@ -384,62 +386,64 @@ def prepare(source, candidate, run_id, attempt, output, source_cache=None, api=N
     return output / MANIFEST
 
 
+def release_selection(document):
+    """Recover the compact immutable CI selections recorded during preparation."""
+    configurations = document["configurations"]
+    if set(configurations) != set(variants()):
+        raise ValueError("Release does not contain the complete configuration inventory")
+    return {name: {key: value for key, value in selected.items() if key != "packages"}
+            for name, selected in configurations.items()}
+
+
 def verify_freeze(manifest_path, source):
-    evidence = module("qcs-release-evidence")
     root = manifest_path.parent.resolve()
     if manifest_path.name != MANIFEST:
-        raise ValueError("Unexpected release freeze manifest filename")
+        raise ValueError("Unexpected release manifest filename")
     document = read_json(safe_file(root, manifest_path.name))
-    if (document.get("schemaVersion") != SCHEMA or document.get("kind") != "release-freeze"
+    if (document.get("schemaVersion") != SCHEMA or document.get("kind") != "release"
             or document.get("repository") != REPOSITORY or document.get("draftOnly") is not True
             or document.get("published") is not False):
-        raise ValueError("Unsupported or non-draft release freeze manifest")
+        raise ValueError("Unsupported or non-draft release manifest")
     identity = document["identity"]
     candidate = identity["candidateHead"]
-    if identity_for(source, candidate, evidence) != identity or document["version"] != project_version(source):
-        raise ValueError("Frozen release source differs from the current candidate")
-    records = document["files"]
-    if not records or len({item["path"].casefold() for item in records}) != len(records):
-        raise ValueError("Frozen release files are missing or duplicated")
-    files = {item["path"]: item for item in records}
-    actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
-    if actual != set(files) | {MANIFEST}:
-        raise ValueError("Frozen release contains missing or extra files")
-    for relative, item in files.items():
-        path = safe_file(root, relative)
-        if item["bytes"] != path.stat().st_size or item["sha256"] != digest(path):
-            raise ValueError("Frozen release content changed: " + relative)
-    collected = read_json(safe_file(root, "provenance/github.json"))
+    if identity_for(source, candidate) != identity or document["version"] != project_version(source):
+        raise ValueError("Release source differs from the current clean commit")
     run_id, attempt = document["runId"], document["requestedAttempt"]
-    validate_context(collected["context"], candidate, run_id, attempt)
-    selected = selector_module().select(REPOSITORY, run_id, candidate, attempt, collected["jobs"], collected["artifacts"])
-    require_passed(selected, "Frozen CI package selection failed")
-    if selected != collected["selection"] or set(selected["selected"]) != set(variants()):
-        raise ValueError("Frozen CI selection differs from its complete execution history")
-    expected_assets, packages = {}, {}
-    provenance = {"provenance/github.json"}
-    for configuration, selected_artifact in sorted(selected["selected"].items()):
-        relative = f"provenance/artifacts/{selected_artifact['artifactId']}.zip"
-        provenance.add(relative)
-        artifact = safe_file(root, relative)
-        if digest(artifact) != selected_artifact["artifactDigest"].removeprefix("sha256:"):
-            raise ValueError("Frozen CI artifact SHA-256 differs from GitHub")
-        contents = inspect_packages(artifact, package_name_options(configuration, document["version"], candidate, selected_artifact["sourceAttempt"]))
-        packages[configuration] = {**selected_artifact, "packages": []}
-        for name, metadata in sorted(contents.items()):
-            expected_assets[name] = {**metadata, "role": "user-package", "configuration": configuration}
-            packages[configuration]["packages"].append({"filename": name, **metadata})
-    if packages != document["configurations"]:
-        raise ValueError("Frozen package identities differ from their CI artifacts")
+    selector_module().arguments(REPOSITORY, run_id, candidate, attempt)
+    selected = release_selection(document)
+    expected_assets = {}
+    artifact_ids = set()
+    for configuration, selection in sorted(selected.items()):
+        if set(selection) != {"sourceAttempt", "sourceJobId", "observedJobId", "artifactId", "artifactName", "artifactDigest"}:
+            raise ValueError("Release CI selection fields are incomplete or unexpected")
+        for key in ("sourceAttempt", "sourceJobId", "observedJobId", "artifactId"):
+            positive_id(selection[key])
+        if (selection["sourceAttempt"] > attempt or selection["artifactId"] in artifact_ids
+                or selection["artifactName"] != selector_module().artifact_name(configuration, candidate, selection["sourceAttempt"])
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", selection["artifactDigest"])):
+            raise ValueError("Release CI artifact identity is invalid or duplicated")
+        artifact_ids.add(selection["artifactId"])
+        packages = document["configurations"][configuration]["packages"]
+        names = [item["filename"] for item in packages]
+        if (len(names) != len(set(names))
+                or set(names) not in package_name_options(configuration, document["version"], candidate, selection["sourceAttempt"])):
+            raise ValueError("Release configuration has missing, extra or duplicate packages")
+        for item in packages:
+            if set(item) != {"filename", "bytes", "sha256"} or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]):
+                raise ValueError("Release package metadata is invalid")
+            expected_assets[item["filename"]] = {"bytes": item["bytes"], "sha256": item["sha256"],
+                                                  "role": "user-package", "configuration": configuration}
     source_name = f"qcs-source-materials-{candidate[:12]}.zip"
     source_bundle = safe_file(root, "assets/" + source_name)
     validate_sources(source_bundle, identity, source)
-    expected_assets[source_name] = {"bytes": source_bundle.stat().st_size, "sha256": digest(source_bundle), "role": "sources", "configuration": "all"}
+    expected_assets[source_name] = {"bytes": source_bundle.stat().st_size, "sha256": digest(source_bundle),
+                                   "role": "sources", "configuration": "all"}
     expected_checksums = "".join(f"{item['sha256']}  {name}\n" for name, item in sorted(expected_assets.items()))
     checksum = safe_file(root, "assets/SHA256SUMS")
     if checksum.read_text(encoding="utf-8") != expected_checksums:
-        raise ValueError("Release checksums differ from the accepted upload bytes")
-    expected_assets[checksum.name] = {"bytes": checksum.stat().st_size, "sha256": digest(checksum), "role": "checksums", "configuration": "all"}
+        raise ValueError("Release checksums differ from the prepared package bytes")
+    expected_assets[checksum.name] = {"bytes": checksum.stat().st_size, "sha256": digest(checksum),
+                                    "role": "checksums", "configuration": "all"}
     assets = document["assets"]
     if len(assets) != len(expected_assets) or len({item["name"].casefold() for item in assets}) != len(assets):
         raise ValueError("Release assets are missing, duplicated or extra")
@@ -447,148 +451,23 @@ def verify_freeze(manifest_path, source):
         name = item["name"]
         require_asset_size(item["bytes"], name)
         expected = {"path": "assets/" + name, "name": name, **expected_assets.get(name, {})}
-        if item != expected or any(item[key] != files.get(item["path"], {}).get(key) for key in ("bytes", "sha256")):
-            raise ValueError("Release asset differs from its accepted source or CI provenance")
-    if set(files) != provenance | {"assets/" + name for name in expected_assets}:
-        raise ValueError("Frozen release contains unexpected provenance or assets")
-    return document
-
-
-def verify_frozen_cpu_package(manifest_path: Path, source: Path) -> dict:
-    """Resolve the portable CPU package only after verifying the complete freeze."""
-    document = verify_freeze(manifest_path, source)
-    root = manifest_path.parent.resolve()
-    configuration = document["configurations"][CPU_VARIANT]
-    selected = {key: value for key, value in configuration.items() if key != "packages"}
-    packages = [item for item in configuration["packages"] if item["filename"].endswith(".zip")]
-    if len(packages) != 1:
-        raise ValueError("The frozen Windows CPU configuration needs exactly one portable ZIP")
-    package = packages[0]
-    artifact = safe_file(root, f"provenance/artifacts/{selected['artifactId']}.zip")
-    github = safe_file(root, "provenance/github.json")
-    return {"identity": document["identity"], "version": document["version"],
-            "runId": document["runId"], "requestedAttempt": document["requestedAttempt"],
-            "variant": CPU_VARIANT, "selected": selected,
-            "package": {"path": safe_file(root, "assets/" + package["filename"]), **package},
-            "githubSnapshot": {"path": github, "bytes": github.stat().st_size, "sha256": digest(github)},
-            "artifact": {"path": artifact, "bytes": artifact.stat().st_size,
-                         "sha256": digest(artifact), "digest": selected["artifactDigest"]}}
-
-
-def verify_ci_origin_tree(root, files):
-    """A portable origin is a closed, ordinary tree, including empty directories."""
-    root = root.expanduser().absolute()
-    for path in (root, *root.parents):
-        if redirected(path):
-            raise ValueError("CI origin cannot use links or junctions")
-    if not root.is_dir():
-        raise ValueError("CI origin root must be an ordinary directory")
-    directories = {str(parent) for name in files for parent in PurePosixPath(name).parents
-                   if str(parent) != "."}
+        if item != expected:
+            raise ValueError("Release asset differs from the prepared package metadata")
+        path = safe_file(root, item["path"])
+        if item["bytes"] != path.stat().st_size or item["sha256"] != digest(path):
+            raise ValueError("Release content changed: " + item["path"])
     actual = set()
-    for current, children, names in os.walk(root, followlinks=False):
-        for name in [*children, *names]:
-            path = Path(current) / name
-            relative = path.relative_to(root).as_posix()
-            if redirected(path):
-                raise ValueError("CI origin cannot use links or junctions")
-            if path.is_dir():
-                if relative not in directories:
-                    raise ValueError("CI origin contains unexpected directories")
-            elif path.is_file() and stat.S_ISREG(path.stat().st_mode):
-                actual.add(relative)
-            else:
-                raise ValueError("CI origin contains a non-ordinary file")
-    if actual != files:
-        raise ValueError("CI origin contains missing or extra files")
-    return root.resolve()
-
-
-def verify_ci_origin_record(root, entry, expected_path, extra=()):
-    if not isinstance(entry, dict) or set(entry) != {"path", "bytes", "sha256", *extra}:
-        raise ValueError("CI origin file record is invalid")
-    if (entry["path"] != expected_path or type(entry["bytes"]) is not int or entry["bytes"] <= 0
-            or not isinstance(entry["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])):
-        raise ValueError("CI origin file identity or path is invalid")
-    path = safe_file(root, expected_path)
-    if entry["bytes"] != path.stat().st_size or entry["sha256"] != digest(path):
-        raise ValueError("CI origin file bytes changed: " + expected_path)
-    return path
-
-
-def verify_ci_cpu_origin(root: Path, doc: dict, source: Path) -> dict:
-    """Validate the closed CPU origin tree and replay the complete frozen CI selection offline."""
-    try:
-        return _verify_ci_cpu_origin(root, doc, source)
-    except (KeyError, TypeError, AttributeError, zipfile.BadZipFile) as error:
-        raise ValueError("Malformed CI CPU package origin: " + str(error)) from error
-
-
-def _verify_ci_cpu_origin(root: Path, doc: dict, source: Path) -> dict:
-    """Replay all CI metadata offline while retaining only the CPU artifact bytes.
-
-    The dedicated root contains ci-origin.json, github.json, artifacts/<id>.zip
-    and package/<portable filename>. This proves the selected CI package origin,
-    independently from local build execution and Computer Use evidence.
-    """
-    keys = {"schemaVersion", "kind", "repository", "identity", "version", "runId", "requestedAttempt",
-            "variant", "selected", "githubSnapshot", "artifact", "package"}
-    if (not isinstance(doc, dict) or set(doc) != keys or type(doc["schemaVersion"]) is not int
-            or doc["schemaVersion"] != 1 or doc["kind"] != "ci-cpu-package-origin"
-            or doc["repository"] != REPOSITORY or doc["variant"] != CPU_VARIANT):
-        raise ValueError("Unsupported CI CPU package origin")
-    evidence = module("qcs-release-evidence")
-    identity = doc["identity"]
-    errors = evidence.valid_identity(identity)
-    if errors or identity["candidateHead"] != identity["checkoutCommit"]:
-        raise ValueError("CI CPU origin needs one clean immutable candidate")
-    candidate = identity["candidateHead"]
-    if identity_for(source, candidate, evidence) != identity or doc["version"] != project_version(source):
-        raise ValueError("CI CPU origin differs from the current clean candidate")
-    selector = selector_module()
-    selector.arguments(REPOSITORY, doc["runId"], candidate, doc["requestedAttempt"])
-    selected = doc["selected"]
-    if (not isinstance(selected, dict) or set(selected) != {"sourceAttempt", "sourceJobId", "observedJobId",
-                                                          "artifactId", "artifactName", "artifactDigest"}):
-        raise ValueError("CI CPU origin selected configuration is invalid")
-    for key in ("sourceAttempt", "sourceJobId", "observedJobId", "artifactId"):
-        positive_id(selected[key])
-    if (not isinstance(selected["artifactName"], str) or not isinstance(selected["artifactDigest"], str)
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", selected["artifactDigest"])):
-        raise ValueError("CI CPU origin selected artifact identity is invalid")
-    artifact_id = positive_id(selected.get("artifactId"))
-    expected_names = package_names(CPU_VARIANT, doc["version"], candidate, selected.get("sourceAttempt"))
-    package_name = next(name for name in expected_names if name.endswith(".zip"))
-    github_relative, artifact_relative = "github.json", f"artifacts/{artifact_id}.zip"
-    package_relative = "package/" + package_name
-    root = verify_ci_origin_tree(root, {CI_CPU_ORIGIN, github_relative, artifact_relative, package_relative})
-    if read_json(safe_file(root, CI_CPU_ORIGIN)) != doc:
-        raise ValueError("CI CPU origin document differs from its saved bytes")
-    github = verify_ci_origin_record(root, doc["githubSnapshot"], github_relative)
-    collected = read_json(github)
-    validate_context(collected["context"], candidate, doc["runId"], doc["requestedAttempt"])
-    selection = selector.select(REPOSITORY, doc["runId"], candidate, doc["requestedAttempt"],
-                                collected["jobs"], collected["artifacts"])
-    require_passed(selection, "CI CPU origin package selection failed")
-    if (selection != collected["selection"] or set(selection["selected"]) != set(variants())
-            or selected != selection["selected"][CPU_VARIANT]):
-        raise ValueError("CI CPU origin selection differs from its complete execution history")
-    artifact = verify_ci_origin_record(root, doc["artifact"], artifact_relative, ("digest",))
-    if (doc["artifact"]["digest"] != selected["artifactDigest"]
-            or doc["artifact"]["sha256"] != selected["artifactDigest"].removeprefix("sha256:")):
-        raise ValueError("CI CPU origin artifact digest differs from GitHub")
-    packages = inspect_packages(artifact, expected_names)
-    package = verify_ci_origin_record(root, doc["package"], package_relative, ("filename",))
-    if (doc["package"]["filename"] != package_name
-            or {key: doc["package"][key] for key in ("bytes", "sha256")} != packages[package_name]):
-        raise ValueError("CI CPU portable ZIP differs from its original artifact member")
-    if identity_for(source, candidate, evidence) != identity:
-        raise ValueError("Source identity changed during CI CPU origin verification")
-    return {"identity": identity, "version": doc["version"], "runId": doc["runId"],
-            "requestedAttempt": doc["requestedAttempt"], "variant": CPU_VARIANT, "selected": selected,
-            "package": {**doc["package"], "path": package},
-            "githubSnapshot": {**doc["githubSnapshot"], "path": github},
-            "artifact": {**doc["artifact"], "path": artifact}}
+    for path in root.rglob("*"):
+        if redirected(path):
+            raise ValueError("Release paths cannot use links or junctions")
+        relative = path.relative_to(root).as_posix()
+        if path.is_file():
+            actual.add(relative)
+        elif not path.is_dir() or relative != "assets":
+            raise ValueError("Release contains an unexpected directory or file type")
+    if actual != {MANIFEST} | {"assets/" + name for name in expected_assets}:
+        raise ValueError("Release contains missing or extra files")
+    return document
 
 
 class ApiError(RuntimeError):
@@ -799,6 +678,25 @@ def check_remote_asset(api, remote, expected):
         raise ValueError(f"Remote asset differs from the frozen release: {expected['name']}. No asset was overwritten")
 
 
+def verify_ci_packages(api, document, temporary_parent):
+    """Bind upload bytes to current CI artifacts without retaining duplicate archives."""
+    candidate = document["identity"]["candidateHead"]
+    with tempfile.TemporaryDirectory(prefix=".qcs-release-validation-", dir=temporary_parent) as temporary:
+        for configuration, selected in sorted(release_selection(document).items()):
+            artifact = Path(temporary) / f"{selected['artifactId']}.zip"
+            api.download_artifact(selected["artifactId"], artifact, selected["artifactDigest"],
+                                  max_bytes=len(variants()[configuration]["generators"]) * MAX_ASSET_BYTES + 16 * 1024**2)
+            if digest(artifact) != selected["artifactDigest"].removeprefix("sha256:"):
+                raise ValueError("Downloaded CI artifact SHA-256 differs from GitHub")
+            contents = inspect_packages(artifact, package_name_options(configuration, document["version"],
+                                                                        candidate, selected["sourceAttempt"]))
+            expected = {item["filename"]: {key: item[key] for key in ("bytes", "sha256")}
+                        for item in document["configurations"][configuration]["packages"]}
+            if contents != expected:
+                raise ValueError("Release package bytes differ from the selected CI artifact: " + configuration)
+            artifact.unlink()
+
+
 def upload_draft(manifest_path, source, tag, title=None, api=None):
     document = verify_freeze(manifest_path, source)
     root, candidate = manifest_path.parent.resolve(), document["identity"]["candidateHead"]
@@ -819,9 +717,9 @@ def upload_draft(manifest_path, source, tag, title=None, api=None):
     if api.request("GET", prefix + "/commits/" + candidate).get("sha") != candidate:
         raise ValueError("The immutable candidate commit is not present in the authorized remote repository")
     current = collect_ci(api, candidate, document["runId"], document["requestedAttempt"])
-    frozen = read_json(safe_file(root, "provenance/github.json"))
-    if current["selection"] != frozen["selection"]:
+    if current["selection"]["selected"] != release_selection(document):
         raise ValueError("Remote CI execution or artifact identity changed after release preparation")
+    verify_ci_packages(api, document, root.parent)
     validate_tag(api, tag, candidate)
     releases = [release for release in paginated(api, prefix + "/releases") if release.get("tag_name") == tag]
     if len(releases) > 1:
@@ -831,7 +729,7 @@ def upload_draft(manifest_path, source, tag, title=None, api=None):
     else:
         release = api.request("POST", prefix + "/releases", {"tag_name": tag, "target_commitish": candidate,
             "name": title or tag, "draft": True, "prerelease": False, "generate_release_notes": False,
-            "body": f"QCopilots Search 候选 {candidate}\n\n冻结清单 SHA-256: {manifest_hash}\n\n此记录仅为未公开的草稿。安装包、对应源码、冻结清单和校验和随资产保存。"})
+            "body": f"QCopilots Search 提交 {candidate}\n\n发布清单 SHA-256: {manifest_hash}\n\n此记录仅为未公开的草稿。安装包、对应源码、发布清单和校验和随资产保存。"})
     release_id = validate_draft(release, tag, candidate)
     def remote_assets():
         rows = paginated(api, prefix + f"/releases/{release_id}/assets")
@@ -863,7 +761,7 @@ def upload_draft(manifest_path, source, tag, title=None, api=None):
     validate_tag(api, tag, candidate)
     if digest(manifest_path) != manifest_hash:
         raise ValueError("Freeze manifest changed during upload")
-    if identity_for(source, candidate, module("qcs-release-evidence")) != document["identity"]:
+    if identity_for(source, candidate) != document["identity"]:
         raise ValueError("Source changed while uploading the frozen candidate")
     return {"schemaVersion": 1, "repository": REPOSITORY, "repositoryId": repository["id"], "releaseId": release_id,
             "candidateCommit": candidate, "tag": tag, "draft": True, "published": False,
