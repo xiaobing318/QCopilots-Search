@@ -89,13 +89,15 @@ qcopilots_search_add_test(NAME qcs-tests-test-policy
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-policy-tests.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-check
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-check.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-gpu-check
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-gpu-check.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-artifact-selection
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-tests-artifact-selection.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-source-bundle
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-source-bundle.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-package-verification
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-package-verification.py" -v)
-set_tests_properties(qcs-tests-native-ci qcs-tests-deb-ci qcs-tests-test-policy qcs-tests-check
+set_tests_properties(qcs-tests-native-ci qcs-tests-deb-ci qcs-tests-test-policy qcs-tests-check qcs-tests-gpu-check
   qcs-tests-artifact-selection qcs-tests-source-bundle qcs-tests-package-verification
   PROPERTIES LABELS "unit;tooling" TIMEOUT 240)
 

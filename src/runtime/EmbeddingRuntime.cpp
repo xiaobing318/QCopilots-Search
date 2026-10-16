@@ -12,6 +12,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QThread>
 #include <llama.h>
 #include <mtmd.h>
@@ -159,11 +160,15 @@ RuntimeDevices enumerateDevices() {
         const auto device = ggml_backend_dev_get(index);
         const auto type = ggml_backend_dev_type(device);
         const auto registry = ggml_backend_dev_backend_reg(device);
+        ggml_backend_dev_props properties{};
+        ggml_backend_dev_get_props(device, &properties);
         result.handles.append(device);
         result.descriptions.append({detail::canonicalBackendName(QString::fromUtf8(ggml_backend_reg_name(registry))),
             QString::fromUtf8(ggml_backend_dev_name(device)), QString::fromUtf8(ggml_backend_dev_description(device)),
             type == GGML_BACKEND_DEVICE_TYPE_CPU,
-            type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU});
+            type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU,
+            {}, QString::fromUtf8(properties.device_id ? properties.device_id : ""),
+            quint64(properties.memory_total), quint64(properties.memory_free)});
     }
     return result;
 }
@@ -202,6 +207,32 @@ void checkMetalCapabilities(RuntimeDevices& devices) {
             device.unavailableReason = QStringLiteral("metal GPU device %1 does not support required %2x%2 F32 matrix multiplication.")
                 .arg(device.name).arg(GpuSelfTestGraph::Side);
     }
+}
+
+std::recursive_mutex& initializationMutex() {
+    static std::recursive_mutex mutex;
+    return mutex;
+}
+
+RuntimeDevices initializeDevices(detail::BackendMode mode, QString* loadError) {
+    // ggml's registry is process-wide. Discovery and model initialization share
+    // the same lock and once flags so a concurrent CPU runtime sees a snapshot.
+    const std::lock_guard initializationLock(initializationMutex());
+    static std::once_flag backend;
+    std::call_once(backend, [] {
+        llama_log_set(&logCallback, nullptr);
+        mtmd_helper_log_set(&logCallback, nullptr);
+        initializeBackend();
+    });
+    static std::once_flag gpuBackend;
+    static QString gpuLoadError;
+    if (mode != detail::BackendMode::Cpu)
+        std::call_once(gpuBackend, [] { gpuLoadError = initializeGpuBackend(); });
+    *loadError = mode == detail::BackendMode::Cpu ? QString{} : gpuLoadError;
+    auto devices = enumerateDevices();
+    if (mode != detail::BackendMode::Cpu && gpuLoadError.isEmpty() && packagedBackend() == QStringLiteral("metal"))
+        checkMetalCapabilities(devices);
+    return devices;
 }
 
 void verifyGpuComputation(ggml_backend_dev_t device) {
@@ -277,10 +308,12 @@ public:
     bool textOnly = true;
     QString error;
     QString requestedMode = qEnvironmentVariable("QCOPILOTS_SEARCH_BACKEND", QStringLiteral("auto"));
+    std::optional<detail::BackendDeviceSelector> deviceSelector;
     detail::BackendSelection selection;
     detail::BackendDevice selectedDevice;
     bool gpuSelfTestPassed = false;
     bool textWarmupCompleted = false;
+    bool deviceFailure = false;
     int threads = threadCount();
     std::function<bool()> cancelled;
     static bool abortCallback(void* data) {
@@ -290,6 +323,10 @@ public:
     static bool loadProgress(float, void* data) { return !abortCallback(data); }
     void checkCancellation() {
         if (abortCallback(this)) throw std::runtime_error("Embedding cancelled");
+    }
+    [[noreturn]] void computationFailed(const std::string& message) {
+        deviceFailure = selection.gpu && !abortCallback(this);
+        throw std::runtime_error(message);
     }
 
     void reset() {
@@ -392,15 +429,15 @@ public:
         checkCancellation();
         const int status = llama_process(context, LLAMA_PROCESS_TYPE_ENCODE, batch);
         checkCancellation();
-        if (status != 0) throw std::runtime_error("llama_process failed: " + std::to_string(status));
+        if (status != 0) computationFailed("llama_process failed: " + std::to_string(status));
         const float* pooled = llama_get_embeddings_seq(context, 0);
-        if (!pooled) throw std::runtime_error("Model returned no pooled embedding");
+        if (!pooled) computationFailed("Model returned no pooled embedding");
         double square = 0;
         for (int i = 0; i < outputSize; ++i) {
-            if (!std::isfinite(pooled[i])) throw std::runtime_error("Model returned a non-finite embedding");
+            if (!std::isfinite(pooled[i])) computationFailed("Model returned a non-finite embedding");
             square += double(pooled[i]) * double(pooled[i]);
         }
-        if (!(square > 0)) throw std::runtime_error("Model returned a zero embedding");
+        if (!(square > 0)) computationFailed("Model returned a zero embedding");
         const float scale = float(1.0 / std::sqrt(square));
         QVector<float> result(outputSize);
         for (int i = 0; i < outputSize; ++i) result[i] = pooled[i] * scale;
@@ -488,7 +525,7 @@ public:
                 const auto* ids = mtmd_input_chunk_get_tokens_text(chunk, &count);
                 for (size_t i = 0; ids && i < count; ++i) token(ids[i]);
             } else {
-                if (mtmd_encode_chunk(media, chunk) != 0) throw std::runtime_error("Media encoder failed");
+                if (mtmd_encode_chunk(media, chunk) != 0) computationFailed("Media encoder failed");
                 checkCancellation();
                 rows(mtmd_get_output_embd(media), mtmd_input_chunk_get_n_tokens(chunk));
             }
@@ -498,6 +535,7 @@ public:
 
     template<class F> QVector<float> guarded(F&& fn, QString* out) {
         error.clear();
+        deviceFailure = false;
         if (out) out->clear();
         reset();
         try {
@@ -531,13 +569,86 @@ bool EmbeddingRuntime::setBackendMode(const QString& mode, QString* error) {
     d->requestedMode = detail::backendModeName(*parsed);
     return true;
 }
+bool EmbeddingRuntime::setDevice(const QJsonObject& selector, QString* error) {
+    if (error) error->clear();
+    if (isLoaded()) {
+        if (error) *error = QStringLiteral("Close the embedding runtime before changing its device binding.");
+        return false;
+    }
+    if (selector.isEmpty()) {
+        d->deviceSelector.reset();
+        return true;
+    }
+    for (auto item = selector.begin(); item != selector.end(); ++item) {
+        if ((item.key() != QStringLiteral("backend") && item.key() != QStringLiteral("deviceId")
+                && item.key() != QStringLiteral("name")) || !item.value().isString()) {
+            if (error) *error = QStringLiteral("Device selection accepts only string backend, deviceId and name fields.");
+            return false;
+        }
+    }
+    detail::BackendDeviceSelector parsed{detail::canonicalBackendName(selector.value(QStringLiteral("backend")).toString()),
+        selector.value(QStringLiteral("deviceId")).toString(), selector.value(QStringLiteral("name")).toString()};
+    const auto& backend = parsed.backend;
+    if ((backend != QStringLiteral("cpu") && backend != QStringLiteral("cuda") && backend != QStringLiteral("hip")
+         && backend != QStringLiteral("vulkan") && backend != QStringLiteral("metal"))
+        || (parsed.deviceId.isEmpty() && parsed.name.isEmpty())) {
+        if (error) *error = QStringLiteral("Device selection requires a supported backend and a hardware ID or unique name.");
+        return false;
+    }
+    d->deviceSelector = std::move(parsed);
+    return true;
+}
+QJsonObject EmbeddingRuntime::discoverDevices(const QString& requestedMode, QString* error) {
+    if (error) error->clear();
+    const auto mode = detail::parseBackendMode(requestedMode, error);
+    if (!mode) return {};
+    try {
+        QString loadError;
+        const auto snapshot = initializeDevices(*mode, &loadError);
+        const auto installation = detail::selectBackend(detail::BackendMode::Cpu, packagedBackend(), snapshot.descriptions);
+        if (!installation.error.isEmpty()) throw std::runtime_error(installation.error.toStdString());
+        const auto compatible = detail::compatibleGpuDevices(packagedBackend(), snapshot.descriptions);
+        QJsonArray devices;
+        for (qsizetype index = 0; index < snapshot.descriptions.size(); ++index) {
+            const auto& device = snapshot.descriptions[index];
+            if (!device.cpu && (!device.gpu || device.backend != packagedBackend()
+                || *mode == detail::BackendMode::Cpu)) continue;
+            QString reason = device.unavailableReason;
+            if (device.gpu && !loadError.isEmpty()) reason = loadError;
+            if (reason.isEmpty()) reason = detail::deviceIdentityError(device, snapshot.descriptions);
+            if (reason.isEmpty() && device.backend == QStringLiteral("metal") && device.name.isEmpty())
+                reason = QStringLiteral("No physical Metal device is available.");
+            const bool available = reason.isEmpty() && (device.cpu || compatible.contains(int(index)));
+            devices.append(QJsonObject{{QStringLiteral("backend"), device.backend},
+                {QStringLiteral("deviceId"), device.deviceId}, {QStringLiteral("name"), device.name},
+                {QStringLiteral("description"), device.description}, {QStringLiteral("cpu"), device.cpu},
+                {QStringLiteral("gpu"), device.gpu}, {QStringLiteral("memoryTotal"), double(device.memoryTotal)},
+                {QStringLiteral("memoryFree"), double(device.memoryFree)}, {QStringLiteral("available"), available},
+                {QStringLiteral("unavailableReason"), reason}});
+        }
+        return {{QStringLiteral("packagedBackend"), packagedBackend()},
+            {QStringLiteral("requestedMode"), detail::backendModeName(*mode)},
+            {QStringLiteral("gpuLoadError"), loadError}, {QStringLiteral("devices"), devices}};
+    } catch (const std::exception& failure) {
+        if (error) *error = QString::fromUtf8(failure.what());
+        return {};
+    }
+}
 QJsonObject EmbeddingRuntime::diagnostics() const {
+    QJsonObject requestedDevice;
+    if (d->deviceSelector)
+        requestedDevice = {{QStringLiteral("backend"), d->deviceSelector->backend},
+            {QStringLiteral("deviceId"), d->deviceSelector->deviceId}, {QStringLiteral("name"), d->deviceSelector->name}};
     return {{QStringLiteral("buildVariant"), QString::fromLatin1(QCOPILOTS_SEARCH_BUILD_VARIANT)},
             {QStringLiteral("requestedBackend"), d->requestedMode},
             {QStringLiteral("packagedBackend"), packagedBackend()},
             {QStringLiteral("selectedBackend"), d->selection.backend},
             {QStringLiteral("deviceName"), d->selectedDevice.name},
             {QStringLiteral("deviceDescription"), d->selectedDevice.description},
+            {QStringLiteral("deviceId"), d->selectedDevice.deviceId},
+            {QStringLiteral("requestedDevice"), requestedDevice},
+            {QStringLiteral("deviceBindingExplicit"), d->deviceSelector.has_value()},
+            {QStringLiteral("deviceFailure"), d->deviceFailure},
             {QStringLiteral("gpuSelected"), d->selection.gpu},
             {QStringLiteral("gpuSelfTestPassed"), d->gpuSelfTestPassed},
             {QStringLiteral("fallbackReason"), d->selection.fallbackReason},
@@ -578,41 +689,35 @@ bool EmbeddingRuntime::load(const QString& modelDir, bool textOnly, QString* err
     close(); d->error.clear(); d->textOnly = textOnly;
     d->selection = {}; d->selectedDevice = {};
     d->gpuSelfTestPassed = false;
+    d->deviceFailure = false;
     if (error) error->clear();
     const auto mode = detail::parseBackendMode(d->requestedMode, &d->error);
     if (!mode) { if (error) *error = d->error; return false; }
     d->requestedMode = detail::backendModeName(*mode);
     if (!verifyModels(modelDir, textOnly, &d->error)) { if (error) *error = d->error; return false; }
     try {
-        // ggml's process-wide registry is mutable while a GPU module loads.
-        // Serialize initialization so a CPU instance cannot enumerate it midway.
-        static std::mutex initializationMutex;
-        const std::lock_guard initializationLock(initializationMutex);
-        static std::once_flag backend;
-        std::call_once(backend, [] {
-            llama_log_set(&logCallback, nullptr);
-            mtmd_helper_log_set(&logCallback, nullptr);
-            initializeBackend();
-        });
-        static std::once_flag gpuBackend;
-        static QString gpuLoadError;
-        if (*mode != detail::BackendMode::Cpu)
-            std::call_once(gpuBackend, [] { gpuLoadError = initializeGpuBackend(); });
-        auto devices = enumerateDevices();
-        auto selection = detail::selectBackend(*mode, packagedBackend(), devices.descriptions, gpuLoadError);
-        // Preserve CPU mode and CPU/loader errors without probing GPU devices.
-        if (selection.gpu && packagedBackend() == QStringLiteral("metal")) {
-            checkMetalCapabilities(devices);
-            selection = detail::selectBackend(*mode, packagedBackend(), devices.descriptions, gpuLoadError);
+        const std::lock_guard initializationLock(initializationMutex());
+        QString gpuLoadError;
+        // An explicit CPU binding must not touch vendor drivers, even when the
+        // caller leaves the general policy at Auto. Policy conflicts are still
+        // checked against the original mode below.
+        const auto initializationMode = d->deviceSelector && d->deviceSelector->backend == QStringLiteral("cpu")
+            ? detail::BackendMode::Cpu : *mode;
+        auto devices = initializeDevices(initializationMode, &gpuLoadError);
+        d->selection = d->deviceSelector
+            ? detail::selectBackendDevice(*mode, packagedBackend(), devices.descriptions, *d->deviceSelector, gpuLoadError)
+            : detail::selectBackend(*mode, packagedBackend(), devices.descriptions, gpuLoadError);
+        if (!d->selection.error.isEmpty()) {
+            d->deviceFailure = d->deviceSelector && d->deviceSelector->backend != QStringLiteral("cpu");
+            throw std::runtime_error(d->selection.error.toStdString());
         }
-        d->selection = std::move(selection);
-        if (!d->selection.error.isEmpty()) throw std::runtime_error(d->selection.error.toStdString());
         d->selectedDevice = devices.descriptions[d->selection.deviceIndex];
         try {
             d->loadModels(modelDir, devices.handles[d->selection.deviceIndex]);
         } catch (const std::exception& gpuFailure) {
+            d->deviceFailure = d->selection.gpu && !Private::abortCallback(d.get());
             // A cancellation is not a GPU failure and must never restart loading.
-            if (*mode != detail::BackendMode::Auto || !d->selection.gpu || Private::abortCallback(d.get())) throw;
+            if (d->deviceSelector || *mode != detail::BackendMode::Auto || !d->selection.gpu || Private::abortCallback(d.get())) throw;
             const auto reason = QStringLiteral("%1 GPU initialization or warmup failed: %2. Retrying on CPU.")
                 .arg(packagedBackend(), QString::fromUtf8(gpuFailure.what()));
             d->close();
@@ -620,6 +725,7 @@ bool EmbeddingRuntime::load(const QString& modelDir, bool textOnly, QString* err
             d->selection.fallbackReason = reason;
             if (!d->selection.error.isEmpty()) throw std::runtime_error(d->selection.error.toStdString());
             d->selectedDevice = devices.descriptions[d->selection.deviceIndex];
+            d->deviceFailure = false;
             d->loadModels(modelDir, devices.handles[d->selection.deviceIndex]);
         }
         return true;

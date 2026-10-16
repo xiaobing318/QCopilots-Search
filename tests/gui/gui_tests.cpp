@@ -485,6 +485,46 @@ private slots:
         emit backend.eventReceived("settings", backend.settings.toJson());
         QVERIFY(status->text().contains(QString::fromUtf8("推理不可用")));
     }
+    void inferenceStatusShowsEachGpuAndPoolHealth() {
+        TestEnvironment env("gui-multiple-gpus"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoStatus = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false); window.show(); window.start();
+        QTRY_COMPARE(backend.count("status"), 1);
+        const QJsonObject first{{"backend", "hip"}, {"deviceId", "0000:01:00.0"}, {"name", "AMD Radeon 0"},
+            {"description", "First GPU"}, {"state", "busy"}, {"activePath", env.path("documents/report.txt")}, {"completedTasks", 4}};
+        QJsonObject second{{"backend", "hip"}, {"deviceId", "0000:02:00.0"}, {"name", "AMD Radeon 1"},
+            {"description", "Second GPU"}, {"state", "ready"}, {"completedTasks", 3}};
+        const QJsonObject runtime{{"buildVariant", "windows-x64-rocm"}, {"selectedBackend", "hip"},
+            {"deviceName", "AMD Radeon 0"}, {"loaded", true}, {"gpuSelected", true}};
+        auto statusData = [&](const QJsonObject &counts) {
+            return QJsonObject{{"modelAvailable", true}, {"runtime", runtime},
+                {"indexDevices", QJsonArray{first, second}}, {"indexDeviceCounts", counts}};
+        };
+        emit backend.response(backend.last("status").id,
+            statusData({{"discovered", 2}, {"ready", 2}, {"busy", 1}, {"failed", 0}}));
+        auto *status = window.findChild<QLabel *>("inferenceRuntimeStatus"); QVERIFY(status);
+        QVERIFY(status->text().contains("Indexing: HIP"));
+        QVERIFY(status->text().contains("2/2 GPU available"));
+        QVERIFY(status->text().contains("1 busy"));
+        QVERIFY(status->text().contains("AMD Radeon 0 · busy · 4 batches completed · report.txt"));
+        QVERIFY(status->text().contains("AMD Radeon 1 · ready · 3 batches completed"));
+        QVERIFY(status->toolTip().contains("0000:02:00.0"));
+        QVERIFY(status->toolTip().contains(env.path("documents/report.txt")));
+        second.insert("state", "failed");
+        second.insert("error", "GPU allocation failed");
+        emit backend.eventReceived("runtime", statusData({{"discovered", 2}, {"ready", 1}, {"busy", 1}, {"failed", 1}}));
+        QVERIFY(status->text().contains("1/2 GPU available"));
+        QVERIFY(status->text().contains("1 failed"));
+        QVERIFY(status->text().contains("GPU allocation failed"));
+        backend.settings.language = "zh_CN";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QVERIFY(status->text().contains(QString::fromUtf8("1/2 GPU 可用")));
+        QVERIFY(status->text().contains(QString::fromUtf8("已完成 4 批次")));
+        emit backend.disconnected();
+        QVERIFY(status->text().contains(QString::fromUtf8("0/2 GPU 可用")));
+        QVERIFY(status->text().contains(QString::fromUtf8("已断开")));
+        QVERIFY(!status->text().contains("report.txt"));
+    }
     void independentFoldersAndExternalApplicationArgumentsRoundTrip() {
         AppSettings settings; settings.language = "en"; settings.roots = {"ordinary"}; settings.excludes = {"ordinary/private"};
         settings.codeRoots = {"code"}; settings.codeExcludes = {"code/build"}; settings.includeCode = false;

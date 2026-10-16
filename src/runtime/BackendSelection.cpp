@@ -34,6 +34,100 @@ QString canonicalBackendName(const QString& registryName)
     return name;
 }
 
+QString deviceIdentityError(const BackendDevice& device, const QVector<BackendDevice>& devices)
+{
+    const auto backend = canonicalBackendName(device.backend);
+    if (device.deviceId.isEmpty() && device.name.isEmpty())
+        return QStringLiteral("The %1 device has neither a hardware ID nor a device name.").arg(backend);
+    int matches = 0;
+    for (const auto& candidate : devices) {
+        if (canonicalBackendName(candidate.backend) != backend) continue;
+        if (!device.deviceId.isEmpty() ? candidate.deviceId == device.deviceId : candidate.name == device.name)
+            ++matches;
+    }
+    if (matches != 1)
+        return QStringLiteral("The %1 device identity '%2' is not unique.")
+            .arg(backend, device.deviceId.isEmpty() ? device.name : device.deviceId);
+    return {};
+}
+
+QVector<int> compatibleGpuDevices(const QString& packagedBackend, const QVector<BackendDevice>& devices)
+{
+    const auto backend = canonicalBackendName(packagedBackend);
+    QVector<int> result;
+    if (backend != QStringLiteral("cuda") && backend != QStringLiteral("hip")
+        && backend != QStringLiteral("vulkan") && backend != QStringLiteral("metal")) return result;
+    for (qsizetype index = 0; index < devices.size(); ++index) {
+        const auto& device = devices[index];
+        if (device.gpu && canonicalBackendName(device.backend) == backend
+            && !(backend == QStringLiteral("metal") && device.name.isEmpty())
+            && device.unavailableReason.isEmpty() && deviceIdentityError(device, devices).isEmpty())
+            result.append(int(index));
+    }
+    return result;
+}
+
+BackendSelection selectBackendDevice(BackendMode mode, const QString& packagedBackend,
+    const QVector<BackendDevice>& devices, const BackendDeviceSelector& selector, const QString& gpuLoadError)
+{
+    // Reuse the package and CPU installation checks, independent of GPU policy.
+    auto result = selectBackend(BackendMode::Cpu, packagedBackend, devices);
+    if (!result.error.isEmpty()) return result;
+    result = {};
+    const auto requested = canonicalBackendName(selector.backend);
+    const auto packaged = canonicalBackendName(packagedBackend);
+    if (requested != QStringLiteral("cpu") && (requested != packaged || packaged == QStringLiteral("cpu"))) {
+        result.error = QStringLiteral("Selected backend '%1' is not included in this %2 installation.").arg(requested, packaged);
+        return result;
+    }
+    if ((mode == BackendMode::Gpu && requested == QStringLiteral("cpu"))
+        || (mode == BackendMode::Cpu && requested != QStringLiteral("cpu"))) {
+        result.error = QStringLiteral("Selected device conflicts with the requested %1 mode.").arg(backendModeName(mode));
+        return result;
+    }
+    if (requested != QStringLiteral("cpu") && !gpuLoadError.isEmpty()) {
+        result.error = gpuLoadError;
+        return result;
+    }
+    if (selector.deviceId.isEmpty() && selector.name.isEmpty()) {
+        result.error = QStringLiteral("Explicit device selection requires a hardware ID or a unique device name.");
+        return result;
+    }
+    int match = -1;
+    for (qsizetype index = 0; index < devices.size(); ++index) {
+        const auto& device = devices[index];
+        if (canonicalBackendName(device.backend) != requested
+            || (requested == QStringLiteral("cpu") ? !device.cpu : !device.gpu)) continue;
+        const bool matches = !selector.deviceId.isEmpty() ? device.deviceId == selector.deviceId
+                                                         : device.name == selector.name;
+        if (!matches) continue;
+        if (match >= 0) {
+            result.error = QStringLiteral("Selected device identity is ambiguous in backend %1.").arg(requested);
+            return result;
+        }
+        match = int(index);
+    }
+    if (match < 0) {
+        result.error = QStringLiteral("Selected %1 device '%2' is no longer available.")
+            .arg(requested, selector.deviceId.isEmpty() ? selector.name : selector.deviceId);
+        return result;
+    }
+    const auto& device = devices[match];
+    if (selector.deviceId.isEmpty() && !device.deviceId.isEmpty()) {
+        result.error = QStringLiteral("Selected device now supplies a hardware ID. Rediscover devices before binding it.");
+        return result;
+    }
+    result.error = device.unavailableReason;
+    if (result.error.isEmpty()) result.error = deviceIdentityError(device, devices);
+    if (result.error.isEmpty() && requested == QStringLiteral("metal") && device.name.isEmpty())
+        result.error = QStringLiteral("Selected Metal device has no physical device.");
+    if (!result.error.isEmpty()) return result;
+    result.deviceIndex = match;
+    result.backend = requested;
+    result.gpu = device.gpu;
+    return result;
+}
+
 BackendSelection selectBackend(BackendMode mode, const QString& packagedBackend,
                                const QVector<BackendDevice>& devices, const QString& gpuLoadError)
 {

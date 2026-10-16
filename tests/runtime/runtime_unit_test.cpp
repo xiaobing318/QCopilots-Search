@@ -105,6 +105,40 @@ private slots:
         QVERIFY(!runtime.diagnostics().value(QStringLiteral("loaded")).toBool());
     }
 
+    void explicitDeviceSelectorIsValidatedBeforeLoad()
+    {
+        EmbeddingRuntime runtime;
+        QString error;
+        const QJsonObject requested{{"backend", "ROCm"}, {"deviceId", "0000:c1:00.0"}, {"name", "HIP1"}};
+        QVERIFY2(runtime.setDevice(requested, &error), qPrintable(error));
+        auto diagnostic = runtime.diagnostics();
+        QVERIFY(diagnostic.value("deviceBindingExplicit").toBool());
+        QCOMPARE(diagnostic.value("requestedDevice").toObject().value("backend").toString(), QStringLiteral("hip"));
+        QCOMPARE(diagnostic.value("requestedDevice").toObject().value("deviceId").toString(), QStringLiteral("0000:c1:00.0"));
+        QVERIFY(!diagnostic.value("loaded").toBool());
+        const auto valid = diagnostic.value("requestedDevice");
+        for (const auto& invalid : {QJsonObject{{"backend", "cuda"}}, QJsonObject{{"backend", "unknown"}, {"name", "GPU0"}},
+            QJsonObject{{"backend", "cuda"}, {"deviceId", 2}}, QJsonObject{{"backend", "cuda"}, {"name", "GPU0"}, {"index", 0}}}) {
+            QVERIFY(!runtime.setDevice(invalid, &error));
+            QVERIFY(!error.isEmpty());
+            QCOMPARE(runtime.diagnostics().value("requestedDevice"), valid);
+        }
+        QVERIFY(runtime.setDevice({}, &error));
+        QVERIFY(!runtime.diagnostics().value("deviceBindingExplicit").toBool());
+        QVERIFY(runtime.diagnostics().value("requestedDevice").toObject().isEmpty());
+    }
+
+    void missingModelsDoNotCountAsDeviceFailure()
+    {
+        EmbeddingRuntime runtime;
+        QString error;
+        QVERIFY(runtime.setDevice({{"backend", "cuda"}, {"deviceId", "0000:c1:00.0"}}, &error));
+        QVERIFY(!runtime.load(QString{}, false, &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(!runtime.diagnostics().value("deviceFailure").toBool());
+        QVERIFY(runtime.diagnostics().value("deviceBindingExplicit").toBool());
+    }
+
     void missingAndCorruptModelsAreRejected()
     {
         QString error;

@@ -18,6 +18,7 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QLocalSocket>
+#include <QLockFile>
 #include <QProcess>
 #include <QSignalSpy>
 #include <QScopeGuard>
@@ -44,13 +45,22 @@ namespace {
 // This executable doubles as a protocol peer for lifecycle and scheduling
 // tests. The seam is C++ construction-only and never affects installed workers.
 int controlledWorker(const QStringList &arguments) {
-    if (arguments.size() != 6) return 2;
+    if (arguments.size() < 6) return 2;
     const QString logPath = arguments.at(2);
     const QString mode = arguments.at(3);
     const QString gates = arguments.at(4);
     const int delayMs = arguments.at(5).toInt();
+    const int deviceArgument = arguments.indexOf(QStringLiteral("--device"));
+    const auto device = deviceArgument < 0 ? QJsonObject{} : QJsonDocument::fromJson(
+        arguments.value(deviceArgument + 1).toUtf8()).object();
+    const QString deviceId = device.value("deviceId").toString();
     const auto record = [&](QJsonObject event) {
         event.insert("pid", QString::number(QCoreApplication::applicationPid()));
+        event.insert("deviceId", deviceId);
+        // Independent peers append to one fixture log. Serialize the append so
+        // simultaneous startup or completion cannot lose an observable event.
+        QLockFile lock(logPath + ".lock");
+        if (!lock.tryLock(5000)) return false;
         QFile log(logPath);
         if (!log.open(QIODevice::WriteOnly | QIODevice::Append)) return false;
         const auto bytes = QJsonDocument(event).toJson(QJsonDocument::Compact) + '\n';
@@ -75,6 +85,29 @@ int controlledWorker(const QStringList &arguments) {
             return record({{"event", "exited"}}) ? 0 : 3;
         }
         if (operation == "cancel") continue;
+        if (operation == "devices") {
+            QFile fixture(QDir(gates).filePath("devices.json"));
+            QJsonArray devices;
+            if (fixture.open(QIODevice::ReadOnly)) devices = QJsonDocument::fromJson(fixture.readAll()).array();
+            if (!record({{"event", operation}})) return 3;
+            const auto response = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"ok", true},
+                {"result", QJsonObject{{"devices", devices}, {"packagedBackend", devices.isEmpty() ? "cpu" : "hip"},
+                    {"requestedMode", requestedBackend.trimmed().toLower()}, {"gpuLoadError", ""}}}})
+                .toJson(QJsonDocument::Compact);
+            std::cout << response.constData() << '\n' << std::flush;
+            continue;
+        }
+        if (!deviceId.isEmpty() && QFileInfo::exists(QDir(gates).filePath("crash-" + deviceId))) {
+            const QJsonObject runtime{{"requestedBackend", requestedBackend}, {"packagedBackend", "hip"},
+                {"selectedBackend", device.value("backend")}, {"deviceId", deviceId},
+                {"buildVariant", "test-hip"}, {"loaded", true}, {"gpuSelected", true}};
+            const auto event = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"event", "runtime"},
+                {"data", QJsonObject{{"phase", "inference-start"}, {"activity", "encode"},
+                    {"runtime", runtime}}}}).toJson(QJsonDocument::Compact);
+            std::cout << event.constData() << '\n' << std::flush;
+            if (!record({{"event", "aborted"}, {"backend", requestedBackend}, {"path", request.value("path")}})) return 3;
+            return 71;
+        }
         QFile crashPolicy(QDir(gates).filePath(mode + "-crash-policy"));
         if (crashPolicy.open(QIODevice::ReadOnly)) {
             const auto policy = QString::fromUtf8(crashPolicy.readAll()).trimmed();
@@ -107,6 +140,16 @@ int controlledWorker(const QStringList &arguments) {
             QFile source(path);
             if (!source.open(QIODevice::ReadOnly)) return 5;
             const auto fixture = QJsonDocument::fromJson(source.readAll()).object();
+            if (!fixture.value("errorCode").toString().isEmpty()) {
+                const auto response = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"ok", false},
+                    {"error", QJsonObject{{"code", fixture.value("errorCode")},
+                        {"message", fixture.value("errorMessage")}, {"deviceFailure", false}}}})
+                    .toJson(QJsonDocument::Compact);
+                std::cout << response.constData() << '\n' << std::flush;
+                if (!record({{"event", "responded"}, {"operation", operation}, {"path", path},
+                             {"offset", offset}, {"ok", false}})) return 3;
+                continue;
+            }
             const int count = fixture.value("segments").toInt(1);
             const int next = qMin(count, offset + request.value("maxSegments").toInt(40));
             QJsonArray segments;
@@ -134,16 +177,26 @@ int controlledWorker(const QStringList &arguments) {
             for (int i = 0; i < embeddingDimensions; ++i) embedding.append(i == 0 ? 1.0 : 0.0);
             result = {{"embedding", embedding}, {"modelFingerprint", embeddingPipelineFingerprint()}};
         } else return 6;
-        // Deliberately identify this protocol test peer as CPU. This makes
-        // strict GPU service tests detect a peer that silently fell back.
+        // Unbound peers identify as CPU so strict GPU tests detect silent
+        // fallback. Explicit device fixtures report their independent GPU.
         result.insert("runtime", QJsonObject{{"buildVariant", "test-cpu"}, {"requestedBackend", "auto"},
             {"packagedBackend", "cpu"}, {"selectedBackend", "cpu"}, {"deviceName", "Protocol test CPU"},
             {"deviceDescription", "Lifecycle test peer"}, {"gpuSelected", false},
             {"fallbackReason", "Test fixture has no GPU"}, {"loaded", true}, {"error", ""}});
+        if (!deviceId.isEmpty()) {
+            result.insert("runtime", QJsonObject{{"buildVariant", "test-hip"}, {"requestedBackend", requestedBackend},
+                {"packagedBackend", "hip"}, {"selectedBackend", device.value("backend")},
+                {"deviceId", deviceId}, {"deviceName", device.value("name")},
+                {"deviceDescription", "Controlled independent GPU"}, {"gpuSelected", true},
+                {"gpuSelfTestPassed", true}, {"textWarmupCompleted", true},
+                {"fallbackReason", ""}, {"loaded", true}, {"error", ""}});
+        }
         if (delayMs > 0) QThread::msleep(static_cast<unsigned long>(delayMs));
         const auto response = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"ok", true}, {"result", result}})
             .toJson(QJsonDocument::Compact);
         std::cout << response.constData() << '\n' << std::flush;
+        if (!record({{"event", "responded"}, {"operation", operation}, {"path", request.value("path")},
+                     {"offset", request.value("offset")}})) return 3;
     }
     return record({{"event", "eof"}}) ? 0 : 3;
 }
@@ -162,6 +215,21 @@ struct ControlledWorkers {
         QFile gate(gatePath(query, name)); return gate.open(QIODevice::WriteOnly);
     }
     bool release(bool query, const QString &name) const { return QFile::remove(gatePath(query, name)); }
+    bool useDevices(int count) const {
+        QJsonArray devices;
+        for (int i = 0; i < count; ++i)
+            devices.append(QJsonObject{{"backend", "HIP"}, {"deviceId", QStringLiteral("gpu%1").arg(i)},
+                {"name", "Identical GPU name"}, {"description", "Controlled independent GPU"},
+                {"gpu", true}, {"cpu", false}, {"available", true},
+                {"memoryTotal", qint64(16) * 1024 * 1024 * 1024},
+                {"memoryFree", qint64(12) * 1024 * 1024 * 1024}});
+        QFile fixture(QDir(root).filePath("devices.json"));
+        const auto bytes = QJsonDocument(devices).toJson(QJsonDocument::Compact);
+        return fixture.open(QIODevice::WriteOnly) && fixture.write(bytes) == bytes.size();
+    }
+    bool crashDevice(const QString &deviceId) const {
+        QFile gate(QDir(root).filePath("crash-" + deviceId)); return gate.open(QIODevice::WriteOnly);
+    }
     QList<QJsonObject> events(bool query, const QString &type = {}) const {
         QList<QJsonObject> result;
         QFile file(logPath(query));
@@ -178,8 +246,10 @@ struct ControlledWorkers {
         ServiceDependencies result;
         result.verifyModels = [models](QString *) { return models; };
         result.configureWorker = [*this, delayMs](QProcess &worker, bool query) {
+            const bool probe = worker.property("qcsDeviceProbe").toBool();
             worker.setProgram(QCoreApplication::applicationFilePath());
-            worker.setArguments({"--qcs-test-worker", logPath(query), query ? "query" : "index", root, QString::number(delayMs)});
+            worker.setArguments({"--qcs-test-worker", probe ? QDir(root).filePath("probe.jsonl") : logPath(query),
+                probe ? "probe" : query ? "query" : "index", root, QString::number(delayMs)});
         };
         return result;
     }
@@ -1727,6 +1797,379 @@ private slots:
         const auto code = localCall(client, "files.list", {{"code", true}});
         QVERIFY(code.value("ok").toBool());
         QVERIFY(code.value("result").toObject().value("files").toArray().isEmpty());
+        client.disconnectFromService(); service.stop();
+    }
+
+    void multipleGpuWorkersOverlapFilesAndPublishOutOfOrder() {
+        TestEnvironment environment("service-multiple-gpus");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment backend("QCOPILOTS_SEARCH_BACKEND", "auto");
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.useDevices(2));
+        for (const QString name : {QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c")}) {
+            QVERIFY(environment.writeFile("selected/" + name + ".txt", controlledDocument("parallel" + name + "keyword", 85)));
+            QVERIFY(workers.block(false, name + ".txt-0"));
+        }
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        auto dependencies = workers.dependencies(true);
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "extract").size(), 2, 5000);
+        const auto initial = workers.events(false, "extract");
+        const auto slow = initial.first(), fast = initial.last();
+        QVERIFY(slow.value("pid").toString() != fast.value("pid").toString());
+        QCOMPARE(QSet<QString>({slow.value("deviceId").toString(), fast.value("deviceId").toString()}),
+                 QSet<QString>({QStringLiteral("gpu0"), QStringLiteral("gpu1")}));
+        const auto running = localCall(client, "status").value("result").toObject();
+        QCOMPARE(running.value("indexDeviceCounts").toObject().value("discovered").toInt(), 2);
+        QCOMPARE(running.value("indexDeviceCounts").toObject().value("busy").toInt(), 2);
+        QCOMPARE(running.value("indexDevices").toArray().size(), 2);
+        const QString slowPath = slow.value("path").toString(), fastPath = fast.value("path").toString();
+        QVERIFY(slowPath != fastPath);
+        QVERIFY(workers.release(false, QFileInfo(fastPath).fileName() + "-0"));
+        QJsonObject third;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            for (const auto &event : workers.events(false, "extract")) {
+                const auto path = event.value("path").toString();
+                if (path != slowPath && path != fastPath) { third = event; return true; }
+            }
+            return false;
+        })(), 5000);
+        QCOMPARE(third.value("pid"), fast.value("pid"));
+        QCOMPARE(third.value("deviceId"), fast.value("deviceId"));
+        QVERIFY(workers.release(false, QFileInfo(third.value("path").toString()).fileName() + "-0"));
+        const QString fastToken = "parallel" + QFileInfo(fastPath).completeBaseName() + "keyword";
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "search", {{"query", fastToken + " 84"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().size(), 1, 5000);
+        const QString slowToken = "parallel" + QFileInfo(slowPath).completeBaseName() + "keyword";
+        QVERIFY(localCall(client, "search", {{"query", slowToken}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().isEmpty());
+        int slowAttempts = 0;
+        for (const auto &event : workers.events(false, "extract"))
+            if (event.value("path").toString() == slowPath) ++slowAttempts;
+        QCOMPARE(slowAttempts, 1);
+        QVERIFY(workers.release(false, QFileInfo(slowPath).fileName() + "-0"));
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+            .value("progress").toObject().value("completed").toInt(), 3, 10000);
+        QHash<QString, QList<int>> offsets;
+        for (const auto &event : workers.events(false, "extract"))
+            offsets[event.value("path").toString()].append(event.value("offset").toInt());
+        QCOMPARE(offsets.size(), 3);
+        for (const auto &values : offsets) QCOMPARE(values, QList<int>({0, 40, 80}));
+        const auto settled = localCall(client, "status").value("result").toObject();
+        QCOMPARE(settled.value("indexDeviceCounts").toObject().value("failed").toInt(), 0);
+        QCOMPARE(settled.value("progress").toObject().value("failed").toInt(), 0);
+        qint64 completedBatches = 0;
+        for (const auto &device : settled.value("indexDevices").toArray())
+            completedBatches += device.toObject().value("completedTasks").toInteger();
+        QCOMPARE(completedBatches, qint64(9));
+        client.disconnectFromService(); service.stop();
+    }
+
+    void multiGpuPauseAndReconcileWaitForEveryActiveBatch() {
+        TestEnvironment environment("service-multiple-gpu-reconcile");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment backend("QCOPILOTS_SEARCH_BACKEND", "auto");
+        QVERIFY(environment.writeFile("selected/a.txt", controlledDocument("barrierfirstkeyword")));
+        QVERIFY(environment.writeFile("selected/b.txt", controlledDocument("barriersecondkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.useDevices(2));
+        QVERIFY(workers.block(false, "a.txt-0")); QVERIFY(workers.block(false, "b.txt-0"));
+        auto dependencies = workers.dependencies(true);
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "extract").size(), 2, 5000);
+        QSignalSpy events(&client, &ServiceClient::eventReceived);
+        QVERIFY(localCall(client, "index.pause").value("ok").toBool());
+        QVERIFY(environment.writeFile("selected/c.txt", controlledDocument("barrierarrivingkeyword")));
+        QVERIFY(localCall(client, "index.reconcile").value("ok").toBool());
+        const auto catalogMerged = [&] {
+            for (const auto &event : events)
+                if (event.at(0).toString() == "indexChanged"
+                    && event.at(1).value<QJsonObject>().value("path").toString().isEmpty()) return true;
+            return false;
+        };
+        QVERIFY(workers.release(false, "a.txt-0"));
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "responded").size(), 1, 5000);
+        QTest::qWait(100);
+        QVERIFY(!catalogMerged());
+        QCOMPARE(workers.events(false, "extract").size(), 2);
+        QCOMPARE(localCall(client, "status").value("result").toObject()
+            .value("indexDeviceCounts").toObject().value("busy").toInt(), 1);
+        QVERIFY(workers.release(false, "b.txt-0"));
+        QTRY_VERIFY_WITH_TIMEOUT(catalogMerged(), 5000);
+        QCOMPARE(workers.events(false, "extract").size(), 2);
+        QCOMPARE(localCall(client, "status").value("result").toObject()
+            .value("progress").toObject().value("state").toString(), QString("paused"));
+        QVERIFY(localCall(client, "index.resume").value("ok").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "search", {{"query", "barrierarrivingkeyword"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().size(), 1, 5000);
+        QCOMPARE(workers.events(false, "extract").size(), 3);
+        QCOMPARE(workers.events(false, "extract").last().value("path").toString(), environment.path("selected/c.txt"));
+        client.disconnectFromService(); service.stop();
+    }
+
+    void settingsChangeCancelsEveryActiveGpuFile() {
+        TestEnvironment environment("service-multiple-gpu-settings");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment backend("QCOPILOTS_SEARCH_BACKEND", "auto");
+        QVERIFY(environment.writeFile("old/a.txt", controlledDocument("obsoletegpukeyword")));
+        QVERIFY(environment.writeFile("old/b.txt", controlledDocument("obsoletegpukeyword")));
+        QVERIFY(environment.writeFile("new/kept.txt", controlledDocument("replacementgpukeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("old")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.useDevices(2));
+        QVERIFY(workers.block(false, "a.txt-0")); QVERIFY(workers.block(false, "b.txt-0"));
+        auto dependencies = workers.dependencies(true);
+        dependencies.reconcileMs = 60000;
+        dependencies.workerShutdownGraceMs = 100;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "extract").size(), 2, 5000);
+        QVERIFY(localCall(client, "settings.set", {{"roots", QJsonArray{environment.path("new")}}}).value("ok").toBool());
+        // Releasing both old operations allows a late reply if shutdown has not
+        // already terminated its process. Neither may publish into the new epoch.
+        QVERIFY(workers.release(false, "a.txt-0")); QVERIFY(workers.release(false, "b.txt-0"));
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "search", {{"query", "replacementgpukeyword"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().size(), 1, 10000);
+        QVERIFY(localCall(client, "search", {{"query", "obsoletegpukeyword"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().isEmpty());
+        const auto files = localCall(client, "files.list").value("result").toObject().value("files").toArray();
+        QCOMPARE(files.size(), 1);
+        QCOMPARE(files.first().toObject().value("path").toString(), environment.path("new/kept.txt"));
+        const auto status = localCall(client, "status").value("result").toObject();
+        QCOMPARE(status.value("indexDeviceCounts").toObject().value("failed").toInt(), 0);
+        client.disconnectFromService(); service.stop();
+    }
+
+    void failedGpuSlotHandsUnfinishedFileToHealthyGpu() {
+        TestEnvironment environment("service-multiple-gpu-failover");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment backend("QCOPILOTS_SEARCH_BACKEND", "auto");
+        QVERIFY(environment.writeFile("selected/a.txt", controlledDocument("failoverfirstkeyword")));
+        QVERIFY(environment.writeFile("selected/b.txt", controlledDocument("failoversecondkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.useDevices(2));
+        QVERIFY(workers.crashDevice("gpu0"));
+        auto dependencies = workers.dependencies(true);
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+            .value("progress").toObject().value("completed").toInt(), 2, 10000);
+        QCOMPARE(workers.events(false, "aborted").size(), 1);
+        const auto aborted = workers.events(false, "aborted").first();
+        QCOMPARE(aborted.value("deviceId").toString(), QString("gpu0"));
+        const auto extracted = workers.events(false, "extract");
+        QCOMPARE(extracted.size(), 2);
+        bool recovered = false;
+        for (const auto &event : extracted) {
+            QCOMPARE(event.value("deviceId").toString(), QString("gpu1"));
+            recovered |= event.value("path") == aborted.value("path");
+        }
+        QVERIFY(recovered);
+        for (const auto &event : workers.events(false, "started"))
+            QVERIFY(event.value("backend").toString() != "cpu");
+        const auto status = localCall(client, "status").value("result").toObject();
+        QCOMPARE(status.value("indexDeviceCounts").toObject().value("failed").toInt(), 1);
+        QCOMPARE(status.value("progress").toObject().value("failed").toInt(), 0);
+
+        QVERIFY(environment.writeFile("changed/kept.txt", controlledDocument("quarantinedsettingskeyword")));
+        QVERIFY(localCall(client, "settings.set", {{"roots", QJsonArray{environment.path("changed")}}}).value("ok").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "search", {{"query", "quarantinedsettingskeyword"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().size(), 1, 5000);
+        QCOMPARE(workers.events(false, "aborted").size(), 1);
+        int failedDeviceStarts = 0;
+        for (const auto &event : workers.events(false, "started"))
+            if (event.value("deviceId").toString() == "gpu0") ++failedDeviceStarts;
+        QCOMPARE(failedDeviceStarts, 1);
+        QCOMPARE(workers.events(false, "extract").last().value("deviceId").toString(), QString("gpu1"));
+        QCOMPARE(localCall(client, "status").value("result").toObject()
+            .value("indexDeviceCounts").toObject().value("failed").toInt(), 1);
+
+        // Explicit model reload clears the session quarantine. Keep two new
+        // files blocked to prove both devices are eligible concurrently again.
+        QVERIFY(QFile::remove(QDir(workers.root).filePath("crash-gpu0")));
+        QVERIFY(localCall(client, "index.pause").value("ok").toBool());
+        for (const QString name : {QStringLiteral("restored-a"), QStringLiteral("restored-b")}) {
+            QVERIFY(workers.block(false, name + ".txt-0"));
+            QVERIFY(environment.writeFile("changed/" + name + ".txt", controlledDocument("restoredgpukeyword")));
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "models.reload").value("ok").toBool(), 5000);
+        QVERIFY(localCall(client, "index.resume").value("ok").toBool());
+        QSet<QString> restoredDeviceIds;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            restoredDeviceIds.clear();
+            for (const auto &event : workers.events(false, "extract"))
+                if (QFileInfo(event.value("path").toString()).fileName().startsWith("restored-"))
+                    restoredDeviceIds.insert(event.value("deviceId").toString());
+            return restoredDeviceIds.size() == 2;
+        })(), 5000);
+        QCOMPARE(restoredDeviceIds, QSet<QString>({QStringLiteral("gpu0"), QStringLiteral("gpu1")}));
+        QVERIFY(workers.release(false, "restored-a.txt-0")); QVERIFY(workers.release(false, "restored-b.txt-0"));
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "search", {{"query", "restoredgpukeyword"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray().size(), 2, 5000);
+        QCOMPARE(localCall(client, "status").value("result").toObject()
+            .value("indexDeviceCounts").toObject().value("failed").toInt(), 0);
+        client.disconnectFromService(); service.stop();
+    }
+
+    void ordinaryFileErrorsDoNotQuarantineGpu_data() {
+        QTest::addColumn<QString>("errorCode");
+        QTest::newRow("ordinary-decode-error") << QString("extract_failed");
+        QTest::newRow("shared-model-file-error") << QString("model_unavailable");
+    }
+
+    void ordinaryFileErrorsDoNotQuarantineGpu() {
+        QFETCH(QString, errorCode);
+        TestEnvironment environment("service-file-error-healthy-gpu");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment backend("QCOPILOTS_SEARCH_BACKEND", "auto");
+        // The error file is newer and sorts first if timestamps tie, so the
+        // successful extraction proves the worker continues after the error.
+        QVERIFY(environment.writeFile("selected/b-valid.txt", controlledDocument("healthyafterfileerrorkeyword")));
+        QVERIFY(environment.writeFile("selected/a-error.txt", QJsonDocument(QJsonObject{
+            {"errorCode", errorCode}, {"errorMessage", "Controlled file or shared model failure"}})
+                .toJson(QJsonDocument::Compact)));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.useDevices(1));
+        auto dependencies = workers.dependencies(true);
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            const auto progress = localCall(client, "status").value("result").toObject().value("progress").toObject();
+            return progress.value("completed").toInt() == 1 && progress.value("failed").toInt() == 1;
+        })(), 10000);
+        const auto status = localCall(client, "status").value("result").toObject();
+        QCOMPARE(status.value("indexDeviceCounts").toObject().value("failed").toInt(), 0);
+        QCOMPARE(status.value("indexDeviceCounts").toObject().value("discovered").toInt(), 1);
+        QCOMPARE(workers.events(false, "started").size(), 1);
+        const auto operations = workers.events(false, "extract");
+        QCOMPARE(operations.size(), 2);
+        QCOMPARE(operations.first().value("path").toString(), environment.path("selected/a-error.txt"));
+        QCOMPARE(operations.last().value("path").toString(), environment.path("selected/b-valid.txt"));
+        for (const auto &operation : operations) QCOMPARE(operation.value("deviceId").toString(), QString("gpu0"));
+        const auto hits = localCall(client, "search", {{"query", "healthyafterfileerrorkeyword"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray();
+        QCOMPARE(hits.size(), 1);
+        QCOMPARE(hits.first().toObject().value("path").toString(), environment.path("selected/b-valid.txt"));
+        client.disconnectFromService(); service.stop();
+    }
+
+    void allGpuSlotsFailAccordingToBackendPolicy_data() {
+        QTest::addColumn<QString>("mode");
+        QTest::newRow("auto-cpu-fallback") << QString("auto");
+        QTest::newRow("strict-gpu-stays-failed") << QString("gpu");
+    }
+
+    void allGpuSlotsFailAccordingToBackendPolicy() {
+        QFETCH(QString, mode);
+        TestEnvironment environment("service-all-gpus-fail");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment backend("QCOPILOTS_SEARCH_BACKEND", mode.toUtf8());
+        QVERIFY(environment.writeFile("selected/a.txt", controlledDocument("allgpufirstkeyword")));
+        QVERIFY(environment.writeFile("selected/b.txt", controlledDocument("allgpusecondkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.useDevices(2));
+        QVERIFY(workers.crashDevice("gpu0")); QVERIFY(workers.crashDevice("gpu1"));
+        auto dependencies = workers.dependencies(true);
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "aborted").size(), 2, 5000);
+        if (mode == "auto") {
+            QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+                .value("progress").toObject().value("completed").toInt(), 2, 10000);
+            QCOMPARE(workers.events(false, "started").size(), 3);
+            QCOMPARE(workers.events(false, "started").last().value("backend").toString(), QString("cpu"));
+            for (const auto &event : workers.events(false, "extract")) QVERIFY(event.value("deviceId").toString().isEmpty());
+        } else {
+            QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+                .value("progress").toObject().value("state").toString(), QString("error"), 5000);
+            QTest::qWait(100);
+            QCOMPARE(workers.events(false, "started").size(), 2);
+            QVERIFY(workers.events(false, "extract").isEmpty());
+        }
+        const auto status = localCall(client, "status").value("result").toObject();
+        QCOMPARE(status.value("indexDeviceCounts").toObject().value("failed").toInt(), 2);
+        QCOMPARE(status.value("indexDeviceCounts").toObject().value("ready").toInt(), 0);
+        QCOMPARE(status.value("indexDevices").toArray().size(), mode == "auto" ? 3 : 2);
+        QCOMPARE(status.value("progress").toObject().value("failed").toInt(), 0);
+        client.disconnectFromService(); service.stop();
+    }
+
+    void missingModelsKeepSingleKeywordExtractorWithoutGpuProbe() {
+        TestEnvironment environment("service-no-model-gpu-pool");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ScopedEnvironment backend("QCOPILOTS_SEARCH_BACKEND", "auto");
+        QVERIFY(environment.writeFile("selected/a.txt", controlledDocument("keywordonlyfirst")));
+        QVERIFY(environment.writeFile("selected/b.txt", controlledDocument("keywordonlysecond")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.useDevices(2));
+        QVERIFY(workers.block(false, "a.txt-0")); QVERIFY(workers.block(false, "b.txt-0"));
+        auto dependencies = workers.dependencies(false);
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "extract").size(), 1, 5000);
+        QTest::qWait(100);
+        QCOMPARE(workers.events(false, "extract").size(), 1);
+        QVERIFY(!QFileInfo::exists(QDir(workers.root).filePath("probe.jsonl")));
+        QCOMPARE(workers.events(false, "started").size(), 1);
+        QVERIFY(workers.release(false, "a.txt-0")); QVERIFY(workers.release(false, "b.txt-0"));
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+            .value("progress").toObject().value("completed").toInt(), 2, 5000);
+        for (const auto &event : workers.events(false, "extract")) QVERIFY(event.value("deviceId").toString().isEmpty());
         client.disconnectFromService(); service.stop();
     }
 

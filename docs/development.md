@@ -14,7 +14,7 @@
 
 Windows 包装脚本自动查找 Visual Studio 2022、初始化 x64 编译环境，并查找其自带 Ninja。如果 `python` 只是 Microsoft Store 占位入口，请安装真实 Python，或将 `QCOPILOTS_SEARCH_PYTHON` 设置为已有解释器的绝对路径。不要将某台机器的私有 Python 路径写进仓库。
 
-以下示例使用已安装的 Qt。`--qt-root` 指向 SDK 根，脚本从中选择 `6.12.0/msvc2022_64`，不能把根与 kit 目录混用。
+以下示例使用已安装的 Qt。`--qt-root` 接受 SDK 根或具体 kit 目录。指向 SDK 根时，脚本从中选择当前平台的 kit，例如 Windows 的 `6.12.0/msvc2022_64`。指向包含 `lib/cmake/Qt6/Qt6Config.cmake` 的 kit 时直接使用该目录。
 
 ```powershell
 Set-Location C:\Dev\github-repos\QCopilots-Search
@@ -25,6 +25,8 @@ $variant = 'windows-x64-cpu'
 ```
 
 如果尚未安装 Qt，使用相同参数执行 `bootstrap`，下载并校验锁定 SDK。已有 SDK 不需要重复安装。
+
+`doctor` 记录当前实际 Python 解释器、CMake、CTest、CPack、Ninja、Git 和编译器的路径与版本，检查 Python 3.10+、CMake 3.28+ 及 CMake 工具版本一致性。Qt 检查涵盖必需组件，并核对 Qt Core 6.12.0 和独立 Qt PDF 6.140.0。GPU 变体还会按照依赖锁只读检查 SDK 与编译器，不安装或下载依赖，也不要求本机有可执行推理的 GPU。缺少工具或版本不符时会列出具体错误，完整记录保存在外置报告目录的 `doctor.json`。
 
 ```bash
 build_root="$(dirname "$PWD")/qcs-build"

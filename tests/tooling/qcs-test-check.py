@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parents[2]
@@ -61,6 +61,108 @@ class CheckTests(unittest.TestCase):
         latest = json.loads((self.reports / "latest-check.json").read_text(encoding="utf-8"))
         path = Path(latest["report"])
         return path, json.loads(path.read_text(encoding="utf-8"))
+
+    def test_doctor_records_running_python_and_handles_msvc_banner_exit(self):
+        outputs = [("Python 3.12.10\n", "", 0),
+                   ("", "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35217 for x64\n", 2)]
+        def probe(command, **options):
+            self.assertEqual(options["timeout"], 30)
+            self.assertIs(options["env"], self.environment)
+            stdout, stderr, code = outputs.pop(0)
+            return subprocess.CompletedProcess(command, code, stdout, stderr)
+        with patch.object(workflow.subprocess, "run", side_effect=probe) as execute:
+            python = workflow.doctor_tool("python", self.environment, path=sys.executable)
+            compiler = workflow.doctor_tool("cl", self.environment, path="fixture cl.exe")
+        self.assertEqual(execute.call_args_list[0].args[0], [sys.executable, "--version"])
+        self.assertEqual(execute.call_args_list[1].args[0], ["fixture cl.exe"])
+        self.assertTrue(python["passed"])
+        self.assertTrue(compiler["passed"])
+        self.assertEqual(compiler["version"], "19.44.35217")
+
+    def test_doctor_reports_missing_failed_and_timed_out_tools(self):
+        with patch.object(workflow.shutil, "which", return_value=None):
+            self.assertIn("missing from PATH", workflow.doctor_tool("ninja", self.environment)["error"])
+        for failure in (OSError("not executable"), subprocess.TimeoutExpired("fixture", 30)):
+            with self.subTest(failure=failure), patch.object(workflow.subprocess, "run", side_effect=failure):
+                self.assertFalse(workflow.doctor_tool("git", self.environment, path="fixture")["passed"])
+        with patch.object(workflow.subprocess, "run", return_value=subprocess.CompletedProcess("fixture", 1, "1.2.3", "broken")):
+            self.assertIn("exit 1", workflow.doctor_tool("git", self.environment, path="fixture")["error"])
+
+    def test_doctor_checks_all_required_qt_components_and_independent_pdf_version(self):
+        prefix = self.root / "Qt SDK/6.12.0/msvc2022_64"
+        components = ("", "Core", "Gui", "Widgets", "Network", "Sql", "Concurrent", "Test", "Xml",
+                      "Svg", "Core5Compat", "Multimedia", "MultimediaWidgets", "Pdf", "PdfWidgets")
+        for component in components:
+            name = "Qt6" + component
+            directory = prefix / "lib/cmake" / name
+            directory.mkdir(parents=True)
+            (directory / (name + "Config.cmake")).write_text("# fixture", encoding="utf-8")
+            version = "6.140.0" if component.startswith("Pdf") else "6.12.0"
+            (directory / (name + "ConfigVersionImpl.cmake")).write_text(f'set(PACKAGE_VERSION "{version}")', encoding="utf-8")
+        self.assertEqual(workflow.doctor_qt(prefix)["errors"], [])
+        with patch.object(workflow.platform, "system", return_value="Windows"):
+            self.assertEqual(workflow.qt_prefix(self.root / "Qt SDK"), prefix)
+            self.assertEqual(workflow.qt_prefix(prefix), prefix)
+        (prefix / "lib/cmake/Qt6PdfWidgets/Qt6PdfWidgetsConfig.cmake").unlink()
+        (prefix / "lib/cmake/Qt6Pdf/Qt6PdfConfigVersionImpl.cmake").write_text('set(PACKAGE_VERSION "6.12.0")', encoding="utf-8")
+        errors = workflow.doctor_qt(prefix)["errors"]
+        self.assertIn("Required Qt component Qt6PdfWidgets is missing", errors)
+        self.assertIn("Qt6Pdf requires 6.140.0, found 6.12.0", errors)
+
+    def test_doctor_gpu_preflight_uses_read_only_backend_validator(self):
+        sdk = self.root / "absent GPU SDK"
+        lock = self.root / "gpu-lock.json"
+        lock.write_text("{}", encoding="utf-8")
+        compiler = self.root / "toolkit/bin/nvcc.exe"
+        module = argparse.Namespace(LOCK=lock, cuda_sdk=Mock(return_value={
+            "cmakeCache": {"CUDAToolkit_ROOT": str(compiler.parent.parent)}, "environment": {}}),
+            rocm_sdk=Mock(), vulkan_sdk=Mock())
+        variant = {"backend": "cuda", "toolkitVersion": "12.4"}
+        with patch.object(workflow, "build_variant", return_value=variant), \
+                patch.object(workflow, "helper_module", return_value=module), \
+                patch.object(workflow, "doctor_tool", return_value={"passed": True, "version": "12.4.99"}):
+            result = workflow.doctor_gpu_sdk(self.args(gpu_sdk_root=sdk), self.root, self.environment)
+        module.cuda_sdk.assert_called_once_with(variant, sdk, False, {})
+        self.assertTrue(result["passed"])
+        self.assertFalse(sdk.exists())
+        module.rocm_sdk.assert_not_called()
+        module.vulkan_sdk.assert_not_called()
+        with patch.object(workflow.subprocess, "run", return_value=subprocess.CompletedProcess("fixture", 0, "value\n", "")) as probe:
+            self.assertEqual(module.run(["sdk-python", "-m", "rocm_sdk", "path", "--root"], capture=True), "value")
+        self.assertEqual(probe.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(probe.call_args.kwargs["timeout"], 30)
+
+    def test_doctor_missing_gpu_sdk_does_not_create_or_download_sdk(self):
+        sdk = self.root / "uninstalled SDK"
+        module = workflow.helper_module("tools/qcs-gpu-sdk.py", "qcs_doctor_missing_sdk_test")
+        variant = {"id": "windows-x64-cuda-12.4", "backend": "cuda", "os": "windows", "toolkitVersion": "12.4"}
+        with patch.object(workflow, "build_variant", return_value=variant), \
+                patch.object(workflow, "helper_module", return_value=module), \
+                patch.dict(os.environ, {"CUDA_PATH": str(sdk), "CUDAToolkit_ROOT": str(sdk)}), \
+                patch.object(module, "download", side_effect=AssertionError("doctor must not download")) as download:
+            with self.assertRaisesRegex(RuntimeError, "CUDA 12.4 is unavailable"):
+                workflow.doctor_gpu_sdk(self.args(gpu_sdk_root=sdk), self.root, self.environment)
+        download.assert_not_called()
+        self.assertFalse(sdk.exists())
+
+    def test_doctor_failure_persists_aggregate_errors_before_stopping_check(self):
+        def probe(name, *arguments, **options):
+            version = {"python": "3.9.9", "cmake": "3.27.0", "ctest": "3.31.0", "cpack": "3.27.0"}.get(name, "1.2.3")
+            return {"path": "fixture " + name, "passed": True, "version": version}
+        with patch.object(workflow, "doctor_tool", side_effect=probe), \
+                patch.object(workflow, "doctor_qt", return_value={"installed": False, "errors": ["Qt PDF missing"]}), \
+                patch.object(workflow, "doctor_gpu_sdk", side_effect=RuntimeError("locked CUDA is missing")), \
+                patch.object(workflow, "check_path_budget") as path_check, redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "Toolchain preflight failed"):
+                workflow.execute_action("doctor", self.args(), self.root, self.root / "Release",
+                    self.root / "stage", self.reports, self.root / "SDK", self.root / "SDK/qt", self.environment)
+        report = json.loads((self.reports / "doctor.json").read_text(encoding="utf-8"))
+        self.assertFalse(report["passed"])
+        self.assertEqual(len(report["errors"]), 5)
+        self.assertIn("python requires 3.10+, found 3.9.9", report["errors"])
+        self.assertIn("ctest 3.31.0 does not match cmake 3.27.0", report["errors"])
+        self.assertIn("GPU SDK preflight failed: locked CUDA is missing", report["errors"])
+        path_check.assert_called_once()
 
     def test_gpu_run_installs_selected_configuration_before_launching_stage_gui(self):
         for system, backend, relative_gui in (

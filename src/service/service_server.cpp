@@ -34,6 +34,7 @@
 #include <cstring>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace qcopilots_search {
 namespace {
@@ -120,12 +121,12 @@ public:
     explicit Private(ServiceServer *owner, RuntimePaths value, ServiceDependencies dependencies) : q(owner), paths(std::move(value)),
         repository(std::move(dependencies.storage)), modelVerifier(std::move(dependencies.verifyModels)),
         listenFunction(std::move(dependencies.listen)),
-        configureWorker(std::move(dependencies.configureWorker)),
+        configureWorker(std::move(dependencies.configureWorker)), deviceSelections(std::move(dependencies.indexDevices)),
         indexIdleMs(qMax(1, dependencies.indexIdleMs)), queryIdleMs(qMax(1, dependencies.queryIdleMs)),
         shutdownGraceMs(qMax(1, dependencies.workerShutdownGraceMs)), reconcileMs(qMax(1, dependencies.reconcileMs)),
         lock(nativeLockFilePath(paths.lockFile)), server(owner), monitor(owner), reconcile(owner), debounce(owner),
-        indexWorker(owner), queryWorker(owner), indexTimeout(owner), queryTimeout(owner),
-        indexIdle(owner), queryIdle(owner), indexShutdownGrace(owner), queryShutdownGrace(owner) {
+        queryWorker(owner), deviceProbe(owner), queryTimeout(owner), probeTimeout(owner),
+        queryIdle(owner), queryShutdownGrace(owner) {
         scanPool.setMaxThreadCount(1);
         writePool.setMaxThreadCount(1);
         searchPool.setMaxThreadCount(2);
@@ -149,17 +150,37 @@ public:
     std::function<bool(QString *)> modelVerifier;
     std::function<bool(QLocalServer &, const QString &)> listenFunction;
     std::function<void(QProcess &, bool)> configureWorker;
+    QList<QJsonObject> deviceSelections;
     int indexIdleMs, queryIdleMs, shutdownGraceMs, reconcileMs;
     QLockFile lock;
     QLocalServer server;
     QFileSystemWatcher monitor;
     QTimer reconcile, debounce;
-    QProcess indexWorker, queryWorker;
-    QTimer indexTimeout, queryTimeout;
-    QTimer indexIdle, queryIdle, indexShutdownGrace, queryShutdownGrace;
+    QProcess queryWorker, deviceProbe;
+    QTimer queryTimeout, probeTimeout;
+    QTimer queryIdle, queryShutdownGrace;
     enum class ExitReason { None, Idle, Restart, Fault, Stop };
-    ExitReason indexExit = ExitReason::None, queryExit = ExitReason::None;
-    QByteArray indexBuffer, queryBuffer, token;
+    struct IndexSlot {
+        explicit IndexSlot(QObject *owner) : worker(owner), timeout(owner), idle(owner), shutdownGrace(owner) {}
+        QProcess worker;
+        QTimer timeout, idle, shutdownGrace;
+        ExitReason exit = ExitReason::None;
+        QByteArray buffer;
+        std::unique_ptr<Job> current;
+        QString requestId, cpuFallback, error;
+        QJsonObject device, runtime;
+        bool gpuOperation = false, restartPending = false, publishing = false;
+        bool failed = false, retired = false, initialized = false;
+        quint64 completedTasks = 0;
+        bool gpu() const { return device.value("gpu").toBool(); }
+    };
+    std::vector<std::unique_ptr<IndexSlot>> indexSlots;
+    ExitReason queryExit = ExitReason::None;
+    QByteArray queryBuffer, probeBuffer, token;
+    bool poolReady = false, probing = false, catalogPublishing = false;
+    QString probeId, indexPoolError;
+    QHash<QString, QString> quarantinedIndexDevices;
+    quint64 probeGeneration = 0;
     QHash<QLocalSocket *, QByteArray> buffers;
     QHash<QString, Pending> requests;
     QHash<QString, Pending> activeSearches;
@@ -172,26 +193,25 @@ public:
     int queueTurn = 0;
     quint64 nextBatch = 0;
     quint64 nextQueueToken = 0;
-    std::unique_ptr<Job> current;
     std::unique_ptr<ScanPackage> pendingCatalog;
     QSet<QString> scanProtectedGeneral, scanProtectedCode;
     QHash<QString, QString> knownVersions;
     QSet<QString> completedFiles, failedFiles;
     QSet<QString> catalogFiles;
-    QString currentWorkerId;
     QJsonObject failures;
     QJsonObject indexRuntime, queryRuntime;
     bool latestRuntimeIsQuery = false;
-    bool indexGpuOperation = false, queryGpuOperation = false;
-    QString indexCpuFallback, queryCpuFallback;
+    bool queryGpuOperation = false;
+    QString queryCpuFallback;
     IndexProgress progress;
     QThreadPool scanPool, writePool, searchPool;
     std::mutex publicationConfigurationMutex;
     std::atomic_bool scanCancelled{false};
     quint64 generation = 1;
     quint64 visibilityEpoch = 1;
-    bool started = false, stopping = false, scanning = false, publishing = false;
-    bool indexRestartPending = false, queryRestartPending = false;
+    bool started = false, stopping = false, scanning = false;
+    int publishing = 0;
+    bool queryRestartPending = false;
     bool modelAvailable = false, pendingScan = false;
     bool pipelineReady = false, retryIncomplete = false;
     bool catalogReady = false, firstScan = true;
@@ -278,15 +298,10 @@ public:
         QObject::connect(&debounce, &QTimer::timeout, q, [this] { startScan(); });
         reconcile.setInterval(reconcileMs);
         QObject::connect(&reconcile, &QTimer::timeout, q, [this] { startScan(); });
-        setupWorker(indexWorker, false);
         setupWorker(queryWorker, true);
-        setupIdle(false);
         setupIdle(true);
-        indexTimeout.setSingleShot(true);
         queryTimeout.setSingleShot(true);
-        QObject::connect(&indexTimeout, &QTimer::timeout, q, [this] {
-            publishFailedCurrent(QStringLiteral("Index worker timed out")); stopWorkerForRestart(false, ExitReason::Fault);
-        });
+        setupDeviceProbe();
         QObject::connect(&queryTimeout, &QTimer::timeout, q, [this] {
             const QString id = activeQuery;
             activeQuery.clear();
@@ -309,15 +324,20 @@ public:
         stopping = true;
         for (const auto &request : std::as_const(requests)) request.cancelled->store(true);
         for (const auto &request : std::as_const(activeSearches)) request.cancelled->store(true);
-        reconcile.stop(); debounce.stop(); indexTimeout.stop(); queryTimeout.stop();
-        indexIdle.stop(); queryIdle.stop(); indexShutdownGrace.stop(); queryShutdownGrace.stop();
-        indexExit = queryExit = ExitReason::Stop;
+        reconcile.stop(); debounce.stop(); queryTimeout.stop(); probeTimeout.stop();
+        queryIdle.stop(); queryShutdownGrace.stop();
+        queryExit = ExitReason::Stop;
+        for (auto &slot : indexSlots) {
+            slot->timeout.stop(); slot->idle.stop(); slot->shutdownGrace.stop(); slot->exit = ExitReason::Stop;
+        }
         scanCancelled.store(true);
         { const std::lock_guard guard(publicationConfigurationMutex); ++generation; }
         saveJournal();
         server.close();
         releaseClients();
-        for (auto *worker : {&indexWorker, &queryWorker}) {
+        QList<QProcess *> workers{&queryWorker, &deviceProbe};
+        for (auto &slot : indexSlots) workers.append(&slot->worker);
+        for (auto *worker : workers) {
             if (worker->state() != QProcess::NotRunning) {
                 worker->write("{\"id\":\"shutdown\",\"operation\":\"shutdown\"}\n");
                 worker->closeWriteChannel();
@@ -401,16 +421,253 @@ public:
     }
     void publishProgress() { event(QStringLiteral("progress"), progress.toJson()); }
 
+    qsizetype activeIndexCount() const {
+        return std::count_if(indexSlots.cbegin(), indexSlots.cend(), [](const auto &slot) { return bool(slot->current); });
+    }
+
+    bool fileActive(const QString &key) const {
+        const auto found = jobs.constFind(key);
+        if (found == jobs.cend()) return false;
+        return std::any_of(indexSlots.cbegin(), indexSlots.cend(), [&found](const auto &slot) {
+            return slot->current && pathKey(normalizePath(slot->current->file.path), false) == pathKey(normalizePath(found->file.path), false);
+        });
+    }
+
+    QString deviceKey(const QJsonObject &device) const {
+        const auto id = device.value("deviceId").toString();
+        return device.value("backend").toString().toLower() + u':'
+            + (id.isEmpty() ? QStringLiteral("name:") + device.value("name").toString() : QStringLiteral("id:") + id);
+    }
+
+    QJsonArray indexDeviceStatus() const {
+        QJsonArray devices;
+        for (const auto &slot : indexSlots) {
+            if (slot->retired) continue;
+            auto device = slot->device;
+            if (device.isEmpty()) device = {{"backend", "cpu"}, {"name", "CPU"}, {"deviceId", ""}};
+            device.insert("state", slot->failed ? "failed" : slot->current ? "busy"
+                : !slot->initialized ? "discovered" : slot->worker.state() == QProcess::NotRunning ? "idle" : "ready");
+            device.insert("activePath", slot->current ? slot->current->file.path : QString{});
+            device.insert("completedTasks", qint64(slot->completedTasks));
+            device.insert("error", slot->error);
+            device.insert("runtime", slot->runtime);
+            devices.append(device);
+        }
+        return devices;
+    }
+
+    QJsonObject indexDeviceCounts() const {
+        int discovered = 0, ready = 0, busy = 0, failed = 0;
+        for (const auto &slot : indexSlots) {
+            if (slot->retired || !slot->gpu() || !slot->device.value("discovered").toBool(true)) continue;
+            ++discovered;
+            if (slot->failed) ++failed;
+            else {
+                if (slot->initialized) ++ready;
+                if (slot->current) ++busy;
+            }
+        }
+        return {{"discovered", discovered}, {"ready", ready}, {"busy", busy}, {"failed", failed}};
+    }
+
+    IndexSlot &addIndexSlot(QJsonObject device = {}, QString fallback = {}) {
+        auto owned = std::make_unique<IndexSlot>(q);
+        auto &slot = *owned;
+        slot.device = std::move(device); slot.cpuFallback = std::move(fallback);
+        indexSlots.push_back(std::move(owned));
+        setupWorker(slot.worker, false, &slot);
+        setupIdle(false, &slot);
+        slot.timeout.setSingleShot(true);
+        QObject::connect(&slot.timeout, &QTimer::timeout, q, [this, &slot] {
+            if (slot.gpu() && slot.gpuOperation) isolateDevice(slot, QStringLiteral("GPU index worker timed out"));
+            else {
+                publishFailedCurrent(slot, QStringLiteral("Index worker timed out"));
+                stopWorkerForRestart(false, ExitReason::Fault, &slot);
+            }
+        });
+        return slot;
+    }
+
+    void resetIndexPool() {
+        poolReady = false; probing = false; probeId.clear(); indexPoolError.clear(); probeTimeout.stop();
+        if (deviceProbe.state() != QProcess::NotRunning) deviceProbe.kill();
+        for (auto &slot : indexSlots) {
+            slot->retired = true;
+            if (!slot->requestId.isEmpty()) slot->worker.write(QJsonDocument(QJsonObject{
+                {"id", "cancel"}, {"operation", "cancel"}, {"targetId", slot->requestId}}).toJson(QJsonDocument::Compact) + '\n');
+            if (!slot->publishing) slot->current.reset();
+            slot->requestId.clear(); slot->timeout.stop();
+            stopWorkerForRestart(false, ExitReason::Restart, slot.get());
+        }
+        QTimer::singleShot(0, q, [this] { pruneRetiredIndexSlots(); });
+    }
+
+    void pruneRetiredIndexSlots() {
+        // Only run after the signal/publication callback that released a slot
+        // has returned. Pending writes and running processes keep it alive.
+        std::erase_if(indexSlots, [](const auto &slot) {
+            return slot->retired && !slot->publishing && !slot->current && slot->worker.state() == QProcess::NotRunning;
+        });
+    }
+
+    void ensureIndexCapacity() {
+        if (!poolReady || strictGpu() || stopping) return;
+        if (std::any_of(indexSlots.cbegin(), indexSlots.cend(), [](const auto &slot) { return !slot->retired && !slot->failed; })) return;
+        const QString reason = indexPoolError.isEmpty()
+            ? QStringLiteral("All compatible GPU index workers are unavailable. Continuing with one CPU worker.")
+            : indexPoolError + QStringLiteral("\nContinuing with one CPU index worker.");
+        addIndexSlot({{"backend", "cpu"}, {"name", "CPU"}, {"gpu", false}}, reason);
+        log(reason); event(QStringLiteral("runtime"), runtimeStatus());
+    }
+
+    void isolateDevice(IndexSlot &slot, const QString &error) {
+        if (slot.failed || slot.retired) return;
+        slot.failed = true; slot.error = error; slot.gpuOperation = false;
+        quarantinedIndexDevices.insert(deviceKey(slot.device), error);
+        slot.timeout.stop(); slot.requestId.clear(); slot.runtime.insert("loaded", false);
+        indexRuntime = slot.runtime;
+        if (slot.current && !slot.publishing) {
+            Job retry = std::move(*slot.current); slot.current.reset();
+            if (retry.generation == generation) enqueue(std::move(retry), QueueClass::Continuation);
+        }
+        log(QStringLiteral("Index device %1 isolated: %2").arg(slot.device.value("deviceId").toString(), error));
+        stopWorkerForRestart(false, ExitReason::Fault, &slot);
+        // Create the CPU fallback outside active slot iteration.
+        QTimer::singleShot(0, q, [this] { ensureIndexCapacity(); scheduleNext(); });
+        event(QStringLiteral("runtime"), runtimeStatus());
+    }
+
+    void setupDeviceProbe() {
+        deviceProbe.setProcessChannelMode(QProcess::SeparateChannels);
+        probeTimeout.setSingleShot(true);
+        QObject::connect(&probeTimeout, &QTimer::timeout, q, [this] {
+            finishDeviceProbe({}, QStringLiteral("GPU device discovery timed out"));
+        });
+        QObject::connect(&deviceProbe, &QProcess::readyReadStandardError, q, [this] {
+            const auto text = QString::fromUtf8(deviceProbe.readAllStandardError()).trimmed();
+            if (!text.isEmpty()) log(text.left(16384));
+        });
+        QObject::connect(&deviceProbe, &QProcess::readyReadStandardOutput, q, [this] {
+            probeBuffer += deviceProbe.readAllStandardOutput();
+            if (!probing) return;
+            if (probeBuffer.size() > maxMessageBytes) { finishDeviceProbe({}, QStringLiteral("Device discovery response exceeds protocol limit")); return; }
+            while (probeBuffer.contains('\n')) {
+                const auto newline = probeBuffer.indexOf('\n');
+                const auto bytes = probeBuffer.left(newline); probeBuffer.remove(0, newline + 1);
+                QJsonParseError parse;
+                const auto document = QJsonDocument::fromJson(bytes, &parse);
+                if (parse.error != QJsonParseError::NoError || !document.isObject()) { finishDeviceProbe({}, QStringLiteral("Invalid device discovery response")); return; }
+                const auto message = document.object();
+                if (message.value("id").toString() != probeId) continue;
+                if (!message.value("event").toString().isEmpty()) continue;
+                if (!message.value("ok").toBool()) finishDeviceProbe({}, message.value("error").toObject().value("message").toString("Device discovery failed"));
+                else finishDeviceProbe(message.value("result").toObject(), {});
+                return;
+            }
+        });
+        QObject::connect(&deviceProbe, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), q, [this](int code, QProcess::ExitStatus) {
+            if (probing) finishDeviceProbe({}, QStringLiteral("Device discovery worker exited (%1)").arg(code));
+            else if (!stopping && !poolReady) QTimer::singleShot(0, q, [this] { scheduleNext(); });
+        });
+    }
+
+    void discoverIndexDevices() {
+        if (probing || stopping) return;
+        if (deviceProbe.state() != QProcess::NotRunning) return;
+        // Retired slots stay alive until queued publication callbacks release
+        // them. Their process and request identities cannot enter the new pool.
+        if (!modelAvailable || qEnvironmentVariable("QCOPILOTS_SEARCH_BACKEND").trimmed().compare("cpu", Qt::CaseInsensitive) == 0) {
+            poolReady = true;
+            addIndexSlot({{"backend", "cpu"}, {"name", "CPU"}, {"gpu", false}});
+            QTimer::singleShot(0, q, [this] { scheduleNext(); }); return;
+        }
+        probing = true; probeGeneration = generation; probeBuffer.clear();
+        probeId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        deviceProbe.setProgram(executablePath(QStringLiteral("qcs-worker")));
+        deviceProbe.setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir, "--mode", "extract", "--threads", "1"});
+        deviceProbe.setProcessEnvironment(QProcessEnvironment::systemEnvironment());
+        deviceProbe.setProperty("qcsDeviceProbe", true);
+        if (configureWorker) configureWorker(deviceProbe, false);
+        deviceProbe.start();
+        if (!deviceProbe.waitForStarted(3000)) { finishDeviceProbe({}, QStringLiteral("Cannot start device discovery worker")); return; }
+        deviceProbe.write(QJsonDocument(QJsonObject{{"id", probeId}, {"operation", "devices"}}).toJson(QJsonDocument::Compact) + '\n');
+        probeTimeout.start(30000);
+    }
+
+    void finishDeviceProbe(const QJsonObject &result, QString error) {
+        if (!probing) return;
+        probing = false; probeTimeout.stop();
+        if (deviceProbe.state() != QProcess::NotRunning) {
+            deviceProbe.write("{\"id\":\"shutdown\",\"operation\":\"shutdown\"}\n");
+            deviceProbe.closeWriteChannel();
+            QTimer::singleShot(shutdownGraceMs, q, [this, id = probeId] {
+                if (!probing && probeId == id && deviceProbe.state() != QProcess::NotRunning) deviceProbe.kill();
+            });
+        }
+        if (stopping || probeGeneration != generation) return;
+        poolReady = true;
+        const bool valid = result.value("devices").isArray() && !result.value("packagedBackend").toString().isEmpty()
+            && result.value("requestedMode").isString() && result.value("gpuLoadError").isString();
+        if (error.isEmpty() && !valid) error = QStringLiteral("Device discovery returned an incomplete protocol response");
+        QJsonArray devices = valid ? result.value("devices").toArray() : QJsonArray{};
+        if (error.isEmpty()) error = result.value("gpuLoadError").toString();
+        QList<QJsonObject> selected;
+        for (const auto &value : devices) {
+            const auto device = value.toObject();
+            if (!device.value("gpu").toBool()) continue;
+            if (deviceSelections.isEmpty()) selected.append(device);
+        }
+        for (const auto &selection : deviceSelections) {
+            QList<QJsonObject> matches;
+            for (const auto &value : devices) {
+                const auto device = value.toObject();
+                if (!device.value("gpu").toBool() || device.value("backend").toString().compare(selection.value("backend").toString(), Qt::CaseInsensitive)) continue;
+                const auto id = selection.value("deviceId").toString();
+                if (!id.isEmpty() ? device.value("deviceId").toString() == id : device.value("name").toString() == selection.value("name").toString()) matches.append(device);
+            }
+            if (matches.size() == 1) {
+                if (!selected.contains(matches.first())) selected.append(matches.first());
+            } else {
+                auto failed = selection; failed.insert("gpu", true); failed.insert("available", false); failed.insert("discovered", false);
+                failed.insert("unavailableReason", matches.isEmpty() ? "Requested GPU was not discovered" : "Requested GPU name is ambiguous");
+                selected.append(failed);
+            }
+        }
+        for (const auto &device : selected) {
+            auto &slot = addIndexSlot(device);
+            const auto quarantined = quarantinedIndexDevices.constFind(deviceKey(device));
+            if (quarantined != quarantinedIndexDevices.cend()) {
+                slot.failed = true; slot.error = quarantined.value();
+            } else if (!device.value("available").toBool(true)) {
+                slot.failed = true; slot.error = device.value("unavailableReason").toString("GPU is unavailable");
+            }
+        }
+        if (selected.isEmpty()) {
+            const auto packaged = result.value("packagedBackend").toString();
+            if (error.isEmpty() && deviceSelections.isEmpty() && packaged == "cpu") {
+                // CPU packages use one worker. Strict GPU still verifies its
+                // diagnostics and cannot accept a CPU inference result.
+                addIndexSlot();
+            } else {
+                indexPoolError = error.isEmpty() ? QStringLiteral("No compatible GPU was discovered") : error;
+                log(indexPoolError);
+            }
+        }
+        ensureIndexCapacity(); event(QStringLiteral("runtime"), runtimeStatus());
+        QTimer::singleShot(0, q, [this] { scheduleNext(); });
+    }
+
     QJsonObject runtimeStatus() const {
         return {{"runtime", latestRuntimeIsQuery ? queryRuntime : indexRuntime},
+                {"indexDevices", indexDeviceStatus()}, {"indexDeviceCounts", indexDeviceCounts()},
                 {"runtimeWorkers", QJsonObject{{"index", indexRuntime}, {"query", queryRuntime}}}};
     }
 
-    void recordRuntime(bool query, const QJsonObject &message) {
+    void recordRuntime(bool query, const QJsonObject &message, IndexSlot *slot = nullptr) {
         const auto payload = message.value(message.value("ok").toBool() ? "result" : "error").toObject();
         auto diagnostics = payload.value("runtime").toObject();
         if (diagnostics.isEmpty()) return;
-        const auto &cpuFallback = query ? queryCpuFallback : indexCpuFallback;
+        const auto &cpuFallback = query ? queryCpuFallback : slot->cpuFallback;
         if (!cpuFallback.isEmpty()) {
             diagnostics.insert("requestedBackend", "auto");
             diagnostics.insert("effectiveBackendRequest", "cpu");
@@ -418,18 +675,22 @@ public:
             diagnostics.insert("fallbackReason", reason.isEmpty() ? cpuFallback : cpuFallback + '\n' + reason);
         }
         diagnostics.insert("workerRole", query ? "query" : "index");
-        auto &previous = query ? queryRuntime : indexRuntime;
+        auto &previous = query ? queryRuntime : slot->runtime;
         if (previous == diagnostics && latestRuntimeIsQuery == query) return;
         previous = diagnostics;
+        if (!query) { indexRuntime = diagnostics; slot->initialized = diagnostics.value("loaded").toBool()
+            && (!slot->gpu() || (diagnostics.value("gpuSelected").toBool() && diagnostics.value("gpuSelfTestPassed").toBool()
+                && diagnostics.value("textWarmupCompleted").toBool())); }
         latestRuntimeIsQuery = query;
         log(QStringLiteral("Inference runtime: %1").arg(QString::fromUtf8(QJsonDocument(diagnostics).toJson(QJsonDocument::Compact))));
         event(QStringLiteral("runtime"), runtimeStatus());
     }
 
-    void runtimeStopped(bool query) {
-        auto &diagnostics = query ? queryRuntime : indexRuntime;
+    void runtimeStopped(bool query, IndexSlot *slot = nullptr) {
+        auto &diagnostics = query ? queryRuntime : slot->runtime;
         if (diagnostics.isEmpty() || !diagnostics.value("loaded").toBool()) return;
         diagnostics.insert("loaded", false);
+        if (!query) indexRuntime = diagnostics;
         event(QStringLiteral("runtime"), runtimeStatus());
     }
 
@@ -437,37 +698,37 @@ public:
         return qEnvironmentVariable("QCOPILOTS_SEARCH_BACKEND").trimmed().compare("gpu", Qt::CaseInsensitive) == 0;
     }
 
-    bool runtimeEvent(bool query, const QJsonObject &message) {
+    bool runtimeEvent(bool query, const QJsonObject &message, IndexSlot *slot = nullptr) {
         if (message.value("event").toString() != "runtime") return false;
         const auto id = message.value("id").toString();
-        if (id.isEmpty() || id != (query ? activeQuery : currentWorkerId)) return true;
+        if (id.isEmpty() || id != (query ? activeQuery : slot->requestId)) return true;
         const auto data = message.value("data").toObject();
         const auto diagnostics = data.value("runtime").toObject();
-        auto &gpuOperation = query ? queryGpuOperation : indexGpuOperation;
+        auto &gpuOperation = query ? queryGpuOperation : slot->gpuOperation;
         const auto phase = data.value("phase").toString();
         if (phase == "inference-start") {
             const QString packaged = diagnostics.value("packagedBackend").toString();
-            gpuOperation = diagnostics.value("requestedBackend").toString().trimmed().compare("auto", Qt::CaseInsensitive) == 0
+            gpuOperation = (!query && slot->gpu()) || (diagnostics.value("requestedBackend").toString().trimmed().compare("auto", Qt::CaseInsensitive) == 0
                 && !packaged.isEmpty() && packaged != "cpu"
                 && (data.value("activity").toString() == "model-load"
-                    || !diagnostics.value("loaded").toBool() || diagnostics.value("gpuSelected").toBool());
+                    || !diagnostics.value("loaded").toBool() || diagnostics.value("gpuSelected").toBool()));
         } else if (phase == "inference-end") gpuOperation = false;
         else return true;
-        recordRuntime(query, {{"ok", true}, {"result", QJsonObject{{"runtime", diagnostics}}}});
+        recordRuntime(query, {{"ok", true}, {"result", QJsonObject{{"runtime", diagnostics}}}}, slot);
         return true;
     }
 
-    bool retryGpuCrashOnCpu(bool query, int code, QProcess::ExitStatus status) {
-        auto &fallback = query ? queryCpuFallback : indexCpuFallback;
-        const bool gpuOperation = std::exchange(query ? queryGpuOperation : indexGpuOperation, false);
+    bool retryGpuCrashOnCpu(bool query, int code, QProcess::ExitStatus status, IndexSlot *slot = nullptr) {
+        auto &fallback = query ? queryCpuFallback : slot->cpuFallback;
+        const bool gpuOperation = std::exchange(query ? queryGpuOperation : slot->gpuOperation, false);
         if (!gpuOperation || strictGpu() || !fallback.isEmpty()
             || (status == QProcess::NormalExit && code == 0)) return false;
         if (query ? activeQuery.isEmpty() || !requests.contains(activeQuery)
-                  : !current || currentWorkerId.isEmpty() || publishing) return false;
+                  : !slot->current || slot->requestId.isEmpty() || slot->publishing) return false;
         fallback = QStringLiteral("The GPU worker exited during inference (exit %1, status %2). Retrying once on CPU.")
             .arg(code).arg(int(status));
         log(fallback);
-        auto &diagnostics = query ? queryRuntime : indexRuntime;
+        auto &diagnostics = query ? queryRuntime : slot->runtime;
         diagnostics.insert("loaded", false);
         diagnostics.insert("gpuSelected", false);
         diagnostics.insert("gpuSelfTestPassed", false);
@@ -483,8 +744,8 @@ public:
             queryQueue.prepend(activeQuery);
             activeQuery.clear();
         } else {
-            indexTimeout.stop();
-            currentWorkerId.clear();
+            slot->timeout.stop();
+            slot->requestId.clear();
         }
         return true;
     }
@@ -520,8 +781,9 @@ public:
                 {"failures", failures}, {"warning", error},
                 {"watcherMode", watcherMode}, {"watcherWarning", watcherWarning}, {"reconcileIntervalMs", reconcile.interval()},
                 {"activeSearches", activeSearches.size()}, {"queuedQueries", queryQueue.size()},
-                {"queuedFiles", jobs.size() + (current ? 1 : 0)}, {"catalogReady", catalogReady},
+                {"queuedFiles", jobs.size() + activeIndexCount()}, {"catalogReady", catalogReady},
                 {"runtime", latestRuntimeIsQuery ? queryRuntime : indexRuntime},
+                {"indexDevices", indexDeviceStatus()}, {"indexDeviceCounts", indexDeviceCounts()},
                 {"runtimeWorkers", QJsonObject{{"index", indexRuntime}, {"query", queryRuntime}}}});
         } else if (method == "settings.get") sendResult(socket, id, settings.toJson());
         else if (method == "settings.set") {
@@ -553,7 +815,6 @@ public:
             sendResult(socket, id, settings.toJson());
             event(QStringLiteral("settings"), settings.toJson());
             if (changed) startScan();
-            else if (!settings.indexingPaused && current && currentWorkerId.isEmpty() && !publishing) dispatchIndex();
             else scheduleNext();
         } else if (method == "search") {
             if (params.value("code").toBool() && !settings.includeCode) {
@@ -616,8 +877,7 @@ public:
             settings = next;
             progress.state = settings.indexingPaused ? QStringLiteral("paused") : QStringLiteral("indexing");
             if (!settings.indexingPaused) {
-                if (current && currentWorkerId.isEmpty() && !publishing) dispatchIndex();
-                else if (jobs.isEmpty() && !current) startScan();
+                if (jobs.isEmpty() && !activeIndexCount()) startScan();
                 else scheduleNext();
             }
             updateIdleWorkers();
@@ -646,8 +906,9 @@ public:
 
     bool refreshModels(QString *error = nullptr) {
         indexRuntime = {}; queryRuntime = {}; latestRuntimeIsQuery = false;
-        indexGpuOperation = queryGpuOperation = false;
-        indexCpuFallback.clear(); queryCpuFallback.clear();
+        quarantinedIndexDevices.clear();
+        queryGpuOperation = false;
+        queryCpuFallback.clear();
         if (started) event(QStringLiteral("runtime"), runtimeStatus());
         QString verificationError;
         ModelFiles models(paths.modelDir);
@@ -702,11 +963,7 @@ public:
         pendingCatalog.reset(); knownVersions.clear(); completedFiles.clear(); failedFiles.clear();
         if (invalidateCatalog) { catalogReady = false; catalogRoots.clear(); catalogCodeRoots.clear(); catalogFiles.clear(); }
         firstScan = true;
-        if (!currentWorkerId.isEmpty()) indexWorker.write(QJsonDocument(QJsonObject{{"id", "cancel"}, {"operation", "cancel"},
-            {"targetId", currentWorkerId}}).toJson(QJsonDocument::Compact) + '\n');
-        if (!publishing) current.reset();
-        currentWorkerId.clear(); indexTimeout.stop();
-        stopWorkerForRestart(false);
+        resetIndexPool();
         pendingScan = true;
     }
 
@@ -738,7 +995,7 @@ public:
     }
 
     void mergeCatalog() {
-        if (!pendingCatalog || current || publishing || stopping) return;
+        if (!pendingCatalog || activeIndexCount() || publishing || stopping) return;
         auto result = std::move(pendingCatalog);
         const quint64 epoch = result->generation;
         if (epoch != generation) { scheduleNext(); return; }
@@ -825,11 +1082,11 @@ public:
         visibleGeneral.removeDuplicates(); visibleGeneral.sort();
         visibleCode.removeDuplicates(); visibleCode.sort();
         const bool includeCode = settings.includeCode;
-        publishing = true;
+        ++publishing; catalogPublishing = true;
         auto *writer = new QFutureWatcher<QString>(q);
         QObject::connect(writer, &QFutureWatcher<QString>::finished, q, [this, writer, epoch, includeCode, completeScan,
                                                                         visibleGeneral, visibleCode, presentKeys] {
-            const QString error = writer->result(); writer->deleteLater(); publishing = false;
+            const QString error = writer->result(); writer->deleteLater(); --publishing; catalogPublishing = false;
             if (stopping) return;
             if (!error.isEmpty()) { progress.error = error; log(error); }
             else if (epoch == generation) {
@@ -872,8 +1129,8 @@ public:
         const bool includeCode = settings.includeCode;
         scanProtectedGeneral.clear(); scanProtectedCode.clear();
         for (const auto &job : std::as_const(jobs)) protectForScan(job);
-        if (current) protectForScan(*current);
-        if (!current && jobs.isEmpty()) progress.state = QStringLiteral("scanning");
+        for (auto &slot : indexSlots) if (slot->current) protectForScan(*slot->current);
+        if (!activeIndexCount() && jobs.isEmpty()) progress.state = QStringLiteral("scanning");
         publishProgress();
         auto *watcher = new QFutureWatcher<ScanPackage>(q);
         QObject::connect(watcher, &QFutureWatcher<ScanPackage>::finished, q, [this, watcher, epoch] {
@@ -921,69 +1178,70 @@ public:
         }));
     }
 
-    bool workerIdle(bool query) const {
+    bool workerIdle(bool query, const IndexSlot *slot = nullptr) const {
         if (query) {
             if (!activeQuery.isEmpty()) return false;
             for (const auto &id : queryQueue) if (requests.contains(id)) return false;
             return true;
         }
-        return currentWorkerId.isEmpty() && (!publishing || !current)
-            && (settings.indexingPaused || (!current && jobs.isEmpty()));
+        return slot->requestId.isEmpty() && (!slot->publishing || !slot->current)
+            && (settings.indexingPaused || (!slot->current && jobs.isEmpty()));
     }
 
     void updateIdleWorkers() {
         if (stopping) return;
-        for (const bool query : {false, true}) {
-            auto &worker = query ? queryWorker : indexWorker;
-            auto &timer = query ? queryIdle : indexIdle;
-            const auto reason = query ? queryExit : indexExit;
-            if (worker.state() != QProcess::Running || reason != ExitReason::None || !workerIdle(query)) {
-                timer.stop(); continue;
+        const auto update = [this](bool query, IndexSlot *slot) {
+            auto &worker = query ? queryWorker : slot->worker;
+            auto &timer = query ? queryIdle : slot->idle;
+            const auto reason = query ? queryExit : slot->exit;
+            if (worker.state() != QProcess::Running || reason != ExitReason::None || !workerIdle(query, slot)) {
+                timer.stop(); return;
             }
-            // Repeated empty scans must not extend the existing idle deadline.
             if (!timer.isActive()) timer.start(query ? queryIdleMs : indexIdleMs);
-        }
+        };
+        update(true, nullptr);
+        for (auto &slot : indexSlots) update(false, slot.get());
     }
 
-    void setupIdle(bool query) {
-        auto &idle = query ? queryIdle : indexIdle;
-        auto &grace = query ? queryShutdownGrace : indexShutdownGrace;
+    void setupIdle(bool query, IndexSlot *slot = nullptr) {
+        auto &idle = query ? queryIdle : slot->idle;
+        auto &grace = query ? queryShutdownGrace : slot->shutdownGrace;
         idle.setSingleShot(true); grace.setSingleShot(true);
-        QObject::connect(&idle, &QTimer::timeout, q, [this, query] {
-            auto &worker = query ? queryWorker : indexWorker;
-            auto &reason = query ? queryExit : indexExit;
-            if (stopping || reason != ExitReason::None || worker.state() != QProcess::Running || !workerIdle(query)) return;
+        QObject::connect(&idle, &QTimer::timeout, q, [this, query, slot] {
+            auto &worker = query ? queryWorker : slot->worker;
+            auto &reason = query ? queryExit : slot->exit;
+            if (stopping || reason != ExitReason::None || worker.state() != QProcess::Running || !workerIdle(query, slot)) return;
             reason = ExitReason::Idle;
-            (query ? queryRestartPending : indexRestartPending) = true;
+            (query ? queryRestartPending : slot->restartPending) = true;
             worker.write("{\"id\":\"shutdown\",\"operation\":\"shutdown\"}\n");
             worker.closeWriteChannel();
-            (query ? queryShutdownGrace : indexShutdownGrace).start(shutdownGraceMs);
+            (query ? queryShutdownGrace : slot->shutdownGrace).start(shutdownGraceMs);
         });
-        QObject::connect(&grace, &QTimer::timeout, q, [this, query] {
-            auto &worker = query ? queryWorker : indexWorker;
-            if ((query ? queryExit : indexExit) == ExitReason::Idle && worker.state() != QProcess::NotRunning)
+        QObject::connect(&grace, &QTimer::timeout, q, [this, query, slot] {
+            auto &worker = query ? queryWorker : slot->worker;
+            if ((query ? queryExit : slot->exit) == ExitReason::Idle && worker.state() != QProcess::NotRunning)
                 worker.kill();
         });
     }
 
-    void stopWorkerForRestart(bool query, ExitReason reason = ExitReason::Restart) {
-        auto &worker = query ? queryWorker : indexWorker;
-        (query ? queryIdle : indexIdle).stop();
-        (query ? queryShutdownGrace : indexShutdownGrace).stop();
-        (query ? queryExit : indexExit) = reason;
-        (query ? queryRestartPending : indexRestartPending) = worker.state() != QProcess::NotRunning;
+    void stopWorkerForRestart(bool query, ExitReason reason = ExitReason::Restart, IndexSlot *slot = nullptr) {
+        auto &worker = query ? queryWorker : slot->worker;
+        (query ? queryIdle : slot->idle).stop();
+        (query ? queryShutdownGrace : slot->shutdownGrace).stop();
+        (query ? queryExit : slot->exit) = reason;
+        (query ? queryRestartPending : slot->restartPending) = worker.state() != QProcess::NotRunning;
         if (worker.state() != QProcess::NotRunning) worker.kill();
-        else (query ? queryExit : indexExit) = ExitReason::None;
+        else (query ? queryExit : slot->exit) = ExitReason::None;
     }
 
-    void setupWorker(QProcess &worker, bool query) {
+    void setupWorker(QProcess &worker, bool query, IndexSlot *slot = nullptr) {
         worker.setProcessChannelMode(QProcess::SeparateChannels);
-        QObject::connect(&worker, &QProcess::readyReadStandardOutput, q, [this, &worker, query] {
-            QByteArray &buffer = query ? queryBuffer : indexBuffer;
+        QObject::connect(&worker, &QProcess::readyReadStandardOutput, q, [this, &worker, query, slot] {
+            QByteArray &buffer = query ? queryBuffer : slot->buffer;
             buffer += worker.readAllStandardOutput();
             if (buffer.size() > maxMessageBytes) {
-                workerFailure(query, QStringLiteral("Worker response exceeds protocol limit"));
-                stopWorkerForRestart(query, ExitReason::Fault); return;
+                workerFailure(query, QStringLiteral("Worker response exceeds protocol limit"), slot);
+                stopWorkerForRestart(query, ExitReason::Fault, slot); return;
             }
             while (true) {
                 const qsizetype line = buffer.indexOf('\n');
@@ -992,47 +1250,50 @@ public:
                 QJsonParseError parse;
                 const auto document = QJsonDocument::fromJson(bytes, &parse);
                 if (parse.error != QJsonParseError::NoError || !document.isObject()) {
-                    workerFailure(query, QStringLiteral("Malformed worker response"));
-                    stopWorkerForRestart(query, ExitReason::Fault); return;
+                    workerFailure(query, QStringLiteral("Malformed worker response"), slot);
+                    stopWorkerForRestart(query, ExitReason::Fault, slot); return;
                 }
-                if (runtimeEvent(query, document.object())) continue;
-                if (query) receiveQuery(document.object()); else receiveIndex(document.object());
+                if (runtimeEvent(query, document.object(), slot)) continue;
+                if (query) receiveQuery(document.object()); else receiveIndex(*slot, document.object());
             }
         });
         QObject::connect(&worker, &QProcess::readyReadStandardError, q, [this, &worker] {
             const auto text = QString::fromUtf8(worker.readAllStandardError()).trimmed();
             if (!text.isEmpty()) log(text.left(16384));
         });
-        QObject::connect(&worker, &QProcess::errorOccurred, q, [this, query](QProcess::ProcessError error) {
+        QObject::connect(&worker, &QProcess::errorOccurred, q, [this, query, slot](QProcess::ProcessError error) {
             if (error != QProcess::FailedToStart) return;
-            (query ? queryIdle : indexIdle).stop();
-            (query ? queryShutdownGrace : indexShutdownGrace).stop();
-            (query ? queryRestartPending : indexRestartPending) = false;
-            (query ? queryExit : indexExit) = ExitReason::None;
+            (query ? queryIdle : slot->idle).stop();
+            (query ? queryShutdownGrace : slot->shutdownGrace).stop();
+            (query ? queryRestartPending : slot->restartPending) = false;
+            (query ? queryExit : slot->exit) = ExitReason::None;
             // ensureWorker's caller owns the one failed-start reply/publication.
         });
         QObject::connect(&worker, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), q,
-            [this, query](int code, QProcess::ExitStatus status) {
-                runtimeStopped(query);
+            [this, query, slot](int code, QProcess::ExitStatus status) {
+                runtimeStopped(query, slot);
                 if (stopping) return;
-                (query ? queryIdle : indexIdle).stop();
-                (query ? queryShutdownGrace : indexShutdownGrace).stop();
-                auto &reason = query ? queryExit : indexExit;
+                (query ? queryIdle : slot->idle).stop();
+                (query ? queryShutdownGrace : slot->shutdownGrace).stop();
+                auto &reason = query ? queryExit : slot->exit;
                 const auto previousReason = std::exchange(reason, ExitReason::None);
-                if (query) queryRestartPending = false; else indexRestartPending = false;
-                if (query) queryBuffer.clear(); else indexBuffer.clear();
-                if (previousReason == ExitReason::None && !retryGpuCrashOnCpu(query, code, status))
-                    workerFailure(query, QStringLiteral("Worker exited (%1, %2)").arg(code).arg(int(status)));
+                if (query) queryRestartPending = false; else slot->restartPending = false;
+                if (query) queryBuffer.clear(); else slot->buffer.clear();
+                if (previousReason == ExitReason::None && !query && slot->gpu() && !slot->failed
+                    && !slot->retired && slot->gpuOperation) {
+                    isolateDevice(*slot, QStringLiteral("GPU worker exited (%1, %2)").arg(code).arg(int(status)));
+                } else if (previousReason == ExitReason::None && !retryGpuCrashOnCpu(query, code, status, slot))
+                    workerFailure(query, QStringLiteral("Worker exited (%1, %2)").arg(code).arg(int(status)), slot);
                 QTimer::singleShot(0, q, [this, query] {
+                    pruneRetiredIndexSlots();
                     if (query) nextQuery();
-                    else if (current && currentWorkerId.isEmpty() && !publishing) dispatchIndex();
                     else scheduleNext();
                 });
             });
     }
 
-    bool ensureWorker(QProcess &worker, bool query) {
-        if ((query ? queryExit : indexExit) != ExitReason::None) return false;
+    bool ensureWorker(QProcess &worker, bool query, IndexSlot *slot = nullptr) {
+        if ((query ? queryExit : slot->exit) != ExitReason::None) return false;
         if (worker.state() == QProcess::Running) return true;
         if (worker.state() == QProcess::Starting) return false;
         worker.setProgram(executablePath(QStringLiteral("qcs-worker")));
@@ -1040,169 +1301,227 @@ public:
                              "--mode", query ? "query" : (modelAvailable ? "full" : "extract"), "--threads", query ? "4" : "2"});
         worker.setProcessEnvironment(QProcessEnvironment::systemEnvironment());
         if (configureWorker) configureWorker(worker, query);
-        if (!(query ? queryCpuFallback : indexCpuFallback).isEmpty()) {
+        if (!query && slot->gpu()) {
+            auto arguments = worker.arguments();
+            const QJsonObject selector{{"backend", slot->device.value("backend")}, {"deviceId", slot->device.value("deviceId")},
+                                       {"name", slot->device.value("name")}};
+            arguments << "--device" << QString::fromUtf8(QJsonDocument(selector).toJson(QJsonDocument::Compact));
+            worker.setArguments(arguments);
+        }
+        if (!(query ? queryCpuFallback : slot->cpuFallback).isEmpty()
+            || (!query && slot->device.value("backend").toString() == "cpu")) {
             auto environment = worker.processEnvironment();
             if (environment.inheritsFromParent()) environment = QProcessEnvironment::systemEnvironment();
             environment.insert("QCOPILOTS_SEARCH_BACKEND", "cpu");
             worker.setProcessEnvironment(environment);
         }
-        (query ? queryGpuOperation : indexGpuOperation) = false;
+        (query ? queryGpuOperation : slot->gpuOperation) = false;
         worker.start();
         // Process startup is bounded. File decoding and inference are always asynchronous.
         return worker.waitForStarted(3000);
     }
 
     void scheduleNext() {
-        if (stopping || publishing || current) { updateIdleWorkers(); return; }
-        if (pendingCatalog) { mergeCatalog(); return; }
+        if (stopping || catalogPublishing) { updateIdleWorkers(); return; }
+        // A pending catalog result is a barrier: finish active batches and their
+        // writes before changing directory visibility or removing index rows.
+        if (pendingCatalog) {
+            for (auto &slot : indexSlots) if (slot->current && slot->requestId.isEmpty() && !slot->publishing) {
+                Job deferred = std::move(*slot->current); slot->current.reset();
+                if (deferred.generation == generation) enqueue(std::move(deferred), QueueClass::Continuation);
+            }
+            mergeCatalog(); updateIdleWorkers(); return;
+        }
         if (pendingScan && !scanning) startScan();
         if (!pipelineReady) { progress.state = QStringLiteral("error"); progress.error = pipelineError; publishProgress(); return; }
-        if (indexExit != ExitReason::None || (indexRestartPending && indexWorker.state() != QProcess::NotRunning)) return;
         if (settings.indexingPaused) { progress.state = QStringLiteral("paused"); publishProgress(); updateIdleWorkers(); return; }
-        if (jobs.isEmpty()) {
+        if (jobs.isEmpty() && !activeIndexCount()) {
             progress.state = scanning ? QStringLiteral("scanning")
                 : progress.failed > 0 || !progress.error.isEmpty() ? QStringLiteral("partial") : QStringLiteral("idle");
-            progress.currentPath.clear(); publishProgress(); saveJournal();
-            updateIdleWorkers();
-            return;
+            progress.currentPath.clear(); publishProgress(); saveJournal(); updateIdleWorkers(); return;
         }
+        if (!poolReady) { discoverIndexDevices(); return; }
+        ensureIndexCapacity();
+        bool usable = false;
+        for (auto &owned : indexSlots) {
+            auto &slot = *owned;
+            if (slot.retired || slot.failed) continue;
+            usable = true;
+            if (slot.exit != ExitReason::None || slot.publishing
+                || (slot.restartPending && slot.worker.state() != QProcess::NotRunning)) continue;
+            if (slot.current) { if (slot.requestId.isEmpty()) dispatchIndex(slot); }
+            else assignIndex(slot);
+        }
+        if (!usable && !jobs.isEmpty()) {
+            progress.state = QStringLiteral("error");
+            progress.error = indexPoolError.isEmpty()
+                ? QStringLiteral("No compatible GPU remains available. Reload models or restart after resolving the device error.") : indexPoolError;
+            publishProgress();
+        }
+        updateIdleWorkers();
+    }
+
+    void assignIndex(IndexSlot &slot) {
+        if (jobs.isEmpty() || slot.current || slot.failed || slot.retired) return;
         // Four recent batches, one bulk first pass and one continuation. Empty
         // classes are skipped, retaining a finite batch bound for every class.
         QString key;
         for (int attempts = 0; attempts < 6 && key.isEmpty(); ++attempts) {
             auto &queue = queueTurn < 4 ? recentJobs : queueTurn == 4 ? backfillJobs : continuationJobs;
             queueTurn = (queueTurn + 1) % 6;
-            while (!queue.isEmpty()) {
+            const qsizetype candidates = queue.size();
+            for (qsizetype attempt = 0; attempt < candidates && !queue.isEmpty(); ++attempt) {
                 const auto candidate = queue.dequeue();
                 const auto found = jobs.constFind(candidate.key);
-                if (found != jobs.cend() && found->queueToken == candidate.token) { key = candidate.key; break; }
+                if (found != jobs.cend() && found->queueToken == candidate.token) {
+                    if (fileActive(candidate.key)) { queue.enqueue(candidate); continue; }
+                    key = candidate.key; break;
+                }
             }
         }
         if (key.isEmpty()) return;
-        current = std::make_unique<Job>(jobs.take(key));
-        if (current->generation != generation) { current.reset(); QTimer::singleShot(0, q, [this] { scheduleNext(); }); return; }
+        slot.current = std::make_unique<Job>(jobs.take(key));
+        if (slot.current->generation != generation) { slot.current.reset(); QTimer::singleShot(0, q, [this] { scheduleNext(); }); return; }
         QString error;
-        const auto stored = repository.fileVersion(current->file.path, current->file.kind == "code", &error);
-        if (!error.isEmpty()) { failCurrent(error); return; }
-        if (!current->retry && stored == current->indexedVersion && !failures.contains(failureKey(current->file))) {
-            completedFiles.insert(key); failedFiles.remove(key); refreshProgressCounts(); current.reset();
+        const auto stored = repository.fileVersion(slot.current->file.path, slot.current->file.kind == "code", &error);
+        if (!error.isEmpty()) { failCurrent(slot, error); return; }
+        if (!slot.current->retry && stored == slot.current->indexedVersion && !failures.contains(failureKey(slot.current->file))) {
+            completedFiles.insert(key); failedFiles.remove(key); refreshProgressCounts(); slot.current.reset();
             QTimer::singleShot(0, q, [this] { scheduleNext(); }); return;
         }
-        if (!current->retry && (stored == current->indexedVersion + QStringLiteral("|capped:5000")
-            || stored == current->indexedVersion + QStringLiteral("|partial:5000"))) {
-            failCurrent(QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it.")); return;
+        if (!slot.current->retry && (stored == slot.current->indexedVersion + QStringLiteral("|capped:5000")
+            || stored == slot.current->indexedVersion + QStringLiteral("|partial:5000"))) {
+            failCurrent(slot, QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it.")); return;
         }
-        current->offset = 0;
-        if (!current->retry) {
-            const auto restoreError = restoreContinuation(*current, stored);
-            if (!restoreError.isEmpty()) { failCurrent(restoreError); return; }
+        slot.current->offset = 0;
+        if (!slot.current->retry) {
+            const auto restoreError = restoreContinuation(*slot.current, stored);
+            if (!restoreError.isEmpty()) { failCurrent(slot, restoreError); return; }
         }
-        current->retry = false;
-        current->batch = ++nextBatch;
-        progress.currentPath = current->file.path; progress.state = QStringLiteral("indexing"); publishProgress();
-        dispatchIndex();
+        slot.current->retry = false;
+        slot.current->batch = ++nextBatch;
+        progress.currentPath = slot.current->file.path; progress.state = QStringLiteral("indexing"); publishProgress();
+        dispatchIndex(slot);
     }
 
-    void dispatchIndex() {
-        if (!current || stopping || settings.indexingPaused || !pipelineReady) { updateIdleWorkers(); return; }
-        if (publishing || !currentWorkerId.isEmpty() || indexExit != ExitReason::None
-            || (indexRestartPending && indexWorker.state() != QProcess::NotRunning)) return;
+    void dispatchIndex(IndexSlot &slot) {
+        if (!slot.current || stopping || settings.indexingPaused || !pipelineReady) { updateIdleWorkers(); return; }
+        if (slot.publishing || !slot.requestId.isEmpty() || slot.exit != ExitReason::None
+            || (slot.restartPending && slot.worker.state() != QProcess::NotRunning)) return;
         // A paused job can outlive its source version. Reconcile now instead of
         // sending a knowingly stale request and waiting for the periodic scan.
-        if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
-        if (!ensureWorker(indexWorker, false)) { publishFailedCurrent(QStringLiteral("Cannot start index worker")); return; }
-        indexIdle.stop();
-        currentWorkerId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        const QJsonObject request{{"id", currentWorkerId}, {"operation", "extract"}, {"path", current->file.path},
-            {"expectedVersion", current->workerVersion}, {"code", current->file.kind == "code"}, {"embed", modelAvailable},
-            {"offset", current->offset}, {"maxSegments", 40}, {"pipelineFingerprint", pipeline}, {"runtimeEvents", true}};
-        indexWorker.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
-        indexTimeout.start(10 * 60 * 1000);
+        if (!currentSourceMatches(slot)) { rescanStaleCurrent(slot); return; }
+        if (!ensureWorker(slot.worker, false, &slot)) {
+            if (slot.gpu()) isolateDevice(slot, QStringLiteral("Cannot start GPU index worker"));
+            else publishFailedCurrent(slot, QStringLiteral("Cannot start index worker"));
+            return;
+        }
+        slot.idle.stop();
+        slot.requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const QJsonObject request{{"id", slot.requestId}, {"operation", "extract"}, {"path", slot.current->file.path},
+            {"expectedVersion", slot.current->workerVersion}, {"code", slot.current->file.kind == "code"}, {"embed", modelAvailable},
+            {"offset", slot.current->offset}, {"maxSegments", 40}, {"pipelineFingerprint", pipeline}, {"runtimeEvents", true}};
+        slot.worker.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
+        slot.timeout.start(10 * 60 * 1000);
+        event(QStringLiteral("runtime"), runtimeStatus());
     }
 
-    void receiveIndex(const QJsonObject &message) {
-        if (!current || message.value("id").toString() != currentWorkerId) return;
-        indexGpuOperation = false;
-        recordRuntime(false, message);
-        indexTimeout.stop(); currentWorkerId.clear();
+    void receiveIndex(IndexSlot &slot, const QJsonObject &message) {
+        if (!slot.current || message.value("id").toString() != slot.requestId) return;
+        slot.gpuOperation = false;
+        recordRuntime(false, message, &slot);
+        slot.timeout.stop(); slot.requestId.clear();
         if (!message.value("ok").toBool()) {
             const auto error = message.value("error").toObject();
-            if (error.value("code").toString() == "stale_source" || !currentSourceMatches()) {
-                rescanStaleCurrent(); return;
+            if (error.value("code").toString() == "stale_source" || !currentSourceMatches(slot)) {
+                rescanStaleCurrent(slot); return;
             }
-            publishFailedCurrent(error.value("message").toString("Worker failed")); return;
+            const auto code = error.value("code").toString();
+            if (slot.gpu() && (error.value("deviceFailure").toBool()
+                || code == "gpu_unavailable" || code == "device_unavailable" || code == "device_identity_ambiguous")) {
+                isolateDevice(slot, error.value("message").toString("GPU inference failed")); return;
+            }
+            publishFailedCurrent(slot, error.value("message").toString("Worker failed")); return;
         }
         const auto result = message.value("result").toObject();
-        if (modelAvailable && strictGpu() && (!indexRuntime.value("gpuSelected").toBool()
-            || !indexRuntime.value("loaded").toBool() || !indexRuntime.value("gpuSelfTestPassed").toBool()
-            || !indexRuntime.value("textWarmupCompleted").toBool())) {
-            publishFailedCurrent(QStringLiteral("Strict GPU inference did not confirm a loaded GPU backend")); return;
+        if (modelAvailable && (strictGpu() || slot.gpu()) && (!slot.runtime.value("gpuSelected").toBool()
+            || !slot.runtime.value("loaded").toBool() || !slot.runtime.value("gpuSelfTestPassed").toBool()
+            || !slot.runtime.value("textWarmupCompleted").toBool())) {
+            if (slot.gpu()) isolateDevice(slot, QStringLiteral("GPU inference did not confirm a loaded, tested and warmed GPU backend"));
+            else publishFailedCurrent(slot, QStringLiteral("Strict GPU inference did not confirm a loaded GPU backend"));
+            return;
         }
         if (result.value("extractionFingerprint").toString() != extractionPipelineFingerprint()
             || (modelAvailable && result.value("modelFingerprint").toString() != embeddingPipelineFingerprint())) {
-            failCurrent(QStringLiteral("Worker pipeline fingerprint differs from the service build")); return;
+            failCurrent(slot, QStringLiteral("Worker pipeline fingerprint differs from the service build")); return;
         }
-        if (!currentSourceMatches()
-            || result.value("sourceVersion").toString() != current->workerVersion) {
-            rescanStaleCurrent(); return;
+        if (!currentSourceMatches(slot)
+            || result.value("sourceVersion").toString() != slot.current->workerVersion) {
+            rescanStaleCurrent(slot); return;
         }
         const auto state = result.value("state").toString();
-        if (state == "cancelled") { failCurrent(result.value("error").toString(state)); return; }
-        if (state == "failed" || state == "unsupported") { publishFailedCurrent(result.value("error").toString(state)); return; }
-        const qsizetype previousCount = current->segments.size();
+        if (slot.gpu() && result.value("deviceFailure").toBool()) {
+            isolateDevice(slot, result.value("error").toString("GPU inference failed")); return;
+        }
+        if (state == "cancelled") { failCurrent(slot, result.value("error").toString(state)); return; }
+        if (state == "failed" || state == "unsupported") { publishFailedCurrent(slot, result.value("error").toString(state)); return; }
+        const qsizetype previousCount = slot.current->segments.size();
         for (const auto &value : result.value("segments").toArray()) {
             auto segment = Segment::fromJson(value.toObject());
-            segment.path = current->file.path;
+            segment.path = slot.current->file.path;
             segment.mediaPath.clear(); // Worker temporary files are never persisted as preview paths.
-            current->segments.append(std::move(segment));
+            slot.current->segments.append(std::move(segment));
         }
-        const bool exceedsLimit = current->segments.size() > 5000;
-        if (exceedsLimit) current->segments.resize(5000);
+        const bool exceedsLimit = slot.current->segments.size() > 5000;
+        if (exceedsLimit) slot.current->segments.resize(5000);
         const bool complete = !exceedsLimit && result.value("complete").toBool(false) && state == "complete";
-        const int next = result.value("next").toInt(current->offset);
+        const int next = result.value("next").toInt(slot.current->offset);
         const QString extractionError = result.value("error").toString();
-        const bool capped = !complete && (next >= 5000 || current->segments.size() >= 5000);
-        const bool resume = !complete && !capped && next > current->offset && extractionError.isEmpty();
-        current->offset = next;
+        const bool capped = !complete && (next >= 5000 || slot.current->segments.size() >= 5000);
+        const bool resume = !complete && !capped && next > slot.current->offset && extractionError.isEmpty();
+        slot.current->offset = next;
         // Empty documents remain searchable by filename without inventing semantic vectors.
-        if (current->segments.isEmpty() && complete) {
-            Segment segment; segment.path = current->file.path; segment.title = QFileInfo(segment.path).fileName();
-            segment.kind = current->file.kind; segment.modality = QStringLiteral("text"); current->segments.append(segment);
+        if (slot.current->segments.isEmpty() && complete) {
+            Segment segment; segment.path = slot.current->file.path; segment.title = QFileInfo(segment.path).fileName();
+            segment.kind = slot.current->file.kind; segment.modality = QStringLiteral("text"); slot.current->segments.append(segment);
         }
-        const Job job = *current;
+        const Job job = *slot.current;
         const QString version = job.indexedVersion + (complete ? QString{}
             : capped ? QStringLiteral("|capped:5000")
             : (resume ? QStringLiteral("|partial:%1") : QStringLiteral("|failed:%1")).arg(next));
-        publishing = true;
+        slot.publishing = true; ++publishing;
         auto *watcher = new QFutureWatcher<QString>(q);
-        QObject::connect(watcher, &QFutureWatcher<QString>::finished, q, [this, watcher, job, complete, capped, resume, extractionError, previousCount] {
-            const auto error = watcher->result(); watcher->deleteLater(); publishing = false;
+        QObject::connect(watcher, &QFutureWatcher<QString>::finished, q, [this, &slot, watcher, job, complete, capped, resume, extractionError, previousCount] {
+            const auto error = watcher->result(); watcher->deleteLater(); slot.publishing = false; --publishing;
             if (stopping) return;
-            if (!current || current->batch != job.batch || job.generation != generation) {
-                if (current && current->batch == job.batch) current.reset();
+            if (!slot.current || slot.current->batch != job.batch || job.generation != generation) {
+                if (slot.current && slot.current->batch == job.batch) slot.current.reset();
+                QTimer::singleShot(0, q, [this] { pruneRetiredIndexSlots(); });
                 scheduleNext(); return;
             }
             // The source can change after decoding or while the writer waits
             // to enter its publication gate. Such a rejection requires work
             // for the new version, never a failed placeholder for the old one.
-            if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
-            if (!error.isEmpty()) { failCurrent(error); return; }
-            progress.segments += current->segments.size() - previousCount;
+            if (!currentSourceMatches(slot)) { rescanStaleCurrent(slot); return; }
+            if (!error.isEmpty()) { failCurrent(slot, error); return; }
+            progress.segments += slot.current->segments.size() - previousCount;
+            ++slot.completedTasks;
             protectForScan(job);
             event(QStringLiteral("indexChanged"), {{"path", job.file.path}});
             saveJournal();
             if (complete) {
                 failures.remove(failureKey(job.file)); completedFiles.insert(fileKey(job.file));
-                failedFiles.remove(fileKey(job.file)); refreshProgressCounts(); current.reset();
+                failedFiles.remove(fileKey(job.file)); refreshProgressCounts(); slot.current.reset();
+                event(QStringLiteral("runtime"), runtimeStatus());
                 scheduleNext();
             } else if (capped) {
-                failCurrent(QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it."));
+                failCurrent(slot, QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it."));
             } else if (resume) {
-                Job continuation = std::move(*current); current.reset();
+                Job continuation = std::move(*slot.current); slot.current.reset();
                 enqueue(std::move(continuation), QueueClass::Continuation);
                 publishProgress();
                 QTimer::singleShot(0, q, [this] { scheduleNext(); });
-            } else failCurrent(extractionError.isEmpty() ? QStringLiteral("Worker returned a partial result without a continuation") : extractionError);
+            } else failCurrent(slot, extractionError.isEmpty() ? QStringLiteral("Worker returned a partial result without a continuation") : extractionError);
         });
         watcher->setFuture(QtConcurrent::run(&writePool, [this, job, version] {
             QString error;
@@ -1221,23 +1540,24 @@ public:
         }));
     }
 
-    void publishFailedCurrent(const QString &failure) {
-        if (!current || publishing) return;
-        indexTimeout.stop(); currentWorkerId.clear();
-        if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
-        const Job job = *current;
-        publishing = true;
+    void publishFailedCurrent(IndexSlot &slot, const QString &failure) {
+        if (!slot.current || slot.publishing) return;
+        slot.timeout.stop(); slot.requestId.clear();
+        if (!currentSourceMatches(slot)) { rescanStaleCurrent(slot); return; }
+        const Job job = *slot.current;
+        slot.publishing = true; ++publishing;
         auto *watcher = new QFutureWatcher<QString>(q);
-        QObject::connect(watcher, &QFutureWatcher<QString>::finished, q, [this, watcher, job, failure] {
-            const QString error = watcher->result(); watcher->deleteLater(); publishing = false;
+        QObject::connect(watcher, &QFutureWatcher<QString>::finished, q, [this, &slot, watcher, job, failure] {
+            const QString error = watcher->result(); watcher->deleteLater(); slot.publishing = false; --publishing;
             if (stopping) return;
-            if (!current || current->batch != job.batch || job.generation != generation) {
-                if (current && current->batch == job.batch) current.reset();
+            if (!slot.current || slot.current->batch != job.batch || job.generation != generation) {
+                if (slot.current && slot.current->batch == job.batch) slot.current.reset();
+                QTimer::singleShot(0, q, [this] { pruneRetiredIndexSlots(); });
                 scheduleNext(); return;
             }
-            if (!currentSourceMatches()) { rescanStaleCurrent(); return; }
+            if (!currentSourceMatches(slot)) { rescanStaleCurrent(slot); return; }
             if (error.isEmpty()) { protectForScan(job); event(QStringLiteral("indexChanged"), {{"path", job.file.path}}); }
-            failCurrent(error.isEmpty() ? failure : failure + QStringLiteral("\nCannot preserve filename index: ") + error);
+            failCurrent(slot, error.isEmpty() ? failure : failure + QStringLiteral("\nCannot preserve filename index: ") + error);
         });
         watcher->setFuture(QtConcurrent::run(&writePool, [this, job] {
             QString error;
@@ -1270,19 +1590,19 @@ public:
         }));
     }
 
-    bool currentSourceMatches() const {
-        if (!current || current->generation != generation) return false;
-        if (!pathAllowed(current->file.path, current->file.kind == "code")) return false;
+    bool currentSourceMatches(const IndexSlot &slot) const {
+        if (!slot.current || slot.current->generation != generation) return false;
+        if (!pathAllowed(slot.current->file.path, slot.current->file.kind == "code")) return false;
         FileRecord now;
-        return FileCatalog::describe(current->file.path, &now)
-            && now.fingerprint == current->file.fingerprint
-            && sourceVersion(current->file.path) == current->workerVersion;
+        return FileCatalog::describe(slot.current->file.path, &now)
+            && now.fingerprint == slot.current->file.fingerprint
+            && sourceVersion(slot.current->file.path) == slot.current->workerVersion;
     }
 
-    void rescanStaleCurrent() {
-        indexTimeout.stop(); currentWorkerId.clear();
-        if (current) log(QStringLiteral("Source changed, rescheduling index: %1").arg(current->file.path));
-        current.reset();
+    void rescanStaleCurrent(IndexSlot &slot) {
+        slot.timeout.stop(); slot.requestId.clear();
+        if (slot.current) log(QStringLiteral("Source changed, rescheduling index: %1").arg(slot.current->file.path));
+        slot.current.reset();
         // Let already queued files make progress before retrying this source.
         // Re-sorting the whole queue here can starve every later path when the
         // first file keeps changing. An empty queue triggers the pending scan.
@@ -1290,24 +1610,24 @@ public:
         QTimer::singleShot(0, q, [this] { scheduleNext(); });
     }
 
-    void failCurrent(const QString &error) {
-        indexTimeout.stop(); currentWorkerId.clear();
-        if (current) {
-            failures.insert(failureKey(current->file), error);
-            failedFiles.insert(fileKey(current->file)); completedFiles.remove(fileKey(current->file));
+    void failCurrent(IndexSlot &slot, const QString &error) {
+        slot.timeout.stop(); slot.requestId.clear();
+        if (slot.current) {
+            failures.insert(failureKey(slot.current->file), error);
+            failedFiles.insert(fileKey(slot.current->file)); completedFiles.remove(fileKey(slot.current->file));
             refreshProgressCounts();
-            log(QStringLiteral("Index failed %1: %2").arg(current->file.path, error));
+            log(QStringLiteral("Index failed %1: %2").arg(slot.current->file.path, error));
         }
-        progress.error = error; current.reset(); saveJournal(); publishProgress();
+        progress.error = error; slot.current.reset(); saveJournal(); publishProgress();
         QTimer::singleShot(0, q, [this] { scheduleNext(); });
     }
 
-    void workerFailure(bool query, const QString &error) {
+    void workerFailure(bool query, const QString &error, IndexSlot *slot = nullptr) {
         if (query) {
             queryTimeout.stop();
             const auto id = activeQuery; activeQuery.clear();
             if (!id.isEmpty()) completeQuery(id, {}, error);
-        } else if (current && !publishing && !currentWorkerId.isEmpty()) publishFailedCurrent(error);
+        } else if (slot && slot->current && !slot->publishing && !slot->requestId.isEmpty()) publishFailedCurrent(*slot, error);
     }
 
     void nextQuery() {
@@ -1585,7 +1905,7 @@ public:
         QFile file(journalPath());
         if (file.open(QIODevice::ReadOnly) && file.size() <= 16 * 1024 * 1024) {
             const auto json = QJsonDocument::fromJson(file.readAll()).object();
-            if (json.value("version").toInt() == 1) failures = json.value("failures").toObject();
+            if (json.value("version").toInt() == 1 || json.value("version").toInt() == 2) failures = json.value("failures").toObject();
         }
     }
     QString restoreContinuation(Job &job, const QString &storedVersion) {
@@ -1603,9 +1923,12 @@ public:
         return error;
     }
     void saveJournal() {
-        QJsonObject journal{{"version", 1}, {"failures", failures}, {"progress", progress.toJson()}};
-        if (current) journal.insert("current", QJsonObject{{"path", current->file.path}, {"version", current->indexedVersion},
-            {"offset", current->offset}, {"settings", settings.fingerprint()}});
+        QJsonArray active;
+        for (const auto &slot : indexSlots) if (slot->current) active.append(QJsonObject{
+            {"path", slot->current->file.path}, {"version", slot->current->indexedVersion},
+            {"offset", slot->current->offset}, {"settings", settings.fingerprint()},
+            {"deviceId", slot->device.value("deviceId")}});
+        QJsonObject journal{{"version", 2}, {"failures", failures}, {"progress", progress.toJson()}, {"active", active}};
         QSaveFile file(journalPath());
         if (!file.open(QIODevice::WriteOnly)) { log(QStringLiteral("Cannot write index journal: %1").arg(file.errorString())); return; }
         const auto bytes = QJsonDocument(journal).toJson(QJsonDocument::Compact);

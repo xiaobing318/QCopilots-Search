@@ -649,6 +649,122 @@ def gpu_sdk(args, root, reports, environment, *, install=False):
     return {**configuration["cmakeCache"], "QCOPILOTS_SEARCH_GPU_SDK_MANIFEST": str(manifest)}
 
 
+def doctor_tool(name, environment, *, path=None):
+    """Run a bounded version query against the executable this invocation uses."""
+    executable_path = str(path) if path else shutil.which(name, path=environment.get("PATH"))
+    result = {"path": executable_path, "passed": False}
+    if not executable_path:
+        return {**result, "error": f"{name} is missing from PATH"}
+    command = [executable_path] if name == "cl" else [executable_path, "--version"]
+    try:
+        process = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=30)
+        output = (process.stdout + process.stderr).strip()
+        version = re.search(r"\b\d+(?:\.\d+){1,3}\b", output)
+        result.update(exitCode=process.returncode, output=output[:8192],
+                      version=version.group(0) if version else None)
+        # MSVC prints its version and a missing-input diagnostic with exit 2.
+        result["passed"] = bool(version) and (process.returncode == 0 or name == "cl" and process.returncode == 2)
+        if not result["passed"]:
+            result["error"] = f"{name} version query failed (exit {process.returncode}): {output[:500]}"
+    except (OSError, subprocess.TimeoutExpired) as error:
+        result["error"] = f"{name} version query failed: {error}"
+    return result
+
+
+def doctor_qt(prefix):
+    """Inspect SDK metadata without configuring a project or writing into Qt."""
+    components = ("Core", "Gui", "Widgets", "Network", "Sql", "Concurrent", "Test", "Xml",
+                  "Svg", "Core5Compat", "Multimedia", "MultimediaWidgets", "Pdf", "PdfWidgets")
+    result = {"installed": (prefix / "lib/cmake/Qt6/Qt6Config.cmake").is_file(), "components": {}, "errors": []}
+    if not result["installed"]:
+        result["errors"].append(f"Qt6Config.cmake is missing under {prefix}")
+    for component in components:
+        package = "Qt6" + component
+        directory = prefix / "lib/cmake" / package
+        installed = (directory / (package + "Config.cmake")).is_file()
+        version = None
+        for suffix in ("ConfigVersionImpl.cmake", "ConfigVersion.cmake"):
+            metadata = directory / (package + suffix)
+            if metadata.is_file():
+                match = re.search(r'set\(PACKAGE_VERSION\s+"?(\d+\.\d+\.\d+)', metadata.read_text(encoding="utf-8"))
+                if match:
+                    version = match.group(1)
+                    break
+        result["components"][component] = {"installed": installed, "version": version}
+        if not installed:
+            result["errors"].append(f"Required Qt component {package} is missing")
+        expected = {"Core": "6.12.0", "Pdf": "6.140.0"}.get(component)
+        if expected and version != expected:
+            result["errors"].append(f"{package} requires {expected}, found {version or 'unknown'}")
+    return result
+
+
+def doctor_gpu_sdk(args, root, environment):
+    """Reuse locked SDK checks with installation disabled and no SDK writes."""
+    variant = build_variant(args.variant)
+    backend = variant["backend"]
+    result = {"backend": backend, "toolkitVersion": variant.get("toolkitVersion", ""), "passed": True}
+    if backend in ("cpu", "metal"):
+        return {**result, "required": False}
+    sdk_root = Path(getattr(args, "gpu_sdk_root", None) or root.parent / "gpu-sdk").expanduser().resolve()
+    assert_external(sdk_root)
+    module = helper_module("tools/qcs-gpu-sdk.py", "qcs_doctor_gpu_sdk")
+    lock = json.loads(module.LOCK.read_text(encoding="utf-8"))
+    def probe(command, *, capture=False, env=None):
+        # ROCm queries use its own Python. Prevent even bytecode cache writes in
+        # that SDK, and bound compiler/package-manager version queries too.
+        probe_environment = {**environment, **(env or {}), "PYTHONDONTWRITEBYTECODE": "1"}
+        process = subprocess.run([str(item) for item in command], check=True, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=30, env=probe_environment)
+        return process.stdout.strip() if capture else ""
+    module.run = probe
+    # prepare() creates the SDK directory even in inspection mode. Calling the
+    # backend validator directly keeps doctor read-only outside its reports.
+    configuration = {"cuda": module.cuda_sdk, "hip": module.rocm_sdk,
+                     "vulkan": module.vulkan_sdk}[backend](variant, sdk_root, False, lock)
+    cache = configuration["cmakeCache"]
+    if backend == "cuda":
+        compiler = Path(cache["CUDAToolkit_ROOT"]) / "bin" / ("nvcc.exe" if os.name == "nt" else "nvcc")
+    elif backend == "hip":
+        compiler = Path(cache["CMAKE_HIP_COMPILER"])
+    else:
+        compiler = Path(cache["Vulkan_ROOT"]) / "Bin/glslc.exe" if os.name == "nt" else Path(cache["Vulkan_GLSLC_EXECUTABLE"])
+    compiler_report = doctor_tool(compiler.stem, {**environment, **configuration["environment"]}, path=compiler)
+    return {**result, "required": True, "sdkRoot": str(sdk_root), "cmakeCache": cache,
+            "compiler": compiler_report, "passed": compiler_report["passed"]}
+
+
+def doctor(args, root, prefix, environment):
+    names = ("cmake", "ctest", "cpack", "ninja", "git", "cl" if os.name == "nt" else "c++")
+    versions = {"python": doctor_tool("python", environment, path=sys.executable)}
+    versions.update({name: doctor_tool(name, environment) for name in names})
+    errors = [item["error"] for item in versions.values() if not item["passed"]]
+    for name, minimum in (("python", (3, 10)), ("cmake", (3, 28))):
+        item = versions[name]
+        if item["passed"] and tuple(map(int, item["version"].split("."))) < minimum:
+            errors.append(f"{name} requires {'.'.join(map(str, minimum))}+, found {item['version']}")
+    for name in ("ctest", "cpack"):
+        if versions[name]["passed"] and versions["cmake"]["passed"] and versions[name]["version"] != versions["cmake"]["version"]:
+            errors.append(f"{name} {versions[name]['version']} does not match cmake {versions['cmake']['version']}")
+    qt = doctor_qt(prefix)
+    errors.extend(qt["errors"])
+    try:
+        gpu = doctor_gpu_sdk(args, root, environment)
+        if not gpu["passed"]:
+            errors.append(gpu["compiler"]["error"])
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+        detail = str(error)
+        if isinstance(error, subprocess.CalledProcessError):
+            detail += " " + str(error.stderr or error.output or "")[:1000]
+        gpu = {"passed": False, "error": detail}
+        errors.append("GPU SDK preflight failed: " + detail)
+    return {"source": str(SOURCE), "buildRoot": str(root), "qtPrefix": str(prefix),
+            "platform": platform.platform(), "freeGiB": round(shutil.disk_usage(root).free / 1024**3, 2),
+            "tools": {name: item["path"] for name, item in versions.items()}, "toolVersions": versions,
+            "qtInstalled": qt["installed"], "qt": qt, "gpuSdk": gpu, "errors": errors, "passed": not errors}
+
+
 def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, environment):
     """The only implementation of local and CI single-stage operations."""
     packages = package_directory(root, args.config)
@@ -661,13 +777,12 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
         run([python, SOURCE / "tools/qcs-bootstrap-qt.py", "--qt-root", sdk_root, "--cache-dir", root / "bootstrap/qt-downloads"], cwd=root)
         gpu_sdk(args, root, reports, environment, install=True)
     elif action == "doctor":
-        report = {"source": str(SOURCE), "buildRoot": str(root), "qtPrefix": str(prefix), "platform": platform.platform(), "freeGiB": round(shutil.disk_usage(root).free / 1024**3, 2), "tools": {name: shutil.which(name) for name in ("cmake", "ctest", "cpack", "ninja", "git", "cl" if os.name == "nt" else "c++")}}
-        report["qtInstalled"] = (prefix / "lib/cmake/Qt6/Qt6Config.cmake").is_file()
+        report = doctor(args, root, prefix, environment)
         print(json.dumps(report, indent=2, ensure_ascii=False))
         (reports / "doctor.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         check_path_budget(root, build, stage, reports, configured=False)
-        if not report["qtInstalled"] or not all(report["tools"].values()):
-            raise RuntimeError("Toolchain is incomplete. Install missing tools or run bootstrap.")
+        if not report["passed"]:
+            raise RuntimeError("Toolchain preflight failed: " + " | ".join(report["errors"]))
     elif action == "configure":
         command = ["cmake", "-S", SOURCE, "-B", build, "-G", "Ninja", f"-DCMAKE_BUILD_TYPE={args.config}", f"-DCMAKE_PREFIX_PATH={prefix}", f"-DCMAKE_INSTALL_PREFIX={stage}", f"-DCPACK_PACKAGE_DIRECTORY={packages}", f"-DQCOPILOTS_SEARCH_DEPENDENCY_ROOT={root / 'deps' / args.config}", f"-DQCOPILOTS_SEARCH_TEST_ROOT={root / 'runs' / args.config}", f"-DPython3_EXECUTABLE={sys.executable}", "-DQCOPILOTS_SEARCH_BUILD_TESTS=ON", f"-DQCOPILOTS_SEARCH_VARIANT={args.variant}"]
         for key, value in gpu_sdk(args, root, reports, environment).items():

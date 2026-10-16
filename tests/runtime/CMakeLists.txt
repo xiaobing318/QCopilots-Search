@@ -23,6 +23,10 @@ foreach(_helper selection loader)
   set_tests_properties(qcs-tests-backend-${_helper} PROPERTIES LABELS "unit;runtime;gpu" TIMEOUT 60)
 endforeach()
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+qcopilots_search_add_test(NAME qcs-tests-worker-devices
+  COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/worker_devices_test.py"
+    --worker "$<TARGET_FILE:qcs-worker>" -v)
+set_tests_properties(qcs-tests-worker-devices PROPERTIES LABELS "integration;runtime;gpu" TIMEOUT 180)
 FetchContent_GetProperties(qcs_llama SOURCE_DIR _qcopilots_llama_source)
 qcopilots_search_add_test(NAME qcs-tests-source-integrity
   COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/source_integrity_test.py"

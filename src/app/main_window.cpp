@@ -152,6 +152,8 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
         else if (event == "settings") applySettings(data);
         else if (event == "runtime") {
             runtime_ = data.value("runtime").toObject();
+            runtime_.insert("indexDevices", data.value("indexDevices"));
+            runtime_.insert("indexDeviceCounts", data.value("indexDeviceCounts"));
             updateRuntimeStatus();
         }
         else if (event == "indexChanged") {
@@ -390,7 +392,8 @@ void MainWindow::updateRuntimeStatus() {
     const QString device = runtime_.value("deviceName").toString();
     const QString fallback = runtime_.value("fallbackReason").toString();
     const QString error = runtime_.value("error").toString();
-    runtimeStatus_->setVisible(!variant.isEmpty() || !backend.isEmpty() || !error.isEmpty());
+    const QJsonArray indexDevices = runtime_.value("indexDevices").toArray();
+    runtimeStatus_->setVisible(!variant.isEmpty() || !backend.isEmpty() || !error.isEmpty() || !indexDevices.isEmpty());
     QStringList details;
     if (!backend.isEmpty()) details.append(backend.toUpper());
     if (!device.isEmpty()) details.append(device);
@@ -402,8 +405,51 @@ void MainWindow::updateRuntimeStatus() {
     text += details.join(QStringLiteral(" · "));
     if (!fallback.isEmpty()) text += '\n' + label("CPU fallback: ", "CPU 回退：") + fallback;
     if (!error.isEmpty()) text += '\n' + error;
+    QStringList deviceDetails;
+    const auto counts = runtime_.value("indexDeviceCounts").toObject();
+    const int discovered = counts.value("discovered").toInt();
+    if (discovered > 0) {
+        QStringList backends;
+        for (const auto &entry : indexDevices) {
+            const auto item = entry.toObject();
+            const QString name = item.value("backend").toString().toUpper();
+            if (!name.isEmpty() && name != "CPU" && !backends.contains(name)) backends.append(name);
+        }
+        text += '\n' + label("Indexing: ", "索引：") + backends.join('/') + QStringLiteral(" · ")
+            + label("%1/%2 GPU available", "%1/%2 GPU 可用")
+                  .arg(connected_ ? counts.value("ready").toInt() : 0).arg(discovered)
+            + label(" · %1 busy · %2 failed", " · %1 忙碌 · %2 故障")
+                  .arg(connected_ ? counts.value("busy").toInt() : 0).arg(counts.value("failed").toInt());
+    }
+    for (const auto &entry : indexDevices) {
+        const auto item = entry.toObject();
+        const QString state = connected_ ? item.value("state").toString() : QStringLiteral("disconnected");
+        const QString stateText = state == "busy" ? label("busy", "忙碌")
+            : state == "ready" ? label("ready", "可用")
+            : state == "failed" ? label("failed", "故障")
+            : state == "idle" ? label("idle", "空闲")
+            : state == "disconnected" ? label("disconnected", "已断开")
+            : label("initializing", "初始化中");
+        QString detail = item.value("name").toString() + QStringLiteral(" · ") + stateText
+            + label(" · %1 batches completed", " · 已完成 %1 批次").arg(item.value("completedTasks").toInteger());
+        const QString activePath = item.value("activePath").toString();
+        if (connected_ && !activePath.isEmpty()) detail += QStringLiteral(" · ") + QFileInfo(activePath).fileName();
+        const QString deviceError = item.value("error").toString();
+        if (!deviceError.isEmpty()) detail += QStringLiteral(" · ") + deviceError;
+        text += '\n' + detail;
+        QString fullDetail = detail + '\n' + item.value("description").toString();
+        const QString id = item.value("deviceId").toString();
+        if (!id.isEmpty()) fullDetail += '\n' + label("Device ID: ", "设备 ID：") + id;
+        if (connected_ && !activePath.isEmpty()) fullDetail += '\n' + activePath;
+        deviceDetails.append(fullDetail);
+    }
     runtimeStatus_->setText(text);
-    runtimeStatus_->setToolTip(runtime_.value("deviceDescription").toString());
+    QString tooltip = runtime_.value("deviceDescription").toString();
+    if (!deviceDetails.isEmpty()) {
+        if (!tooltip.isEmpty()) tooltip += '\n';
+        tooltip += deviceDetails.join(QStringLiteral("\n\n"));
+    }
+    runtimeStatus_->setToolTip(tooltip);
 }
 void MainWindow::createTray() {
     if (!QSystemTrayIcon::isSystemTrayAvailable()) return;
@@ -608,6 +654,8 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
     } else if (method == "status") {
         modelAvailable_ = data.value("modelAvailable").toBool();
         runtime_ = data.value("runtime").toObject();
+        runtime_.insert("indexDevices", data.value("indexDevices"));
+        runtime_.insert("indexDeviceCounts", data.value("indexDeviceCounts"));
         if (data.contains("progress")) updateProgress(data.value("progress").toObject());
         const QString watcherWarning = data.value("watcherWarning").toString();
         if (!watcherWarning.isEmpty()) showError(watcherWarning);

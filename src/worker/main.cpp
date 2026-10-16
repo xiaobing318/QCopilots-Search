@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #ifdef Q_OS_WIN
 #include <windows.h>
 #else
@@ -189,9 +190,9 @@ private:
 
 class Worker final : public QObject {
 public:
-    Worker(RuntimePaths paths, QString mode, QString tessdata, QObject *parent = nullptr)
+    Worker(RuntimePaths paths, QString mode, QString tessdata, QJsonObject device, QObject *parent = nullptr)
         : QObject(parent), paths_(std::move(paths)), mode_(std::move(mode)),
-          tessdata_(std::move(tessdata)), input_(this)
+          tessdata_(std::move(tessdata)), device_(std::move(device)), input_(this)
     {
         pool_.setMaxThreadCount(1);
         pool_.setExpiryTimeout(-1);
@@ -271,11 +272,11 @@ private:
             return;
         }
         if (operation != QStringLiteral("extract") && operation != QStringLiteral("query")
-            && operation != QStringLiteral("diagnostics")) {
-            send(failure(id, QStringLiteral("unknown_operation"), QStringLiteral("Supported operations: extract, query, diagnostics, cancel, shutdown")));
+            && operation != QStringLiteral("diagnostics") && operation != QStringLiteral("devices")) {
+            send(failure(id, QStringLiteral("unknown_operation"), QStringLiteral("Supported operations: extract, query, diagnostics, devices, cancel, shutdown")));
             return;
         }
-        if (operation != QStringLiteral("diagnostics")
+        if (operation != QStringLiteral("diagnostics") && operation != QStringLiteral("devices")
             && ((mode_ == QStringLiteral("query") && operation != QStringLiteral("query"))
                 || (mode_ == QStringLiteral("extract") && operation != QStringLiteral("extract")))) {
             send(failure(id, QStringLiteral("wrong_mode"), QStringLiteral("Operation is unavailable in this worker mode")));
@@ -303,7 +304,14 @@ private:
                 const QString key = response.value(QStringLiteral("ok")).toBool()
                     ? QStringLiteral("result") : QStringLiteral("error");
                 auto payload = response.value(key).toObject();
-                payload.insert(QStringLiteral("runtime"), runtime_->diagnostics());
+                const auto diagnostic = runtime_->diagnostics();
+                payload.insert(QStringLiteral("runtime"), diagnostic);
+                if (!response.value(QStringLiteral("ok")).toBool()) {
+                    const bool deviceFailure = runtimeUsed_ && diagnostic.value(QStringLiteral("deviceFailure")).toBool()
+                        && payload.value(QStringLiteral("code")).toString() != QStringLiteral("cancelled");
+                    payload.insert(QStringLiteral("deviceFailure"), deviceFailure);
+                    if (deviceFailure) payload.insert(QStringLiteral("code"), QStringLiteral("gpu_unavailable"));
+                }
                 response.insert(key, payload);
             }
             return response;
@@ -315,6 +323,8 @@ private:
             runtime_ = std::make_unique<EmbeddingRuntime>();
             runtime_->setThreadCount(qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_THREADS"));
             runtime_->setCancellationCallback([this] { return cancelled_.load(); });
+            QString error;
+            if (!runtime_->setDevice(device_, &error)) throw std::runtime_error(error.toStdString());
         }
     }
     void reportRuntime(const QJsonValue &id, const QString &phase, bool loadingModel)
@@ -329,6 +339,7 @@ private:
     }
     template<typename Function> auto infer(const QJsonValue &id, Function operation, bool loadingModel = false)
     {
+        runtimeUsed_ = true;
         reportRuntime(id, QStringLiteral("inference-start"), loadingModel);
         const auto finished = qScopeGuard([this, id, loadingModel] { reportRuntime(id, QStringLiteral("inference-end"), loadingModel); });
         return operation();
@@ -342,8 +353,16 @@ private:
     QJsonObject run(const QJsonObject &request)
     {
         const auto id = request.value(QStringLiteral("id"));
+        runtimeUsed_ = false;
         runtimeEvents_ = request.value(QStringLiteral("runtimeEvents")).toBool(false);
         if (cancelled_.load()) return failure(id, QStringLiteral("cancelled"), QStringLiteral("Job cancelled"));
+        if (request.value(QStringLiteral("operation")).toString() == QStringLiteral("devices")) {
+            QString error;
+            const auto devices = EmbeddingRuntime::discoverDevices(
+                qEnvironmentVariable("QCOPILOTS_SEARCH_BACKEND", QStringLiteral("auto")), &error);
+            if (!error.isEmpty()) return failure(id, QStringLiteral("device_discovery"), error);
+            return success(id, devices);
+        }
         if (request.value(QStringLiteral("operation")).toString() == QStringLiteral("diagnostics")) {
             ensureRuntime();
             QString error;
@@ -432,6 +451,9 @@ private:
                 // retrieval remains available for the original source name.
                 continue;
             }
+            if (segment.embedding.size() != embeddingDimensions
+                && runtime_->diagnostics().value(QStringLiteral("deviceFailure")).toBool())
+                return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("gpu_unavailable"), error);
             if (segment.embedding.size() != embeddingDimensions)
                 embeddingErrors.append(QJsonObject{{QStringLiteral("index"), qint64(index)},
                     {QStringLiteral("error"), error.isEmpty() ? QStringLiteral("No embedding produced") : error}});
@@ -467,6 +489,7 @@ private:
     RuntimePaths paths_;
     QString mode_;
     QString tessdata_;
+    QJsonObject device_;
     QFile output_;
     InputPump input_;
     QThreadPool pool_;
@@ -476,6 +499,7 @@ private:
     QJsonValue activeId_;
     bool active_ = false;
     bool runtimeEvents_ = false;
+    bool runtimeUsed_ = false;
     bool stopping_ = false;
     int exitCode_ = 0;
 };
@@ -496,6 +520,7 @@ int main(int argc, char **argv)
     parser.addOption({QStringLiteral("model-dir"), QStringLiteral("Verified GGUF model directory."), QStringLiteral("directory")});
     parser.addOption({QStringLiteral("tessdata-dir"), QStringLiteral("OCR language data directory."), QStringLiteral("directory")});
     parser.addOption({QStringLiteral("mode"), QStringLiteral("Worker mode: full, extract, query."), QStringLiteral("mode"), QStringLiteral("full")});
+    parser.addOption({QStringLiteral("device"), QStringLiteral("Bind one device using JSON with backend, deviceId and name. Disables automatic CPU fallback."), QStringLiteral("json")});
     parser.addOption({QStringLiteral("threads"), QStringLiteral("CPU inference threads, from 1 to 32."), QStringLiteral("count"), QString::number(std::clamp(QThread::idealThreadCount() / 2, 1, 32))});
     parser.process(application);
     const auto mode = parser.value(QStringLiteral("mode"));
@@ -507,6 +532,20 @@ int main(int argc, char **argv)
         return 2;
     }
     qputenv("QCOPILOTS_SEARCH_THREADS", QByteArray::number(threads));
+    QJsonObject device;
+    if (parser.isSet(QStringLiteral("device"))) {
+        QJsonParseError parse;
+        const auto document = QJsonDocument::fromJson(parser.value(QStringLiteral("device")).toUtf8(), &parse);
+        EmbeddingRuntime validation;
+        QString error;
+        if (parse.error != QJsonParseError::NoError || !document.isObject() || document.object().isEmpty()
+            || !validation.setDevice(document.object(), &error)) {
+            std::fprintf(stderr, "Invalid device selector: %s\n", error.isEmpty()
+                ? "Expected a nonempty JSON object with backend and deviceId or name" : error.toUtf8().constData());
+            return 2;
+        }
+        device = document.object();
+    }
     const auto paths = RuntimePaths::resolve(parser.value(QStringLiteral("profile-dir")), parser.value(QStringLiteral("model-dir")));
     QString error;
     if (!paths.ensure(&error)) {
@@ -528,7 +567,7 @@ int main(int argc, char **argv)
             }
         }
     }
-    Worker worker(paths, mode, tessdata);
+    Worker worker(paths, mode, tessdata, device);
     worker.start();
     return application.exec();
 }

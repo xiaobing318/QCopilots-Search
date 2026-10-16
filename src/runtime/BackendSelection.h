@@ -22,6 +22,17 @@ struct BackendDevice {
     bool gpu = false;
     // An explicit capability rejection, never an initialization failure.
     QString unavailableReason;
+    // Upstream's hardware identity, normally a PCI bus ID. An empty ID may
+    // only be replaced by a unique backend-local device name.
+    QString deviceId;
+    quint64 memoryTotal = 0;
+    quint64 memoryFree = 0;
+};
+
+struct BackendDeviceSelector {
+    QString backend;
+    QString deviceId;
+    QString name;
 };
 
 struct BackendSelection {
@@ -35,5 +46,13 @@ struct BackendSelection {
 BackendSelection selectBackend(BackendMode mode, const QString& packagedBackend,
                                const QVector<BackendDevice>& devices,
                                const QString& gpuLoadError = {});
+
+QString deviceIdentityError(const BackendDevice& device, const QVector<BackendDevice>& devices);
+QVector<int> compatibleGpuDevices(const QString& packagedBackend, const QVector<BackendDevice>& devices);
+// Explicit selection is strict even in Auto mode. It must never silently use
+// another device or CPU when an identity disappears or a backend fails.
+BackendSelection selectBackendDevice(BackendMode mode, const QString& packagedBackend,
+    const QVector<BackendDevice>& devices, const BackendDeviceSelector& selector,
+    const QString& gpuLoadError = {});
 
 }

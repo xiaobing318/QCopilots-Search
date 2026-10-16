@@ -20,6 +20,9 @@ struct ServiceDependencies {
     // Construction-only seams for deterministic lifecycle tests. Production
     // callers use these defaults and the installed worker executable.
     std::function<void(QProcess &, bool query)> configureWorker;
+    // Empty uses every compatible device. Explicit selectors are supplied by
+    // --index-device and matched against isolated worker discovery.
+    QList<QJsonObject> indexDevices;
     int indexIdleMs = 60000;
     int queryIdleMs = 600000;
     int workerShutdownGraceMs = 1500;

@@ -29,6 +29,12 @@ public:
     // GPU mode is strict: initialization must succeed on the packaged GPU
     // backend. Auto may retry on CPU and records the reason in diagnostics().
     bool setBackendMode(const QString& mode, QString* error = nullptr);
+    // Empty object clears a binding. Otherwise backend and either deviceId or
+    // name are required. Explicit binding disables automatic CPU fallback.
+    bool setDevice(const QJsonObject& selector, QString* error = nullptr);
+    // Isolated workers call this without loading model files. "available"
+    // describes a bindable device, not a successful compute self-test.
+    static QJsonObject discoverDevices(const QString& mode, QString* error = nullptr);
     QJsonObject diagnostics() const;
     // Set these on the owner thread before load. The callback may read a shared atomic flag.
     void setThreadCount(int threads);
