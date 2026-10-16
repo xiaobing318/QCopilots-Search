@@ -132,7 +132,7 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
     connect(updateButton_, &QPushButton::clicked, this, [this] { checkForUpdates(true); });
     connect(backend_, &AppBackend::connected, this, [this] {
         connected_ = true;
-        error_->hide();
+        clearError(errorSource_);
         indexButton_->setEnabled(true);
         send("status");
         send("settings.get");
@@ -589,9 +589,8 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
         if (popup) {
             if (!warning.isEmpty()) popupStatus_->setText(popupStatus_->text() + '\n' + warning);
         } else {
-            if (!warning.isEmpty()) showError(warning);
-            else if (!lastSearchWarning_.isEmpty() && error_->text() == lastSearchWarning_) error_->hide();
-            lastSearchWarning_ = warning;
+            if (!warning.isEmpty()) showError(warning, ErrorSource::SearchWarning);
+            else clearError(ErrorSource::SearchWarning);
         }
     } else if (method == "document.preview") {
         if (id == documentRequest_ && preview_->currentHit().path == documentPath_) {
@@ -716,7 +715,8 @@ void MainWindow::updateProgress(const QJsonObject &value) {
     pauseButton_->setText(indexState_ == "paused" ? label("Resume", "继续") : label("Pause", "暂停"));
     if (trayPause_) trayPause_->setText(indexState_ == "paused" ? label("Resume indexing", "继续索引") : label("Pause indexing", "暂停索引"));
     const QString error = value.value("error").toString();
-    if (!error.isEmpty()) showError(error);
+    if (!error.isEmpty()) showError(error, ErrorSource::IndexProgress);
+    else clearError(ErrorSource::IndexProgress);
 }
 void MainWindow::showSettings(bool firstRun) {
     if (auto *existing = findChild<SettingsDialog *>()) { existing->raise(); existing->activateWindow(); return; }
@@ -738,6 +738,9 @@ void MainWindow::showSettings(bool firstRun) {
         // Pausing belongs to the service's live task state. A preferences dialog
         // may stay open while that state changes and must never overwrite it.
         changes.remove("indexingPaused");
+        // These JSON-only rules have no controls here. Preserve the service's
+        // current values, including updates made while this dialog was open.
+        changes.remove("generalFileRules");
         send("settings.set", changes);
     });
     dialog->open();
@@ -749,7 +752,19 @@ void MainWindow::showModels() {
     connect(dialog, &ModelDialog::modelsReady, this, [this] { if (!modelAvailable_) { modelReloadAttempts_ = 0; send("models.reload", {}, 120000); } });
     dialog->open();
 }
-void MainWindow::showError(const QString &message) { error_->setText(message); error_->show(); }
+void MainWindow::showError(const QString &message, ErrorSource source) {
+    errorSource_ = source;
+    error_->setText(message);
+    error_->show();
+}
+void MainWindow::clearError(ErrorSource source) {
+    // A successful status or search only clears its own message. An unrelated
+    // failure may have replaced it, even with exactly the same wording.
+    if (errorSource_ != source) return;
+    error_->clear();
+    error_->hide();
+    errorSource_ = ErrorSource::Other;
+}
 void MainWindow::openCurrent() {
     const int row = results_->currentRow();
     if (row < 0 || row >= hits_.size()) return;

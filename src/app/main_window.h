@@ -50,6 +50,7 @@ protected:
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
 private:
+    enum class ErrorSource { Other, IndexProgress, SearchWarning };
     QString label(const char *en, const char *zh) const;
     void buildUi();
     void applyLanguage();
@@ -71,7 +72,8 @@ private:
     void showModels();
     void openCurrent();
     void selectResult(int row);
-    void showError(const QString &message);
+    void showError(const QString &message, ErrorSource source = ErrorSource::Other);
+    void clearError(ErrorSource source);
     void checkForUpdates(bool manual);
     void quitApplication();
     RuntimePaths paths_;
@@ -86,6 +88,7 @@ private:
     QListWidget *results_;
     PreviewPanel *preview_;
     QLabel *heading_, *subtitle_, *summary_, *error_, *progressText_, *capability_;
+    ErrorSource errorSource_ = ErrorSource::Other;
     QLabel *runtimeStatus_;
     QJsonObject runtime_;
     QPushButton *settingsButton_, *modelButton_, *indexButton_, *pauseButton_, *retryButton_, *quickButton_, *updateButton_;
@@ -113,7 +116,6 @@ private:
     QJsonObject displayedSearchContext_, popupDisplayedContext_;
     BrowseState browse_, popupBrowse_;
     QString popupResultQuery_;
-    QString lastSearchWarning_;
     QString documentRequest_, documentPath_;
     int documentStart_ = 0;
     int modelReloadAttempts_ = 0;

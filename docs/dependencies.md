@@ -89,6 +89,8 @@ libgit2 通过公开文件配置 API 使用应用级 `core.longpaths`，不修�
 | 视频 | FFmpeg 解码、抽帧与音轨 | 真实 PTS、变帧率、重复画面和时间定位 |
 | 代码 / Notebook | 独立代码空间 | Git ignore、未跟踪源码、整行分块和单元格，仅读取 Notebook 源码 |
 
+普通文档和代码使用不同的提取限制。普通文档输入默认上限为 64 MiB，代码源文件为 1 MiB。Notebook 容器上限为 20 MiB，其中源码合计不超过 1 MiB。单个文件最多索引 5000 个片段，超过时明确报告部分索引，已有片段仍可查询。这些容量限制不决定文件夹是否被扫描，也不要求普通文本开启代码搜索。
+
 HEIF 不隐式启用 x265、GPL 编码器或任意系统 codec，LibRaw 不隐式引入 GPL demosaic pack、RawSpeed 或未锁定依赖。具体格式的支持结论以实际样本测试为准。
 
 发行包携带实际部署组件的完整许可材料。源码材料和符号分别生成，范围见[对应源码材料](source-materials.md)与[第三方声明](../THIRD_PARTY_NOTICES.md)。

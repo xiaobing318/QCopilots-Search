@@ -31,6 +31,7 @@
 #include <sys/un.h>
 #endif
 #include <atomic>
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <stdexcept>
@@ -495,6 +496,187 @@ private slots:
         QVERIFY(restarted.call("status").value("result").toObject().value("failures").toObject().contains(file.path));
     }
 
+    void ordinaryRepositoryDocumentsAreListedAndIndexedDespiteProjectMarkers() {
+        TestEnvironment environment("service-general-repository");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        // General discovery must not require a valid Git repository or code
+        // indexing merely because the user stores documents with their sources.
+        QVERIFY(environment.writeFile("selected/.git/HEAD", "ref: refs/heads/main\n"));
+        QVERIFY(environment.writeFile("selected/README.md", "ordinaryrepositorybodytoken documentation"));
+        QVERIFY(environment.writeFile("selected/nested/package.json", "{}"));
+        QVERIFY(environment.writeFile("selected/nested/notes.txt", "nestedordinarybodytoken notes"));
+        QVERIFY(environment.writeFile("selected/nested/project/CMakeLists.txt", "project(ordinarycmakebodytoken)\n"));
+        const QByteArray longText = QByteArray(1024 * 1024 + 1, ' ') + "largeordinarybodytoken\n";
+        QVERIFY(environment.writeFile("selected/nested/project/long.txt", longText));
+        QVERIFY(environment.writeFile("selected/nested/project/source.cpp", "int codeonlybodytoken = 1;\n"));
+        QVERIFY(environment.writeFile("selected/.hidden/guide.txt", "hiddenordinarybodytoken documentation"));
+        QVERIFY(environment.writeFile("selected/secret-notes.txt", "sensitiveordinarybodytoken documentation"));
+        QVERIFY(environment.writeFile("selected/node_modules/guide.txt", "cacheordinarybodytoken documentation"));
+        QVERIFY(environment.writeFile("selected/corruptordinaryprobe.docx", "Invalid ZIP. rejectedcorruptbodytoken"));
+        const QString corruptPath = environment.path("selected/corruptordinaryprobe.docx");
+        const QStringList documents{"selected/README.md", "selected/nested/notes.txt",
+            "selected/nested/project/CMakeLists.txt", "selected/nested/project/long.txt",
+            "selected/.hidden/guide.txt", "selected/secret-notes.txt", "selected/node_modules/guide.txt"};
+        QSet<QString> expected{corruptPath};
+        for (const auto &relative : documents) expected.insert(environment.path(relative));
+
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.roots = {environment.path("selected")};
+        settings.includeCode = false;
+        settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ServiceProcess service(paths);
+        QVERIFY2(service.start(), qPrintable(service.error));
+        const auto status = [&] { return service.call("status").value("result").toObject(); };
+        QTRY_VERIFY2_WITH_TIMEOUT(status().value("catalogReady").toBool(),
+            qPrintable(serviceDiagnostics(paths, service.call("status"))), 10000);
+        const auto paused = status();
+        QVERIFY(!paused.value("modelAvailable").toBool());
+        QCOMPARE(paused.value("progress").toObject().value("total").toInteger(), qint64(expected.size()));
+        QCOMPARE(paused.value("progress").toObject().value("completed").toInteger(), 0);
+        QCOMPARE(paused.value("queuedFiles").toInt(), int(expected.size()));
+        QCOMPARE(paused.value("progress").toObject().value("state").toString(), QStringLiteral("paused"));
+        const auto filePaths = [](const QJsonObject &reply) {
+            QSet<QString> actual;
+            for (const auto &value : reply.value("result").toObject().value("files").toArray())
+                actual.insert(value.toObject().value("path").toString());
+            return actual;
+        };
+        QVERIFY(service.call("index.resume").value("ok").toBool());
+        // This uses the production worker and real document extraction with an
+        // empty isolated model directory. Semantic quality is tested separately.
+        QTRY_VERIFY2_WITH_TIMEOUT(([&] {
+            const auto current = status();
+            const auto progress = current.value("progress").toObject();
+            return progress.value("completed").toInteger() == documents.size()
+                && progress.value("failed").toInteger() == 1
+                && current.value("queuedFiles").toInt() == 0;
+        })(), qPrintable(serviceDiagnostics(paths, service.call("status"))), 30000);
+        const auto settled = status();
+        QCOMPARE(settled.value("failures").toObject().keys(), QStringList{corruptPath});
+        QCOMPARE(settled.value("progress").toObject().value("total").toInteger(), qint64(expected.size()));
+        QVERIFY(!settled.value("progress").toObject().value("error").toString().contains("code extraction size limit"));
+        const auto after = service.call("files.list");
+        QVERIFY(after.value("ok").toBool());
+        QCOMPARE(filePaths(after), expected);
+        for (const auto &value : after.value("result").toObject().value("files").toArray())
+            QVERIFY(!value.toObject().value("code").toBool());
+        const QStringList tokens{"ordinaryrepositorybodytoken", "nestedordinarybodytoken",
+            "ordinarycmakebodytoken", "largeordinarybodytoken", "hiddenordinarybodytoken",
+            "sensitiveordinarybodytoken", "cacheordinarybodytoken"};
+        for (qsizetype i = 0; i < documents.size(); ++i) {
+            const auto result = service.call("search", {{"query", tokens.at(i)}, {"semantic", false}});
+            QVERIFY(result.value("ok").toBool());
+            const auto hits = result.value("result").toObject().value("hits").toArray();
+            QCOMPARE(hits.size(), 1);
+            QCOMPARE(hits.first().toObject().value("path").toString(), environment.path(documents.at(i)));
+        }
+        QVERIFY(service.waitForHit("corruptordinaryprobe", corruptPath, 5000));
+        for (const auto *query : {"rejectedcorruptbodytoken", "codeonlybodytoken"}) {
+            const auto result = service.call("search", {{"query", query}, {"semantic", false}});
+            QVERIFY(result.value("ok").toBool());
+            QVERIFY(result.value("result").toObject().value("hits").toArray().isEmpty());
+        }
+        const auto code = service.call("files.list", {{"code", true}});
+        QCOMPARE(code.value("error").toObject().value("code").toString(), QStringLiteral("code_search_disabled"));
+    }
+
+    void generalProjectRuleUpdatesCatalogAndIndexWithoutRestart() {
+        TestEnvironment environment("service-general-rule-update");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/kept.txt", "keptgeneralruletoken outside the project"));
+        QVERIFY(environment.writeFile("selected/project/package.json", "{}"));
+        QVERIFY(environment.writeFile("selected/project/docs/guide.md", "projectgeneralruletoken project documentation"));
+        QVERIFY(environment.writeFile("selected/private/blocked.txt", "excludedgeneralruletoken outside the project"));
+        QVERIFY(environment.writeFile("selected/project/private/blocked.txt", "excludedgeneralruletoken inside the project"));
+        const QString kept = environment.path("selected/kept.txt");
+        const QString project = environment.path("selected/project/docs/guide.md");
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        // This nested root has no marker of its own. Listing it first must not
+        // bypass the enclosing project's exclusion during per-root scanning.
+        settings.roots = {environment.path("selected/project/docs"), environment.path("selected")};
+        settings.excludes = {environment.path("selected/private"), environment.path("selected/project/private")};
+        settings.generalFileRules.directoryNames = {"custom-cache", "generated-assets"};
+        settings.generalFileRules.mediaDatasetMinimumFiles = 417;
+        settings.generalFileRules.mediaDatasetMachineNamedPercent = 83;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ServiceProcess service(paths);
+        QVERIFY2(service.start(), qPrintable(service.error));
+        const auto servicePid = service.process.processId();
+        const auto status = [&] { return service.call("status").value("result").toObject(); };
+        const auto indexed = [&](int count) {
+            const auto current = status();
+            const auto progress = current.value("progress").toObject();
+            return current.value("catalogReady").toBool() && current.value("queuedFiles").toInt() == 0
+                && progress.value("total").toInteger() == count
+                && progress.value("completed").toInteger() == count
+                && progress.value("failed").toInteger() == 0
+                && progress.value("state").toString() == "idle";
+        };
+        const auto persistedSettings = [&] {
+            QFile file(paths.configFile);
+            return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+        };
+        const auto listedPaths = [](const QJsonObject &reply) {
+            QSet<QString> actual;
+            for (const auto &value : reply.value("result").toObject().value("files").toArray())
+                actual.insert(value.toObject().value("path").toString());
+            return actual;
+        };
+        QTRY_VERIFY2_WITH_TIMEOUT(indexed(2), qPrintable(serviceDiagnostics(paths, service.call("status"))), 30000);
+        const auto initialSettings = service.call("settings.get");
+        QVERIFY(initialSettings.value("ok").toBool());
+        const auto initialRules = initialSettings.value("result").toObject().value("generalFileRules").toObject();
+        QVERIFY(initialRules.value("excludeProjects").isBool());
+        QVERIFY(!initialRules.value("excludeProjects").toBool());
+        QCOMPARE(initialRules, settings.generalFileRules.toJson());
+        QCOMPARE(persistedSettings().value("generalFileRules").toObject(), initialRules);
+        const auto initialFiles = service.call("files.list");
+        QVERIFY(initialFiles.value("ok").toBool());
+        QCOMPARE(listedPaths(initialFiles), QSet<QString>({kept, project}));
+        QVERIFY(service.waitForHit("projectgeneralruletoken", project, 5000));
+
+        for (const bool excludeProjects : {true, false}) {
+            const auto changed = service.call("settings.set", {{"generalFileRules", QJsonObject{{"excludeProjects", excludeProjects}}}});
+            QVERIFY(changed.value("ok").toBool());
+            const auto changedRules = changed.value("result").toObject().value("generalFileRules").toObject();
+            auto expectedRules = initialRules;
+            expectedRules.insert("excludeProjects", excludeProjects);
+            // Patching one switch must retain the user's lists and thresholds.
+            QCOMPARE(changedRules, expectedRules);
+            QCOMPARE(persistedSettings().value("generalFileRules").toObject(), changedRules);
+            QTRY_VERIFY2_WITH_TIMEOUT(indexed(excludeProjects ? 1 : 2),
+                qPrintable(serviceDiagnostics(paths, service.call("status"))), 30000);
+            QCOMPARE(service.process.processId(), servicePid);
+            QCOMPARE(service.process.state(), QProcess::Running);
+            const auto currentSettings = service.call("settings.get");
+            QVERIFY(currentSettings.value("ok").toBool());
+            QCOMPARE(currentSettings.value("result").toObject().value("generalFileRules").toObject(), changedRules);
+            QCOMPARE(currentSettings.value("result").toObject().value("excludes").toArray(),
+                QJsonArray::fromStringList(settings.excludes));
+            QCOMPARE(currentSettings.value("result").toObject().value("roots").toArray(),
+                QJsonArray::fromStringList(settings.roots));
+            const auto files = service.call("files.list");
+            QVERIFY(files.value("ok").toBool());
+            QCOMPARE(listedPaths(files), excludeProjects ? QSet<QString>{kept} : QSet<QString>({kept, project}));
+            const auto projectSearch = service.call("search", {{"query", "projectgeneralruletoken"}, {"semantic", false}});
+            QVERIFY(projectSearch.value("ok").toBool());
+            const auto projectHits = projectSearch.value("result").toObject().value("hits").toArray();
+            QCOMPARE(projectHits.size(), excludeProjects ? 0 : 1);
+            if (!excludeProjects) QCOMPARE(projectHits.first().toObject().value("path").toString(), project);
+            QVERIFY(service.waitForHit("keptgeneralruletoken", kept, 5000));
+            const auto excludedSearch = service.call("search", {{"query", "excludedgeneralruletoken"}, {"semantic", false}});
+            QVERIFY(excludedSearch.value("ok").toBool());
+            QVERIFY(excludedSearch.value("result").toObject().value("hits").toArray().isEmpty());
+        }
+    }
+
     void failedRetryPreservesPreviouslyPublishedPrefix() {
         TestEnvironment environment("service-failed-prefix");
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
@@ -652,8 +834,12 @@ private slots:
         QCOMPARE(second.first().toObject().value("path").toString(), environment.path("second/document.txt"));
         QVERIFY(service.call("settings.set", {{"excludes", QJsonArray{environment.path("first")}}}).value("ok").toBool());
         QTRY_VERIFY_WITH_TIMEOUT(ready(), 5000);
-        // An explicitly selected root overrides an equal exclusion, as in FileCatalog.
-        QCOMPARE(limited().first().toObject().value("path").toString(), environment.path("first/needle.txt"));
+        // General exclusions take precedence even when the excluded directory
+        // is also selected. The next eligible hit must still fill limit=1.
+        const auto afterExclusion = limited();
+        QCOMPARE(afterExclusion.size(), 1);
+        QCOMPARE(afterExclusion.first().toObject().value("path").toString(), environment.path("second/document.txt"));
+        QVERIFY(limited(environment.path("first")).isEmpty());
         QVERIFY(service.call("settings.set", {{"roots", QJsonArray{environment.root()}},
             {"excludes", QJsonArray{environment.path("first")}}}).value("ok").toBool());
         QTRY_VERIFY_WITH_TIMEOUT(ready(), 5000);
@@ -1887,10 +2073,10 @@ private slots:
         client.disconnectFromService(); service.stop();
     }
 
-    void newProjectMarkerWithdrawsQueuedOrdinaryFile() {
-        TestEnvironment environment("service-queued-exclusion");
+    void newProjectMarkerKeepsQueuedOrdinaryFile() {
+        TestEnvironment environment("service-queued-project-marker");
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        QVERIFY(environment.writeFile("selected/z-project/queued.txt", controlledDocument("excludedqueuedkeyword")));
+        QVERIFY(environment.writeFile("selected/z-project/queued.txt", controlledDocument("retainedqueuedkeyword")));
         QVERIFY(environment.writeFile("selected/a-block.txt", controlledDocument("retainedblockkeyword")));
         const auto paths = environment.runtimePaths();
         QString error;
@@ -1907,30 +2093,43 @@ private slots:
         QCOMPARE(workers.events(false, "extract").first().value("path").toString(), environment.path("selected/a-block.txt"));
         QCOMPARE(localCall(client, "status").value("result").toObject().value("queuedFiles").toInt(), 2);
         QVERIFY(localCall(client, "index.pause").value("ok").toBool());
-        QVERIFY(environment.writeFile("selected/z-project/CMakeLists.txt", "project(ExcludedFixture)\n"));
+        QSignalSpy events(&client, &ServiceClient::eventReceived);
+        QVERIFY(environment.writeFile("selected/z-project/package.json", "{}"));
         QVERIFY(localCall(client, "index.reconcile").value("ok").toBool());
         QVERIFY(workers.release(false, "a-block.txt-0"));
         // The in-flight batch may finish, while pause holds every later batch.
-        // A completed reconciliation must withdraw the now-ineligible job.
+        // A completed reconciliation must preserve the queued document even
+        // when its folder acquires a project marker while indexing is paused.
         QJsonObject settled;
         QTRY_VERIFY_WITH_TIMEOUT(([&] {
             settled = localCall(client, "status").value("result").toObject();
-            return settled.value("catalogReady").toBool()
-                && settled.value("queuedFiles").toInt() == 0
+            const bool catalogMerged = std::any_of(events.cbegin(), events.cend(), [](const auto &event) {
+                return event.at(0).toString() == "indexChanged"
+                    && event.at(1).template value<QJsonObject>().value("path").toString().isEmpty();
+            });
+            return catalogMerged && settled.value("catalogReady").toBool()
+                && settled.value("queuedFiles").toInt() == 1
                 && settled.value("progress").toObject().value("state").toString() == "paused";
         })(), 5000);
         QVERIFY(localCall(client, "index.resume").value("ok").toBool());
         QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
             .value("progress").toObject().value("state").toString(), QStringLiteral("idle"), 5000);
-        QCOMPARE(workers.events(false, "extract").size(), 1);
-        const auto excluded = localCall(client, "search", {{"query", "excludedqueuedkeyword"}, {"semantic", false}});
-        QVERIFY(excluded.value("ok").toBool());
-        QVERIFY(excluded.value("result").toObject().value("hits").toArray().isEmpty());
+        const auto operations = workers.events(false, "extract");
+        QCOMPARE(operations.size(), 2);
+        QCOMPARE(operations.last().value("path").toString(), environment.path("selected/z-project/queued.txt"));
+        QVERIFY(!operations.last().value("code").toBool());
+        const auto retained = localCall(client, "search", {{"query", "retainedqueuedkeyword"}, {"semantic", false}});
+        QVERIFY(retained.value("ok").toBool());
+        const auto hits = retained.value("result").toObject().value("hits").toArray();
+        QCOMPARE(hits.size(), 1);
+        QCOMPARE(hits.first().toObject().value("path").toString(), environment.path("selected/z-project/queued.txt"));
         const auto listing = localCall(client, "files.list");
         QVERIFY(listing.value("ok").toBool());
         const auto files = listing.value("result").toObject().value("files").toArray();
-        QCOMPARE(files.size(), 1);
-        QCOMPARE(files.first().toObject().value("path").toString(), environment.path("selected/a-block.txt"));
+        QCOMPARE(files.size(), 2);
+        QSet<QString> actual;
+        for (const auto &value : files) actual.insert(value.toObject().value("path").toString());
+        QCOMPARE(actual, QSet<QString>({environment.path("selected/a-block.txt"), environment.path("selected/z-project/queued.txt")}));
         client.disconnectFromService(); service.stop();
     }
 

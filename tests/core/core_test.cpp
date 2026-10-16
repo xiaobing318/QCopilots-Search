@@ -75,6 +75,12 @@ private slots:
     void legacyProfileRejected_data();
     void legacyProfileRejected();
     void settingsRoundTrip();
+    void generalFileRulesDefaults();
+    void generalFileRulesUpgrade();
+    void generalFileRulesRoundTrip();
+    void generalFileRulesRejectInvalid_data();
+    void generalFileRulesRejectInvalid();
+    void generalFileRulesFingerprint();
     void settingsV1Migration_data();
     void settingsV1Migration();
     void settingsRejectCorruption();
@@ -823,6 +829,179 @@ void CoreTest::settingsRoundTrip()
     QCOMPARE(second.pdfOpener.arguments.last(), QString{});
     QVERIFY(!second.needsMigration());
     QVERIFY(!QFileInfo::exists(env.path("registry")));
+}
+
+void CoreTest::generalFileRulesDefaults()
+{
+    const AppSettings settings;
+    const auto rules = settings.toJson().value(QStringLiteral("generalFileRules")).toObject();
+    QCOMPARE(rules.size(), 10);
+    for (const auto &key : {"excludeHidden", "excludeProjects", "excludeNamedDirectories", "excludeMediaDatasets"}) {
+        QVERIFY(rules.value(QLatin1StringView(key)).isBool());
+        QVERIFY(!rules.value(QLatin1StringView(key)).toBool());
+    }
+    QCOMPARE(settings.generalFileRules.mediaDatasetMinimumFiles, 300);
+    QCOMPARE(settings.generalFileRules.mediaDatasetMachineNamedPercent, 70);
+    QVERIFY(settings.generalFileRules.projectFileNames.contains(QStringLiteral(".git")));
+    QVERIFY(settings.generalFileRules.projectFileNames.contains(QStringLiteral("CMakeLists.txt")));
+    QVERIFY(settings.generalFileRules.directoryNames.contains(QStringLiteral("node_modules")));
+    QVERIFY(settings.generalFileRules.directorySuffixes.contains(QStringLiteral("noindex")));
+}
+
+void CoreTest::generalFileRulesUpgrade()
+{
+    TestEnvironment env(QStringLiteral("general-rules-upgrade"));
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    AppSettings original;
+    original.roots = {env.path("documents")};
+    original.codeRoots = {env.path("separate-code")};
+    original.codeExcludes = {env.path("separate-code/build")};
+    original.includeCode = true;
+    const auto settingsPath = env.path("settings.json");
+    QString error;
+    for (const bool partial : {false, true}) {
+        auto json = original.toJson();
+        if (partial) {
+            json[QStringLiteral("generalFileRules")] = QJsonObject{{"excludeHidden", true}};
+        } else {
+            json.remove(QStringLiteral("generalFileRules"));
+        }
+        const auto bytes = QJsonDocument(json).toJson();
+        QVERIFY(env.writeFile("settings.json", bytes));
+        AppSettings loaded;
+        QVERIFY2(loaded.load(settingsPath, &error), qPrintable(error));
+        QVERIFY(loaded.needsMigration());
+        QCOMPARE(loaded.codeRoots, original.codeRoots);
+        QCOMPARE(loaded.codeExcludes, original.codeExcludes);
+        QCOMPARE(loaded.generalFileRules.excludeHidden, partial);
+        QVERIFY(!loaded.generalFileRules.excludeProjects);
+        QCOMPARE(loaded.generalFileRules.mediaDatasetMinimumFiles, 300);
+        QFile file(settingsPath);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(file.readAll(), bytes); // Load never writes before the profile lock.
+        file.close();
+        QVERIFY2(loaded.save(settingsPath, &error), qPrintable(error));
+        AppSettings reloaded;
+        QVERIFY2(reloaded.load(settingsPath, &error), qPrintable(error));
+        QVERIFY(!reloaded.needsMigration());
+        QCOMPARE(reloaded.toJson(), loaded.toJson());
+        QCOMPARE(reloaded.toJson().value("version").toInt(), 2);
+        QCOMPARE(reloaded.toJson().value("generalFileRules").toObject().size(), 10);
+    }
+}
+
+void CoreTest::generalFileRulesRoundTrip()
+{
+    TestEnvironment env(QStringLiteral("general-rules-round-trip"));
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    AppSettings original;
+    auto &rules = original.generalFileRules;
+    rules.excludeHidden = true;
+    rules.excludeProjects = true;
+    rules.excludeNamedDirectories = true;
+    rules.excludeMediaDatasets = true;
+    rules.projectFileNames = {QStringLiteral("自定义 标记.json")};
+    rules.projectDirectorySuffixes = {QStringLiteral("myproject")};
+    rules.directoryNames = {QStringLiteral("custom-cache"), QStringLiteral("缓存 文件")};
+    rules.directorySuffixes = {};
+    rules.mediaDatasetMinimumFiles = 47;
+    rules.mediaDatasetMachineNamedPercent = 100;
+    const auto path = env.path("settings.json");
+    QString error;
+    QVERIFY2(original.save(path, &error), qPrintable(error));
+    AppSettings loaded;
+    QVERIFY2(loaded.load(path, &error), qPrintable(error));
+    QCOMPARE(loaded.toJson(), original.toJson());
+    QCOMPARE(loaded.fingerprint(), original.fingerprint());
+    rules.mediaDatasetMinimumFiles = 1;
+    rules.mediaDatasetMachineNamedPercent = 0;
+    QVERIFY2(AppSettings::fromJson(original.toJson(), &loaded, &error), qPrintable(error));
+    QCOMPARE(loaded.generalFileRules.toJson(), rules.toJson());
+}
+
+void CoreTest::generalFileRulesRejectInvalid_data()
+{
+    QTest::addColumn<QJsonValue>("value");
+    QTest::newRow("not-object") << QJsonValue(true);
+    QTest::newRow("null") << QJsonValue(QJsonValue::Null);
+    QTest::newRow("misspelled-rule") << QJsonValue(QJsonObject{{"excludeProject", true}});
+    for (const auto &key : {"excludeHidden", "excludeProjects", "excludeNamedDirectories", "excludeMediaDatasets"}) {
+        QTest::newRow(key) << QJsonValue(QJsonObject{{QLatin1StringView(key), "true"}});
+    }
+    const QString nul = QStringLiteral("bad") + QChar::Null + QStringLiteral("name");
+    for (const auto &key : {"projectFileNames", "projectDirectorySuffixes", "directoryNames", "directorySuffixes"}) {
+        const QByteArray prefix(key);
+        const QString field = QString::fromLatin1(key);
+        QTest::newRow((prefix + "-array-required").constData()) << QJsonValue(QJsonObject{{field, "cache"}});
+        QTest::newRow((prefix + "-string-required").constData()) << QJsonValue(QJsonObject{{field, QJsonArray{true}}});
+        QTest::newRow((prefix + "-empty").constData()) << QJsonValue(QJsonObject{{field, QJsonArray{""}}});
+        QTest::newRow((prefix + "-blank").constData()) << QJsonValue(QJsonObject{{field, QJsonArray{" \t "}}});
+        QTest::newRow((prefix + "-slash").constData()) << QJsonValue(QJsonObject{{field, QJsonArray{"one/two"}}});
+        QTest::newRow((prefix + "-backslash").constData()) << QJsonValue(QJsonObject{{field, QJsonArray{"one\\two"}}});
+        QTest::newRow((prefix + "-nul").constData()) << QJsonValue(QJsonObject{{field, QJsonArray{nul}}});
+        QTest::newRow((prefix + "-dot").constData()) << QJsonValue(QJsonObject{{field, QJsonArray{"."}}});
+        QTest::newRow((prefix + "-dot-dot").constData()) << QJsonValue(QJsonObject{{field, QJsonArray{".."}}});
+    }
+    for (const auto &key : {"projectDirectorySuffixes", "directorySuffixes"}) {
+        QTest::newRow((QByteArray(key) + "-leading-dot").constData())
+            << QJsonValue(QJsonObject{{QLatin1StringView(key), QJsonArray{".app"}}});
+    }
+    for (const auto &key : {"mediaDatasetMinimumFiles", "mediaDatasetMachineNamedPercent"}) {
+        const QByteArray prefix(key);
+        const QString field = QString::fromLatin1(key);
+        QTest::newRow((prefix + "-integer-required").constData()) << QJsonValue(QJsonObject{{field, 1.5}});
+        QTest::newRow((prefix + "-number-required").constData()) << QJsonValue(QJsonObject{{field, "10"}});
+        QTest::newRow((prefix + "-negative").constData()) << QJsonValue(QJsonObject{{field, -1}});
+        QTest::newRow((prefix + "-overflow").constData()) << QJsonValue(QJsonObject{{field, 2147483648.0}});
+    }
+    QTest::newRow("minimum-zero") << QJsonValue(QJsonObject{{"mediaDatasetMinimumFiles", 0}});
+    QTest::newRow("percent-over-100") << QJsonValue(QJsonObject{{"mediaDatasetMachineNamedPercent", 101}});
+}
+
+void CoreTest::generalFileRulesRejectInvalid()
+{
+    QFETCH(QJsonValue, value);
+    TestEnvironment env(QStringLiteral("general-rules-invalid"));
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    const auto path = env.path("settings.json");
+    AppSettings settings;
+    settings.language = QStringLiteral("zh_CN");
+    settings.generalFileRules.excludeHidden = true;
+    settings.generalFileRules.directoryNames = {QStringLiteral("retained")};
+    const auto before = settings.toJson();
+    auto invalid = AppSettings{}.toJson();
+    invalid[QStringLiteral("generalFileRules")] = value;
+    const auto bytes = QJsonDocument(invalid).toJson();
+    QVERIFY(env.writeFile("settings.json", bytes));
+    QString error;
+    QVERIFY(!settings.load(path, &error));
+    QVERIFY2(error.contains(QStringLiteral("generalFileRules")), qPrintable(error));
+    QCOMPARE(settings.toJson(), before);
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), bytes);
+}
+
+void CoreTest::generalFileRulesFingerprint()
+{
+    const AppSettings original;
+    const auto fingerprint = original.fingerprint();
+    const auto defaults = original.generalFileRules.toJson();
+    for (auto entry = defaults.begin(); entry != defaults.end(); ++entry) {
+        auto changed = defaults;
+        if (entry.value().isBool()) changed[entry.key()] = true;
+        else if (entry.value().isArray()) changed[entry.key()] = QJsonArray{"custom"};
+        else changed[entry.key()] = entry.value().toInt() + 1;
+        auto json = original.toJson();
+        json[QStringLiteral("generalFileRules")] = changed;
+        AppSettings settings;
+        QString error;
+        QVERIFY2(AppSettings::fromJson(json, &settings, &error), qPrintable(error));
+        QVERIFY2(settings.fingerprint() != fingerprint, qPrintable(entry.key()));
+    }
+    QString error;
+    QVERIFY(!GeneralFileRules::fromJson({}, nullptr, &error));
+    QVERIFY(!error.isEmpty());
 }
 
 void CoreTest::settingsV1Migration_data()

@@ -526,7 +526,17 @@ public:
         } else if (method == "settings.get") sendResult(socket, id, settings.toJson());
         else if (method == "settings.set") {
             auto json = settings.toJson();
-            for (auto it = params.begin(); it != params.end(); ++it) json.insert(it.key(), it.value());
+            for (auto it = params.begin(); it != params.end(); ++it) {
+                // A caller may toggle one discovery rule without replacing
+                // the user's other rule switches or matching conditions.
+                if (it.key() == QStringLiteral("generalFileRules") && it.value().isObject()) {
+                    auto rules = json.value(it.key()).toObject();
+                    const auto changes = it.value().toObject();
+                    for (auto rule = changes.begin(); rule != changes.end(); ++rule)
+                        rules.insert(rule.key(), rule.value());
+                    json.insert(it.key(), rules);
+                } else json.insert(it.key(), it.value());
+            }
             AppSettings next;
             QString error;
             if (!AppSettings::fromJson(json, &next, &error) || !next.save(paths.configFile, &error)) {
@@ -856,6 +866,7 @@ public:
         scanning = true; pendingScan = false; scanCancelled.store(false);
         const quint64 epoch = generation;
         FolderRules general{settings.roots, settings.excludes, false};
+        general.generalFileRules = settings.generalFileRules;
         FolderRules code{settings.codeRoots, settings.codeExcludes, true};
         code.scope = FolderRules::Scope::Code;
         const bool includeCode = settings.includeCode;
@@ -876,10 +887,20 @@ public:
             ScanPackage result; result.generation = epoch;
             QSet<QString> seen;
             const auto scanSpace = [this, &result, &seen](const FolderRules &rules, QStringList &successfulRoots) {
-                for (const auto &root : rules.roots) {
+                auto roots = rules.roots;
+                const bool general = !rules.includeCode && rules.scope == FolderRules::Scope::General;
+                if (general) std::stable_sort(roots.begin(), roots.end(), [](const auto &left, const auto &right) {
+                    return normalizePath(left).size() < normalizePath(right).size();
+                });
+                QStringList policyExcludes;
+                for (const auto &root : roots) {
                     if (scanCancelled.load()) { result.scan.cancelled = true; return; }
                     auto selected = rules; selected.roots = {root};
+                    // Root failures stay isolated, while enabled directory
+                    // exclusions also govern separately selected descendants.
+                    if (general) selected.excludes.append(policyExcludes);
                     const auto source = FileCatalog::scan(selected, &scanCancelled);
+                    if (general) policyExcludes.append(source.policyExcludedDirectories);
                     result.scan.directories.append(source.directories); result.scan.errors.append(source.errors);
                     if (source.cancelled) { result.scan.cancelled = true; return; }
                     if (!source.errors.isEmpty()) continue;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "general_file_rules.h"
+
 #include <QJsonObject>
 #include <QString>
 #include <QStringList>
@@ -15,6 +17,7 @@ struct ExternalOpenerSettings {
 struct AppSettings {
     QStringList roots;
     QStringList excludes;
+    GeneralFileRules generalFileRules;
     QStringList codeRoots;
     QStringList codeExcludes;
     bool includeCode = false;
@@ -35,7 +38,8 @@ struct AppSettings {
     static bool fromJson(const QJsonObject &object, AppSettings *settings,
                          QString *error = nullptr);
     QString fingerprint() const;
-    // Loading v1 changes memory only. The profile owner persists v2 after locking.
+    // Loading older/incomplete settings changes memory only. The profile owner
+    // persists the complete v2 configuration after locking.
     bool needsMigration() const { return migrationPending_; }
 
 private:

@@ -281,24 +281,48 @@ private slots:
         QCOMPARE(result.directories, expectedDirectories);
     }
 
-    void exclusionsUseBoundariesAndChosenNestedRootOverridesAncestor()
+    void exclusionsUseBoundariesAndScopeSpecificRootPrecedence_data()
     {
+        QTest::addColumn<bool>("code");
+        QTest::newRow("general-exclusion-wins") << false;
+        QTest::newRow("code-explicit-root-override") << true;
+    }
+
+    void exclusionsUseBoundariesAndScopeSpecificRootPrecedence()
+    {
+        QFETCH(bool, code);
         TestEnvironment temporary;
         QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
         const QString root = temporary.root();
         QVERIFY(writeFile(root + "/private/omitted.txt"));
         QVERIFY(writeFile(root + "/private/chosen/kept.txt"));
         QVERIFY(writeFile(root + "/private-sibling/visible.txt"));
-        const auto result = FileCatalog::scan({{root, root + "/private/chosen"}, {root + "/private"}, false});
+        const auto scope = code ? FolderRules::Scope::Code : FolderRules::Scope::General;
+        const auto result = FileCatalog::scan({{root, root + "/private/chosen"}, {root + "/private"}, false, scope});
         QVERIFY(result.errors.isEmpty());
-        QCOMPARE(fileNames(result), QSet<QString>({"kept.txt", "visible.txt"}));
-        QStringList expectedDirectories{normalizePath(root), normalizePath(root + "/private/chosen"),
-            normalizePath(root + "/private-sibling")};
+        QCOMPARE(fileNames(result), code ? QSet<QString>({"kept.txt", "visible.txt"}) : QSet<QString>({"visible.txt"}));
+        QStringList expectedDirectories{normalizePath(root), normalizePath(root + "/private-sibling")};
+        if (code) expectedDirectories.append(normalizePath(root + "/private/chosen"));
         expectedDirectories.sort();
         QCOMPARE(result.directories, expectedDirectories);
     }
 
-    void excludesGeneratedDirectoriesAndSecrets()
+    void generalExcludedRootsAreNotVisited()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString root = temporary.path("selected");
+        QVERIFY(writeFile(root + "/notes.txt"));
+        QVERIFY(writeFile(root + "/nested/guide.md"));
+        for (const auto &excluded : {root, temporary.root()}) {
+            const auto result = FileCatalog::scan({{root, root + "/nested"}, {excluded}, false});
+            QVERIFY2(result.errors.isEmpty(), qPrintable(result.errors.join('\n')));
+            QVERIFY(result.files.isEmpty());
+            QVERIFY(result.directories.isEmpty());
+        }
+    }
+
+    void generalScopeUsesExplicitExclusionsInsteadOfNameFilters()
     {
         TestEnvironment temporary;
         QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
@@ -311,8 +335,21 @@ private slots:
         QVERIFY(writeFile(root + "/notes.txt"));
         const auto result = FileCatalog::scan({{root}, {}, false});
         QVERIFY(result.errors.isEmpty());
-        QCOMPARE(fileNames(result), QSet<QString>({"notes.txt"}));
-        QCOMPARE(result.directories, QStringList{normalizePath(root)});
+        QCOMPARE(fileNames(result), QSet<QString>({"readme.txt", "note.txt", "internal.txt", "secret-passwords.txt", "notes.txt"}));
+        for (const auto &file : result.files) {
+            FileRecord described;
+            QString error;
+            QVERIFY2(FileCatalog::describe(file.path, &described, &error), qPrintable(error));
+            QCOMPARE(described.kind, QStringLiteral("text"));
+            QCOMPARE(described.fingerprint, file.fingerprint);
+        }
+        const auto excluded = FileCatalog::scan({{root}, {root + "/node_modules", root + "/.svn"}, false});
+        QVERIFY(excluded.errors.isEmpty());
+        QCOMPARE(fileNames(excluded), QSet<QString>({"note.txt", "secret-passwords.txt", "notes.txt"}));
+        const auto code = FileCatalog::scan({{root}, {}, false, FolderRules::Scope::Code});
+        QVERIFY(code.errors.isEmpty());
+        QCOMPARE(fileNames(code), QSet<QString>({"notes.txt"}));
+        QCOMPARE(code.directories, QStringList{normalizePath(root)});
     }
 
     void independentScopesAllowSharedTextAndRejectCodeData()
@@ -347,41 +384,88 @@ private slots:
         QCOMPARE(generalShared.fingerprint, codeShared.fingerprint);
     }
 
-    void projectContentIsLimitedToScreenshotsEvenWhenChosen()
+    void projectMarkersDoNotHideGeneralContent_data()
     {
+        QTest::addColumn<bool>("repository");
+        QTest::newRow("git-repository") << true;
+        QTest::newRow("package-project") << false;
+    }
+
+    void projectMarkersDoNotHideGeneralContent()
+    {
+        QFETCH(bool, repository);
         TestEnvironment temporary;
         QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
         const QString project = temporary.path("project");
+        QVERIFY(QDir().mkpath(project));
+        if (repository) {
+            QVERIFY(createRepository(project));
+            QVERIFY(writeFile(project + "/.gitignore", "git-ignored.md\n"));
+            QVERIFY(writeFile(project + "/git-ignored.md"));
+        }
         QVERIFY(writeFile(project + "/package.json", "{}"));
         QVERIFY(writeFile(project + "/notes.txt"));
+        QVERIFY(writeFile(project + "/README.md"));
         QVERIFY(writeFile(project + "/photo.png"));
+        QVERIFY(writeFile(project + "/nested/CMakeLists.txt", "project(CatalogFixture)"));
+        QVERIFY(writeFile(project + "/nested/guide.markdown"));
         QVERIFY(writeFile(project + "/nested/recording.wav"));
         QVERIFY(writeFile(project + "/nested/source.cpp"));
+        QVERIFY(writeFile(project + "/nested/excluded/omitted.md"));
+        QVERIFY(writeFile(project + "/.hidden/hidden.md"));
+        QVERIFY(writeFile(project + "/secret-notes.txt"));
+        QVERIFY(writeFile(project + "/node_modules/cached.txt"));
         const QStringList screenshots{"Screenshot 2026-10-14.png", "Screen Shot example.jpg",
             "CleanShot result.webp", "SCR-example.PNG"};
         for (const auto &name : screenshots) QVERIFY(writeFile(project + "/nested/" + name));
-        // A screenshot-like name on a document must not bypass project rules.
         QVERIFY(writeFile(project + "/Screenshot notes.txt"));
         QVERIFY(writeFile(temporary.path("outside.txt")));
-        const auto selectedProject = FileCatalog::scan({{project}, {}, false});
+        const QStringList excludes{project + "/nested/excluded"};
+        const auto selectedProject = FileCatalog::scan({{project}, excludes, false});
         QVERIFY2(selectedProject.errors.isEmpty(), qPrintable(selectedProject.errors.join('\n')));
-        QCOMPARE(fileNames(selectedProject), QSet<QString>(screenshots.cbegin(), screenshots.cend()));
+        QSet<QString> expected(screenshots.cbegin(), screenshots.cend());
+        expected.unite({"notes.txt", "README.md", "photo.png", "CMakeLists.txt", "guide.markdown",
+                        "recording.wav", "Screenshot notes.txt", "hidden.md", "secret-notes.txt", "cached.txt"});
+        if (repository) expected.insert("git-ignored.md");
+        QCOMPARE(fileNames(selectedProject), expected);
         for (const auto &record : selectedProject.files) {
-            QVERIFY(record.screenshot);
-            QCOMPARE(record.kind, QStringLiteral("image"));
+            const QString name = QFileInfo(record.path).fileName();
+            if (screenshots.contains(name)) {
+                QVERIFY(record.screenshot);
+                QCOMPARE(record.kind, QStringLiteral("image"));
+            } else if (name == "photo.png") {
+                QVERIFY(!record.screenshot);
+                QCOMPARE(record.kind, QStringLiteral("image"));
+            } else if (name == "recording.wav") QCOMPARE(record.kind, QStringLiteral("audio"));
+            else {
+                QVERIFY(!record.screenshot);
+                QCOMPARE(record.kind, QStringLiteral("text"));
+            }
         }
-        auto expected = fileNames(selectedProject);
+        // Encountering the same repository below a selected ancestor must not
+        // silently hide its ordinary documents or media either.
         expected.insert("outside.txt");
-        const auto ancestor = FileCatalog::scan({{temporary.root()}, {}, false});
+        const auto ancestor = FileCatalog::scan({{temporary.root()}, excludes, false});
         QVERIFY2(ancestor.errors.isEmpty(), qPrintable(ancestor.errors.join('\n')));
         QCOMPARE(fileNames(ancestor), expected);
-        const auto code = FileCatalog::scan({{project}, {}, false, FolderRules::Scope::Code});
+        const auto code = FileCatalog::scan({{project}, excludes, false, FolderRules::Scope::Code});
         QVERIFY2(code.errors.isEmpty(), qPrintable(code.errors.join('\n')));
-        QCOMPARE(fileNames(code), QSet<QString>({"notes.txt", "source.cpp", "Screenshot notes.txt"}));
-        for (const auto &record : code.files) QVERIFY(!record.screenshot);
+        QCOMPARE(fileNames(code), QSet<QString>({"notes.txt", "README.md", "CMakeLists.txt", "guide.markdown",
+                                               "source.cpp", "Screenshot notes.txt"}));
+        for (const auto &record : code.files) {
+            QVERIFY(!record.screenshot);
+            QCOMPARE(record.kind, QStringLiteral("code"));
+            FileRecord described;
+            QString error;
+            QVERIFY2(FileCatalog::describe(record.path, &described, &error), qPrintable(error));
+            QCOMPARE(described.fingerprint, record.fingerprint);
+            if (QFileInfo(record.path).fileName() == "source.cpp"
+                || QFileInfo(record.path).fileName() == "CMakeLists.txt")
+                QCOMPARE(described.kind, QStringLiteral("code"));
+        }
     }
 
-    void explicitlyChosenExcludedDirectoriesStillExcludeDescendants_data()
+    void directoryNameFiltersOnlyApplyToCodeScope_data()
     {
         QTest::addColumn<QString>("directory");
         QTest::addColumn<bool>("code");
@@ -391,7 +475,7 @@ private slots:
         }
     }
 
-    void explicitlyChosenExcludedDirectoriesStillExcludeDescendants()
+    void directoryNameFiltersOnlyApplyToCodeScope()
     {
         QFETCH(QString, directory);
         QFETCH(bool, code);
@@ -407,33 +491,36 @@ private slots:
         const auto scope = code ? FolderRules::Scope::Code : FolderRules::Scope::General;
         const auto notChosen = FileCatalog::scan({{temporary.root()}, {}, false, scope});
         QVERIFY2(notChosen.errors.isEmpty(), qPrintable(notChosen.errors.join('\n')));
-        QVERIFY(notChosen.files.isEmpty());
+        const QSet<QString> generalNames{"kept.txt", "visible.txt", ".hidden.txt", "hidden.txt", "cached.txt", "bundled.txt"};
+        if (code) QVERIFY(notChosen.files.isEmpty());
+        else QCOMPARE(fileNames(notChosen), generalNames);
         const auto chosen = FileCatalog::scan({{temporary.root(), selected}, {}, false, scope});
         QVERIFY2(chosen.errors.isEmpty(), qPrintable(chosen.errors.join('\n')));
-        QCOMPARE(fileNames(chosen), QSet<QString>({"kept.txt", "visible.txt"}));
-        QVERIFY(!chosen.directories.contains(normalizePath(selected + "/.hidden")));
-        QVERIFY(!chosen.directories.contains(normalizePath(selected + "/node_modules")));
-        QVERIFY(!chosen.directories.contains(normalizePath(selected + "/Nested.app")));
+        QCOMPARE(fileNames(chosen), code ? QSet<QString>({"kept.txt", "visible.txt"}) : generalNames);
+        QCOMPARE(chosen.directories.contains(normalizePath(selected + "/.hidden")), !code);
+        QCOMPARE(chosen.directories.contains(normalizePath(selected + "/node_modules")), !code);
+        QCOMPARE(chosen.directories.contains(normalizePath(selected + "/Nested.app")), !code);
+        const auto excluded = FileCatalog::scan({{temporary.root()}, {selected}, false, scope});
+        QVERIFY2(excluded.errors.isEmpty(), qPrintable(excluded.errors.join('\n')));
+        QVERIFY(excluded.files.isEmpty());
     }
 
-    void mediaDatasetDetectionUsesCountRatioAndCameraExceptions_data()
+    void generalMediaCountAndNamesDoNotHideFiles_data()
     {
         QTest::addColumn<int>("total");
         QTest::addColumn<int>("machine");
         QTest::addColumn<bool>("camera");
-        QTest::addColumn<bool>("excluded");
-        QTest::newRow("below-minimum-count") << 299 << 299 << false << false;
-        QTest::newRow("below-seventy-percent") << 300 << 209 << false << false;
-        QTest::newRow("at-seventy-percent") << 300 << 210 << false << true;
-        QTest::newRow("camera-names-are-personal-media") << 300 << 300 << true << false;
+        QTest::newRow("below-former-minimum-count") << 299 << 299 << false;
+        QTest::newRow("below-former-seventy-percent") << 300 << 209 << false;
+        QTest::newRow("at-former-seventy-percent") << 300 << 210 << false;
+        QTest::newRow("camera-names") << 300 << 300 << true;
     }
 
-    void mediaDatasetDetectionUsesCountRatioAndCameraExceptions()
+    void generalMediaCountAndNamesDoNotHideFiles()
     {
         QFETCH(int, total);
         QFETCH(int, machine);
         QFETCH(bool, camera);
-        QFETCH(bool, excluded);
         TestEnvironment temporary;
         QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
         const QString dataset = temporary.path("media");
@@ -449,19 +536,160 @@ private slots:
         QVERIFY(writeFile(dataset + "/notes.txt"));
         const auto result = FileCatalog::scan({{temporary.root()}, {}, false});
         QVERIFY2(result.errors.isEmpty(), qPrintable(result.errors.join('\n')));
-        if (excluded) {
-            QCOMPARE(fileNames(result), QSet<QString>({"Screenshot retained.png", "notes.txt"}));
-        } else {
-            QCOMPARE(result.files.size(), total + 3);
-        }
-        // Explicitly selecting the media directory opts in, also when an
-        // ancestor was scanned first and excluded this directory's dataset.
+        QCOMPARE(result.files.size(), total + 3);
+        // Overlapping selected roots must not duplicate any media records.
         const auto selected = FileCatalog::scan({{temporary.root(), dataset}, {}, false});
         QVERIFY2(selected.errors.isEmpty(), qPrintable(selected.errors.join('\n')));
         QCOMPARE(selected.files.size(), total + 3);
+        const auto excluded = FileCatalog::scan({{temporary.root()}, {dataset}, false});
+        QVERIFY2(excluded.errors.isEmpty(), qPrintable(excluded.errors.join('\n')));
+        QVERIFY(excluded.files.isEmpty());
+    }
+
+    void configurableGeneralHiddenRule()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString root = temporary.root();
+        QVERIFY(writeFile(root + "/visible.txt"));
+        QVERIFY(writeFile(root + "/.hidden.md"));
+        QVERIFY(writeFile(root + "/.hidden-folder/nested.md"));
+        QVERIFY(writeFile(root + "/node_modules/package.txt"));
+        FolderRules rules{{root}, {}, false};
+        rules.generalFileRules.excludeHidden = true;
+        const auto filtered = FileCatalog::scan(rules);
+        QVERIFY2(filtered.errors.isEmpty(), qPrintable(filtered.errors.join('\n')));
+        QCOMPARE(fileNames(filtered), QSet<QString>({"visible.txt", "package.txt"}));
+        QCOMPARE(filtered.policyExcludedDirectories, QStringList{normalizePath(root + "/.hidden-folder")});
+        rules.roots = {root + "/.hidden-folder", root};
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), fileNames(filtered));
+        rules.roots = {root + "/.hidden-folder"};
+        QVERIFY(FileCatalog::scan(rules).files.isEmpty());
+        rules.generalFileRules.excludeHidden = false;
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"nested.md"}));
+    }
+
+    void configurableGeneralDirectoryNamesAndSuffixes()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString root = temporary.root();
+        QVERIFY(writeFile(root + "/visible.txt"));
+        QVERIFY(writeFile(root + "/node_modules/package.txt"));
+        QVERIFY(writeFile(root + "/App.app/bundled.txt"));
+        QVERIFY(writeFile(root + "/folder.noindex/unindexed.txt"));
+        QVERIFY(writeFile(root + "/.hidden/hidden.txt"));
+        QVERIFY(writeFile(root + "/manual/manual.txt"));
+        QVERIFY(writeFile(root + "/folder.custom/custom.txt"));
+        FolderRules rules{{root}, {}, false};
+        rules.generalFileRules.excludeNamedDirectories = true;
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"visible.txt", "hidden.txt", "manual.txt", "custom.txt"}));
+        rules.generalFileRules.directoryNames = {"manual"};
+        rules.generalFileRules.directorySuffixes = {"CUSTOM"};
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"visible.txt", "package.txt", "bundled.txt", "unindexed.txt", "hidden.txt"}));
+        rules.roots = {root + "/manual", root + "/folder.custom", root};
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"visible.txt", "package.txt", "bundled.txt", "unindexed.txt", "hidden.txt"}));
+        rules.roots = {root + "/manual"};
+        QVERIFY(FileCatalog::scan(rules).files.isEmpty());
+        rules.roots = {root};
+        rules.generalFileRules.directoryNames.clear();
+        rules.generalFileRules.directorySuffixes.clear();
+        QCOMPARE(FileCatalog::scan(rules).files.size(), 7);
+        rules.excludes = {root + "/node_modules"};
+        QCOMPARE(FileCatalog::scan(rules).files.size(), 6);
+    }
+
+    void configurableGeneralProjectMarkers()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString root = temporary.root();
+        const QString project = root + "/package";
+        QVERIFY(writeFile(root + "/visible.txt"));
+        QVERIFY(writeFile(project + "/package.json", "{}"));
+        QVERIFY(writeFile(project + "/nested/project.md"));
+        QVERIFY(writeFile(project + "/Screenshot project.png"));
+        QVERIFY(writeFile(root + "/custom/PROJECT.marker"));
+        QVERIFY(writeFile(root + "/custom/custom.md"));
+        QVERIFY(QDir().mkpath(root + "/suffix/Example.workspace"));
+        QVERIFY(writeFile(root + "/suffix/suffix.md"));
+        FolderRules rules{{root}, {}, false};
+        rules.generalFileRules.excludeProjects = true;
+        const auto filtered = FileCatalog::scan(rules);
+        QVERIFY2(filtered.errors.isEmpty(), qPrintable(filtered.errors.join('\n')));
+        QCOMPARE(fileNames(filtered), QSet<QString>({"visible.txt", "custom.md", "suffix.md"}));
+        QVERIFY(!filtered.directories.contains(normalizePath(project)));
+        QCOMPARE(filtered.policyExcludedDirectories, QStringList{normalizePath(project)});
+        for (const QStringList &roots : {QStringList{project + "/nested", root}, QStringList{root, project + "/nested"}}) {
+            rules.roots = roots;
+            QCOMPARE(fileNames(FileCatalog::scan(rules)), fileNames(filtered));
+        }
+        rules.roots = {project};
+        QVERIFY(FileCatalog::scan(rules).files.isEmpty());
+        // A selected child does not inspect project markers outside its scope.
+        rules.roots = {project + "/nested"};
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"project.md"}));
+        rules.roots = {root};
+        rules.generalFileRules.projectFileNames = {"PROJECT.marker"};
+        rules.generalFileRules.projectDirectorySuffixes = {"WORKSPACE"};
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"visible.txt", "project.md", "Screenshot project.png"}));
+        rules.generalFileRules.projectFileNames.clear();
+        rules.generalFileRules.projectDirectorySuffixes.clear();
+        QCOMPARE(FileCatalog::scan(rules).files.size(), 5);
+        rules.generalFileRules.projectFileNames = {"package.json", "PROJECT.marker"};
+        rules.generalFileRules.projectDirectorySuffixes = {"workspace"};
+        rules.scope = FolderRules::Scope::Code;
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"visible.txt", "project.md", "custom.md", "suffix.md"}));
+    }
+
+    void configurableGeneralMediaThresholdsApplyToSelectedRoot()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString root = temporary.root();
+        for (const auto &name : {"sample-001.jpg", "sample-002.jpg", "IMG_0003.jpg", "Screenshot capture.png",
+                                 "personal.wav", "movie.mp4", "notes.txt"})
+            QVERIFY(writeFile(QDir(root).filePath(QString::fromLatin1(name))));
+        FolderRules rules{{root}, {}, false};
+        rules.generalFileRules.excludeMediaDatasets = true;
+        rules.generalFileRules.mediaDatasetMinimumFiles = 4;
+        rules.generalFileRules.mediaDatasetMachineNamedPercent = 50;
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"notes.txt"}));
+        rules.generalFileRules.mediaDatasetMinimumFiles = 5;
+        QCOMPARE(FileCatalog::scan(rules).files.size(), 7);
+        rules.generalFileRules.mediaDatasetMinimumFiles = 4;
+        rules.generalFileRules.mediaDatasetMachineNamedPercent = 51;
+        QCOMPARE(FileCatalog::scan(rules).files.size(), 7);
+        rules.generalFileRules.mediaDatasetMachineNamedPercent = 0;
+        QCOMPARE(fileNames(FileCatalog::scan(rules)), QSet<QString>({"notes.txt"}));
+        rules.generalFileRules.excludeMediaDatasets = false;
+        QCOMPARE(FileCatalog::scan(rules).files.size(), 7);
     }
 
 #ifdef Q_OS_WIN
+    void hiddenWindowsAttributesOnlyFilterCodeScope()
+    {
+        TestEnvironment temporary;
+        QVERIFY2(temporary.isValid(), qPrintable(temporary.error()));
+        const QString document = temporary.path("hidden-attribute.txt");
+        const QString folder = temporary.path("hidden-attribute-folder");
+        QVERIFY(writeFile(document));
+        QVERIFY(writeFile(folder + "/nested.md"));
+        TestWindowsAttributes documentAttributes(document), folderAttributes(folder);
+        QVERIFY(documentAttributes.add(FILE_ATTRIBUTE_HIDDEN));
+        QVERIFY(folderAttributes.add(FILE_ATTRIBUTE_HIDDEN));
+        const auto general = FileCatalog::scan({{temporary.root()}, {}, false});
+        QVERIFY2(general.errors.isEmpty(), qPrintable(general.errors.join('\n')));
+        QCOMPARE(fileNames(general), QSet<QString>({"hidden-attribute.txt", "nested.md"}));
+        const auto excluded = FileCatalog::scan({{temporary.root()}, {folder}, false});
+        QCOMPARE(fileNames(excluded), QSet<QString>({"hidden-attribute.txt"}));
+        const auto code = FileCatalog::scan({{temporary.root()}, {}, false, FolderRules::Scope::Code});
+        QVERIFY2(code.errors.isEmpty(), qPrintable(code.errors.join('\n')));
+        QVERIFY(code.files.isEmpty());
+        QVERIFY(documentAttributes.restore());
+        QVERIFY(folderAttributes.restore());
+    }
+
     void offlineFilesAreRejectedBeforeContentInspection()
     {
         TestEnvironment temporary;
@@ -664,15 +892,17 @@ private slots:
         QString junctionError;
         QVERIFY2(junctions.create(root + "/outside-link", outside, &junctionError), qPrintable(junctionError));
         QVERIFY2(junctions.create(root + "/loop", root, &junctionError), qPrintable(junctionError));
+        QVERIFY2(junctions.create(root + "/.hidden-link", outside, &junctionError), qPrintable(junctionError));
         QVERIFY(QFileInfo(root + "/outside-link").isJunction());
         QVERIFY(QFileInfo(root + "/loop").isJunction());
         qInfo("Native link coverage: Windows directory junctions (outside target and loop)");
 #else
-        TestSymbolicLink outsideLink, loopLink, fileLink;
+        TestSymbolicLink outsideLink, loopLink, fileLink, hiddenLink;
         QString linkError;
         QVERIFY2(outsideLink.create(root + "/outside-link", outside, &linkError), qPrintable(linkError));
         QVERIFY2(loopLink.create(root + "/loop", root, &linkError), qPrintable(linkError));
         QVERIFY2(fileLink.create(root + "/file-link.txt", outside + "/outside.txt", &linkError), qPrintable(linkError));
+        QVERIFY2(hiddenLink.create(root + "/.hidden-link", outside, &linkError), qPrintable(linkError));
         qInfo("Native link coverage: POSIX directory and file symbolic links");
 #endif
         QVERIFY(!isPathWithin(root + "/outside-link/does-not-exist.txt", root));
@@ -685,9 +915,16 @@ private slots:
         QVERIFY(linkedRoot.files.isEmpty());
         QVERIFY(linkedRoot.directories.isEmpty());
         QCOMPARE(linkedRoot.errors.size(), 1);
+        FolderRules hiddenRules{{root, outside}, {}, false};
+        hiddenRules.generalFileRules.excludeHidden = true;
+        const auto hidden = FileCatalog::scan(hiddenRules);
+        QVERIFY2(hidden.errors.isEmpty(), qPrintable(hidden.errors.join('\n')));
+        QCOMPARE(fileNames(hidden), QSet<QString>({"inside.txt", "outside.txt"}));
+        QVERIFY(hidden.policyExcludedDirectories.isEmpty());
 #ifdef Q_OS_WIN
         QVERIFY2(junctions.removeAll(&junctionError), qPrintable(junctionError));
 #else
+        QVERIFY2(hiddenLink.remove(&linkError), qPrintable(linkError));
         QVERIFY2(fileLink.remove(&linkError), qPrintable(linkError));
         QVERIFY2(loopLink.remove(&linkError), qPrintable(linkError));
         QVERIFY2(outsideLink.remove(&linkError), qPrintable(linkError));
@@ -698,6 +935,7 @@ private slots:
         QVERIFY(!QFileInfo(root + "/loop").isSymLink());
         QVERIFY(!QFileInfo::exists(root + "/outside-link"));
         QVERIFY(!QFileInfo::exists(root + "/loop"));
+        QVERIFY(!QFileInfo::exists(root + "/.hidden-link"));
         for (const auto &target : {root + "/inside.txt", outside + "/outside.txt"}) {
             QFile preserved(target);
             QVERIFY(preserved.open(QIODevice::ReadOnly));

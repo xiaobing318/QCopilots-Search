@@ -1,5 +1,6 @@
 add_library(qcs-core STATIC
     app_settings.cpp app_settings.h
+    general_file_rules.cpp general_file_rules.h
     file_catalog.cpp file_catalog.h
     file_formats.h
     model_files.cpp model_files.h

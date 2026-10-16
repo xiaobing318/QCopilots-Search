@@ -162,6 +162,33 @@ private slots:
         QCOMPARE(extractDocument(directory->filePath(QStringLiteral("missing.txt")), {}).state, QStringLiteral("failed"));
         QCOMPARE(extractDocument(write(QStringLiteral("binary.txt"), QByteArray("x\0y", 3)), {}).state, QStringLiteral("failed"));
     }
+    void largeMarkdownUsesDocumentLimitsOutsideCodeScope() {
+        QByteArray content("# Large document\nunique-document-start\n");
+        const QByteArray paragraph = QStringLiteral("This document explains building a desktop application. 中文编译说明。\n").toUtf8();
+        while (content.size() <= 1024 * 1024) content += paragraph;
+        content += "\nunique-document-tail\n";
+        const QString path = write(QStringLiteral("large.md"), content);
+        QVERIFY(!path.isEmpty());
+        QVERIFY(QFileInfo(path).size() > 1024 * 1024);
+
+        ExtractionOptions options;
+        options.maxSegments = 5000;
+        const auto document = Extractor::extract(path, options);
+        QVERIFY2(document.error.isEmpty(), qPrintable(document.error));
+        QCOMPARE(document.state, QStringLiteral("complete"));
+        QVERIFY(document.complete);
+        QVERIFY(document.segments.size() > 40);
+        QVERIFY(allText(document).contains(QStringLiteral("unique-document-start")));
+        QVERIFY(allText(document).contains(QStringLiteral("unique-document-tail")));
+        for (const auto &segment : document.segments) QCOMPARE(segment.kind, QStringLiteral("text"));
+
+        options.code = true;
+        const auto code = Extractor::extract(path, options);
+        QCOMPARE(code.state, QStringLiteral("failed"));
+        QVERIFY(!code.complete);
+        QVERIFY(code.segments.isEmpty());
+        QCOMPARE(code.error, QStringLiteral("Source file exceeds code extraction size limit"));
+    }
     void longDocumentResumesWithoutLosingTail() {
         QString content;
         for (int i = 0; i < 100; ++i) content += QStringLiteral("paragraph %1 body 中文\n").arg(i);
@@ -462,16 +489,42 @@ private slots:
     }
     void codeFilenameMatchingKeepsExclusions() {
         for (const QString &name : {QStringLiteral("DockerfileBackup"), QStringLiteral("Dockerfile.pem"),
-                QStringLiteral("credentials.yaml"), QStringLiteral("SecretPicture.png"), QStringLiteral("bundle.MIN.JS")}) {
+                QStringLiteral("credentials.yaml"), QStringLiteral("SecretPicture.png"), QStringLiteral("SecretNotes.txt"),
+                QStringLiteral("bundle.MIN.JS")}) {
             const QString path = write(name, "safe fixture content\n");
             QVERIFY(!path.isEmpty());
             QVERIFY(!supportsCode(QFileInfo(path).suffix(), name));
             QVERIFY(Extractor::kindForPath(path, true).isEmpty());
+            ExtractionOptions codeOptions;
+            codeOptions.code = true;
+            const auto code = Extractor::extract(path, codeOptions);
+            QCOMPARE(code.state, QStringLiteral("unsupported"));
+            QVERIFY(code.segments.isEmpty());
             FileRecord record;
             QString error;
-            QVERIFY(!FileCatalog::describe(path, &record, &error));
-            QVERIFY(!error.isEmpty());
+            if (name == QStringLiteral("SecretPicture.png") || name == QStringLiteral("SecretNotes.txt")) {
+                // General search accepts supported formats independently of
+                // code-only filename exclusions. describe serves both spaces.
+                QVERIFY2(FileCatalog::describe(path, &record, &error), qPrintable(error));
+                QVERIFY(error.isEmpty());
+                QCOMPARE(record.kind, name.endsWith(QStringLiteral(".png")) ? QStringLiteral("image") : QStringLiteral("text"));
+                QCOMPARE(Extractor::kindForPath(path, false), record.kind);
+                if (record.kind == QStringLiteral("text")) {
+                    const auto general = Extractor::extract(path);
+                    QVERIFY2(general.complete, qPrintable(general.error));
+                    QVERIFY(allText(general).contains(QStringLiteral("safe fixture content")));
+                }
+            } else {
+                QVERIFY(!FileCatalog::describe(path, &record, &error));
+                QVERIFY(!error.isEmpty());
+            }
         }
+        const auto code = FileCatalog::scan({{directory->path()}, {}, false, FolderRules::Scope::Code});
+        QVERIFY2(code.errors.isEmpty(), qPrintable(code.errors.join('\n')));
+        QVERIFY(code.files.isEmpty());
+        const auto general = FileCatalog::scan({{directory->path()}, {}, false});
+        QVERIFY2(general.errors.isEmpty(), qPrintable(general.errors.join('\n')));
+        QCOMPARE(general.files.size(), 2);
     }
     void transportClassificationMatchesExtraction() {
         const auto &root = *directory;

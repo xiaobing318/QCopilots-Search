@@ -41,6 +41,41 @@ export QCS_HOME="$HOME/qcs-data"
 
 父进程会把解析后的绝对路径显式传给服务与 worker。同一规范化 profile 只运行一个 GUI 主实例和一个服务，不同 profile 可以并行。开发脚本与自动测试使用独立 profile，不访问正常用户数据。
 
+## 搜索目录与过滤规则
+
+普通文件搜索递归读取所选目录内所有受支持的文件，包括 Git 仓库和嵌套项目中的文本、Word、PDF、图片及音视频。普通文件索引不要求开启代码搜索。普通目录的 `excludes` 优先于 `roots`，被排除的目录及其子目录不会因为再次加入搜索根而被重新纳入。代码搜索继续使用独立的目录、排除条件和 Git ignore 规则。
+
+`qcs-settings.json` 的 `generalFileRules` 显式保存普通文件的自动过滤开关和匹配条件。四个开关默认均为 `false`，只有主动开启后才过滤对应内容：
+
+| 字段 | 含义 |
+| --- | --- |
+| `excludeHidden` | 排除隐藏文件、隐藏目录和点号开头的名称 |
+| `excludeProjects` | 排除匹配项目标记的目录及其整个子目录树 |
+| `projectFileNames`、`projectDirectorySuffixes` | 项目标记名称和目录后缀，例如 `.git`、`CMakeLists.txt`、`xcodeproj` |
+| `excludeNamedDirectories` | 启用目录名称和后缀过滤 |
+| `directoryNames`、`directorySuffixes` | 需要过滤的目录名称和后缀，例如 `node_modules`、`venv`、`app`、`noindex` |
+| `excludeMediaDatasets` | 过滤符合数量与机器命名比例条件的文件夹中的图片、音频和视频，普通文档仍保留 |
+| `mediaDatasetMinimumFiles` | 同一种媒体的最少文件数，默认 `300` |
+| `mediaDatasetMachineNamedPercent` | 其中机器命名文件的最少百分比，默认 `70` |
+
+名称列表按完整名称匹配，区分大小写。后缀不含点，匹配时不区分大小写。列表可以清空，表示不匹配任何名称或后缀。素材数量必须为正整数，比例必须为 `0` 到 `100` 的整数。
+
+机器命名判断识别较长的十六进制名称和带连续数字的名称。常见相机、手机及截图名称前缀不计作机器命名。素材过滤只统计当前文件夹，不把整个目录树合并统计。项目和素材开关开启后，同样作用于直接选中的搜索根，没有截图或搜索根的隐式豁免。
+
+文件中始终写出完整规则，包括关闭开关所对应的匹配条件。旧配置缺少这些字段时，应用在获得实例锁后自动补齐默认值，保留原目录和其他设置。未知规则字段、错误类型和无效阈值会明确报错，避免拼写错误被静默忽略。
+
+手工修改 JSON 前先退出该 profile 的 GUI 和服务，再重新启动。也可以将下面的内容保存为 UTF-8 文件 `qcs-settings-patch.json`，通过 CLI 在线修改一个开关。服务会保留其余条件并自动重新扫描：
+
+```json
+{"generalFileRules":{"excludeHidden":true}}
+```
+
+```powershell
+& '<qcs-cli 的绝对路径>' config set --file '<qcs-settings-patch.json 的绝对路径>'
+```
+
+GUI 保存其他设置时会保留这些规则。符号链接、Windows 目录联接、尚未下载的云占位文件和不可读取的文件不参与正常索引。提取失败只影响对应文件，正常文件继续索引，失败文件仍可按文件名查找。
+
 ## 数据布局与备份
 
 ```text

@@ -78,6 +78,7 @@ QJsonObject AppSettings::toJson() const
     return {{QStringLiteral("version"), 2},
             {QStringLiteral("roots"), QJsonArray::fromStringList(roots)},
             {QStringLiteral("excludes"), QJsonArray::fromStringList(excludes)},
+            {QStringLiteral("generalFileRules"), generalFileRules.toJson()},
             {QStringLiteral("codeRoots"), QJsonArray::fromStringList(codeRoots)},
             {QStringLiteral("codeExcludes"), QJsonArray::fromStringList(codeExcludes)},
             {QStringLiteral("includeCode"), includeCode},
@@ -118,8 +119,19 @@ bool AppSettings::fromJson(const QJsonObject &object, AppSettings *settings, QSt
             *field.destination = object.value(key).toBool();
         }
     }
-    parsed.migrationPending_ = version.toDouble() == 1.0;
-    if (parsed.migrationPending_) {
+    const bool versionOne = version.toDouble() == 1.0;
+    parsed.migrationPending_ = versionOne || !object.contains(QStringLiteral("generalFileRules"));
+    if (object.contains(QStringLiteral("generalFileRules"))) {
+        const auto rules = object.value(QStringLiteral("generalFileRules"));
+        if (!rules.isObject())
+            return fail(error, QStringLiteral("Setting 'generalFileRules' must be an object"));
+        if (!GeneralFileRules::fromJson(rules.toObject(), &parsed.generalFileRules, error))
+            return false;
+        // Persist defaults for omitted fields so every active rule is inspectable.
+        parsed.migrationPending_ = parsed.migrationPending_
+            || rules.toObject().size() != parsed.generalFileRules.toJson().size();
+    }
+    if (versionOne) {
         if (parsed.includeCode) {
             parsed.codeRoots = parsed.roots;
             parsed.codeExcludes = parsed.excludes;
@@ -190,6 +202,7 @@ QString AppSettings::fingerprint() const
     // Only options which affect indexing invalidate in-flight extraction jobs.
     QJsonObject object{{QStringLiteral("roots"), QJsonArray::fromStringList(roots)},
                        {QStringLiteral("excludes"), QJsonArray::fromStringList(excludes)},
+                       {QStringLiteral("generalFileRules"), generalFileRules.toJson()},
                        {QStringLiteral("codeRoots"), QJsonArray::fromStringList(codeRoots)},
                        {QStringLiteral("codeExcludes"), QJsonArray::fromStringList(codeExcludes)},
                        {QStringLiteral("includeCode"), includeCode}};

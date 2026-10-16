@@ -989,6 +989,64 @@ private slots:
         QCOMPARE(backend.count("index.resume"), 0);
         QVERIFY(!backend.last("settings.set").params.contains("indexingPaused"));
     }
+    void editingPreferencesPreservesJsonOnlyGeneralFileRules_data() {
+        QTest::addColumn<bool>("excludeProjects");
+        QTest::newRow("include-project-documents") << false;
+        QTest::newRow("exclude-project-documents") << true;
+    }
+    void editingPreferencesPreservesJsonOnlyGeneralFileRules() {
+        QFETCH(bool, excludeProjects);
+        TestEnvironment env("gui-preserve-general-file-rules"); QVERIFY(env.isValid());
+        FakeBackend backend;
+        backend.settings.generalFileRules.excludeProjects = excludeProjects;
+        backend.settings.generalFileRules.directoryNames = {QStringLiteral("custom-cache"), QStringLiteral("generated-assets")};
+        backend.settings.generalFileRules.mediaDatasetMinimumFiles = 47;
+        const auto originalRules = backend.settings.generalFileRules.toJson();
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("files.list"), 1);
+        QTest::mouseClick(window.findChild<QPushButton *>("settingsButton"), Qt::LeftButton);
+        auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
+        QCOMPARE(dialog->settings().generalFileRules.toJson(), originalRules);
+        dialog->findChild<QListWidget *>("rootFolders")->addItem(env.root());
+        auto *language = dialog->findChild<QComboBox *>("languageCombo"); QVERIFY(language);
+        language->setCurrentIndex(language->findData(QStringLiteral("zh_CN")));
+        QCOMPARE(dialog->settings().generalFileRules.toJson(), originalRules);
+        QTest::mouseClick(dialog->findChild<QPushButton *>("saveSettingsButton"), Qt::LeftButton);
+        QTRY_COMPARE(backend.settings.language, QString("zh_CN"));
+        QCOMPARE(backend.settings.roots, QStringList{env.root()});
+        QVERIFY(!backend.last("settings.set").params.contains("generalFileRules"));
+        QCOMPARE(backend.settings.generalFileRules.toJson(), originalRules);
+    }
+    void openPreferencesPreserveOnlineGeneralFileRulesChanges() {
+        TestEnvironment env("gui-preserve-live-general-file-rules"); QVERIFY(env.isValid());
+        FakeBackend backend;
+        backend.settings.generalFileRules.excludeProjects = true;
+        backend.settings.generalFileRules.directoryNames = {QStringLiteral("old-cache")};
+        backend.settings.generalFileRules.mediaDatasetMinimumFiles = 47;
+        const auto originalRules = backend.settings.generalFileRules.toJson();
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("files.list"), 1);
+        QTest::mouseClick(window.findChild<QPushButton *>("settingsButton"), Qt::LeftButton);
+        auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
+        QCOMPARE(dialog->settings().generalFileRules.toJson(), originalRules);
+        // A CLI update can arrive while this dialog still holds its opening snapshot.
+        backend.settings.generalFileRules.excludeProjects = false;
+        backend.settings.generalFileRules.directoryNames = {QStringLiteral("new-cache"), QStringLiteral("large-datasets")};
+        backend.settings.generalFileRules.mediaDatasetMinimumFiles = 93;
+        const auto onlineRules = backend.settings.generalFileRules.toJson();
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QCOMPARE(dialog->settings().generalFileRules.toJson(), originalRules);
+        dialog->findChild<QListWidget *>("rootFolders")->addItem(env.root());
+        auto *language = dialog->findChild<QComboBox *>("languageCombo"); QVERIFY(language);
+        language->setCurrentIndex(language->findData(QStringLiteral("zh_CN")));
+        QTest::mouseClick(dialog->findChild<QPushButton *>("saveSettingsButton"), Qt::LeftButton);
+        QTRY_COMPARE(backend.settings.language, QString("zh_CN"));
+        QCOMPARE(backend.settings.roots, QStringList{env.root()});
+        QVERIFY(!backend.last("settings.set").params.contains("generalFileRules"));
+        QCOMPARE(backend.settings.generalFileRules.toJson(), onlineRules);
+    }
     void firstRunCanBeDeferred() {
         TestEnvironment env("gui-onboarding"); QVERIFY(env.isValid());
         FakeBackend backend;
@@ -1048,6 +1106,75 @@ private slots:
         QCOMPARE(window.findChild<QLabel *>("applicationError")->text(), QString("Unreadable source file"));
         QTest::mouseClick(window.findChild<QPushButton *>("retryIndexButton"), Qt::LeftButton);
         QTRY_COMPARE(backend.count("index.retry"), 1);
+    }
+    void indexProgressErrorClearsWhenIndexRecovers_data() {
+        QTest::addColumn<bool>("statusResponse");
+        QTest::newRow("progress-event") << false;
+        QTest::newRow("status-response") << true;
+    }
+    void indexProgressErrorClearsWhenIndexRecovers() {
+        QFETCH(bool, statusResponse);
+        TestEnvironment env("gui-index-error-recovery"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoStatus = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("files.list"), 1);
+        auto *error = window.findChild<QLabel *>("applicationError"); QVERIFY(error);
+        const QJsonObject failure{{"state", "partial"}, {"total", 1}, {"completed", 0}, {"failed", 1},
+            {"error", "Source file exceeds code extraction size limit"}};
+        emit backend.eventReceived("progress", failure);
+        QVERIFY(error->isVisible());
+        QCOMPARE(error->text(), failure.value("error").toString());
+        // A persistent failure must remain visible until the service clears it.
+        emit backend.eventReceived("progress", failure);
+        QVERIFY(error->isVisible());
+        const QJsonObject recovered{{"state", "idle"}, {"total", 0}, {"completed", 0}, {"failed", 0}, {"error", ""}};
+        if (statusResponse) emit backend.response(backend.last("status").id, {{"progress", recovered}});
+        else emit backend.eventReceived("progress", recovered);
+        QCOMPARE(window.findChild<QLabel *>("indexProgressText")->text(), QString("Index ready  0 / 0"));
+        QVERIFY(error->isHidden());
+        QVERIFY(error->text().isEmpty());
+    }
+    void indexRecoveryPreservesNewerErrorFromAnotherSource_data() {
+        QTest::addColumn<bool>("searchWarning");
+        QTest::newRow("request-error") << false;
+        QTest::newRow("search-warning") << true;
+    }
+    void indexRecoveryPreservesNewerErrorFromAnotherSource() {
+        QFETCH(bool, searchWarning);
+        TestEnvironment env("gui-index-error-ownership"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoStatus = false; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("files.list"), 1);
+        const QString message("Unable to read a source file");
+        emit backend.eventReceived("progress", {{"state", "partial"}, {"error", message}});
+        window.findChild<SearchEdit *>("searchInput")->setText("document question");
+        QTRY_COMPARE(backend.count("search"), 1);
+        // Deliberately reuse the text: ownership cannot be inferred from the message.
+        if (searchWarning) emit backend.response(backend.last("search").id, {{"hits", QJsonArray{}}, {"warning", message}});
+        else emit backend.failed(backend.last("search").id, "storage_error", message);
+        emit backend.eventReceived("progress", {{"state", "idle"}, {"error", ""}});
+        auto *error = window.findChild<QLabel *>("applicationError"); QVERIFY(error);
+        QVERIFY(error->isVisible());
+        QCOMPARE(error->text(), message);
+    }
+    void successfulSearchPreservesCurrentIndexError() {
+        TestEnvironment env("gui-search-index-error-ownership"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoStatus = false; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        window.findChild<SearchEdit *>("searchInput")->setText("first question");
+        QTRY_COMPARE(backend.count("search"), 1);
+        const QString message("Unable to read a source file");
+        emit backend.response(backend.last("search").id, {{"hits", QJsonArray{}}, {"warning", message}});
+        emit backend.eventReceived("progress", {{"state", "partial"}, {"error", message}});
+        window.findChild<SearchEdit *>("searchInput")->setText("next question");
+        QTRY_COMPARE(backend.count("search"), 2);
+        emit backend.response(backend.last("search").id, {{"hits", QJsonArray{}}});
+        auto *error = window.findChild<QLabel *>("applicationError"); QVERIFY(error);
+        QVERIFY(error->isVisible());
+        QCOMPARE(error->text(), message);
     }
     void keyboardNavigationAndQuickSearch() {
         TestEnvironment env("gui-keyboard"); QVERIFY(env.isValid());

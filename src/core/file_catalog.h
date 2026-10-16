@@ -1,5 +1,7 @@
 #pragma once
 
+#include "general_file_rules.h"
+
 #include <QList>
 #include <QString>
 #include <QStringList>
@@ -31,6 +33,7 @@ struct FolderRules {
     // Retained for legacy mixed callers. Services use an explicit Code scope.
     bool includeCode = false;
     Scope scope = Scope::General;
+    GeneralFileRules generalFileRules;
 };
 
 struct ScanResult {
@@ -38,6 +41,9 @@ struct ScanResult {
     // Unique, normalized directories actually visited, including empty directories.
     // Intended for directory watchers. Excluded directories and links are absent.
     QStringList directories;
+    // Normalized directories rejected by enabled General rules. Callers that
+    // scan roots separately carry these forward as exclusions for descendants.
+    QStringList policyExcludedDirectories;
     QStringList errors;
     bool cancelled = false;
 };
@@ -48,9 +54,9 @@ public:
     // Rejects links, non-regular files and unsupported file kinds.
     static bool describe(const QString &path, FileRecord *record, QString *error = nullptr);
     // Partial results are returned on cancellation or per-root/file failures.
-    // Explicit roots override default directory and dataset exclusions at that
-    // root only. Hidden/bundle/cache descendants remain excluded. A project
-    // root still limits General content to screenshots, as in DigUp.
+    // General search includes supported files unless an explicit exclusion or
+    // an enabled generalFileRules policy applies. General exclusions take
+    // precedence over overlapping selected roots. Code keeps its own filters.
     // Directory links are never followed, so cycles cannot escape selected roots.
     // Called synchronously after each accepted record is appended. The count is
     // cumulative and the callback may set cancel. No locks are held by scan.

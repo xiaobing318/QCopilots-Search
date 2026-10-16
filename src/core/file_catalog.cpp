@@ -125,7 +125,7 @@ QString classify(const QFileInfo &info, bool includeCode, bool codeOnly = false)
 {
     const QString extension = info.suffix().toLower();
     const QString name = info.fileName();
-    if (file_formats::isSensitiveFilename(name))
+    if (includeCode && file_formats::isSensitiveFilename(name))
         return {};
     if (extension == "ts" || extension == "mts" || extension == "m2ts") {
         if (transportStream(info.absoluteFilePath()))
@@ -154,7 +154,7 @@ QString classify(const QFileInfo &info, bool includeCode, bool codeOnly = false)
     return {};
 }
 
-bool skipDirectory(const QFileInfo &info, bool includeCode)
+bool skipCodeDirectory(const QFileInfo &info)
 {
     const auto name = info.fileName();
     static const QSet<QString> common = {".git", ".svn", ".hg", "node_modules", "bower_components", "venv", ".venv",
@@ -165,20 +165,24 @@ bool skipDirectory(const QFileInfo &info, bool includeCode)
     static const QSet<QString> bundles = {"app", "bundle", "framework", "plugin", "kext", "prefpane",
         "appex", "xcodeproj", "xcworkspace", "pkg", "photoslibrary"};
     return info.isHidden() || name.startsWith(u'.') || common.contains(name) || name.endsWith(".noindex")
-        || bundles.contains(info.suffix().toLower()) || (includeCode && code.contains(name))
+        || bundles.contains(info.suffix().toLower()) || code.contains(name)
 #ifdef Q_OS_MACOS
         || info.absoluteFilePath() == QDir::homePath() + QStringLiteral("/Library")
 #endif
         ;
 }
 
-bool projectDirectory(const QFileInfoList &entries)
+bool skipGeneralDirectory(const QFileInfo &info, const GeneralFileRules &rules)
 {
-    static const QSet<QString> markers = {".git", "package.json", "Package.swift", "pyproject.toml", "setup.py",
-        "requirements.txt", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile",
-        "composer.json", "CMakeLists.txt"};
-    return std::any_of(entries.cbegin(), entries.cend(), [](const auto &entry) {
-        return markers.contains(entry.fileName()) || entry.suffix() == "xcodeproj" || entry.suffix() == "xcworkspace";
+    return rules.excludeNamedDirectories
+        && (rules.directoryNames.contains(info.fileName()) || rules.directorySuffixes.contains(info.suffix(), Qt::CaseInsensitive));
+}
+
+bool projectDirectory(const QFileInfoList &entries, const GeneralFileRules &rules)
+{
+    return std::any_of(entries.cbegin(), entries.cend(), [&rules](const auto &entry) {
+        return rules.projectFileNames.contains(entry.fileName())
+            || (entry.isDir() && rules.projectDirectorySuffixes.contains(entry.suffix(), Qt::CaseInsensitive));
     });
 }
 
@@ -466,6 +470,9 @@ bool FileCatalog::describe(const QString &path, FileRecord *record, QString *err
         return false;
     }
     described.kind = classify(info, true);
+    // Identity checks serve both spaces. Keep existing code classification,
+    // while allowing ordinary documents whose names code search excludes.
+    if (described.kind.isEmpty()) described.kind = classify(info, false);
     described.screenshot = described.kind == QStringLiteral("image") && isScreenshot(info);
     if (described.kind.isEmpty()) {
         if (error) *error = QStringLiteral("Unsupported file type: %1").arg(path);
@@ -499,16 +506,16 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
     QSet<QString> seenDirectories;
     QHash<QString, QString> repositoryCache;
     QHash<QString, QList<FileRecord>> repositoryFiles;
-    QSet<QString> explicitRoots;
-    for (const auto &root : rules.roots) {
-        const QFileInfo info(root);
-        if (!info.isSymLink()
-#ifdef Q_OS_WIN
-            && !info.isJunction()
-#endif
-        ) explicitRoots.insert(pathKey(normalizePath(root)));
+    QStringList roots = rules.roots;
+    if (!includeCode) {
+        // Discover ancestor policies first, so repeating a selected descendant
+        // cannot bypass a directory rule and input order cannot change results.
+        std::stable_sort(roots.begin(), roots.end(), [](const auto &left, const auto &right) {
+            return normalizePath(left).size() < normalizePath(right).size();
+        });
     }
-    for (const auto &rawRoot : rules.roots) {
+    auto &policyExcludedDirectories = result.policyExcludedDirectories;
+    for (const auto &rawRoot : roots) {
         if (isCancelled(cancel)) { result.cancelled = true; break; }
         const QFileInfo rawInfo(rawRoot);
         if (rawInfo.isSymLink()
@@ -520,21 +527,27 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
             continue;
         }
         const QString root = normalizePath(rawRoot);
+        if (!includeCode && std::any_of(excludes.cbegin(), excludes.cend(), [&root](const auto &exclude) {
+                return containsNormalized(root, exclude);
+            })) continue;
+        if (!includeCode && std::any_of(policyExcludedDirectories.cbegin(), policyExcludedDirectories.cend(), [&root](const auto &exclude) {
+                return containsNormalized(root, exclude);
+            })) continue;
         const QFileInfo rootInfo(root);
         if (root.isEmpty() || !rootInfo.isDir() || !rootInfo.isReadable()) {
             result.errors.append(QStringLiteral("Search root is unavailable or unreadable: %1").arg(rawRoot));
             continue;
         }
-        // A chosen nested root overrides exclusions at or above that root.
+        // Code retains its chosen-root override. Ordinary search always honors
+        // the user's exclusions, including excluded roots and their ancestors.
         QStringList activeExcludes;
         for (const auto &exclude : excludes)
-            if (containsNormalized(exclude, root) && exclude.compare(root, pathCase) != 0) activeExcludes.append(exclude);
-        struct PendingDirectory { QString path; bool inProject; };
-        QList<PendingDirectory> pending{{root, false}};
+            if (!includeCode || (containsNormalized(exclude, root) && exclude.compare(root, pathCase) != 0))
+                activeExcludes.append(exclude);
+        QStringList pending{root};
         while (!pending.isEmpty()) {
             if (isCancelled(cancel)) { result.cancelled = true; break; }
-            const auto next = pending.takeLast();
-            const QString directory = next.path;
+            const QString directory = pending.takeLast();
             const QFileInfo current(directory);
             if (current.isSymLink()
 #ifdef Q_OS_WIN
@@ -550,8 +563,17 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
                 || std::any_of(activeExcludes.cbegin(), activeExcludes.cend(), [&actualDirectory](const auto &exclude) {
                     return containsNormalized(actualDirectory, exclude);
                 })) continue;
+            if (!includeCode && ((rules.generalFileRules.excludeHidden && (current.isHidden() || current.fileName().startsWith(u'.')))
+                || skipGeneralDirectory(current, rules.generalFileRules))) {
+                policyExcludedDirectories.append(actualDirectory);
+                continue;
+            }
             const auto entries = QDir(directory).entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDir::NoSort);
-            const bool inProject = next.inProject || (!includeCode && projectDirectory(entries));
+            if (!includeCode && rules.generalFileRules.excludeProjects
+                && projectDirectory(entries, rules.generalFileRules)) {
+                policyExcludedDirectories.append(actualDirectory);
+                continue;
+            }
             if (!seenDirectories.contains(pathKey(actualDirectory))) {
                 seenDirectories.insert(pathKey(actualDirectory));
                 result.directories.append(actualDirectory);
@@ -560,12 +582,17 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
             for (const auto &info : entries) {
                 if (isCancelled(cancel)) { result.cancelled = true; break; }
                 // Symlinks and Windows junctions are never followed, including file links.
-                if (info.isSymLink() || info.isHidden() || info.fileName().startsWith(u'.')
+                if (info.isSymLink()
 #ifdef Q_OS_WIN
                     || info.isJunction()
 #endif
                 ) continue;
                 if (unavailablePlaceholder(info)) continue;
+                if ((includeCode || rules.generalFileRules.excludeHidden) && (info.isHidden() || info.fileName().startsWith(u'.'))) {
+                    if (!includeCode && info.isDir())
+                        policyExcludedDirectories.append(normalizePath(info.absoluteFilePath()));
+                    continue;
+                }
                 const QString path = normalizePath(info.absoluteFilePath());
                 if (!containsNormalized(path, root)) continue;
                 if (std::any_of(activeExcludes.cbegin(), activeExcludes.cend(), [&path](const auto &exclude) {
@@ -575,8 +602,10 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
                     const QFileInfo gitMarker(QDir(path).filePath(QStringLiteral(".git")));
                     // A selected worktree root is valid, but nested worktrees
                     // and submodules are excluded from a code walk.
-                    if (!skipDirectory(info, includeCode) && !(codeOnly && gitMarker.isFile()))
-                        pending.append({path, inProject});
+                    const bool skip = includeCode ? skipCodeDirectory(info) : skipGeneralDirectory(info, rules.generalFileRules);
+                    if (!includeCode && skip) policyExcludedDirectories.append(path);
+                    if (!skip && !(codeOnly && gitMarker.isFile()))
+                        pending.append(path);
                     continue;
                 }
                 if (!info.isFile() || seenFiles.contains(pathKey(path))) continue;
@@ -585,7 +614,6 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
                 FileRecord record;
                 record.kind = kind;
                 record.screenshot = kind == QStringLiteral("image") && isScreenshot(info);
-                if (inProject && !record.screenshot) continue;
                 QString error;
                 if (!describeFile(info, record, error)) { result.errors.append(error); continue; }
                 // Validate the actual handle-resolved path after any ancestor changes.
@@ -595,25 +623,29 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
                     })) continue;
                 directoryFiles.append(record);
             }
-            // DigUp excludes a whole folder's media when one media kind has
-            // >=300 entries and >=70% machine names. Explicit roots opt in.
+            // Optional media filtering applies equally to selected roots and
+            // their descendants, using the configured count and name ratio.
             bool dataset = false;
-            if (!includeCode && !explicitRoots.contains(pathKey(actualDirectory))) {
+            if (!includeCode && rules.generalFileRules.excludeMediaDatasets) {
                 QHash<QString, QPair<qsizetype, qsizetype>> counts;
                 for (const auto &record : directoryFiles) {
-                    if (record.screenshot || (record.kind != "image" && record.kind != "audio" && record.kind != "video"))
+                    if (record.kind != "image" && record.kind != "audio" && record.kind != "video")
                         continue;
                     auto &count = counts[record.kind];
                     ++count.first;
                     if (machineNamed(QFileInfo(record.path).completeBaseName())) ++count.second;
                 }
                 for (const auto &count : counts) {
-                    if (count.first >= 300 && count.second * 10 >= count.first * 7) { dataset = true; break; }
+                    if (count.first >= rules.generalFileRules.mediaDatasetMinimumFiles
+                        && qint64(count.second) * 100 >= qint64(count.first) * rules.generalFileRules.mediaDatasetMachineNamedPercent) {
+                        dataset = true;
+                        break;
+                    }
                 }
             }
             for (const auto &record : directoryFiles) {
                 if (isCancelled(cancel)) { result.cancelled = true; break; }
-                if (dataset && !record.screenshot && (record.kind == "image" || record.kind == "audio" || record.kind == "video"))
+                if (dataset && (record.kind == "image" || record.kind == "audio" || record.kind == "video"))
                     continue;
                 if (seenFiles.contains(pathKey(record.path))) continue;
                 seenFiles.insert(pathKey(record.path));
@@ -650,6 +682,8 @@ ScanResult FileCatalog::scan(const FolderRules &rules, std::atomic_bool *cancel,
     result.cancelled = result.cancelled || isCancelled(cancel);
     std::sort(result.files.begin(), result.files.end(), [](const auto &left, const auto &right) { return left.path < right.path; });
     std::sort(result.directories.begin(), result.directories.end());
+    policyExcludedDirectories.removeDuplicates();
+    std::sort(policyExcludedDirectories.begin(), policyExcludedDirectories.end());
     return result;
 }
 
