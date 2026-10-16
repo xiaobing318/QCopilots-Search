@@ -2013,17 +2013,23 @@ class NativeStageDependencyTests(unittest.TestCase):
 
     def test_upload_is_only_after_all_real_model_and_package_checks(self):
         uploads = [step for step in self.steps if "uses: actions/upload-artifact@" in step]
-        self.assertEqual(len(uploads), 1)
-        upload = uploads[0]
-        self.assertGreater(self.steps.index(upload), self.steps.index(self.step("products")))
-        self.assertIsNone(re.search(r"^        if:", upload, re.MULTILINE), "Upload must inherit success()")
-        self.assertIn("path: ${{ steps.packages.outputs.paths }}", upload)
+        self.assertEqual(len(uploads), 2)
         self.assertIn("id: packages", self.step("products"))
-        self.assertIn("overwrite: false", upload)
-        self.assertIn("if-no-files-found: error", upload)
-        self.assertIn("qcs-packages-${{ matrix.id }}-${{ env.QCOPILOTS_SEARCH_CANDIDATE_HEAD }}-attempt${{ github.run_attempt }}", upload)
-        self.assertNotIn("/reports", upload)
-        self.assertNotIn("/pkg/", upload)
+        for index, upload in enumerate(uploads, start=1):
+            with self.subTest(index=index):
+                self.assertGreater(self.steps.index(upload), self.steps.index(self.step("products")))
+                conditions = re.findall(r"^        if: (.+)$", upload, re.MULTILINE)
+                self.assertEqual(conditions, [] if index == 1 else ["steps.packages.outputs.package_2_path != ''"])
+                self.assertIn("uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2", upload)
+                self.assertIn("name: ${{ steps.packages.outputs.package_" + str(index) + "_name }}", upload)
+                self.assertIn("path: ${{ steps.packages.outputs.package_" + str(index) + "_path }}", upload)
+                self.assertIn("archive: false", upload)
+                self.assertIn("overwrite: true", upload)
+                self.assertIn("if-no-files-found: error", upload)
+                self.assertIn("retention-days: 14", upload)
+                self.assertNotIn("/reports", upload)
+                self.assertNotIn("/pkg/", upload)
+                self.assertNotIn("compression-level:", upload)
 
     def test_matrix_comes_from_shared_manifest_and_keeps_independent_variants(self):
         self.assertIn("run: python3 .github/scripts/qcs-native-ci.py matrix", self.workflow)
@@ -2051,39 +2057,52 @@ class NativeStageDependencyTests(unittest.TestCase):
 
 
 class NativePackageProductsTests(unittest.TestCase):
-    def package_set(self, root, identifier="windows-x64-cpu", head="a" * 40, attempt="2"):
+    def package_set(self, root, identifier="windows-x64-cpu"):
         selected = native.variants()[identifier]
         suffixes = {"NSIS": ".exe", "ZIP": ".zip", "DEB": ".deb", "TGZ": ".tar.gz", "DragNDrop": ".dmg"}
         files = []
         for generator in selected["generators"]:
-            path = root / f"qcs-0.1.0-{identifier}-{head[:12]}-attempt{attempt}{suffixes[generator]}"
+            path = root / f"qcs-0.1.0-{identifier}{suffixes[generator]}"
             path.write_bytes(b"synthetic package bytes for output contract only")
             files.append(path)
         return selected, files
 
     def test_every_variant_requires_its_installer_and_portable_formats(self):
+        count = 0
         for identifier in native.variants():
             with self.subTest(identifier=identifier), tempfile.TemporaryDirectory(prefix="qcs-package-set-",
                     dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
                 root = Path(temporary)
                 selected, files = self.package_set(root, identifier)
-                self.assertEqual(set(native.package_files(root, selected, "a" * 40, "2")), set(files))
+                self.assertEqual(native.package_files(root, selected), sorted(files))
+                count += len(files)
                 files[0].unlink()
                 with self.assertRaisesRegex(RuntimeError, "Package formats differ"):
-                    native.package_files(root, selected, "a" * 40, "2")
+                    native.package_files(root, selected)
+        self.assertEqual(count, 21)
 
-    def test_wrong_candidate_attempt_backend_or_extra_format_is_rejected(self):
+    def test_stable_package_name_keeps_provenance_inside_the_package(self):
+        packaging = (native.SOURCE / "cmake/qcs-package.cmake").read_text(encoding="utf-8")
+        self.assertIn('set(CPACK_PACKAGE_FILE_NAME "qcs-${PROJECT_VERSION}-${QCOPILOTS_SEARCH_VARIANT}")', packaging)
+        self.assertIn('include(qcs-package-identity)', packaging)
+        self.assertIn('RENAME build-identity.json', packaging)
+        identity = (native.SOURCE / "cmake/qcs-package-identity.cmake").read_text(encoding="utf-8")
+        for field in ('candidateCommit', 'workingTreeModified', 'attempt', 'variant',
+                      'dependencyLockSha256', 'variantsSha256', 'gpuSdkLockSha256', 'gpuLicenseLockSha256'):
+            self.assertIn(field, identity)
+
+    def test_old_commit_names_wrong_backend_or_extra_format_is_rejected(self):
         for mutation in ("candidate", "attempt", "backend", "extra", "sources", "symbols", "checksums", "duplicate", "empty"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(prefix="qcs-package-invalid-",
                     dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
                 root = Path(temporary)
                 selected, files = self.package_set(root)
                 if mutation == "candidate":
-                    files[0].rename(files[0].with_name(files[0].name.replace("a" * 12, "b" * 12)))
+                    files[0].rename(files[0].with_name(files[0].stem + "-" + "a" * 12 + "-attempt2" + files[0].suffix))
                 elif mutation == "attempt":
-                    files[0].rename(files[0].with_name(files[0].name.replace("attempt2", "attempt1")))
+                    files[0].rename(files[0].with_name(files[0].stem + "-attempt1" + files[0].suffix))
                 elif mutation == "backend":
-                    files[0].rename(files[0].with_name(files[0].name.replace("-cpu-", "-vulkan-")))
+                    files[0].rename(files[0].with_name(files[0].name.replace("-cpu.", "-vulkan.")))
                 elif mutation == "extra":
                     (root / "qcs-report.json").write_text("{}", encoding="utf-8")
                 elif mutation in ("sources", "symbols", "checksums"):
@@ -2095,7 +2114,7 @@ class NativePackageProductsTests(unittest.TestCase):
                 else:
                     files[0].write_bytes(b"")
                 with self.assertRaises(RuntimeError):
-                    native.package_files(root, selected, "a" * 40, "2")
+                    native.package_files(root, selected)
 
     def test_rocm_setup_archive_replaces_only_the_installer(self):
         with tempfile.TemporaryDirectory(prefix="qcs-rocm-setup-",
@@ -2106,14 +2125,14 @@ class NativePackageProductsTests(unittest.TestCase):
             portable = next(path for path in files if path.suffix == ".zip")
             setup = installer.with_name(installer.stem + "-setup.zip")
             installer.rename(setup)
-            self.assertEqual(set(native.package_files(root, selected, "a" * 40, "2")), {setup, portable})
+            self.assertEqual(set(native.package_files(root, selected)), {setup, portable})
             installer.write_bytes(b"a second installer must not be uploaded")
             with self.assertRaisesRegex(RuntimeError, "Package formats differ"):
-                native.package_files(root, selected, "a" * 40, "2")
+                native.package_files(root, selected)
             installer.unlink()
             portable.unlink()
             with self.assertRaisesRegex(RuntimeError, "Package formats differ"):
-                native.package_files(root, selected, "a" * 40, "2")
+                native.package_files(root, selected)
 
     def test_setup_archive_is_rejected_for_every_other_variant(self):
         for identifier in set(native.variants()) - {"windows-x64-rocm"}:
@@ -2123,10 +2142,10 @@ class NativePackageProductsTests(unittest.TestCase):
                 selected, files = self.package_set(root, identifier)
                 if any(path.suffix == ".exe" for path in files):
                     next(path for path in files if path.suffix == ".exe").unlink()
-                setup = root / f"qcs-0.1.0-{identifier}-{'a' * 12}-attempt2-setup.zip"
+                setup = root / f"qcs-0.1.0-{identifier}-setup.zip"
                 setup.write_bytes(b"unsupported installer fallback")
                 with self.assertRaisesRegex(RuntimeError, "Unexpected package output"):
-                    native.package_files(root, selected, "a" * 40, "2")
+                    native.package_files(root, selected)
 
     def test_installer_and_portable_versions_cannot_be_mixed(self):
         for fallback in (False, True):
@@ -2139,8 +2158,8 @@ class NativePackageProductsTests(unittest.TestCase):
                 if fallback:
                     name = name.removesuffix(".exe") + "-setup.zip"
                 installer.rename(installer.with_name(name))
-                with self.assertRaisesRegex(RuntimeError, "same version and source commit"):
-                    native.package_files(root, selected, "a" * 40, "2")
+                with self.assertRaisesRegex(RuntimeError, "Unexpected package output"):
+                    native.package_files(root, selected)
 
     def test_two_gib_limit_is_strict_without_allocating_large_files(self):
         with tempfile.TemporaryDirectory(prefix="qcs-package-size-",
@@ -2158,10 +2177,10 @@ class NativePackageProductsTests(unittest.TestCase):
                     return actual
                 with self.subTest(size=size), mock.patch.object(Path, "stat", sized_stat):
                     if size < 2 * 1024**3:
-                        self.assertEqual(set(native.package_files(root, selected, "a" * 40, "2")), set(files))
+                        self.assertEqual(set(native.package_files(root, selected)), set(files))
                     else:
                         with self.assertRaisesRegex(RuntimeError, "below 2 GiB"):
-                            native.package_files(root, selected, "a" * 40, "2")
+                            native.package_files(root, selected)
 
     def test_symbolic_package_cannot_enter_upload_list(self):
         with tempfile.TemporaryDirectory(prefix="qcs-package-link-",
@@ -2171,7 +2190,7 @@ class NativePackageProductsTests(unittest.TestCase):
             real_is_symlink = Path.is_symlink
             with mock.patch.object(Path, "is_symlink", lambda path: path == files[0] or real_is_symlink(path)):
                 with self.assertRaisesRegex(RuntimeError, "Not an ordinary package file"):
-                    native.package_files(root, selected, "a" * 40, "2")
+                    native.package_files(root, selected)
 
     def test_cpack_working_tree_and_unrelated_side_files_never_enter_upload_list(self):
         with tempfile.TemporaryDirectory(prefix="qcs-package-whitelist-",
@@ -2182,7 +2201,7 @@ class NativePackageProductsTests(unittest.TestCase):
             working_tree.mkdir()
             (working_tree / "transient-output").write_bytes(b"CPack working data")
             (root / "SHA256SUMS").write_bytes(b"diagnostic checksums")
-            self.assertEqual(set(native.package_files(root, selected, "a" * 40, "2")), set(files))
+            self.assertEqual(set(native.package_files(root, selected)), set(files))
 
     def test_products_emits_only_verified_paths_and_hashes_to_native_logs(self):
         with tempfile.TemporaryDirectory(prefix="qcs-products-",
@@ -2208,8 +2227,33 @@ class NativePackageProductsTests(unittest.TestCase):
                 self.assertEqual(record["bytes"], len(raw))
                 self.assertEqual(record["sha256"], native.hashlib.sha256(raw).hexdigest())
                 self.assertIn(record["sha256"], summary_path.read_text(encoding="utf-8"))
-            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines(),
-                             ["paths<<QCS_PACKAGE_PATHS", *[str(path) for path in emitted], "QCS_PACKAGE_PATHS"])
+            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines(), [
+                f"package_1_name={emitted[0].name}", f"package_1_path={emitted[0]}",
+                f"package_2_name={emitted[1].name}", f"package_2_path={emitted[1]}"])
+
+    def test_macos_outputs_one_raw_package_and_disables_second_upload(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-macos-product-",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+            root = Path(temporary)
+            packages = root / "pkg/Release"
+            packages.mkdir(parents=True)
+            selected, files = self.package_set(packages, "macos-arm64-metal")
+            output_path = root / "github-output"
+            with mock.patch.object(native, "ROOT", root, create=True), \
+                    mock.patch.object(native, "variant", return_value=selected), \
+                    mock.patch.dict(native.os.environ, {"GITHUB_OUTPUT": str(output_path), "GITHUB_STEP_SUMMARY": ""}), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(native.products(), files)
+            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines(), [
+                f"package_1_name={files[0].name}", f"package_1_path={files[0]}",
+                "package_2_name=", "package_2_path="])
+
+    def test_product_path_newline_cannot_inject_github_outputs(self):
+        with mock.patch.object(native, "ROOT", Path("unused"), create=True), \
+                mock.patch.object(native, "variant", return_value=native.variants()["windows-x64-cpu"]), \
+                mock.patch.object(native, "package_files", return_value=[Path("unsafe\noutput=qcs.exe")]):
+            with self.assertRaisesRegex(RuntimeError, "cannot contain newlines"):
+                native.products()
 
 
 if __name__ == "__main__":

@@ -25,6 +25,20 @@ RUN = "1234567"
 REPOSITORY = "fixture-owner/QCopilots-Search"
 
 
+def package_suffixes(platform):
+    if platform.startswith("windows-"):
+        return (".exe", ".zip")
+    if platform.startswith("linux-"):
+        return (".deb", ".tar.gz")
+    if platform.startswith("macos-"):
+        return (".dmg",)
+    raise ValueError("Unknown fixture platform: " + platform)
+
+
+def package_name(platform, suffix):
+    return f"qcs-{selection.project_version(SCRIPT.parents[2])}-{platform}{suffix}"
+
+
 def iso(value):
     return value.isoformat().replace("+00:00", "Z")
 
@@ -44,13 +58,20 @@ def job(platform, identifier, attempt=1, hour=1):
                        "started_at": iso(start + timedelta(minutes=9)), "completed_at": iso(start + timedelta(minutes=10))}]}
 
 
-def artifact(source, identifier):
+def artifact(source, identifier, suffix=None):
     platform = source["name"].removeprefix("qcs ")
     return {"id": identifier,
-            "name": selection.artifact_name(platform, HEAD, source["run_attempt"]),
+            "name": package_name(platform, suffix or package_suffixes(platform)[0]),
             "expired": False, "digest": "sha256:" + f"{identifier:064x}",
+            "size_in_bytes": identifier + 100,
             "created_at": source["steps"][-1]["started_at"],
             "workflow_run": {"id": int(RUN), "head_sha": HEAD}}
+
+
+def packages(source, first_id):
+    platform = source["name"].removeprefix("qcs ")
+    return [artifact(source, first_id + index, suffix)
+            for index, suffix in enumerate(package_suffixes(platform))]
 
 
 def clone(source, identifier, attempt):
@@ -70,18 +91,20 @@ class ArtifactSelectionTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         self.jobs = [job(platform, index + 1) for index, platform in enumerate(selection.CONFIGURATIONS)]
-        self.artifacts = [artifact(source, index + 1001) for index, source in enumerate(self.jobs)]
+        self.artifacts = [package for index, source in enumerate(self.jobs)
+                          for package in packages(source, 1001 + index * 10)]
 
     def inspect(self, attempt=1):
         return selection.select(REPOSITORY, RUN, HEAD, attempt, self.jobs, self.artifacts)
 
-    def partial_retry(self, *, cloned=True):
+    def partial_retry(self, *, cloned=True, platform="windows-x64-cpu"):
         original = list(self.jobs)
-        retried = job("windows-x64-cpu", 101, attempt=2, hour=2)
+        retried = job(platform, 101, attempt=2, hour=2)
         self.jobs.append(retried)
-        self.artifacts.append(artifact(retried, 2001))
+        self.artifacts.extend(packages(retried, 2001))
         if cloned:
-            self.jobs.extend(clone(source, index + 102, 2) for index, source in enumerate(original[1:]))
+            self.jobs.extend(clone(source, index + 102, 2) for index, source in enumerate(original)
+                             if source["name"] != "qcs " + platform)
         return retried
 
     def pages(self, rows, kind):
@@ -113,13 +136,18 @@ class ArtifactSelectionTests(unittest.TestCase):
         self.assertTrue(result["passed"], result["errors"])
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["excluded"], [])
+        self.assertEqual(len(self.artifacts), 21)
+        self.assertEqual(sum(len(entry["artifacts"]) for entry in result["selected"].values()), 21)
         for index, platform in enumerate(selection.CONFIGURATIONS):
             entry = result["selected"][platform]
             self.assertEqual(entry["sourceAttempt"], 1)
             self.assertEqual(entry["sourceJobId"], index + 1)
             self.assertEqual(entry["observedJobId"], index + 1)
-            self.assertEqual(entry["artifactId"], index + 1001)
-            self.assertEqual(entry["artifactDigest"], self.artifacts[index]["digest"])
+            expected = packages(self.jobs[index], 1001 + index * 10)
+            self.assertEqual(entry["artifacts"], [
+                {"artifactId": item["id"], "artifactName": item["name"],
+                 "artifactDigest": item["digest"], "artifactSize": item["size_in_bytes"]}
+                for item in expected])
 
     def test_shared_manifest_defines_all_eleven_configurations(self):
         manifest = json.loads((SCRIPT.parents[2] / "config/build-variants.json").read_text(encoding="utf-8"))
@@ -129,16 +157,96 @@ class ArtifactSelectionTests(unittest.TestCase):
         self.assertFalse(any(identifier.startswith("macos-x64") for identifier in selection.CONFIGURATIONS))
 
     def test_only_packages_artifact_names_can_satisfy_gate(self):
-        expected = f"qcs-packages-windows-x64-cpu-{HEAD}-attempt1"
+        expected = package_name("windows-x64-cpu", ".exe")
         self.assertEqual(self.artifacts[0]["name"], expected)
-        self.artifacts[0]["name"] = expected.replace("qcs-packages-", "qcs-native-")
+        self.artifacts[0]["name"] = expected.replace("qcs-", "qcs-native-", 1)
         self.assertFalse(self.inspect()["passed"])
         self.artifacts[0]["name"] = expected
         result = self.inspect()
         self.assertTrue(result["passed"], result["errors"])
-        self.assertEqual(result["schemaVersion"], 2)
+        self.assertEqual(result["schemaVersion"], 3)
         self.assertEqual(set(result), {"schemaVersion", "kind", "repository", "runId", "aggregateAttempt",
-                                      "candidateHead", "passed", "errors", "selected", "excluded"})
+                                      "candidateHead", "version", "passed", "errors", "selected", "excluded"})
+        self.assertEqual(result["version"], selection.project_version(SCRIPT.parents[2]))
+
+    def test_every_raw_package_is_required_not_only_one_file_per_variant(self):
+        original = deepcopy(self.artifacts)
+        for artifact_row in original:
+            with self.subTest(name=artifact_row["name"]):
+                self.artifacts = [row for row in original if row["id"] != artifact_row["id"]]
+                result = self.inspect()
+                self.assertFalse(result["passed"])
+                self.assertEqual(len(result["selected"]), len(selection.CONFIGURATIONS) - 1)
+
+    def test_package_version_and_stable_exact_file_names_are_required(self):
+        original = deepcopy(self.artifacts[0])
+        current = selection.project_version(SCRIPT.parents[2])
+        for name in (original["name"].replace(current, "999.0.0", 1),
+                     original["name"].replace(current + "-", "", 1),
+                     original["name"].removesuffix(".exe") + "-" + HEAD[:12] + "-attempt1.exe",
+                     original["name"] + ".zip"):
+            with self.subTest(name=name):
+                self.artifacts[0] = dict(original, name=name)
+                result = self.inspect()
+                self.assertFalse(result["passed"])
+                self.assertNotIn("windows-x64-cpu", result["selected"])
+
+    def test_raw_artifact_size_must_be_positive_integer_below_two_gib(self):
+        original = deepcopy(self.artifacts[0])
+        for size in (None, False, True, 0, -1, 1.0, "100", 2 ** 31, 2 ** 31 + 1):
+            with self.subTest(size=size):
+                self.artifacts[0] = dict(original, size_in_bytes=size)
+                self.assertFalse(self.inspect()["passed"])
+        self.artifacts[0] = deepcopy(original)
+        del self.artifacts[0]["size_in_bytes"]
+        self.assertFalse(self.inspect()["passed"])
+        self.artifacts[0] = dict(original, size_in_bytes=2 ** 31 - 1)
+        result = self.inspect()
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["selected"]["windows-x64-cpu"]["artifacts"][0]["artifactSize"],
+                         2 ** 31 - 1)
+
+    def test_rocm_setup_zip_replaces_only_installer_and_keeps_portable_zip(self):
+        installer = next(row for row in self.artifacts
+                         if row["name"] == package_name("windows-x64-rocm", ".exe"))
+        installer["name"] = package_name("windows-x64-rocm", "-setup.zip")
+        result = self.inspect()
+        self.assertTrue(result["passed"], result["errors"])
+        names = {row["artifactName"] for row in result["selected"]["windows-x64-rocm"]["artifacts"]}
+        self.assertEqual(names, {package_name("windows-x64-rocm", "-setup.zip"),
+                                 package_name("windows-x64-rocm", ".zip")})
+        self.assertEqual(sum(len(row["artifacts"]) for row in result["selected"].values()), 21)
+
+    def test_rocm_same_execution_cannot_supply_both_installer_formats(self):
+        source = next(row for row in self.jobs if row["name"] == "qcs windows-x64-rocm")
+        self.artifacts.append(artifact(source, 9000, "-setup.zip"))
+        result = self.inspect()
+        self.assertFalse(result["passed"])
+        self.assertNotIn("windows-x64-rocm", result["selected"])
+
+    def test_rocm_rerun_format_switch_excludes_old_alternate_and_old_portable(self):
+        original_jobs, original_artifacts = deepcopy(self.jobs), deepcopy(self.artifacts)
+        for previous, current in ((".exe", "-setup.zip"), ("-setup.zip", ".exe")):
+            with self.subTest(previous=previous, current=current):
+                self.jobs, self.artifacts = deepcopy(original_jobs), deepcopy(original_artifacts)
+                old = next(row for row in self.artifacts
+                           if row["name"] == package_name("windows-x64-rocm", ".exe"))
+                old["name"] = package_name("windows-x64-rocm", previous)
+                old_ids = {row["id"] for row in self.artifacts
+                           if row["name"] in (old["name"], package_name("windows-x64-rocm", ".zip"))}
+                self.partial_retry(platform="windows-x64-rocm")
+                fresh = next(row for row in self.artifacts if row["id"] == 2001)
+                fresh["name"] = package_name("windows-x64-rocm", current)
+                result = self.inspect(2)
+                self.assertTrue(result["passed"], result["errors"])
+                entry = result["selected"]["windows-x64-rocm"]
+                self.assertEqual(entry["sourceAttempt"], 2)
+                self.assertEqual({row["artifactId"] for row in entry["artifacts"]}, {2001, 2002})
+                self.assertEqual({row["artifactId"] for row in result["excluded"]}, old_ids)
+
+    def test_setup_zip_is_not_an_installer_alternative_for_other_windows_variants(self):
+        self.artifacts[0]["name"] = package_name("windows-x64-cpu", "-setup.zip")
+        self.assertFalse(self.inspect()["passed"])
 
     def test_every_configuration_requires_its_job_and_package_artifact(self):
         original_jobs = list(self.jobs)
@@ -148,8 +256,8 @@ class ArtifactSelectionTests(unittest.TestCase):
                 with self.subTest(configuration=configuration, missing=missing):
                     self.jobs = [row for number, row in enumerate(original_jobs)
                                  if missing != "job" or number != index]
-                    self.artifacts = [row for number, row in enumerate(original_artifacts)
-                                      if missing != "artifact" or number != index]
+                    self.artifacts = [row for row in original_artifacts
+                                      if missing != "artifact" or row["id"] != 1001 + index * 10]
                     result = self.inspect()
                     self.assertFalse(result["passed"])
                     self.assertNotIn(configuration, result["selected"])
@@ -160,13 +268,14 @@ class ArtifactSelectionTests(unittest.TestCase):
         result = self.inspect(2)
         self.assertTrue(result["passed"], result["errors"])
         self.assertEqual(result["selected"]["windows-x64-cpu"]["sourceAttempt"], 2)
-        self.assertEqual(result["selected"]["windows-x64-cpu"]["artifactId"], 2001)
+        self.assertEqual([row["artifactId"] for row in result["selected"]["windows-x64-cpu"]["artifacts"]],
+                         [2001, 2002])
         for identifier, platform in enumerate(selection.CONFIGURATIONS[1:], 2):
             entry = result["selected"][platform]
             self.assertEqual(entry["sourceAttempt"], 1)
             self.assertEqual(entry["sourceJobId"], identifier)
             self.assertNotEqual(entry["observedJobId"], identifier)
-        self.assertEqual([item["artifactId"] for item in result["excluded"]], [1001])
+        self.assertEqual([item["artifactId"] for item in result["excluded"]], [1001, 1002])
 
     def test_aggregate_only_retry_and_chained_copies_keep_true_source_attempt(self):
         self.partial_retry()
@@ -194,7 +303,7 @@ class ArtifactSelectionTests(unittest.TestCase):
         result = self.inspect(2)
         self.assertFalse(result["passed"])
         self.assertNotIn("windows-x64-cpu", result["selected"])
-        self.assertTrue(any("attempt2" in error for error in result["errors"]))
+        self.assertTrue(result["errors"])
 
     def test_a_copy_cannot_borrow_an_original_with_different_steps(self):
         self.partial_retry()
@@ -242,7 +351,7 @@ class ArtifactSelectionTests(unittest.TestCase):
         retried["conclusion"] = "failure"
         recovered = job("windows-x64-cpu", 201, attempt=3, hour=3)
         self.jobs.append(recovered)
-        self.artifacts.append(artifact(recovered, 3001))
+        self.artifacts.extend(packages(recovered, 3001))
         copied = [clone(source, index + 202, 3)
                   for index, source in enumerate(self.jobs[1:len(selection.CONFIGURATIONS)])]
         self.jobs.extend(copied)
@@ -251,7 +360,8 @@ class ArtifactSelectionTests(unittest.TestCase):
         result = self.inspect(4)
         self.assertTrue(result["passed"], result["errors"])
         self.assertEqual(result["selected"]["windows-x64-cpu"]["sourceAttempt"], 3)
-        self.assertEqual(result["selected"]["windows-x64-cpu"]["artifactId"], 3001)
+        self.assertEqual([row["artifactId"] for row in result["selected"]["windows-x64-cpu"]["artifacts"]],
+                         [3001, 3002])
 
     def test_copy_without_original_and_ambiguous_same_attempt_jobs_fail(self):
         self.partial_retry()
@@ -306,7 +416,7 @@ class ArtifactSelectionTests(unittest.TestCase):
                 self.assertFalse(self.inspect()["passed"])
 
     def test_legacy_artifact_is_preserved_as_excluded_but_cannot_satisfy_gate(self):
-        self.artifacts[0]["name"] = self.artifacts[0]["name"].removesuffix("-attempt1")
+        self.artifacts[0]["name"] = f"qcs-packages-windows-x64-cpu-{HEAD}-attempt1"
         result = self.inspect()
         self.assertFalse(result["passed"])
         self.assertTrue(any(item["artifactId"] == 1001 for item in result["excluded"]))
@@ -340,7 +450,7 @@ class ArtifactSelectionTests(unittest.TestCase):
     def test_load_rejects_incompatible_schema_versions(self):
         path = self.write_snapshot()
         document = json.loads(path.read_text(encoding="utf-8"))
-        for version in (1, 3, True, 2.0):
+        for version in (1, 2, 4, True, 3.0):
             with self.subTest(version=version):
                 document["schemaVersion"] = version
                 self.write_document(path, document)
@@ -350,12 +460,61 @@ class ArtifactSelectionTests(unittest.TestCase):
     def test_load_rejects_boolean_or_float_substitution_for_integer_identities(self):
         path = self.write_snapshot()
         original = json.loads(path.read_text(encoding="utf-8"))
-        for key, value in (("sourceJobId", True), ("sourceAttempt", True), ("artifactId", 1001.0)):
+        for key, value in (("sourceJobId", True), ("sourceAttempt", True)):
             with self.subTest(key=key):
                 document = deepcopy(original)
                 document["selected"]["windows-x64-cpu"][key] = value
                 self.write_document(path, document)
                 with self.assertRaisesRegex(ValueError, "preserved API execution history"):
+                    selection.load_selection(path)
+
+    def test_load_recomputes_each_raw_artifact_field_and_rejects_substitutions(self):
+        path = self.write_snapshot()
+        original = json.loads(path.read_text(encoding="utf-8"))
+        mutations = (("artifactId", 1001.0), ("artifactId", True), ("artifactId", 9999),
+                     ("artifactSize", True), ("artifactSize", 1101.0), ("artifactSize", 1102),
+                     ("artifactDigest", "sha256:" + "f" * 64),
+                     ("artifactName", package_name("windows-x64-cpu", "-renamed.exe")))
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                document = deepcopy(original)
+                document["selected"]["windows-x64-cpu"]["artifacts"][0][key] = value
+                self.write_document(path, document)
+                with self.assertRaisesRegex(ValueError, "preserved API execution history"):
+                    selection.load_selection(path)
+
+    def test_load_rejects_missing_or_extra_packages_and_legacy_flat_entry(self):
+        path = self.write_snapshot()
+        original = json.loads(path.read_text(encoding="utf-8"))
+        for mutation in ("missing", "extra", "legacy"):
+            with self.subTest(mutation=mutation):
+                document = deepcopy(original)
+                entry = document["selected"]["windows-x64-cpu"]
+                if mutation == "missing":
+                    entry["artifacts"].pop()
+                elif mutation == "extra":
+                    entry["artifacts"].append(deepcopy(entry["artifacts"][0]))
+                else:
+                    artifact_row = entry.pop("artifacts")[0]
+                    entry.update(artifact_row)
+                self.write_document(path, document)
+                with self.assertRaisesRegex(ValueError, "preserved API execution history"):
+                    selection.load_selection(path)
+
+    def test_load_rejects_missing_or_changed_version_and_unexpected_top_level_fields(self):
+        path = self.write_snapshot()
+        original = json.loads(path.read_text(encoding="utf-8"))
+        for mutation in ("missing-version", "changed-version", "extra-field"):
+            with self.subTest(mutation=mutation):
+                document = deepcopy(original)
+                if mutation == "missing-version":
+                    del document["version"]
+                elif mutation == "changed-version":
+                    document["version"] = "999.0.0"
+                else:
+                    document["ignoredAuthority"] = True
+                self.write_document(path, document)
+                with self.assertRaises(ValueError):
                     selection.load_selection(path)
 
     def test_load_rejects_changed_snapshot_and_unexpected_requested_identity(self):
@@ -431,7 +590,7 @@ class ArtifactSelectionTests(unittest.TestCase):
         document = selection.load_selection(path)
         self.assertEqual(len(calls), 3)
         self.assertEqual(len(document["files"]), 3)
-        expected_ids = ",".join(str(1001 + index) for index in range(len(selection.CONFIGURATIONS)))
+        expected_ids = ",".join(str(item["id"]) for item in self.artifacts)
         self.assertEqual(output.read_text(encoding="utf-8"), "artifact_ids=" + expected_ids + "\n")
         self.assertNotIn("synthetic-token-never-log", path.read_text(encoding="utf-8"))
 

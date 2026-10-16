@@ -47,7 +47,11 @@ macOS / Linux 使用 `bash ./qcs-dev.sh` 和相同参数，变体分别为 `maco
 
 日常可单独执行 `test`、`install`、`package` 和 `verify-package`。安装与打包自动部署依赖、运行资源、许可证和应用图标，无需手工拷贝。真实模型缺失或校验失败会明确报错，标签筛选只用于局部排查。
 
-CI 构建 11 个变体，产生 21 个用户文件。GPU 变体支持自动回退 CPU，缺少设备的 runner 不代表 GPU 实机验证通过。正式发布使用 `release-prepare` 收集指定成功 CI run 与 attempt 的产物，验证摘要并生成源码材料、校验和与发布清单。`release-upload-draft` 显式上传草稿，公开发布由维护者决定。
+CI 构建 11 个变体，将 21 个用户包分别上传，安装器与便携包可以独立下载。文件名采用 `qcs-<版本>-<变体>.<扩展名>`，完整提交与 attempt 保留在包内。正式安装包见 [Releases](https://github.com/xiaobing318/QCopilots-Search/releases)，按操作系统、架构和 GPU 后端选择。
+
+多 GPU 索引按文件并行，每张当前后端支持的兼容 GPU 使用独立 worker。自动模式在全部 GPU 不可用时回退 CPU，严格 GPU 模式报告失败。缺少设备的 runner 不代表 GPU 实机验证通过，双 AMD 或双 NVIDIA GPU 的实际加速尚未实测。
+
+正式发布使用 `release-prepare` 收集准确的成功 CI run 与 attempt，验证摘要并生成源码材料、校验和与发布清单。`release-upload-draft` 上传或续传草稿，维护者显式运行 `release-publish` 才会公开发布。完整流程见[安装包与发布](docs/releasing.md)。
 
 ## 文档
 

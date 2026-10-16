@@ -175,16 +175,27 @@ jobs:
         id: packages
         timeout-minutes: 10
         run: python "qcs-src/.github/scripts/qcs-native-ci.py" products
-      - name: Upload installers and portable packages
+      - name: Upload the first user package
         timeout-minutes: 20
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: qcs-packages-${{ matrix.id }}-${{ env.QCOPILOTS_SEARCH_CANDIDATE_HEAD }}-attempt${{ github.run_attempt }}
-          path: ${{ steps.packages.outputs.paths }}
-          overwrite: false
+          name: ${{ steps.packages.outputs.package_1_name }}
+          path: ${{ steps.packages.outputs.package_1_path }}
+          archive: false
+          overwrite: true
           if-no-files-found: error
           retention-days: 14
-          compression-level: 0
+      - name: Upload the second user package
+        if: steps.packages.outputs.package_2_path != ''
+        timeout-minutes: 20
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.packages.outputs.package_2_name }}
+          path: ${{ steps.packages.outputs.package_2_path }}
+          archive: false
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
 
   required:
     name: qcs all native combinations

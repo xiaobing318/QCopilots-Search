@@ -27,6 +27,11 @@ SOURCE = Path(__file__).resolve().parents[2]
 PRODUCT = "qcs"
 sys.dont_write_bytecode = True
 
+_selection_spec = importlib.util.spec_from_file_location(
+    "qcs_native_artifact_selection", SOURCE / ".github/scripts/qcs-artifact-selection.py")
+artifact_selection = importlib.util.module_from_spec(_selection_spec)
+_selection_spec.loader.exec_module(artifact_selection)
+
 # CMake 3.28's Ninja depfile binding loses dependencies when external object
 # paths contain spaces. The official fix b11323f1e4 first ships in 3.31.
 CONTAINER_CMAKE_VERSION = "3.31.10"
@@ -463,14 +468,7 @@ def doctor():
 
 
 def variants():
-    document = json.loads((SOURCE / "config/build-variants.json").read_text(encoding="utf-8"))
-    rows = document["variants"]
-    if document.get("schemaVersion") != 1 or not isinstance(rows, list) or not rows:
-        raise ValueError("Invalid build variant manifest")
-    identifiers = [item["id"] for item in rows]
-    if len(set(identifiers)) != len(identifiers):
-        raise ValueError("Duplicate build variant")
-    return {item["id"]: item for item in rows}
+    return artifact_selection.variants()
 
 
 def variant():
@@ -557,39 +555,30 @@ def test_evidence(*, require_complete=False):
     return json.loads((REPORTS / "tests/qt-test-cases.json").read_text(encoding="utf-8"))
 
 
-def package_files(directory: Path, selected: dict, head: str, attempt: str):
-    suffixes = {"NSIS": ".exe", "ZIP": ".zip", "DEB": ".deb", "TGZ": ".tar.gz", "DragNDrop": ".dmg"}
-    expected = {suffixes[name] for name in selected["generators"]}
-    alternatives = [expected]
-    if selected["id"] == "windows-x64-rocm":
-        alternatives.append({"-setup.zip", ".zip"})
+def package_files(directory: Path, selected: dict):
+    version = artifact_selection.project_version(SOURCE)
+    alternatives = artifact_selection.package_name_options(selected["id"], version)
     allowed = set().union(*alternatives)
-    prefix = re.compile(r"qcs-[0-9]+\.[0-9]+\.[0-9]+-" + re.escape(selected["id"])
-                        + "-" + re.escape(head[:12]) + "-attempt" + re.escape(attempt))
     found = {}
-    stems = set()
     for path in sorted(directory.glob("qcs-*")):
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f"Not an ordinary package file: {path.name}")
-        suffix = next((extension for extension in sorted(allowed, key=len, reverse=True)
-                       if path.name.endswith(extension)), None)
-        if suffix is None or not prefix.fullmatch(path.name[:-len(suffix)]):
+        if path.name not in allowed:
             raise RuntimeError(f"Unexpected package output: {path.name}")
-        if suffix in found:
-            raise RuntimeError(f"Duplicate package format: {suffix}")
-        if not 0 < path.stat().st_size < 2 * 1024**3:
+        if not 0 < path.stat().st_size <= artifact_selection.MAX_ASSET_BYTES:
             raise RuntimeError(f"Package must be nonempty and below 2 GiB: {path.name}")
-        found[suffix] = path
-        stems.add(path.name[:-len(suffix)])
+        found[path.name] = path
     if set(found) not in alternatives:
         raise RuntimeError(f"Package formats differ: expected one of {[sorted(item) for item in alternatives]}, found {sorted(found)}")
-    if len(stems) != 1:
-        raise RuntimeError("Package files must have the same version and source commit")
-    return [found[extension] for extension in sorted(found)]
+    return [found[name] for name in sorted(found)]
 
 
 def products():
-    paths = package_files(ROOT / "pkg/Release", variant(), candidate_head(), os.environ["GITHUB_RUN_ATTEMPT"])
+    paths = package_files(ROOT / "pkg/Release", variant())
+    if not 1 <= len(paths) <= 2:
+        raise RuntimeError("Native variants must produce one or two user packages")
+    if any(any(character in str(path) for character in "\r\n") for path in paths):
+        raise RuntimeError("Package paths cannot contain newlines")
     records = []
     for path in paths:
         digest = hashlib.sha256()
@@ -600,10 +589,10 @@ def products():
     print(json.dumps({"configuration": variant()["id"], "packages": records}, indent=2))
     if os.environ.get("GITHUB_OUTPUT"):
         with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-            print("paths<<QCS_PACKAGE_PATHS", file=output)
-            for path in paths:
-                print(path, file=output)
-            print("QCS_PACKAGE_PATHS", file=output)
+            for index in range(2):
+                path = paths[index] if index < len(paths) else None
+                print(f"package_{index + 1}_name={path.name if path else ''}", file=output)
+                print(f"package_{index + 1}_path={path if path else ''}", file=output)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
             print("| Package | Bytes | SHA-256 |\n|---|---:|---|", file=summary)

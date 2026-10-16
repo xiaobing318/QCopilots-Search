@@ -1013,12 +1013,14 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("release-prepare", "release-upload-draft"):
-        action = "prepare" if sys.argv[1] == "release-prepare" else "upload-draft"
+    release_actions = {"release-prepare": "prepare", "release-upload-draft": "upload-draft",
+                       "release-publish": "publish"}
+    if len(sys.argv) > 1 and sys.argv[1] in release_actions:
+        action = release_actions[sys.argv[1]]
         run([sys.executable, SOURCE / "tools/qcs-release.py", action, *sys.argv[2:]], cwd=SOURCE)
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "models", "sources", "symbols", "installers", "check", "release-prepare", "release-upload-draft", "clean"])
+    parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "models", "sources", "symbols", "installers", "check", "release-prepare", "release-upload-draft", "release-publish", "clean"])
     default_root = SOURCE.parent.parent / (SOURCE.parent.name + "-compilations") / PRODUCT
     parser.add_argument("--build-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_BUILD_ROOT") or default_root)
     parser.add_argument("--variant", default=os.environ.get("QCOPILOTS_SEARCH_VARIANT") or None,

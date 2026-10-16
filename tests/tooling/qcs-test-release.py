@@ -45,7 +45,7 @@ class ExternalTest(unittest.TestCase):
 
 
 class FakeCI:
-    """Synthetic GitHub JSON and ZIP bytes exercise the real eleven-job selector."""
+    """Synthetic GitHub JSON and raw package bytes exercise the real eleven-job selector."""
     def __init__(self):
         self.repository = {"id": 42, "full_name": release.REPOSITORY, "archived": False}
         self.workflow = {"id": 71, "path": release.WORKFLOW_PATH}
@@ -54,6 +54,8 @@ class FakeCI:
                     "status": "completed", "conclusion": "success"}
         self.attempt = deepcopy(self.run)
         self.jobs, self.artifacts, self.downloads, self.calls = [], [], {}, []
+        self.download_calls = []
+        self.main_sha = CANDIDATE
         for index, configuration in enumerate(release.variants(), 1):
             self.add_job(configuration, index, 1)
 
@@ -68,15 +70,15 @@ class FakeCI:
                "labels": ["fixture-runner"], "steps": [{"number": 1, "name": "Build, test and upload packages",
                "status": "completed", "conclusion": "success", "started_at": first, "completed_at": last}]}
         self.jobs.append(job)
-        content = io.BytesIO()
-        with zipfile.ZipFile(content, "w") as archive:
-            for name in sorted(release.package_names(configuration, release.project_version(release.SOURCE), CANDIDATE, attempt)):
-                archive.writestr(name, b"SYNTHETIC USER PACKAGE: " + name.encode())
-        artifact_id = identifier + 1000
-        self.downloads[artifact_id] = content.getvalue()
-        self.artifacts.append({"id": artifact_id, "name": release.selector_module().artifact_name(configuration, CANDIDATE, attempt),
-            "expired": False, "digest": "sha256:" + hashlib.sha256(content.getvalue()).hexdigest(),
-            "created_at": last, "workflow_run": {"id": 123, "head_sha": CANDIDATE}})
+        for index, name in enumerate(sorted(release.package_names(configuration, release.project_version(release.SOURCE)))):
+            content = b"SYNTHETIC USER PACKAGE: " + name.encode() + str(attempt).encode()
+            artifact_id = identifier * 10 + index + 1000
+            self.downloads[artifact_id] = content
+            # upload-artifact overwrite:true replaces a rerun's exact name.
+            self.artifacts[:] = [item for item in self.artifacts if item["name"] != name]
+            self.artifacts.append({"id": artifact_id, "name": name,
+                "expired": False, "digest": "sha256:" + hashlib.sha256(content).hexdigest(), "size_in_bytes": len(content),
+                "created_at": last, "workflow_run": {"id": 123, "head_sha": CANDIDATE}})
         return job
 
     def partial_retry(self):
@@ -98,6 +100,8 @@ class FakeCI:
             return deepcopy(self.workflow)
         if endpoint == prefix + "/commits/" + CANDIDATE:
             return {"sha": CANDIDATE}
+        if endpoint == prefix + "/git/ref/heads/main":
+            return {"object": {"type": "commit", "sha": self.main_sha}}
         if endpoint.startswith(prefix + "/actions/runs/123/attempts/"):
             return deepcopy(self.attempt)
         for kind in ("jobs", "artifacts"):
@@ -108,6 +112,7 @@ class FakeCI:
         raise AssertionError(endpoint)
 
     def download_artifact(self, artifact_id, destination, expected_digest, *, max_bytes):
+        self.download_calls.append(artifact_id)
         destination.write_bytes(self.downloads[artifact_id])
 
 
@@ -139,15 +144,18 @@ class FreezeTests(ExternalTest):
         self.assertFalse(any("provenance" in item["path"] for item in document["assets"]))
         self.assertEqual({path.name for path in relocated.iterdir()}, {"assets", release.MANIFEST})
         self.assertFalse(list(self.root.glob(".qcs-release-*")))
-        self.assertFalse(document["published"])
+        self.assertEqual(document["schemaVersion"], 4)
+        self.assertNotIn("published", document)
+        self.assertNotIn("draftOnly", document)
+        self.assertEqual(len(self.api.download_calls), 21)
 
-    def test_partial_retry_uses_original_attempt_in_package_names(self):
+    def test_partial_retry_keeps_source_attempt_and_stable_package_names(self):
         self.api.partial_retry()
         document = release.read_json(self.prepare(attempt=2))
         self.assertEqual(document["configurations"]["windows-x64-cpu"]["sourceAttempt"], 2)
         self.assertEqual(document["configurations"]["linux-x64-cpu"]["sourceAttempt"], 1)
         package = document["configurations"]["linux-x64-cpu"]["packages"][0]["filename"]
-        self.assertIn("-attempt1.", package)
+        self.assertEqual(package, "qcs-0.1.0-linux-x64-cpu.deb")
 
     def test_failed_latest_job_cannot_borrow_old_success(self):
         self.api.partial_retry()
@@ -167,7 +175,7 @@ class FreezeTests(ExternalTest):
             self.prepare()
 
     def test_downloaded_digest_must_match_github(self):
-        self.api.downloads[1001] += b"changed"
+        self.api.downloads[1010] += b"changed"
         with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
             self.prepare()
         self.assertFalse(self.output.exists())
@@ -229,79 +237,69 @@ class FreezeTests(ExternalTest):
         self.assertFalse(self.output.exists())
 
 
-    def test_upload_package_preflight_rechecks_ci_and_removes_downloads(self):
+    def test_preflight_rechecks_metadata_without_downloading_packages_again(self):
         document = release.read_json(self.prepare())
-        release.verify_ci_packages(self.api, document, self.root)
-        self.assertFalse(list(self.root.glob(".qcs-release-validation-*")))
+        before = len(self.api.download_calls)
+        release.verify_ci_packages(self.api, document)
+        self.assertEqual(len(self.api.download_calls), before)
 
-    def test_rewritten_local_manifest_cannot_upload_a_non_ci_package(self):
+    def test_downloaded_raw_size_must_match_artifact(self):
+        self.api.artifacts[0]["size_in_bytes"] += 1
+        with self.assertRaisesRegex(ValueError, "size differs"):
+            self.prepare()
+
+    def test_schema_three_freeze_is_rejected(self):
         manifest = self.prepare()
         document = release.read_json(manifest)
-        item = document["assets"][0]
-        package = manifest.parent / item["path"]
-        package.write_bytes(b"SYNTHETIC non-CI replacement")
-        item.update(bytes=package.stat().st_size, sha256=release.digest(package))
-        for entry in document["configurations"][item["configuration"]]["packages"]:
-            if entry["filename"] == item["name"]:
-                entry.update(bytes=item["bytes"], sha256=item["sha256"])
-        checksums = manifest.parent / "assets/SHA256SUMS"
-        checksums.write_text("".join(f"{asset['sha256']}  {asset['name']}\n"
-                             for asset in sorted(document["assets"], key=lambda entry: entry["name"])
-                             if asset["role"] != "checksums"), encoding="utf-8")
-        for entry in document["assets"]:
-            if entry["role"] == "checksums":
-                entry.update(bytes=checksums.stat().st_size, sha256=release.digest(checksums))
+        document["schemaVersion"] = 3
         release.write_json(manifest, document)
-        # A checksum manifest is not a signature. Upload must independently
-        # compare against the remote immutable artifact before creating a draft.
-        release.verify_freeze(manifest, release.SOURCE)
+        with self.assertRaisesRegex(ValueError, "schema"):
+            release.verify_freeze(manifest, release.SOURCE)
+
+    def test_rewritten_local_package_metadata_must_match_raw_artifact(self):
+        manifest = self.prepare()
+        document = release.read_json(manifest)
+        configuration = next(iter(document["configurations"].values()))
+        configuration["packages"][0]["sha256"] = "9" * 64
+        release.write_json(manifest, document)
         with self.assertRaisesRegex(ValueError, "differ from the selected CI artifact"):
-            release.upload_draft(manifest, release.SOURCE, "v0.0-test", api=self.api)
-        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
-        self.assertFalse(list(self.root.glob(".qcs-release-validation-*")))
+            release.verify_freeze(manifest, release.SOURCE)
 
-    def test_upload_package_preflight_rejects_changed_artifact_download(self):
-        document = release.read_json(self.prepare())
-        self.api.downloads[1001] += b"changed"
-        with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
-            release.verify_ci_packages(self.api, document, self.root)
-        self.assertFalse(list(self.root.glob(".qcs-release-validation-*")))
+    def test_rewritten_entire_freeze_cannot_replace_remote_artifact(self):
+        manifest = self.prepare()
+        document = release.read_json(manifest)
+        selected = next(iter(document["configurations"].values()))
+        artifact, package = selected["artifacts"][0], selected["packages"][0]
+        path = manifest.parent / "assets" / package["filename"]
+        path.write_bytes(b"self-consistent local replacement")
+        artifact.update(artifactSize=path.stat().st_size, artifactDigest="sha256:" + release.digest(path))
+        package.update(bytes=path.stat().st_size, sha256=release.digest(path))
+        for item in document["assets"]:
+            if item["name"] == package["filename"]:
+                item.update(bytes=path.stat().st_size, sha256=release.digest(path))
+        checksum = manifest.parent / "assets/SHA256SUMS"
+        checksum.write_text("".join(f"{item['sha256']}  {item['name']}\n" for item in sorted(document["assets"], key=lambda row: row["name"])
+                                     if item["role"] != "checksums"), encoding="utf-8")
+        for item in document["assets"]:
+            if item["role"] == "checksums":
+                item.update(bytes=checksum.stat().st_size, sha256=release.digest(checksum))
+        release.write_json(manifest, document)
+        release.verify_freeze(manifest, release.SOURCE)
+        with self.assertRaisesRegex(ValueError, "changed after release preparation"):
+            release.verify_ci_packages(self.api, document)
+
+    def test_main_movement_prevents_prepare_downloads(self):
+        self.api.main_sha = "9" * 40
+        with self.assertRaisesRegex(ValueError, "Remote main"):
+            self.prepare()
+        self.assertEqual(self.api.download_calls, [])
 
 
-class PackageArchiveTests(ExternalTest):
-    def archive(self, names):
-        path = self.root / "artifact.zip"
-        with zipfile.ZipFile(path, "w") as archive:
-            for name in names:
-                archive.writestr(name, b"fixture package")
-        return path
-
-    def test_wrong_backend_missing_or_extra_payload_rejected(self):
-        expected = {"qcs-0.1.0-windows-x64-cpu-111111111111-attempt1.exe"}
-        for names in ([], ["qcs-0.1.0-windows-x64-cuda-13.4-111111111111-attempt1.exe"],
-                      [*expected, "report.json"], ["../outside"], ["folder/file.zip"]):
-            with self.subTest(names=names), self.assertRaises(ValueError):
-                release.inspect_packages(self.archive(names), expected)
-
-    def test_symlink_package_rejected(self):
-        path = self.root / "linked.zip"
-        with zipfile.ZipFile(path, "w") as archive:
-            info = zipfile.ZipInfo("qcs.zip")
-            info.external_attr = 0o120777 << 16
-            archive.writestr(info, "outside")
-        with self.assertRaisesRegex(ValueError, "ordinary"):
-            release.inspect_packages(path, {"qcs.zip"})
-
-    def test_rocm_setup_zip_replaces_installer_without_replacing_portable_package(self):
-        options = release.package_name_options("windows-x64-rocm", "0.1.0", CANDIDATE, 1)
-        self.assertEqual(len(options), 2)
-        self.assertEqual(len(options[0] & options[1]), 1)
-        inspected = release.inspect_packages(self.archive(options[1]), options)
-        self.assertTrue(any(name.endswith("-setup.zip") for name in inspected))
-        with self.assertRaisesRegex(ValueError, "extra user packages"):
-            release.inspect_packages(self.archive(options[0] | options[1]), options)
-        cpu = release.package_name_options("windows-x64-cpu", "0.1.0", CANDIDATE, 1)
-        self.assertEqual(len(cpu), 1)
+class PackageContractTests(ExternalTest):
+    def test_rocm_setup_zip_replaces_only_installer(self):
+        options = release.package_name_options("windows-x64-rocm", "0.1.0")
+        self.assertEqual(options, [{"qcs-0.1.0-windows-x64-rocm.exe", "qcs-0.1.0-windows-x64-rocm.zip"},
+                                  {"qcs-0.1.0-windows-x64-rocm-setup.zip", "qcs-0.1.0-windows-x64-rocm.zip"}])
 
     def test_single_release_asset_limit_is_strictly_below_two_gib(self):
         release.require_asset_size(2 * 1024**3 - 1, "fixture.zip")
@@ -315,27 +313,31 @@ class PackageArchiveTests(ExternalTest):
                 release.safe_file(self.root, name)
 
 
-class FakeGitHub:
+class FakeGitHub(FakeCI):
     def __init__(self):
+        super().__init__()
         self.release = None
         self.assets = []
         self.uploaded = []
-        self.calls = []
         self.tag_sha = None
         self.fail_next = None
+        self.lose_publish_response = False
+        self.tag_create_error = None
 
     def request(self, method, endpoint, data=None):
-        self.calls.append((method, endpoint, data))
         prefix = "/repos/" + release.REPOSITORY
-        if endpoint == prefix:
-            return {"id": 42, "full_name": release.REPOSITORY, "archived": False}
-        if endpoint == prefix + "/commits/" + CANDIDATE:
-            return {"sha": CANDIDATE}
         if "/git/ref/tags/" in endpoint:
             if not self.tag_sha:
                 raise release.ApiError(404)
             return {"object": {"type": "commit", "sha": self.tag_sha}}
+        if method == "POST" and endpoint == prefix + "/git/refs":
+            self.calls.append((method, endpoint, data))
+            self.tag_sha = CANDIDATE
+            if self.tag_create_error:
+                raise self.tag_create_error
+            return {"object": {"type": "commit", "sha": self.tag_sha}}
         if method == "POST" and endpoint == prefix + "/releases":
+            self.calls.append((method, endpoint, data))
             self.release = {**data, "id": 17, "published_at": None}
             return deepcopy(self.release)
         if endpoint.startswith(prefix + "/releases?"):
@@ -343,8 +345,18 @@ class FakeGitHub:
         if endpoint.startswith(prefix + "/releases/17/assets?"):
             return deepcopy(self.assets)
         if endpoint == prefix + "/releases/17":
+            if method == "PATCH":
+                self.calls.append((method, endpoint, data))
+                self.release.update(data)
+                self.release["published_at"] = "2026-01-01T04:00:00Z"
+                self.tag_sha = CANDIDATE
+                if self.lose_publish_response:
+                    self.lose_publish_response = False
+                    raise OSError("SYNTHETIC response lost after server publish")
             return deepcopy(self.release)
-        raise AssertionError((method, endpoint, data))
+        if endpoint == prefix + "/releases/latest":
+            return deepcopy(self.release)
+        return super().request(method, endpoint, data)
 
     def asset_digest(self, asset):
         return asset["digest"].removeprefix("sha256:")
@@ -363,51 +375,45 @@ class FakeGitHub:
 class UploadTests(ExternalTest):
     def setUp(self):
         super().setUp()
-        self.manifest = self.file(release.MANIFEST, b'{"synthetic":true}')
-        self.first = self.file("assets/qcs-a.zip", b"first")
-        self.second = self.file("assets/qcs-b.zip", b"second")
-        self.document = {"identity": IDENTITY, "runId": "123", "requestedAttempt": 1, "configurations": {name: {"synthetic": True, "packages": []} for name in release.variants()}, "assets": [release.record(self.root, item, name=item.name)
-                                                         for item in (self.first, self.second)]}
         self.api = FakeGitHub()
-        current = mock.patch.object(release, "collect_ci", return_value={"selection": {"selected": {name: {"synthetic": True} for name in release.variants()}}})
-        self.collect = current.start()
-        self.addCleanup(current.stop)
-        patch = mock.patch.object(release, "verify_freeze", return_value=self.document)
-        self.verify = patch.start()
-        self.addCleanup(patch.stop)
-        identity_patch = mock.patch.object(release, "identity_for", return_value=IDENTITY)
-        identity_patch.start()
-        self.addCleanup(identity_patch.stop)
-        package_patch = mock.patch.object(release, "verify_ci_packages")
-        self.packages = package_patch.start()
-        self.addCleanup(package_patch.stop)
+        self.source_bundle = self.file(f"sources/qcs-source-materials-{CANDIDATE[:12]}.zip", b"SYNTHETIC CORRESPONDING SOURCES")
+        for patch in (mock.patch.object(release, "identity_for", return_value=IDENTITY),
+                      mock.patch.object(release, "build_sources", return_value=self.source_bundle),
+                      mock.patch.object(release, "validate_sources")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.manifest = release.prepare(release.SOURCE, CANDIDATE, "123", 1, self.root / "frozen", api=self.api)
+        self.document = release.read_json(self.manifest)
 
     def upload(self):
-        return release.upload_draft(self.manifest, release.SOURCE, "v0.0-test", api=self.api)
+        return release.upload_draft(self.manifest, release.SOURCE, "v0.1.0", api=self.api)
 
-    def test_create_and_reuse_draft_checks_remote_hashes(self):
+    def publish(self):
+        return release.publish(self.manifest, release.SOURCE, "v0.1.0", api=self.api)
+
+    def test_create_and_reuse_draft_checks_all_twenty_four_assets_without_redownload(self):
         first = self.upload()
         second = self.upload()
-        self.assertEqual(len(first["uploaded"]), 3)
+        self.assertEqual(len(first["uploaded"]), 24)
         self.assertEqual(second["uploaded"], [])
-        self.assertEqual(len(second["reused"]), 3)
-        self.assertEqual(len(self.api.uploaded), 3)
+        self.assertEqual(len(second["reused"]), 24)
+        self.assertEqual(len(self.api.uploaded), 24)
+        self.assertEqual(len(self.api.download_calls), 21)
         self.assertTrue(self.api.release["draft"])
         self.assertFalse(first["published"])
-        self.assertEqual(self.verify.call_count, 2)
-        self.assertEqual(self.packages.call_count, 2)
 
     def test_partial_upload_resumes_without_replacing_completed_asset(self):
-        self.api.fail_next = "qcs-b.zip"
+        self.api.fail_next = self.document["assets"][1]["name"]
         with self.assertRaises(release.ApiError):
             self.upload()
-        self.assertEqual(self.api.uploaded, ["qcs-a.zip"])
+        first = self.document["assets"][0]["name"]
+        self.assertEqual(self.api.uploaded, [first])
         result = self.upload()
-        self.assertEqual(result["reused"], ["qcs-a.zip"])
-        self.assertEqual(self.api.uploaded.count("qcs-a.zip"), 1)
+        self.assertEqual(result["reused"], [first])
+        self.assertEqual(self.api.uploaded.count(first), 1)
         self.assertTrue(self.api.release["draft"])
 
-    def test_same_size_different_hash_is_not_treated_as_already_uploaded(self):
+    def test_same_size_different_hash_is_not_treated_as_uploaded(self):
         self.upload()
         self.api.assets[0]["digest"] = "sha256:" + "a" * 64
         before = list(self.api.uploaded)
@@ -417,7 +423,7 @@ class UploadTests(ExternalTest):
 
     def test_published_release_is_rejected_before_upload(self):
         self.upload()
-        self.api.release["draft"] = False
+        self.publish()
         before = len(self.api.uploaded)
         with self.assertRaisesRegex(ValueError, "only operates on unpublished drafts"):
             self.upload()
@@ -442,43 +448,159 @@ class UploadTests(ExternalTest):
             self.upload()
         self.assertTrue(any(item["name"] == "old-candidate.zip" for item in self.api.assets))
 
-    def test_local_asset_mutation_before_transfer_is_rejected(self):
-        self.first.write_bytes(b"changed since freeze")
-        with self.assertRaisesRegex(ValueError, "changed after upload preflight"):
+    def test_local_asset_mutation_prevents_release_creation(self):
+        first = self.manifest.parent / self.document["assets"][0]["path"]
+        first.write_bytes(b"changed since freeze")
+        with self.assertRaisesRegex(ValueError, "content changed"):
             self.upload()
-        self.assertEqual(self.api.uploaded, [])
-
-    def test_failed_local_gate_prevents_all_remote_requests(self):
-        self.verify.side_effect = ValueError("freeze verification failed")
-        with self.assertRaisesRegex(ValueError, "freeze verification failed"):
-            self.upload()
-        self.assertEqual(self.api.calls, [])
+        self.assertIsNone(self.api.release)
 
     def test_oversized_asset_fails_before_any_remote_request(self):
         self.document["assets"][0]["bytes"] = 2 * 1024**3
+        release.write_json(self.manifest, self.document)
+        before = len(self.api.calls)
         with self.assertRaisesRegex(ValueError, "smaller than 2 GiB"):
             self.upload()
-        self.assertEqual(self.api.calls, [])
+        self.assertEqual(len(self.api.calls), before)
 
     def test_new_failed_ci_attempt_prevents_remote_release_creation(self):
-        self.collect.side_effect = ValueError("The latest workflow attempt must have completed successfully")
-        with self.assertRaisesRegex(ValueError, "latest workflow attempt"):
+        self.api.run.update(run_attempt=2, conclusion="failure")
+        with self.assertRaisesRegex(ValueError, "identity differs"):
             self.upload()
         self.assertIsNone(self.api.release)
-        self.assertEqual(self.api.uploaded, [])
 
-    def test_changed_remote_selection_prevents_remote_release_creation(self):
-        self.collect.return_value = {"selection": {"selected": {"different": True}}}
+    def test_changed_remote_selection_prevents_release_creation(self):
+        self.api.artifacts[0]["digest"] = "sha256:" + "9" * 64
         with self.assertRaisesRegex(ValueError, "changed after release preparation"):
             self.upload()
         self.assertIsNone(self.api.release)
 
-    def test_ci_package_mismatch_prevents_remote_release_creation(self):
-        self.packages.side_effect = ValueError("Release package bytes differ from the selected CI artifact")
-        with self.assertRaisesRegex(ValueError, "differ from the selected CI artifact"):
-            self.upload()
+    def test_publish_requires_uploaded_draft(self):
+        with self.assertRaisesRegex(ValueError, "No prepared draft"):
+            self.publish()
         self.assertIsNone(self.api.release)
-        self.assertEqual(self.api.uploaded, [])
+
+    def test_publish_is_explicit_complete_and_idempotent(self):
+        self.upload()
+        first = self.publish()
+        second = self.publish()
+        self.assertTrue(first["published"])
+        self.assertFalse(first["alreadyPublished"])
+        self.assertTrue(second["alreadyPublished"])
+        self.assertEqual(len(first["assets"]), 24)
+        patches = [data for method, _, data in self.api.calls if method == "PATCH"]
+        self.assertEqual(patches, [{"tag_name": "v0.1.0", "target_commitish": CANDIDATE,
+                                  "draft": False, "prerelease": False, "make_latest": "true"}])
+        self.assertEqual(len(self.api.download_calls), 21)
+
+    def test_publish_response_loss_confirms_success_and_retry(self):
+        self.upload()
+        self.api.lose_publish_response = True
+        self.assertTrue(self.publish()["published"])
+        self.assertTrue(self.publish()["alreadyPublished"])
+
+    def test_publish_missing_asset_does_not_upload_or_publish(self):
+        self.upload()
+        self.api.assets.pop()
+        before = len(self.api.uploaded)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.publish()
+        self.assertEqual(len(self.api.uploaded), before)
+        self.assertTrue(self.api.release["draft"])
+        self.upload()
+        self.assertTrue(self.publish()["published"])
+
+    def test_published_missing_asset_is_not_a_successful_retry(self):
+        self.upload()
+        self.publish()
+        self.api.assets.pop()
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.publish()
+
+    def test_publish_conflicting_asset_or_tag_never_patches(self):
+        self.upload()
+        for conflict in ("asset", "tag"):
+            with self.subTest(conflict=conflict):
+                original = deepcopy(self.api.assets)
+                if conflict == "asset":
+                    self.api.assets[0]["digest"] = "sha256:" + "9" * 64
+                else:
+                    self.api.tag_sha = "9" * 40
+                with self.assertRaises(ValueError):
+                    self.publish()
+                self.api.assets = original
+                self.api.tag_sha = None
+        self.assertFalse(any(method == "PATCH" for method, _, _ in self.api.calls))
+
+    def test_publish_creates_missing_tag_only_after_complete_validation(self):
+        self.upload()
+        self.publish()
+        mutations = [(method, endpoint, data) for method, endpoint, data in self.api.calls if method in ("POST", "PATCH")]
+        self.assertEqual(mutations[-2][1], f"/repos/{release.REPOSITORY}/git/refs")
+        self.assertEqual(mutations[-2][2], {"ref": "refs/tags/v0.1.0", "sha": CANDIDATE})
+        self.assertEqual(mutations[-1][0], "PATCH")
+
+    def test_tag_create_concurrent_same_commit_and_lost_response_are_recoverable(self):
+        self.upload()
+        for error in (release.ApiError(409), release.ApiError(422), OSError("SYNTHETIC tag response lost")):
+            with self.subTest(error=str(error)):
+                self.api.tag_sha = None
+                self.api.tag_create_error = error
+                release.ensure_release_tag(self.api, "v0.1.0", CANDIDATE)
+                self.assertEqual(self.api.tag_sha, CANDIDATE)
+
+    def test_incomplete_assets_do_not_create_a_tag(self):
+        self.upload()
+        self.api.assets.pop()
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.publish()
+        self.assertIsNone(self.api.tag_sha)
+
+    def test_ci_changes_during_publication_preflight_prevent_tag_creation(self):
+        self.upload()
+        original = release.verify_ci_packages
+        calls = []
+        def change(api, document):
+            calls.append(True)
+            if len(calls) == 2:
+                api.run["run_attempt"] = 2
+            return original(api, document)
+        with mock.patch.object(release, "verify_ci_packages", side_effect=change):
+            with self.assertRaisesRegex(ValueError, "identity differs"):
+                self.publish()
+        self.assertIsNone(self.api.tag_sha)
+        self.assertTrue(self.api.release["draft"])
+
+    def test_publish_main_moved_is_rejected(self):
+        self.upload()
+        self.api.main_sha = "9" * 40
+        with self.assertRaisesRegex(ValueError, "Remote main"):
+            self.publish()
+        self.assertTrue(self.api.release["draft"])
+
+    def test_tag_must_match_package_version(self):
+        with self.assertRaisesRegex(ValueError, "frozen project version"):
+            release.upload_draft(self.manifest, release.SOURCE, "v0.2.0", api=self.api)
+        self.assertIsNone(self.api.release)
+
+    def test_notes_have_twenty_one_exact_downloads_and_validation_limits(self):
+        self.upload()
+        notes = self.api.release["body"]
+        for item in self.document["assets"]:
+            self.assertIn("/" + item["name"] + ")", notes)
+        for text in ("Windows x64", "Linux x64", "macOS Apple Silicon", "尚未实测", "未提供 Windows Authenticode", "首次使用", "payload-manifest.json", "gfx1200", "ad-hoc"):
+            self.assertIn(text, notes)
+        self.assertNotIn("attempt1.zip", notes)
+
+    def test_rocm_setup_notes_use_selected_installer_name(self):
+        document = deepcopy(self.document)
+        packages = document["configurations"]["windows-x64-rocm"]["packages"]
+        for item in packages:
+            if item["filename"].endswith(".exe"):
+                item["filename"] = item["filename"].removesuffix(".exe") + "-setup.zip"
+        notes = release.release_notes(document, "v0.1.0", "f" * 64)
+        self.assertIn("qcs-0.1.0-windows-x64-rocm-setup.zip)", notes)
+        self.assertNotIn("qcs-0.1.0-windows-x64-rocm.exe)", notes)
 
 
 class GitNormalizationTests(ExternalTest):
@@ -497,7 +619,7 @@ class SourceIdentityTests(ExternalTest):
     def setUp(self):
         super().setUp()
         self.file("README.md", b"SYNTHETIC source checkout\n")
-        self.git("init", "--quiet")
+        self.git("init", "--quiet", "--initial-branch=main")
         self.git("add", ".")
         self.git("-c", "user.name=QCS synthetic test", "-c", "user.email=synthetic@example.invalid",
                  "commit", "--quiet", "-m", "Synthetic source fixture")
@@ -517,6 +639,11 @@ class SourceIdentityTests(ExternalTest):
         self.assertEqual(identity["checkoutCommit"], self.commit)
         self.assertEqual(identity["sourceTree"], self.git("rev-parse", "HEAD^{tree}"))
         self.assertFalse(identity["workingTreeModified"])
+
+    def test_clean_non_main_branch_cannot_be_released(self):
+        self.git("checkout", "--quiet", "-b", "feature")
+        with self.assertRaisesRegex(ValueError, "main branch"):
+            release.identity_for(self.root, self.commit)
 
     def test_wrong_commit_and_untracked_changes_cannot_be_released(self):
         with self.assertRaisesRegex(ValueError, "exact clean source commit"):
@@ -576,6 +703,29 @@ class SourceMaterialTests(ExternalTest):
         with mock.patch.object(release, "git_blob_identity", return_value="d" * 40):
             with self.assertRaisesRegex(ValueError, "differs from the candidate"):
                 release.validate_sources(self.bundle, IDENTITY, release.SOURCE)
+
+
+class TagIdentityTests(unittest.TestCase):
+    def test_annotated_tag_resolves_to_exact_candidate(self):
+        api = mock.Mock()
+        api.request.side_effect = [{"object": {"type": "tag", "sha": "a" * 40}},
+                                   {"object": {"type": "commit", "sha": CANDIDATE}}]
+        self.assertTrue(release.validate_tag(api, "v0.1.0", CANDIDATE, required=True))
+        self.assertTrue(api.request.call_args_list[1].args[1].endswith("/git/tags/" + "a" * 40))
+
+    def test_required_tag_must_exist(self):
+        api = mock.Mock()
+        api.request.side_effect = release.ApiError(404)
+        with self.assertRaises(release.ApiError):
+            release.validate_tag(api, "v0.1.0", CANDIDATE, required=True)
+
+    def test_concurrent_tag_creation_at_another_commit_is_rejected(self):
+        api = mock.Mock()
+        api.request.side_effect = [release.ApiError(404), release.ApiError(422),
+                                   {"object": {"type": "commit", "sha": "9" * 40}}]
+        with self.assertRaisesRegex(ValueError, "different commit"):
+            release.ensure_release_tag(api, "v0.1.0", CANDIDATE)
+        self.assertFalse(any(call.args[0] == "PATCH" for call in api.request.call_args_list))
 
 
 class ArtifactTransportTests(ExternalTest):

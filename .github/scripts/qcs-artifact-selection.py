@@ -21,23 +21,66 @@ import urllib.error
 import urllib.request
 
 
-def configurations():
-    path = Path(__file__).resolve().parents[2] / "config" / "build-variants.json"
+EXTENSIONS = {"NSIS": ".exe", "ZIP": ".zip", "DEB": ".deb", "TGZ": ".tar.gz", "DragNDrop": ".dmg"}
+MAX_ASSET_BYTES = 2 * 1024**3 - 1
+SOURCE = Path(__file__).resolve().parents[2]
+
+
+def variants():
+    path = SOURCE / "config" / "build-variants.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 1:
+    if not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 1:
         raise ValueError("Unsupported build variant manifest")
-    variants = manifest.get("variants")
-    if not isinstance(variants, list) or not variants:
+    rows = manifest.get("variants")
+    if not isinstance(rows, list) or not rows:
         raise ValueError("Build variant manifest has no configurations")
-    identifiers = []
-    for variant in variants:
+    result = {}
+    for variant in rows:
         identifier = variant.get("id") if isinstance(variant, dict) else None
         if not isinstance(identifier, str) or not re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", identifier):
             raise ValueError("Build variant manifest contains an invalid configuration ID")
-        identifiers.append(identifier)
-    if len(identifiers) != len(set(identifiers)):
-        raise ValueError("Build variant manifest contains duplicate configuration IDs")
-    return tuple(identifiers)
+        if identifier in result:
+            raise ValueError("Build variant manifest contains duplicate configuration IDs")
+        generators = variant.get("generators")
+        if (not isinstance(generators, list) or not generators
+                or not all(isinstance(value, str) and value in EXTENSIONS for value in generators)
+                or len(generators) != len(set(generators))):
+            raise ValueError("Unsupported or repeated configuration package generator")
+        result[identifier] = variant
+    return result
+
+
+def configurations():
+    return tuple(variants())
+
+
+def project_version(source: Path) -> str:
+    match = re.search(r"project\(qcs\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)\s",
+                      (source / "CMakeLists.txt").read_text(encoding="utf-8"))
+    if not match:
+        raise ValueError("Cannot establish the candidate package version")
+    return match.group(1)
+
+
+def package_names(configuration: str, version: str) -> set[str]:
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("Invalid package version")
+    inventory = variants()
+    if not isinstance(configuration, str) or configuration not in inventory:
+        raise ValueError("Unknown package configuration")
+    prefix = f"qcs-{version}-{configuration}"
+    return {prefix + EXTENSIONS[value] for value in inventory[configuration]["generators"]}
+
+
+def package_name_options(configuration: str, version: str) -> list[set[str]]:
+    names = package_names(configuration, version)
+    options = [names]
+    # Only the Windows ROCm builder may replace NSIS after observing its real
+    # data-block limit. The portable ZIP remains a separate user package.
+    if configuration == "windows-x64-rocm":
+        installer = next(name for name in names if name.endswith(".exe"))
+        options.append(names - {installer} | {installer.removesuffix(".exe") + "-setup.zip"})
+    return options
 
 
 CONFIGURATIONS = configurations()
@@ -168,14 +211,11 @@ def original_execution(observed, history):
     return source
 
 
-def artifact_name(variant, head, attempt):
-    return f"qcs-packages-{variant}-{head}-attempt{attempt}"
-
-
 def select(repository, run_id, head, attempt, jobs, artifacts):
     """Pure deterministic selection, suitable for revalidation without network."""
     arguments(repository, run_id, head, attempt)
-    result = {"schemaVersion": 2, "kind": "ci-artifact-selection", "repository": repository,
+    version = project_version(SOURCE)
+    result = {"schemaVersion": 3, "kind": "ci-artifact-selection", "repository": repository, "version": version,
               "runId": run_id, "aggregateAttempt": attempt, "candidateHead": head,
               "passed": False, "errors": [], "selected": {}, "excluded": []}
     errors = result["errors"]
@@ -213,28 +253,40 @@ def select(repository, run_id, head, attempt, jobs, artifacts):
                         later_source = original_execution(later, history)
                         if later_source["id"] != source["id"]:
                             raise ValueError("Current observation bypasses a newer actual execution. Earlier artifacts cannot replace it")
-                name = artifact_name(platform, head, source["run_attempt"])
-                matches = [item for item in artifacts if item.get("name") == name]
-                if len(matches) != 1:
-                    raise ValueError("The original execution needs exactly one artifact named " + name)
-                artifact = matches[0]
-                linked_run = artifact.get("workflow_run", {})
-                if (not isinstance(linked_run, dict) or str(linked_run.get("id")) != run_id
-                        or linked_run.get("head_sha") != head):
-                    raise ValueError("Artifact workflow run or candidate does not match the selected execution")
-                digest = artifact.get("digest")
-                if artifact.get("expired") is not False or not isinstance(digest, str) or not ARTIFACT_DIGEST.fullmatch(digest):
-                    raise ValueError("Artifact is expired or has no complete SHA-256 digest")
-                created = timestamp(artifact.get("created_at"), "Artifact created_at")
-                if not timestamp(source["started_at"], "Job started_at") <= created <= timestamp(source["completed_at"], "Job completed_at"):
-                    raise ValueError("Artifact was not created during its original execution")
+                options = package_name_options(platform, version)
+                names = set().union(*options)
+                started = timestamp(source["started_at"], "Job started_at")
+                completed = timestamp(source["completed_at"], "Job completed_at")
+                matches = [item for item in artifacts if item.get("name") in names
+                           and started <= timestamp(item.get("created_at"), "Artifact created_at") <= completed]
+                actual_names = [item["name"] for item in matches]
+                if len(actual_names) != len(set(actual_names)) or set(actual_names) not in options:
+                    raise ValueError("The original execution needs exactly one raw artifact for every package "
+                                     f"in attempt{source['run_attempt']}: " + ", ".join(sorted(names)))
+                selected = []
+                for artifact in sorted(matches, key=lambda item: item["name"]):
+                    linked_run = artifact.get("workflow_run", {})
+                    if (not isinstance(linked_run, dict) or str(linked_run.get("id")) != run_id
+                            or linked_run.get("head_sha") != head):
+                        raise ValueError("Artifact workflow run or candidate does not match the selected execution")
+                    digest = artifact.get("digest")
+                    if artifact.get("expired") is not False or not isinstance(digest, str) or not ARTIFACT_DIGEST.fullmatch(digest):
+                        raise ValueError("Artifact is expired or has no complete SHA-256 digest")
+                    size = integer(artifact.get("size_in_bytes"), "Artifact size")
+                    if size > MAX_ASSET_BYTES:
+                        raise ValueError("Raw artifact must be smaller than 2 GiB")
+                    selected.append({"artifactId": artifact["id"], "artifactName": artifact["name"],
+                                     "artifactDigest": digest, "artifactSize": size})
                 result["selected"][platform] = {
                     "sourceAttempt": source["run_attempt"], "sourceJobId": source["id"],
-                    "observedJobId": observed["id"], "artifactId": artifact["id"],
-                    "artifactName": name, "artifactDigest": digest}
+                    "observedJobId": observed["id"], "artifacts": selected}
             except (ValueError, TypeError, KeyError) as error:
                 errors.append(f"{platform}: {error}")
-        selected_ids = {item["artifactId"] for item in result["selected"].values()}
+        selected_ids = [artifact["artifactId"] for item in result["selected"].values() for artifact in item["artifacts"]]
+        if len(selected_ids) != len(set(selected_ids)):
+            errors.append("Selected raw artifact IDs are not unique")
+        if not errors and len(selected_ids) != 21:
+            errors.append("The complete release selection must contain exactly 21 raw package artifacts")
         result["excluded"] = [{"artifactId": item["id"], "artifactName": item.get("name"),
                                "reason": "Not the exact artifact of a selected original execution"}
                               for item in sorted(artifacts, key=lambda item: item["id"]) if item["id"] not in selected_ids]
@@ -302,7 +354,7 @@ def load_selection(selection_path, expected_head=None, expected_run=None):
         if selection_path.stat().st_size > MAX_PAGE_BYTES:
             raise ValueError("Selection JSON is too large")
         document = read_json_bytes(selection_path.read_bytes())
-        if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 2 or document.get("kind") != "ci-artifact-selection":
+        if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 3 or document.get("kind") != "ci-artifact-selection":
             raise ValueError("Unsupported artifact selection document")
         repository, run_id, head, attempt = (document[key] for key in
             ("repository", "runId", "candidateHead", "aggregateAttempt"))
@@ -337,7 +389,8 @@ def load_selection(selection_path, expected_head=None, expected_run=None):
             pages[kind].append(read_json_bytes(data))
         recomputed = select(repository, run_id, head, attempt,
                             unpack_pages(pages["jobs"], "jobs"), unpack_pages(pages["artifacts"], "artifacts"))
-        if canonical({key: document.get(key) for key in recomputed}) != canonical(recomputed):
+        if (set(document) != set(recomputed) | {"files", "collectionErrors"}
+                or canonical({key: document.get(key) for key in recomputed}) != canonical(recomputed)):
             raise ValueError("Artifact selection differs from the preserved API execution history")
         if document.get("collectionErrors") != [] or not recomputed["passed"]:
             raise ValueError("Artifact selection did not pass: " + "; ".join(recomputed["errors"]))
@@ -423,7 +476,8 @@ def collect(args):
     load_selection(path, args.candidate_head, args.run_id)
     if os.environ.get("GITHUB_OUTPUT"):
         with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
-            ids = ",".join(str(document["selected"][platform]["artifactId"]) for platform in CONFIGURATIONS)
+            ids = ",".join(str(artifact["artifactId"]) for platform in CONFIGURATIONS
+                           for artifact in document["selected"][platform]["artifacts"])
             stream.write("artifact_ids=" + ids + "\n")
     return path
 
