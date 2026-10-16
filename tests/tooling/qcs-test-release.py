@@ -493,6 +493,19 @@ class UploadTests(ExternalTest):
                                   "draft": False, "prerelease": False, "make_latest": "true"}])
         self.assertEqual(len(self.api.download_calls), 21)
 
+    def test_published_retry_requires_the_same_latest_stable_release(self):
+        self.upload()
+        self.publish()
+        original = self.api.request
+        def different_latest(method, endpoint, data=None):
+            if endpoint == f"/repos/{release.REPOSITORY}/releases/latest":
+                return {"id": 99}
+            return original(method, endpoint, data)
+        with mock.patch.object(self.api, "request", side_effect=different_latest):
+            with self.assertRaisesRegex(ValueError, "latest stable release"):
+                self.publish()
+        self.assertEqual(len([item for item in self.api.calls if item[0] == "PATCH"]), 1)
+
     def test_publish_response_loss_confirms_success_and_retry(self):
         self.upload()
         self.api.lose_publish_response = True

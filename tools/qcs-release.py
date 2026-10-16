@@ -854,10 +854,9 @@ def publish(manifest_path, source, tag, api=None):
     validate_published(published, tag, candidate)
     validate_tag(api, tag, candidate, required=True)
     final = remote_assets(api, release_id, expected, complete=True)
-    if not already_published:
-        latest = api.request("GET", f"/repos/{REPOSITORY}/releases/latest")
-        if latest.get("id") != release_id:
-            raise ValueError("Published release was not designated the latest stable release")
+    latest = api.request("GET", f"/repos/{REPOSITORY}/releases/latest")
+    if latest.get("id") != release_id:
+        raise ValueError("Published release was not designated the latest stable release")
     return {"schemaVersion": 1, "repository": REPOSITORY, "repositoryId": repository["id"],
         "releaseId": release_id, "candidateCommit": candidate, "tag": tag, "draft": False,
         "published": True, "alreadyPublished": already_published,
