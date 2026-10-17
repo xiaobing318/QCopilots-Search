@@ -1041,6 +1041,87 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
         self.assertEqual(invoke.call_args_list, [call("pause", "--timeout", "10000", process_timeout=15),
             *[call("status", "--timeout", "1000", process_timeout=5)] * 3])
 
+    @staticmethod
+    def unavailable_gpu_probe_fixture():
+        reason = "metal GPU device MTL0 does not support required 32x32 F32 matrix multiplication."
+        return {"activePath": "", "available": False, "backend": "metal", "completedTasks": 0,
+                "cpu": False, "description": "Apple Paravirtual device", "deviceId": "", "error": reason,
+                "gpu": True, "name": "MTL0", "runtime": {}, "state": "failed", "unavailableReason": reason}
+
+    def test_package_query_waits_for_actual_workers_after_unavailable_gpu_probe(self):
+        from unittest.mock import Mock, call
+        service = Mock()
+        service.poll.return_value = None
+        # macOS CI reported the unavailable Metal device next to a CPU worker
+        # with five completed tasks. A second usable GPU must work the same way.
+        for backend, gpu in (("cpu", False), ("metal", True)):
+            with self.subTest(backend=backend):
+                probe = self.unavailable_gpu_probe_fixture()
+                ready = {"activePath": "", "backend": backend, "completedTasks": 5, "error": "", "gpu": gpu,
+                         "runtime": {"loaded": True, "selectedBackend": backend, "deviceFailure": False},
+                         "state": "ready"}
+                unloaded = {**ready, "runtime": {**ready["runtime"], "loaded": False}}
+                idle = {**unloaded, "state": "idle"}
+                states = [{"settings": {"indexingPaused": True}, "indexDevices": [probe, worker]}
+                          for worker in (ready, unloaded, idle)]
+                invoke = Mock(side_effect=[{"state": "paused"}, *states])
+                with patch.object(package_verifier.time, "sleep") as sleep:
+                    result = package_verifier.pause_index_workers_before_query(service, invoke)
+                self.assertEqual(result["indexDevices"], [probe, idle])
+                self.assertEqual(sleep.call_count, 2)
+                self.assertEqual(invoke.call_args_list, [call("pause", "--timeout", "10000", process_timeout=15),
+                    *[call("status", "--timeout", "1000", process_timeout=5)] * 3])
+        # Explicit unavailable selections do not include the optional cpu field.
+        probe = self.unavailable_gpu_probe_fixture()
+        del probe["cpu"]
+        invoke = Mock(side_effect=[{"state": "paused"},
+            {"settings": {"indexingPaused": True}, "indexDevices": [probe, idle]}])
+        self.assertEqual(package_verifier.pause_index_workers_before_query(service, invoke)["indexDevices"],
+                         [probe, idle])
+
+    def test_package_query_rejects_near_miss_unavailable_gpu_probe(self):
+        from unittest.mock import Mock
+        service = Mock()
+        service.poll.return_value = None
+        probe = self.unavailable_gpu_probe_fixture()
+        required = ("state", "gpu", "backend", "available", "completedTasks", "activePath", "runtime",
+                    "unavailableReason", "error")
+        cases = [("missing-" + key, {name: value for name, value in probe.items() if name != key})
+                 for key in required]
+        invalid_fields = {"state": (None, "stopped"), "gpu": (False, 1, None),
+                          "backend": (None, "", "cpu", "unknown"), "available": (True, 0, None),
+                          "completedTasks": (False, True, 0.0, "0", -1, 1, None),
+                          "activePath": (None, "indexing-file.txt"),
+                          "runtime": (None, [], {"loaded": False}, {"loaded": True}, {"error": "worker crashed"}),
+                          "unavailableReason": (None, "", " "), "error": (None, "", "worker crashed")}
+        cases.extend((f"{key}={value!r}", {**probe, key: value})
+                     for key, values in invalid_fields.items() for value in values)
+        for name, failed in cases:
+            invoke = Mock(side_effect=[{"state": "paused"},
+                {"settings": {"indexingPaused": True}, "indexDevices": [failed, {"state": "idle"}]}])
+            with self.subTest(case=name), self.assertRaisesRegex(RuntimeError, "invalid index worker|worker failed"):
+                package_verifier.pause_index_workers_before_query(service, invoke)
+            self.assertEqual(invoke.call_count, 2)
+
+    def test_package_query_rejects_unavailable_gpu_probe_without_actual_worker(self):
+        from unittest.mock import Mock
+        service = Mock()
+        service.poll.return_value = None
+        probe = self.unavailable_gpu_probe_fixture()
+        for devices in ([probe], [probe, {**probe, "name": "MTL1"}]):
+            invoke = Mock(side_effect=[{"state": "paused"},
+                {"settings": {"indexingPaused": True}, "indexDevices": devices}])
+            with self.subTest(devices=devices), self.assertRaisesRegex(RuntimeError, "no actual index workers"):
+                package_verifier.pause_index_workers_before_query(service, invoke)
+        # The harmless probe cannot hide a failure in an actual CPU or GPU worker.
+        for backend, gpu in (("cpu", False), ("metal", True)):
+            failed = {"state": "failed", "backend": backend, "gpu": gpu, "completedTasks": 5,
+                      "runtime": {"loaded": False}, "activePath": "", "error": "worker crashed"}
+            invoke = Mock(side_effect=[{"state": "paused"},
+                {"settings": {"indexingPaused": True}, "indexDevices": [probe, failed]}])
+            with self.subTest(backend=backend), self.assertRaisesRegex(RuntimeError, "worker failed"):
+                package_verifier.pause_index_workers_before_query(service, invoke)
+
     def test_package_query_requires_acknowledged_and_persistent_index_pause(self):
         from unittest.mock import Mock
         service = Mock()

@@ -346,6 +346,17 @@ def wait_service_ready(service, invoke, model, require_model, timeout):
         time.sleep(0.2)
 
 
+def unstarted_unavailable_gpu(device):
+    """Recognize a discovery failure that never started an index process."""
+    reason = device.get("unavailableReason")
+    return (device.get("state") == "failed" and device.get("gpu") is True
+            and device.get("backend") in ("cuda", "hip", "vulkan", "metal")
+            and device.get("available") is False
+            and type(device.get("completedTasks")) is int and device["completedTasks"] == 0
+            and device.get("activePath") == "" and device.get("runtime") == {}
+            and isinstance(reason, str) and bool(reason.strip()) and device.get("error") == reason)
+
+
 def pause_index_workers_before_query(service, invoke, timeout=90):
     """Release indexed models through the service's normal idle shutdown."""
     started = time.monotonic()
@@ -372,14 +383,19 @@ def pause_index_workers_before_query(service, invoke, timeout=90):
                        ("idle", "ready", "busy", "discovered", "failed") for device in devices)):
             raise RuntimeError(f"Packaged service returned invalid index worker states: {devices}")
         last_states = [device["state"] for device in devices]
-        if "failed" in last_states:
+        # Discovery can retain unavailable GPU slots without starting QProcess.
+        # Actual worker failures retain runtime evidence and must still fail.
+        workers = [device for device in devices if not unstarted_unavailable_gpu(device)]
+        if any(device["state"] == "failed" for device in workers):
             raise RuntimeError(f"Packaged index worker failed before semantic query: {devices}")
+        if not workers:
+            raise RuntimeError(f"Packaged service returned no actual index workers: {devices}")
         # Only idle proves QProcess::NotRunning. ready, discovered and an empty
         # activePath do not prove that the full indexing model was released.
         elapsed = time.monotonic() - started
         if elapsed >= timeout:
             raise RuntimeError(f"Packaged index workers did not exit before semantic query: {last_states}")
-        if all(state == "idle" for state in last_states):
+        if all(device["state"] == "idle" for device in workers):
             return {"indexingPaused": True, "indexDevices": devices, "waitSeconds": round(elapsed, 3)}
         time.sleep(min(0.5, timeout - elapsed))
 
