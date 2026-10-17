@@ -2099,11 +2099,11 @@ class NativeStageDependencyTests(unittest.TestCase):
                 self.assertNotIn("/pkg/", upload)
                 self.assertNotIn("compression-level:", upload)
 
-    def test_matrix_comes_from_shared_manifest_and_keeps_independent_variants(self):
+    def test_matrix_comes_from_shared_manifest_and_stops_after_failure(self):
         self.assertIn("run: python3 .github/scripts/qcs-native-ci.py matrix", self.workflow)
         self.assertIn("matrix: ${{ fromJSON(needs.matrix.outputs.configurations) }}", self.native_job)
         self.assertIn("container: ${{ matrix.container }}", self.native_job)
-        self.assertIn("fail-fast: false", self.native_job)
+        self.assertIn("fail-fast: true", self.native_job)
         self.assertIn("QCOPILOTS_SEARCH_CI_ID: ${{ matrix.id }}", self.native_job)
         with mock.patch.object(native.sys, "argv", ["synthetic-native-ci", "matrix"]), \
                 mock.patch.dict(native.os.environ, {"GITHUB_OUTPUT": ""}), \

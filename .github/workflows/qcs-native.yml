@@ -37,7 +37,7 @@ jobs:
     container: ${{ matrix.container }}
     timeout-minutes: 360
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJSON(needs.matrix.outputs.configurations) }}
     defaults:
       run:
