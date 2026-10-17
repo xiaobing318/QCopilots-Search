@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import uuid
@@ -50,7 +51,6 @@ class PayloadFixture(unittest.TestCase):
 
 
 class PayloadTests(PayloadFixture):
-    @unittest.skipUnless(os.name == "nt", "Windows CPack entry point")
     def test_cpack_filename_must_match_exact_variant_sdk_and_software_version(self):
         build = self.work / "build"
         build.mkdir()
@@ -60,11 +60,14 @@ class PayloadTests(PayloadFixture):
             with self.subTest(name=wrong):
                 (build / "CPackConfig.cmake").write_text(
                     f'set(CPACK_PACKAGE_FILE_NAME "{wrong}")\nset(CPACK_PACKAGE_VERSION "0.3.0")\n', encoding="utf-8")
-                with mock.patch.object(package.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "locked SDK"):
+                # Only the packaging entry-point guard is simulated. Keep the
+                # real os module unchanged so pathlib uses this host's paths.
+                with mock.patch.object(package, "os", SimpleNamespace(name="nt")), \
+                        mock.patch.object(package.subprocess, "run") as run, \
+                        self.assertRaisesRegex(RuntimeError, "locked SDK"):
                     package._package_in_directory(build, self.work / "output", "Release", package.ROCM_VARIANT)
                 run.assert_not_called()
 
-    @unittest.skipUnless(os.name == "nt", "Windows CPack entry point")
     def test_cpack_accepts_exact_versioned_rocm_installer_name(self):
         build = self.work / "build"
         build.mkdir()
@@ -75,9 +78,18 @@ class PayloadTests(PayloadFixture):
         def run_cpack(*args, **kwargs):
             (output / (name + ".exe")).write_bytes(b"synthetic CPack result")
             return subprocess.CompletedProcess(args[0], 0)
-        with mock.patch.object(package.subprocess, "run", side_effect=run_cpack):
+        with mock.patch.object(package, "os", SimpleNamespace(name="nt")), \
+                mock.patch.object(package.subprocess, "run", side_effect=run_cpack):
             self.assertEqual(package._package_in_directory(build, output, "Release", package.ROCM_VARIANT),
                              output / (name + ".exe"))
+
+    def test_native_installer_entry_point_rejects_non_windows_before_execution(self):
+        with mock.patch.object(package, "os", SimpleNamespace(name="posix")), \
+                mock.patch.object(package.subprocess, "run") as run, \
+                self.assertRaisesRegex(RuntimeError, "must be built on Windows"):
+            package._package_in_directory(self.work / "absent-build", self.work / "output", "Release", package.ROCM_VARIANT)
+        run.assert_not_called()
+        self.assertFalse((self.work / "output").exists())
 
     def test_manifest_binds_every_byte_and_unicode_path(self):
         self.assertEqual(len(self.manifest["files"]), 2)
