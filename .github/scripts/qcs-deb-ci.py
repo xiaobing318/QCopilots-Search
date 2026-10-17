@@ -73,10 +73,17 @@ def linux_variant(identifier):
     return matches[0]
 
 
+def container_package_filename(filename):
+    if not isinstance(filename, str) or not re.fullmatch(r"qcs-[A-Za-z0-9][A-Za-z0-9._-]*\.deb", filename):
+        raise RuntimeError("A safe original DEB package filename is required")
+    return filename
+
+
 def inside_container():
     if platform.system() != "Linux" or os.geteuid() != 0 or not Path("/.dockerenv").is_file() or os.environ.get("QCOPILOTS_SEARCH_DEB_CONTAINER") != "1":
         raise RuntimeError("The installation phase may only run in the explicitly created disposable container")
-    package = Path("/incoming/qcs.deb")
+    filename = container_package_filename(os.environ.get("QCOPILOTS_SEARCH_DEB_FILENAME"))
+    package = Path("/incoming/" + filename)
     report_root = Path("/reports")
     work = Path("/work")
     user_id = int(os.environ["QCOPILOTS_SEARCH_HOST_UID"])
@@ -354,6 +361,7 @@ def main():
     variant = linux_variant(args.variant)
     root = external(args.build_root)
     package = args.package_file.resolve()
+    filename = container_package_filename(package.name)
     models = args.model_dir.expanduser().resolve()
     if not models.is_dir():
         raise RuntimeError("Required real-model directory does not exist")
@@ -381,13 +389,14 @@ exec python3 /source/.github/scripts/qcs-deb-ci.py --inside-container
         if os.environ.get(name)}
     command = ["docker", "run", "--rm", "--platform", "linux/amd64",
                "--env", "QCOPILOTS_SEARCH_DEB_CONTAINER=1",
+               "--env", "QCOPILOTS_SEARCH_DEB_FILENAME=" + filename,
                "--env", "QCOPILOTS_SEARCH_VARIANT=" + variant["id"],
                "--env", "QCOPILOTS_SEARCH_CI_ID=" + variant["id"],
                "--env", "QCOPILOTS_SEARCH_HOST_UID=" + str(os.getuid()),
                "--env", "QCOPILOTS_SEARCH_HOST_GID=" + str(os.getgid()),
                *(argument for name, value in candidate_environment.items() for argument in ("--env", name + "=" + value)),
                "--mount", f"type=bind,source={SOURCE},target=/source,readonly",
-               "--mount", f"type=bind,source={package},target=/incoming/qcs.deb,readonly",
+               "--mount", f"type=bind,source={package},target=/incoming/{filename},readonly",
                "--mount", f"type=bind,source={models},target=/models,readonly",
                "--mount", f"type=bind,source={report},target=/reports",
                "--mount", f"type=bind,source={work},target=/work",

@@ -1091,16 +1091,16 @@ class PackageModelFlowTests(unittest.TestCase):
                     self.assertEqual(command[command.index("--package-file") + 1], extra[1])
                 self.assertTrue(run.call_args.kwargs["display"])
 
-    def invoke_deb_outer(self, root, model_argument):
-        package = root / "package.deb"
+    def invoke_deb_outer(self, root, model_argument, variant_id="linux-x64-cpu"):
+        package = root / ("qcs-0.3.0-" + deb.linux_variant(variant_id)["packageVariant"] + ".deb")
         package.write_bytes(b"synthetic package, never installed")
         argv = ["synthetic-deb-ci", "--build-root", str(root / "build"),
                 "--package-file", str(package)]
         if model_argument is not None:
             argv += ["--model-dir", str(model_argument)]
         with mock.patch.object(deb.sys, "argv", argv), \
-                mock.patch.dict(deb.os.environ, {"QCOPILOTS_SEARCH_VARIANT": "linux-x64-cpu",
-                    "QCOPILOTS_SEARCH_CI_ID": "linux-x64-cpu"}, clear=True), \
+                mock.patch.dict(deb.os.environ, {"QCOPILOTS_SEARCH_VARIANT": variant_id,
+                    "QCOPILOTS_SEARCH_CI_ID": variant_id}, clear=True), \
                 mock.patch.object(deb.platform, "system", return_value="Linux"), \
                 mock.patch.object(deb.os, "geteuid", return_value=1000, create=True), \
                 mock.patch.object(deb.os, "getegid", return_value=1000, create=True), \
@@ -1120,17 +1120,22 @@ class PackageModelFlowTests(unittest.TestCase):
             run.assert_called_once()
             return run.call_args.args[0]
 
-    def test_deb_host_mounts_existing_models_readonly(self):
-        with tempfile.TemporaryDirectory(prefix="qcs-ci-deb-",
-                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
-            root = Path(temporary)
-            models = root / "models"
-            models.mkdir()
-            command = self.invoke_deb_outer(root, models)
-            self.assertEqual(command[:3], ["docker", "run", "--rm"])
-            mounts = [command[i + 1] for i, item in enumerate(command) if item == "--mount"]
-            model_mounts = [item for item in mounts if "target=/models" in item]
-            self.assertEqual(model_mounts, [f"type=bind,source={models.resolve()},target=/models,readonly"])
+    def test_deb_host_preserves_original_cpu_and_sdk_names_and_readonly_models(self):
+        for identifier in ("linux-x64-cpu", "linux-x64-rocm", "linux-x64-vulkan"):
+            with self.subTest(variant=identifier), tempfile.TemporaryDirectory(prefix="qcs-ci-deb-",
+                    dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+                root = Path(temporary)
+                models = root / "models"
+                models.mkdir()
+                command = self.invoke_deb_outer(root, models, identifier)
+                self.assertEqual(command[:3], ["docker", "run", "--rm"])
+                mounts = [command[i + 1] for i, item in enumerate(command) if item == "--mount"]
+                model_mounts = [item for item in mounts if "target=/models" in item]
+                self.assertEqual(model_mounts, [f"type=bind,source={models.resolve()},target=/models,readonly"])
+                name = "qcs-0.3.0-" + deb.linux_variant(identifier)["packageVariant"] + ".deb"
+                self.assertIn("QCOPILOTS_SEARCH_DEB_FILENAME=" + name, command)
+                self.assertEqual([item for item in mounts if "target=/incoming/" in item],
+                                 [f"type=bind,source={root / name},target=/incoming/{name},readonly"])
 
     def test_deb_host_rejects_missing_or_invalid_models_before_docker_and_output(self):
         for case in ("argument absent", "directory absent", "regular file"):
@@ -1148,20 +1153,21 @@ class PackageModelFlowTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "Required real-model directory does not exist"):
                         self.invoke_deb_outer(root, models)
 
-    def inspect_container_smoke(self, smoke, *, ci_commit="a" * 40, expected_error=None):
+    def inspect_container_smoke(self, smoke, *, ci_commit="a" * 40, expected_error=None, variant_id="linux-x64-cpu", incoming_environment=None):
+        filename = "qcs-0.3.0-" + deb.linux_variant(variant_id)["packageVariant"] + ".deb"
         with tempfile.TemporaryDirectory(prefix="qcs-ci-deb-container-",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
             root = Path(temporary)
             for relative in ("incoming", "reports/smoke", "work/user-profile", "etc", "usr/bin"):
                 (root / relative).mkdir(parents=True, exist_ok=True)
             (root / ".dockerenv").touch()
-            (root / "incoming/qcs.deb").write_bytes(b"synthetic DEB fixture")
+            (root / "incoming" / filename).write_bytes(b"synthetic DEB fixture")
             (root / "etc/os-release").write_text("synthetic container", encoding="utf-8")
             # Synthetic identity fields follow the real installed-root smoke
             # contract. This fixture never installs or executes a native DEB.
             bound_smoke = {"syntheticFixture": True, "commit": "a" * 40,
                 "buildIdentity": {"candidateCommit": "a" * 40},
-                "packageSha256": deb.digest(root / "incoming/qcs.deb"), **smoke}
+                "packageSha256": deb.digest(root / "incoming" / filename), **smoke}
             (root / "reports/smoke/report.json").write_text(json.dumps(bound_smoke), encoding="utf-8")
             payload = root / "usr/bin/qcs-gui"
             payload.write_bytes(b"synthetic payload")
@@ -1193,10 +1199,12 @@ class PackageModelFlowTests(unittest.TestCase):
                         and smoke.get("verificationScope") == "full"
                         and smoke.get("modelSmoke", {}).get("passed") is True)
             environment = {"QCOPILOTS_SEARCH_DEB_CONTAINER": "1",
-                "QCOPILOTS_SEARCH_VARIANT": "linux-x64-cpu", "QCOPILOTS_SEARCH_CI_ID": "linux-x64-cpu",
+                "QCOPILOTS_SEARCH_DEB_FILENAME": filename,
+                "QCOPILOTS_SEARCH_VARIANT": variant_id, "QCOPILOTS_SEARCH_CI_ID": variant_id,
                 "QCOPILOTS_SEARCH_HOST_UID": "1000", "QCOPILOTS_SEARCH_HOST_GID": "1000"}
             if ci_commit is not None:
                 environment["QCOPILOTS_SEARCH_CANDIDATE_HEAD"] = ci_commit
+            environment.update(incoming_environment or {})
             with mock.patch.object(deb, "Path", side_effect=container_path), \
                     mock.patch.object(deb.platform, "system", return_value="Linux"), \
                     mock.patch.object(deb.os, "geteuid", return_value=0, create=True), \
@@ -1216,19 +1224,29 @@ class PackageModelFlowTests(unittest.TestCase):
             self.assertEqual(len(verifier), 1)
             self.assertEqual(verifier[0][verifier[0].index("--model-dir") + 1], str(root / "models"))
             self.assertEqual(verifier[0].count("--model-dir"), 1)
-            self.assertEqual(verifier[0][verifier[0].index("--package-file") + 1], str(root / "incoming/qcs.deb"))
+            self.assertEqual(verifier[0][verifier[0].index("--package-file") + 1], str(root / "incoming" / filename))
             self.assertEqual(verifier[0].count("--package-file"), 1)
             if complete and expected_error is None:
                 self.assertEqual(report["commit"], bound_smoke["commit"])
             self.assertEqual(report["packageSha256"], bound_smoke["packageSha256"])
             return report
 
-    def test_deb_container_verifier_receives_models_and_complete_smoke_can_pass(self):
-        report = self.inspect_container_smoke({"passed": True, "fullVerificationPassed": True,
-                                              "verificationScope": "full", "modelSmoke": {"passed": True}})
-        self.assertTrue(report["passed"])
-        self.assertTrue(report["fullVerificationPassed"])
-        self.assertEqual(report["retainedProfileFiles"], 1)
+    def test_deb_container_verifier_receives_original_cpu_and_sdk_names_and_models(self):
+        for identifier in ("linux-x64-cpu", "linux-x64-rocm", "linux-x64-vulkan"):
+            with self.subTest(variant=identifier), tempfile.TemporaryDirectory(prefix="qcs-ci-deb-roundtrip-",
+                    dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as temporary:
+                root = Path(temporary)
+                models = root / "models"
+                models.mkdir()
+                command = self.invoke_deb_outer(root, models, identifier)
+                environment = dict(command[index + 1].split("=", 1) for index, value in enumerate(command)
+                                   if value == "--env")
+                report = self.inspect_container_smoke({"passed": True, "fullVerificationPassed": True,
+                    "verificationScope": "full", "modelSmoke": {"passed": True}}, variant_id=identifier,
+                    incoming_environment=environment)
+                self.assertTrue(report["passed"])
+                self.assertTrue(report["fullVerificationPassed"])
+                self.assertEqual(report["retainedProfileFiles"], 1)
 
     def test_deb_container_partial_smoke_cannot_claim_success(self):
         for smoke in ({"passed": True}, {"passed": False, "fullVerificationPassed": True,

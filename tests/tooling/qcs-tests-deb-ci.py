@@ -80,6 +80,21 @@ class DebContainerTests(unittest.TestCase):
         self.assertEqual(result["image"], CUDA["container"])
         self.assertFalse(self.report.exists())
 
+    def test_disposable_container_requires_safe_explicit_original_filename_before_install(self):
+        for filename in ("", "../qcs-test.deb", "/tmp/qcs-test.deb", "qcs-test.deb,readonly", "qcs-test.deb\n"):
+            with self.subTest(filename=filename), self.guarded({"QCOPILOTS_SEARCH_DEB_CONTAINER": "1",
+                    "QCOPILOTS_SEARCH_DEB_FILENAME": filename}), \
+                    mock.patch.object(deb, "install_and_verify") as install, mock.patch.object(deb, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "original DEB package filename"):
+                    deb.inside_container()
+                install.assert_not_called()
+                run.assert_not_called()
+        with self.guarded({"QCOPILOTS_SEARCH_DEB_CONTAINER": "1"}), \
+                mock.patch.object(deb, "install_and_verify") as install:
+            with self.assertRaisesRegex(RuntimeError, "original DEB package filename"):
+                deb.inside_container()
+            install.assert_not_called()
+
     def test_rejects_local_self_hosted_wrong_identity_and_wrong_image_without_mutation(self):
         invalid = {"QCOPILOTS_SEARCH_CI_CONTAINER": "", "GITHUB_ACTIONS": "false",
             "RUNNER_ENVIRONMENT": "self-hosted", "GITHUB_RUN_ID": "0", "GITHUB_RUN_ATTEMPT": "x",
