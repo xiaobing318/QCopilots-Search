@@ -818,7 +818,7 @@ void CoreTest::settingsRoundTrip()
     first.mediaOpener.preset = QStringLiteral("mpv");
     first.mediaOpener.program = env.path(QStringLiteral("播放器/mpv"));
     first.mediaOpener.arguments = {QStringLiteral("--start={seconds}"), QStringLiteral("{path}")};
-    QCOMPARE(first.toJson().value(QStringLiteral("version")).toInt(), 2);
+    QCOMPARE(first.toJson().value(QStringLiteral("version")).toInt(), 3);
     QVERIFY2(first.save(paths.configFile, &error), qPrintable(error));
     AppSettings second;
     QVERIFY2(second.load(paths.configFile, &error), qPrintable(error));
@@ -885,7 +885,7 @@ void CoreTest::generalFileRulesUpgrade()
         QVERIFY2(reloaded.load(settingsPath, &error), qPrintable(error));
         QVERIFY(!reloaded.needsMigration());
         QCOMPARE(reloaded.toJson(), loaded.toJson());
-        QCOMPARE(reloaded.toJson().value("version").toInt(), 2);
+        QCOMPARE(reloaded.toJson().value("version").toInt(), 3);
         QCOMPARE(reloaded.toJson().value("generalFileRules").toObject().size(), 10);
     }
 }
@@ -1050,7 +1050,7 @@ void CoreTest::settingsV1Migration()
     QVERIFY(file.open(QIODevice::ReadOnly));
     const auto saved = QJsonDocument::fromJson(file.readAll()).object();
     file.close();
-    QCOMPARE(saved.value(QStringLiteral("version")).toInt(), 2);
+    QCOMPARE(saved.value(QStringLiteral("version")).toInt(), 3);
     AppSettings reloaded;
     QVERIFY2(reloaded.load(file.fileName(), &error), qPrintable(error));
     QVERIFY(!reloaded.needsMigration());
@@ -1081,7 +1081,7 @@ void CoreTest::settingsRejectUnsupportedTypes()
     const auto before = parsed.toJson();
     QString error;
     auto json = original.toJson();
-    json["version"] = 3;
+    json["version"] = 4;
     QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
     QCOMPARE(parsed.toJson(), before);
     json = original.toJson();
@@ -1260,7 +1260,7 @@ void CoreTest::invalidVectors()
     object["embedding"] = QJsonArray{1.0, "bad", 2.0};
     QVERIFY(Segment::fromJson(object).embedding.isEmpty());
     QJsonArray tooMany;
-    for (int i = 0; i <= embeddingDimensions; ++i)
+    for (int i = 0; i <= maximumEmbeddingDimensions; ++i)
         tooMany.append(0.0);
     object["embedding"] = tooMany;
     QVERIFY(Segment::fromJson(object).embedding.isEmpty());

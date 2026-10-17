@@ -172,7 +172,7 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
                     if (hits_.isEmpty() && !debounce_.isActive()) debounce_.start();
                 }
             }
-            else debounce_.start();
+            else refreshSearchForIndexChange();
             if (popup_ && popup_->isVisible()) {
                 if (popupQuery_->text().trimmed().isEmpty() && !popupBrowse_.generation.isEmpty() && !popupBrowse_.pending
                     && popupDisplayedContext_ == searchContext(true)) {
@@ -181,12 +181,18 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
                         if (popupHits_.isEmpty() && !popupDebounce_.isActive()) popupDebounce_.start();
                     }
                 }
-                else popupDebounce_.start();
+                else refreshSearchForIndexChange(true);
             }
         }
     });
     refresh_.setInterval(2500);
-    connect(&refresh_, &QTimer::timeout, this, [this] { if (connected_ && !pending_.values().contains("status")) send("status"); });
+    connect(&refresh_, &QTimer::timeout, this, [this] {
+        if (!connected_) return;
+        if (!pending_.values().contains("status")) send("status");
+        if (auto *dialog = findChild<SettingsDialog *>(); dialog && dialog->isVisible()
+            && !pending_.values().contains("models.status"))
+            modelStatusRequests_.insert(send("models.status", {{"modelId", dialog->selectedModelId()}}), dialog);
+    });
     refresh_.start();
     auto *find = new QShortcut(QKeySequence::Find, this);
     connect(find, &QShortcut::activated, this, &MainWindow::showSearch);
@@ -355,7 +361,8 @@ void MainWindow::applyLanguage() {
     refreshFiles_->setText(label("Refresh files", "刷新文件列表"));
     loadMore_->setText(label("Load more files", "加载更多文件"));
     if (popupRefreshFiles_) popupRefreshFiles_->setText(refreshFiles_->text());
-    modelButton_->setText(modelAvailable_ ? label("Model ready", "模型已就绪") : label("Add model", "添加模型"));
+    modelButton_->setText(label("Manage models", "管理模型"));
+    modelButton_->setToolTip(modelAvailable_ ? label("The current model passed loading preflight. Manage or switch models.", "当前模型已通过加载预检。可管理或切换模型。") : label("Keyword search is available. Download and apply a model for semantic search.", "关键词搜索可用。下载并应用模型以启用语义搜索。"));
     settingsButton_->setText(label("Settings", "设置"));
     indexButton_->setText(label("Rescan", "重新扫描"));
     pauseButton_->setText(indexState_ == "paused" ? label("Resume", "继续") : label("Pause", "暂停"));
@@ -431,7 +438,7 @@ void MainWindow::updateRuntimeStatus() {
             : state == "disconnected" ? label("disconnected", "已断开")
             : label("initializing", "初始化中");
         QString detail = item.value("name").toString() + QStringLiteral(" · ") + stateText
-            + label(" · %1 batches completed", " · 已完成 %1 批次").arg(item.value("completedTasks").toInteger());
+            + label(" · %1 cumulative batches completed", " · 累计完成 %1 批次").arg(item.value("completedTasks").toInteger());
         const QString activePath = item.value("activePath").toString();
         if (connected_ && !activePath.isEmpty()) detail += QStringLiteral(" · ") + QFileInfo(activePath).fileName();
         const QString deviceError = item.value("error").toString();
@@ -447,6 +454,8 @@ void MainWindow::updateRuntimeStatus() {
     QString tooltip = runtime_.value("deviceDescription").toString();
     if (!deviceDetails.isEmpty()) {
         if (!tooltip.isEmpty()) tooltip += '\n';
+        tooltip += label("Batch counts are cumulative, not file counts. A file can require multiple batches, and indexing a changed file adds more batches.\n\n",
+                         "批次数是累计处理量，不是文件数。一个文件可能分多批处理，文件修改后重新索引也会增加批次。\n\n");
         tooltip += deviceDetails.join(QStringLiteral("\n\n"));
     }
     runtimeStatus_->setToolTip(tooltip);
@@ -476,11 +485,12 @@ QJsonObject MainWindow::searchContext(bool popup) const {
     return {{"query", (popup ? popupQuery_ : query_)->text().trimmed()},
         {"code", code}, {"kind", popup || code ? "" : kind_->currentData().toString()},
         {"root", popup ? "" : root_->currentData().toString()},
+        {"modelId", settings_.modelId},
         {"configuredRoots", QJsonArray::fromStringList(code ? settings_.codeRoots : settings_.roots)},
         {"configuredExcludes", QJsonArray::fromStringList(code ? settings_.codeExcludes : settings_.excludes)}};
 }
 void MainWindow::sendSearch(bool popup) {
-    if (!connected_) return;
+    if (!connected_ || quitting_ || (popup && (!popup_ || !popup_->isVisible()))) return;
     SearchEdit *input = popup ? popupQuery_ : query_;
     if (!input || input->isComposing()) return;
     (popup ? popupDebounce_ : debounce_).stop();
@@ -489,7 +499,7 @@ void MainWindow::sendSearch(bool popup) {
     const auto context = searchContext(popup);
     const bool browse = context.value("query").toString().isEmpty();
     auto parameters = context;
-    parameters.remove("configuredRoots"); parameters.remove("configuredExcludes");
+    parameters.remove("configuredRoots"); parameters.remove("configuredExcludes"); parameters.remove("modelId");
     parameters.insert("limit", popup ? 12 : 100);
     if (browse) parameters.remove("query"); else parameters.insert("semantic", true);
     auto &state = popup ? popupBrowse_ : browse_;
@@ -502,13 +512,25 @@ void MainWindow::sendSearch(bool popup) {
     (popup ? popupStatus_ : summary_)->setText(browse ? label("Loading files…", "正在加载文件…") : label("Searching…", "正在搜索…"));
     updateBrowseControls(popup);
 }
+void MainWindow::refreshSearchForIndexChange(bool popup) {
+    const auto id = popup ? popupSearch_ : currentSearch_;
+    auto request = resultRequests_.find(id);
+    if (request != resultRequests_.end() && !request->browse
+        && request->context == searchContext(popup)) {
+        // Reconciliation can publish while a cold query model is still loading.
+        // Keep that request alive and coalesce publications into one refresh.
+        request->refreshAfterResponse = true;
+        return;
+    }
+    (popup ? popupDebounce_ : debounce_).start();
+}
 void MainWindow::loadMoreFiles(bool popup) {
     auto &state = popup ? popupBrowse_ : browse_;
     const auto context = searchContext(popup);
     if (!connected_ || !context.value("query").toString().isEmpty() || state.loading || state.stale || state.cursor.isEmpty()
         || context != (popup ? popupDisplayedContext_ : displayedSearchContext_)) return;
     auto parameters = context;
-    parameters.remove("query"); parameters.remove("configuredRoots"); parameters.remove("configuredExcludes");
+    parameters.remove("query"); parameters.remove("configuredRoots"); parameters.remove("configuredExcludes"); parameters.remove("modelId");
     parameters.insert("limit", popup ? 12 : 100);
     parameters.insert("cursor", state.cursor);
     QString &request = popup ? popupSearch_ : currentSearch_;
@@ -638,14 +660,29 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
             if (!warning.isEmpty()) showError(warning, ErrorSource::SearchWarning);
             else clearError(ErrorSource::SearchWarning);
         }
+        if (request.refreshAfterResponse && (!popup || popup_->isVisible()))
+            (popup ? popupDebounce_ : debounce_).start();
     } else if (method == "document.preview") {
         if (id == documentRequest_ && preview_->currentHit().path == documentPath_) {
             const bool append = documentStart_ > 0;
             documentRequest_.clear();
             preview_->setDocumentPreview(data, append);
         }
-    } else if (method == "settings.get" || method == "settings.set") {
+    } else if (method == "models.status") {
+        if (auto dialog = modelStatusRequests_.take(id)) dialog->setModelStatus(data);
+    } else if (method == "settings.get" || method == "settings.set" || method == "settings.reload" || method == "models.select") {
         applySettings(data.contains("settings") ? data.value("settings").toObject() : data);
+        if (auto dialog = settingsOperations_.take(id)) {
+            dialog->setModelOperationPending(false);
+            if (method == "settings.reload") {
+                connect(dialog.data(), &QObject::destroyed, this, [this] { showSettings(false, true); });
+                dialog->reject();
+            } else {
+                const auto request = send("models.status", {{"modelId", dialog->selectedModelId()}});
+                modelStatusRequests_.insert(request, dialog);
+            }
+        }
+        if (method != "settings.get") send("status");
         if (!shownOnboarding_ && onboarding_) {
             shownOnboarding_ = true;
             if (settings_.roots.isEmpty()) QTimer::singleShot(0, this, [this] { showSettings(true); });
@@ -673,6 +710,8 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
 void MainWindow::handleFailure(const QString &id, const QString &code, const QString &message) {
     const QString method = pending_.take(id);
     if (method.isEmpty()) return;
+    if (auto dialog = modelStatusRequests_.take(id)) { dialog->setModelStatusError(message.isEmpty() ? code : message); return; }
+    if (auto dialog = settingsOperations_.take(id)) dialog->setModelError(message.isEmpty() ? code : message);
     if (method == "search" || method == "files.list") {
         if (!resultRequests_.contains(id)) return;
         const auto request = resultRequests_.take(id);
@@ -722,7 +761,21 @@ void MainWindow::applySettings(const QJsonObject &json) {
     if (!AppSettings::fromJson(json, &parsed, &error)) { showError(error); return; }
     const auto previousContext = searchContext(false);
     const auto previousPopupContext = popup_ ? searchContext(true) : QJsonObject{};
+    const bool modelChanged = settingsLoaded_ && settings_.modelId != parsed.modelId;
     settings_ = parsed;
+    if (modelChanged) {
+        for (const auto &request : {currentSearch_, popupSearch_, documentRequest_}) {
+            if (!request.isEmpty()) { backend_->cancel(request); pending_.remove(request); resultRequests_.remove(request); }
+        }
+        currentSearch_.clear(); popupSearch_.clear(); documentRequest_.clear();
+        hits_.clear(); results_->clear(); selectResult(-1);
+        popupHits_.clear();
+        if (popupResults_) popupResults_->clear();
+        browse_ = {}; popupBrowse_ = {};
+        displayedSearchContext_ = {}; popupDisplayedContext_ = {};
+        modelAvailable_ = false;
+        runtime_.insert("loaded", false);
+    }
     language_ = settings_.language == "system" ? QLocale::system().name() : settings_.language;
     code_->setEnabled(settings_.includeCode);
     if (!settings_.includeCode) code_->setChecked(false);
@@ -731,6 +784,7 @@ void MainWindow::applySettings(const QJsonObject &json) {
     if (!settingsLoaded_ || previousContext != searchContext(false)) debounce_.start();
     if (popup_ && popup_->isVisible() && (!settingsLoaded_ || previousPopupContext != searchContext(true))) popupDebounce_.start();
     settingsLoaded_ = true;
+    if (auto *dialog = findChild<SettingsDialog *>()) dialog->updateConfiguredModel(settings_.modelId);
 }
 void MainWindow::refreshRoots() {
     const QSignalBlocker rootBlocker(root_);
@@ -766,8 +820,8 @@ void MainWindow::updateProgress(const QJsonObject &value) {
     if (!error.isEmpty()) showError(error, ErrorSource::IndexProgress);
     else clearError(ErrorSource::IndexProgress);
 }
-void MainWindow::showSettings(bool firstRun) {
-    if (auto *existing = findChild<SettingsDialog *>()) { existing->raise(); existing->activateWindow(); return; }
+void MainWindow::showSettings(bool firstRun, bool modelsPage) {
+    if (auto *existing = findChild<SettingsDialog *>()) { if (modelsPage) existing->showModelsPage(); existing->raise(); existing->activateWindow(); return; }
     const bool allowStartup = PlatformIntegration::canSetStartAtLogin(paths_.profileDir, paths_.modelDir);
     SettingsDialog::StartupOptions startup;
     startup.allowed = allowStartup;
@@ -789,16 +843,36 @@ void MainWindow::showSettings(bool firstRun) {
         // These JSON-only rules have no controls here. Preserve the service's
         // current values, including updates made while this dialog was open.
         changes.remove("generalFileRules");
-        send("settings.set", changes);
+        // A model switch made by another client must survive a preferences-only
+        // save from a dialog opened before that switch.
+        if (!dialog->modelChangeRequested()) changes.remove("modelId");
+        send("settings.set", changes, 600000);
     });
+    const auto requestModelStatus = [this, dialog](const QString &modelId) {
+        modelStatusRequests_.insert(send("models.status", {{"modelId", modelId}}), dialog);
+    };
+    connect(dialog, &SettingsDialog::modelStatusRequested, this, requestModelStatus);
+    connect(dialog, &SettingsDialog::manageModelRequested, this, [this, dialog, requestModelStatus](const QString &modelId) {
+        auto *models = new ModelDialog(paths_.modelDir, language_, modelId, dialog);
+        models->setAttribute(Qt::WA_DeleteOnClose);
+        connect(models, &ModelDialog::modelsReady, dialog, [dialog, requestModelStatus, modelId] {
+            dialog->noteVerifiedModel(modelId);
+            requestModelStatus(modelId);
+        });
+        models->open();
+    });
+    connect(dialog, &SettingsDialog::applyModelRequested, this, [this, dialog](const QString &modelId) {
+        settingsOperations_.insert(send("models.select", {{"modelId", modelId}}, 600000), dialog);
+    });
+    connect(dialog, &SettingsDialog::reloadSettingsRequested, this, [this, dialog] {
+        settingsOperations_.insert(send("settings.reload", {}, 600000), dialog);
+    });
+    if (modelsPage) dialog->showModelsPage();
     dialog->open();
+    requestModelStatus(dialog->selectedModelId());
 }
 void MainWindow::showModels() {
-    if (auto *existing = findChild<ModelDialog *>()) { existing->raise(); existing->activateWindow(); return; }
-    auto *dialog = new ModelDialog(paths_.modelDir, language_, this);
-    dialog->setAttribute(Qt::WA_DeleteOnClose);
-    connect(dialog, &ModelDialog::modelsReady, this, [this] { if (!modelAvailable_) { modelReloadAttempts_ = 0; send("models.reload", {}, 120000); } });
-    dialog->open();
+    showSettings(false, true);
 }
 void MainWindow::showError(const QString &message, ErrorSource source) {
     errorSource_ = source;

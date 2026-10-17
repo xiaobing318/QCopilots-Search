@@ -6,6 +6,7 @@
 #include "core/types.h"
 #include "core/app_settings.h"
 #include "core/file_catalog.h"
+#include "core/model_catalog.h"
 #include "core/pipeline_manifest.h"
 #include "storage/index_repository.h"
 #include "support/test_environment.h"
@@ -50,6 +51,13 @@ int controlledWorker(const QStringList &arguments) {
     const QString mode = arguments.at(3);
     const QString gates = arguments.at(4);
     const int delayMs = arguments.at(5).toInt();
+    const int modelArgument = arguments.indexOf(QStringLiteral("--model"));
+    const QString modelId = modelArgument < 0 ? QStringLiteral("embeddinggemma-2")
+        : arguments.value(modelArgument + 1);
+    const auto *model = findModel(modelId);
+    if (!model) return 2;
+    const int dimensions = model->dimensions;
+    const QString modelFingerprint = modelPipelineFingerprint(modelId);
     const int deviceArgument = arguments.indexOf(QStringLiteral("--device"));
     const auto device = deviceArgument < 0 ? QJsonObject{} : QJsonDocument::fromJson(
         arguments.value(deviceArgument + 1).toUtf8()).object();
@@ -57,6 +65,7 @@ int controlledWorker(const QStringList &arguments) {
     const auto record = [&](QJsonObject event) {
         event.insert("pid", QString::number(QCoreApplication::applicationPid()));
         event.insert("deviceId", deviceId);
+        event.insert("modelId", modelId);
         // Independent peers append to one fixture log. Serialize the append so
         // simultaneous startup or completion cannot lose an observable event.
         QLockFile lock(logPath + ".lock");
@@ -130,7 +139,7 @@ int controlledWorker(const QStringList &arguments) {
             }
             runtimeEvent("inference-end");
         }
-        QJsonObject result;
+        QJsonObject result, contractOverride;
         if (operation == "extract") {
             const QString path = request.value("path").toString();
             const int offset = request.value("offset").toInt();
@@ -140,6 +149,7 @@ int controlledWorker(const QStringList &arguments) {
             QFile source(path);
             if (!source.open(QIODevice::ReadOnly)) return 5;
             const auto fixture = QJsonDocument::fromJson(source.readAll()).object();
+            contractOverride = fixture.value("contractOverride").toObject();
             if (!fixture.value("errorCode").toString().isEmpty()) {
                 const auto response = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"ok", false},
                     {"error", QJsonObject{{"code", fixture.value("errorCode")},
@@ -160,8 +170,8 @@ int controlledWorker(const QStringList &arguments) {
                 segment.modality = "text";
                 segment.text = fixture.value("token").toString("controlledkeyword") + u' ' + QString::number(i);
                 segment.lineStart = i + 1; segment.lineEnd = i + 1;
-                if (request.value("embed").toBool()) {
-                    segment.embedding.fill(0.0f, embeddingDimensions);
+                if (request.value("embed").toBool() || fixture.value("forceEmbedding").toBool()) {
+                    segment.embedding.fill(0.0f, dimensions);
                     segment.embedding[0] = 1.0f;
                 }
                 segments.append(segment.toJson());
@@ -170,13 +180,16 @@ int controlledWorker(const QStringList &arguments) {
             result = {{"segments", segments}, {"state", complete ? "complete" : "partial"},
                 {"complete", complete}, {"next", next}, {"sourceVersion", request.value("expectedVersion")},
                 {"extractionFingerprint", extractionPipelineFingerprint()},
-                {"modelFingerprint", embeddingPipelineFingerprint()}};
+                {"modelFingerprint", request.value("embed").toBool() ? modelFingerprint : QString{}}};
         } else if (operation == "query") {
             if (!record({{"event", operation}}) || !waitForGate("query")) return 4;
             QJsonArray embedding;
-            for (int i = 0; i < embeddingDimensions; ++i) embedding.append(i == 0 ? 1.0 : 0.0);
-            result = {{"embedding", embedding}, {"modelFingerprint", embeddingPipelineFingerprint()}};
+            for (int i = 0; i < dimensions; ++i) embedding.append(i == 0 ? 1.0 : 0.0);
+            result = {{"embedding", embedding}, {"modelFingerprint", modelFingerprint}};
         } else return 6;
+        result.insert("modelId", modelId);
+        result.insert("dimensions", dimensions);
+        result.insert("embeddingFingerprint", modelFingerprint);
         // Unbound peers identify as CPU so strict GPU tests detect silent
         // fallback. Explicit device fixtures report their independent GPU.
         result.insert("runtime", QJsonObject{{"buildVariant", "test-cpu"}, {"requestedBackend", "auto"},
@@ -191,6 +204,13 @@ int controlledWorker(const QStringList &arguments) {
                 {"gpuSelfTestPassed", true}, {"textWarmupCompleted", true},
                 {"fallbackReason", ""}, {"loaded", true}, {"error", ""}});
         }
+        auto runtime = result.value("runtime").toObject();
+        runtime.insert("modelId", modelId);
+        runtime.insert("dimensions", dimensions);
+        runtime.insert("embeddingFingerprint", modelFingerprint);
+        result.insert("runtime", runtime);
+        for (auto it = contractOverride.cbegin(); it != contractOverride.cend(); ++it)
+            result.insert(it.key(), it.value());
         if (delayMs > 0) QThread::msleep(static_cast<unsigned long>(delayMs));
         const auto response = QJsonDocument(QJsonObject{{"id", request.value("id")}, {"ok", true}, {"result", result}})
             .toJson(QJsonDocument::Compact);
@@ -247,9 +267,13 @@ struct ControlledWorkers {
         result.verifyModels = [models](QString *) { return models; };
         result.configureWorker = [*this, delayMs](QProcess &worker, bool query) {
             const bool probe = worker.property("qcsDeviceProbe").toBool();
+            const auto originalArguments = worker.arguments();
+            const int modelArgument = originalArguments.indexOf(QStringLiteral("--model"));
+            const QString modelId = modelArgument < 0 ? QStringLiteral("embeddinggemma-2")
+                : originalArguments.value(modelArgument + 1);
             worker.setProgram(QCoreApplication::applicationFilePath());
             worker.setArguments({"--qcs-test-worker", probe ? QDir(root).filePath("probe.jsonl") : logPath(query),
-                probe ? "probe" : query ? "query" : "index", root, QString::number(delayMs)});
+                probe ? "probe" : query ? "query" : "index", root, QString::number(delayMs), "--model", modelId});
         };
         return result;
     }
@@ -800,7 +824,7 @@ private slots:
         QVERIFY(repository.fileVersion(file.path).contains("|failed:"));
     }
 
-    void pipelineFailureRollsBackAndDisablesInference() {
+    void pipelineStartupFaultRollsBackAndAvailabilityDoesNotMigrate() {
         TestEnvironment environment("service-pipeline-fault");
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
         QVERIFY(environment.writeFile("selected/document.txt", "pipelinefailurekeyword"));
@@ -847,23 +871,544 @@ private slots:
         const auto oldPipeline = initial.value("pipelineFingerprint").toString();
         QVERIFY(!oldPipeline.isEmpty());
         available = true; failCommit = true;
-        const auto failure = localCall(client, "models.reload");
-        QCOMPARE(failure.value("error").toObject().value("code").toString(), QStringLiteral("pipeline_transition_failed"));
+        // File availability is not an embedding-space change. Even with a
+        // failing migration hook, making the same model available is harmless.
+        QVERIFY(localCall(client, "models.reload").value("ok").toBool());
         const auto status = localCall(client, "status").value("result").toObject();
-        QVERIFY(!status.value("modelAvailable").toBool());
+        QVERIFY(status.value("modelAvailable").toBool());
         QCOMPARE(status.value("pipelineFingerprint").toString(), oldPipeline);
-        QVERIFY(status.value("pipelineTransitionError").toString().contains("injected pipeline disk failure"));
+        QVERIFY(status.value("pipelineTransitionError").toString().isEmpty());
+        available = false;
+        QVERIFY(localCall(client, "models.reload").value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(localCall(client, "status").value("result").toObject().value("catalogReady").toBool(), 5000);
         const auto search = localCall(client, "search", {{"query", "pipelinefailurekeyword"}, {"semantic", true}}).value("result").toObject();
         QVERIFY(!search.value("semantic").toBool());
         QCOMPARE(search.value("hits").toArray().size(), 1);
-        QVERIFY(search.value("warning").toString().contains("pipeline"));
-        QCOMPARE(localCall(client, "index.start").value("result").toObject().value("state").toString(), QStringLiteral("error"));
         failCommit = false;
+        available = true;
         QVERIFY(localCall(client, "models.reload").value("ok").toBool());
         const auto recovered = localCall(client, "status").value("result").toObject();
         QVERIFY(recovered.value("modelAvailable").toBool());
         QVERIFY(recovered.value("pipelineTransitionError").toString().isEmpty());
-        QVERIFY(recovered.value("pipelineFingerprint").toString() != oldPipeline);
+        QCOMPARE(recovered.value("pipelineFingerprint").toString(), oldPipeline);
+        client.disconnectFromService(); service.stop();
+    }
+
+    void modelCatalogStatusAndFailedSelectionPreserveActiveSettings() {
+        TestEnvironment environment("service-model-settings");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.indexingPaused = true;
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        auto dependencies = workers.dependencies(true);
+        bool rejectProbe = false;
+        dependencies.probeModel = [&](const QString &modelId, QString *message) {
+            if (!rejectProbe || modelId == QStringLiteral("embeddinggemma-2")) return true;
+            if (message) *message = QStringLiteral("injected target model load failure");
+            return false;
+        };
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            const auto status = localCall(client, "status").value("result").toObject();
+            return status.value("modelAvailable").toBool() && !status.value("modelLoading").toBool()
+                && status.value("catalogReady").toBool();
+        })(), 5000);
+        const auto catalog = localCall(client, "models.list");
+        QVERIFY(catalog.value("ok").toBool());
+        const auto entries = catalog.value("result").toObject().value("models").toArray();
+        QCOMPARE(entries.size(), 3);
+        const QStringList modelIds{QStringLiteral("embeddinggemma-2"),
+            QStringLiteral("qwen3-vl-embedding-2b"), QStringLiteral("qwen3-vl-embedding-8b")};
+        const QList<int> dimensions{768, 2048, 4096};
+        QSet<QString> listedModels;
+        for (const auto &entry : entries) listedModels.insert(entry.toObject().value("id").toString());
+        QCOMPARE(listedModels, QSet<QString>(modelIds.cbegin(), modelIds.cend()));
+        for (qsizetype i = 0; i < modelIds.size(); ++i) {
+            const auto response = localCall(client, "models.status", {{"modelId", modelIds.at(i)}});
+            QVERIFY(response.value("ok").toBool());
+            const auto result = response.value("result").toObject();
+            QCOMPARE(result.value("modelId").toString(), modelIds.at(i));
+            QCOMPARE(result.value("dimensions").toInt(), dimensions.at(i));
+            QCOMPARE(result.value("configuredModelId").toString(), modelIds.first());
+            QCOMPARE(result.value("activeModelId").toString(), modelIds.first());
+            QCOMPARE(result.value("indexDirectory").toString(), paths.forModelIndex(modelIds.at(i)).indexDir);
+            QCOMPARE(result.value("indexState").toString(), i == 0 ? QStringLiteral("empty") : QStringLiteral("not-built"));
+            QCOMPARE(result.value("capabilities").toObject().value("audio").toBool(), i == 0);
+            QVERIFY(result.value("capabilities").toObject().value("image").toBool());
+            QVERIFY(result.value("capabilities").toObject().value("videoFrames").toBool());
+        }
+        const auto before = localCall(client, "settings.get").value("result").toObject();
+        QVERIFY(!localCall(client, "settings.set", {{"modelId", "unknown-model"}}).value("ok").toBool());
+        rejectProbe = true;
+        const auto rejected = localCall(client, "settings.set", {{"modelId", modelIds.at(1)}, {"language", "zh_CN"}});
+        QVERIFY(!rejected.value("ok").toBool());
+        QVERIFY(rejected.value("error").toObject().value("message").toString().contains("injected target model load failure"));
+        QCOMPARE(localCall(client, "settings.get").value("result").toObject(), before);
+        AppSettings persisted;
+        QVERIFY2(persisted.load(paths.configFile, &error), qPrintable(error));
+        QCOMPARE(persisted.toJson(), before);
+
+        // A validated target must not become active before settings persistence
+        // succeeds. A directory at the config path reliably rejects QSaveFile.
+        rejectProbe = false;
+        QVERIFY(QFile::remove(paths.configFile));
+        QVERIFY(QDir().mkdir(paths.configFile));
+        const auto saveFailure = localCall(client, "settings.set", {{"modelId", modelIds.at(1)}});
+        QVERIFY(!saveFailure.value("ok").toBool());
+        QCOMPARE(localCall(client, "settings.get").value("result").toObject(), before);
+        QCOMPARE(localCall(client, "status").value("result").toObject().value("activeModelId").toString(), modelIds.first());
+        QVERIFY(QDir().rmdir(paths.configFile));
+        QVERIFY2(persisted.save(paths.configFile, &error), qPrintable(error));
+        rejectProbe = true;
+
+        // Explicit reload uses the same transactional validation as settings.set.
+        // Write the actual configured path, independent of fixture conventions.
+        QFile malformed(paths.configFile);
+        QVERIFY(malformed.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(malformed.write("{not json"), qint64(9)); malformed.close();
+        QVERIFY(!localCall(client, "settings.reload").value("ok").toBool());
+        QCOMPARE(localCall(client, "settings.get").value("result").toObject(), before);
+        QVERIFY(malformed.open(QIODevice::ReadOnly));
+        QCOMPARE(malformed.readAll(), QByteArray("{not json")); malformed.close();
+        // Keep deliberate CRLF, tabs, key order and an accepted unknown field.
+        // Reload reads this file and must not normalize or rewrite its bytes.
+        const QByteArray handEdited = "{\r\n\t\"version\" : 3,\r\n"
+            "\t\"modelId\" : \"qwen3-vl-embedding-2b\",\r\n"
+            "\t\"roots\": [], \"excludes\": [],\r\n"
+            "\t\"codeRoots\": [], \"codeExcludes\": [],\r\n"
+            "\t\"indexingPaused\" : true,\r\n"
+            "\t\"userNote\" : \"keep this formatting\",\r\n"
+            "\t\"generalFileRules\" : "
+            + QJsonDocument(persisted.generalFileRules.toJson()).toJson(QJsonDocument::Compact)
+            + "\r\n}\r\n  \r\n";
+        QVERIFY(malformed.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(malformed.write(handEdited), qint64(handEdited.size())); malformed.close();
+        QVERIFY(!localCall(client, "settings.reload").value("ok").toBool());
+        QCOMPARE(localCall(client, "settings.get").value("result").toObject(), before);
+        QVERIFY(malformed.open(QIODevice::ReadOnly));
+        QCOMPARE(malformed.readAll(), handEdited); malformed.close();
+        rejectProbe = false;
+        const auto loaded = localCall(client, "settings.reload");
+        QVERIFY2(loaded.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(loaded).toJson())));
+        QCOMPARE(localCall(client, "settings.get").value("result").toObject().value("modelId").toString(), modelIds.at(1));
+        QCOMPARE(localCall(client, "status").value("result").toObject().value("dimensions").toInt(), 2048);
+        QVERIFY(malformed.open(QIODevice::ReadOnly));
+        QCOMPARE(malformed.readAll(), handEdited); malformed.close();
+        QVERIFY(localCall(client, "models.reload").value("ok").toBool());
+        QVERIFY(malformed.open(QIODevice::ReadOnly));
+        QCOMPARE(malformed.readAll(), handEdited); malformed.close();
+        client.disconnectFromService(); service.stop();
+    }
+
+    void startupModelProbePreservesLatestSettingsAndUnappliedDiskEdits() {
+        TestEnvironment environment("service-startup-probe-settings");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("initial/entry.txt", controlledDocument("initialstartupkeyword")));
+        QVERIFY(environment.writeFile("selected/entry.txt", controlledDocument("lateststartupkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("initial")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        std::mutex probeMutex;
+        std::condition_variable probeCondition;
+        bool probeReleased = false;
+        std::atomic_bool probeEntered{false};
+        auto dependencies = workers.dependencies(true);
+        dependencies.probeModel = [&](const QString &, QString *) {
+            std::unique_lock lock(probeMutex);
+            probeEntered.store(true);
+            probeCondition.wait(lock, [&] { return probeReleased; });
+            return true;
+        };
+        ServiceServer service(paths, dependencies);
+        const auto releaseProbe = [&] {
+            { const std::lock_guard lock(probeMutex); probeReleased = true; }
+            probeCondition.notify_all();
+        };
+        // Unblock before destroying the service even if an assertion returns.
+        const auto unblockOnExit = qScopeGuard(releaseProbe);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_VERIFY_WITH_TIMEOUT(probeEntered.load(), 5000);
+        const auto status = [&] { return localCall(client, "status").value("result").toObject(); };
+        QVERIFY(status().value("modelLoading").toBool());
+        QVERIFY(!status().value("modelAvailable").toBool());
+        QVERIFY(workers.events(false, "extract").isEmpty());
+        const auto updated = localCall(client, "settings.set", {
+            {"modelId", "embeddinggemma-2"}, {"roots", QJsonArray{environment.path("selected")}}, {"language", "zh_CN"}});
+        QVERIFY2(updated.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(updated).toJson())));
+        QVERIFY(localCall(client, "index.pause").value("ok").toBool());
+        const auto latest = localCall(client, "settings.get").value("result").toObject();
+        QCOMPARE(latest.value("roots").toArray(), QJsonArray{environment.path("selected")});
+        QCOMPARE(latest.value("language").toString(), QStringLiteral("zh_CN"));
+        QVERIFY(latest.value("indexingPaused").toBool());
+        QVERIFY(status().value("modelLoading").toBool());
+
+        // This is a separate user's edit that has not been explicitly reloaded.
+        // Probe completion may publish model availability, but cannot apply it
+        // or overwrite it with the captured startup settings snapshot.
+        auto diskSettings = settings.toJson();
+        diskSettings.insert("modelId", "qwen3-vl-embedding-8b");
+        diskSettings.insert("language", "en");
+        diskSettings.insert("userNote", "pending manual edit");
+        const QByteArray diskBytes = " \r\n\t" + QJsonDocument(diskSettings).toJson(QJsonDocument::Compact) + "\r\n\r\n";
+        QFile configuration(paths.configFile);
+        QVERIFY(configuration.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(configuration.write(diskBytes), qint64(diskBytes.size())); configuration.close();
+        releaseProbe();
+        QTRY_VERIFY_WITH_TIMEOUT(!status().value("modelLoading").toBool() && status().value("modelAvailable").toBool(), 5000);
+        QCOMPARE(localCall(client, "settings.get").value("result").toObject(), latest);
+        QCOMPARE(status().value("activeModelId").toString(), QStringLiteral("embeddinggemma-2"));
+        QVERIFY(workers.events(false, "extract").isEmpty());
+        QVERIFY(configuration.open(QIODevice::ReadOnly));
+        QCOMPARE(configuration.readAll(), diskBytes); configuration.close();
+        client.disconnectFromService(); service.stop();
+    }
+
+    void unavailableSelectedModelStartsInItsOwnKeywordIndex() {
+        TestEnvironment environment("service-selected-model-keywords");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/entry.txt", controlledDocument("selectedmodelkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings;
+        settings.modelId = QStringLiteral("qwen3-vl-embedding-8b");
+        settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        auto dependencies = workers.dependencies(false);
+        dependencies.verifyModels = [](QString *message) {
+            if (message) *message = QStringLiteral("Selected model files are missing");
+            return false;
+        };
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QJsonObject result;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            result = localCall(client, "search", {{"query", "selectedmodelkeyword"}, {"semantic", true}})
+                .value("result").toObject();
+            return result.value("hits").toArray().size() == 1;
+        })(), 5000);
+        QVERIFY(!result.value("semantic").toBool());
+        const auto status = localCall(client, "status").value("result").toObject();
+        QCOMPARE(status.value("configuredModelId").toString(), settings.modelId);
+        QVERIFY(status.value("activeModelId").toString().isEmpty());
+        QVERIFY(!status.value("modelAvailable").toBool());
+        QCOMPARE(status.value("dimensions").toInt(), 4096);
+        QVERIFY(status.value("modelError").toString().contains("Selected model files are missing"));
+        QCOMPARE(status.value("repository").toObject().value("vectors").toInteger(), qint64(0));
+        QCOMPARE(workers.events(false, "extract").size(), 1);
+        QCOMPARE(workers.events(false, "extract").first().value("modelId").toString(), settings.modelId);
+        client.disconnectFromService(); service.stop();
+        QVERIFY(!QFileInfo::exists(paths.databaseFile()));
+        IndexRepository repository;
+        QVERIFY2(repository.open(paths.forModelIndex(settings.modelId), settings.modelId, &error), qPrintable(error));
+        const auto segments = repository.fileSegments(environment.path("selected/entry.txt"));
+        QCOMPARE(segments.size(), 1);
+        QVERIFY(segments.first().embedding.isEmpty());
+    }
+
+    void keywordWorkersRequireMatchingModelContractAndNoVectors() {
+        TestEnvironment environment("service-keyword-worker-contract");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QList<QPair<QString, QJsonObject>> fixtures{
+            {"wrong-model", {{"contractOverride", QJsonObject{{"modelId", "qwen3-vl-embedding-2b"}}}}},
+            {"wrong-dimensions", {{"contractOverride", QJsonObject{{"dimensions", 2048}}}}},
+            {"wrong-fingerprint", {{"contractOverride", QJsonObject{{"embeddingFingerprint", "foreign-pipeline"}}}}},
+            {"wrong-legacy", {{"contractOverride", QJsonObject{{"modelFingerprint", "foreign-legacy-pipeline"}}}}},
+            {"unexpected-vector", {{"forceEmbedding", true}}},
+            {"valid-keyword", {}}
+        };
+        for (const auto &[name, overrides] : fixtures) {
+            auto fixture = overrides;
+            fixture.insert("token", "keywordcontractcontent");
+            QVERIFY(environment.writeFile("selected/" + name + ".txt", QJsonDocument(fixture).toJson(QJsonDocument::Compact)));
+        }
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        auto dependencies = workers.dependencies(false);
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QJsonObject status;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            status = localCall(client, "status").value("result").toObject();
+            const auto progress = status.value("progress").toObject();
+            return progress.value("completed").toInt() == 1 && progress.value("failed").toInt() == 5;
+        })(), 5000);
+        QVERIFY(!status.value("modelAvailable").toBool());
+        QCOMPARE(status.value("repository").toObject().value("files").toInt(), 1);
+        QCOMPARE(status.value("repository").toObject().value("vectors").toInt(), 0);
+        const auto failures = status.value("failures").toObject();
+        QCOMPARE(failures.size(), 5);
+        for (const auto &[name, overrides] : fixtures) {
+            const auto path = environment.path("selected/" + name + ".txt");
+            if (name == "valid-keyword") QVERIFY(!failures.contains(path));
+            else if (name == "unexpected-vector")
+                QCOMPARE(failures.value(path).toString(), QStringLiteral("Keyword-only worker unexpectedly returned a semantic vector"));
+            else QCOMPARE(failures.value(path).toString(), QStringLiteral("Worker pipeline fingerprint differs from the service build"));
+        }
+        const auto hits = localCall(client, "search", {{"query", "keywordcontractcontent"}, {"semantic", false}})
+            .value("result").toObject().value("hits").toArray();
+        QCOMPARE(hits.size(), 1);
+        QCOMPARE(hits.first().toObject().value("path").toString(), environment.path("selected/valid-keyword.txt"));
+        client.disconnectFromService(); service.stop();
+        IndexRepository repository;
+        QVERIFY2(repository.open(paths, &error), qPrintable(error));
+        for (const auto &[name, overrides] : fixtures) {
+            const auto segments = repository.fileSegments(environment.path("selected/" + name + ".txt"));
+            QCOMPARE(segments.size(), name == "valid-keyword" ? 1 : 0);
+            for (const auto &segment : segments) QVERIFY(segment.embedding.isEmpty());
+        }
+    }
+
+    void modelSwitchReusesIndexesAndInvalidatesChangedFilesWhilePaused() {
+        TestEnvironment environment("service-model-isolation");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/a.txt", controlledDocument("unchangedmodelkeyword")));
+        QVERIFY(environment.writeFile("selected/b.txt", controlledDocument("oldmodelcontentkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        auto dependencies = workers.dependencies(true);
+        dependencies.probeModel = [](const QString &, QString *) { return true; };
+        dependencies.reconcileMs = 60000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        const auto status = [&] { return localCall(client, "status").value("result").toObject(); };
+        const auto hits = [&](const QString &query) {
+            return localCall(client, "search", {{"query", query}, {"semantic", false}})
+                .value("result").toObject().value("hits").toArray();
+        };
+        const auto indexState = [&](const QString &modelId) {
+            return localCall(client, "models.status", {{"modelId", modelId}})
+                .value("result").toObject().value("indexState").toString();
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(status().value("repository").toObject().value("vectors").toInteger(), qint64(2), 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(indexState(QStringLiteral("embeddinggemma-2")), QStringLiteral("ready"), 5000);
+        QCOMPARE(workers.events(false, "extract").size(), 2);
+        const auto firstPage = localCall(client, "files.list", {{"limit", 1}}).value("result").toObject();
+        const auto oldCursor = firstPage.value("nextCursor").toString();
+        QVERIFY(!oldCursor.isEmpty());
+        const QString qwen = QStringLiteral("qwen3-vl-embedding-2b");
+        QVERIFY(localCall(client, "settings.set", {{"modelId", qwen}}).value("ok").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(status().value("repository").toObject().value("vectors").toInteger(), qint64(2), 5000);
+        QCOMPARE(status().value("dimensions").toInt(), 2048);
+        QTRY_COMPARE_WITH_TIMEOUT(indexState(qwen), QStringLiteral("ready"), 5000);
+        QCOMPARE(indexState(QStringLiteral("embeddinggemma-2")), QStringLiteral("cached"));
+        QCOMPARE(workers.events(false, "extract").size(), 4);
+        QCOMPARE(localCall(client, "files.list", {{"limit", 1}, {"cursor", oldCursor}})
+            .value("error").toObject().value("code").toString(), QStringLiteral("cursor_stale"));
+        QVERIFY(localCall(client, "index.pause").value("ok").toBool());
+        QVERIFY(localCall(client, "settings.set", {{"modelId", "embeddinggemma-2"}}).value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(status().value("catalogReady").toBool(), 5000);
+        QCOMPARE(status().value("repository").toObject().value("vectors").toInteger(), qint64(2));
+        QCOMPARE(hits("oldmodelcontentkeyword").size(), 1);
+        QCOMPARE(indexState(QStringLiteral("embeddinggemma-2")), QStringLiteral("ready"));
+        QCOMPARE(indexState(qwen), QStringLiteral("cached"));
+        QCOMPARE(workers.events(false, "extract").size(), 4);
+
+        // Change a source while Gemma is inactive. The old text and vector must
+        // disappear during reconciliation even though inference stays paused.
+        QVERIFY(localCall(client, "settings.set", {{"modelId", qwen}}).value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(status().value("catalogReady").toBool(), 5000);
+        QVERIFY(environment.writeFile("selected/b.txt", controlledDocument("replacementmodelcontentkeywordwithdifferentsize")));
+        QVERIFY(localCall(client, "settings.set", {{"modelId", "embeddinggemma-2"}}).value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(status().value("catalogReady").toBool(), 5000);
+        QVERIFY(hits("oldmodelcontentkeyword").isEmpty());
+        QCOMPARE(hits("unchangedmodelkeyword").size(), 1);
+        QCOMPARE(status().value("repository").toObject().value("vectors").toInteger(), qint64(1));
+        QCOMPARE(indexState(QStringLiteral("embeddinggemma-2")), QStringLiteral("pending"));
+        QCOMPARE(indexState(qwen), QStringLiteral("cached"));
+        QCOMPARE(workers.events(false, "extract").size(), 4);
+        QVERIFY(localCall(client, "index.resume").value("ok").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(hits("replacementmodelcontentkeywordwithdifferentsize").size(), 1, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(indexState(QStringLiteral("embeddinggemma-2")), QStringLiteral("ready"), 5000);
+        QCOMPARE(workers.events(false, "extract").size(), 5);
+        const auto semantic = localCall(client, "search", {{"query", "unchangedmodelkeyword"}, {"semantic", true}});
+        QVERIFY2(semantic.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(semantic).toJson())));
+        QVERIFY(semantic.value("result").toObject().value("semantic").toBool());
+        client.disconnectFromService(); service.stop();
+
+        for (const auto &modelId : {QStringLiteral("embeddinggemma-2"), qwen}) {
+            IndexRepository repository;
+            QVERIFY2(repository.open(paths.forModelIndex(modelId), modelId, &error), qPrintable(error));
+            const auto segments = repository.fileSegments(environment.path("selected/a.txt"), false, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(segments.size(), 1);
+            QCOMPARE(segments.first().embedding.size(), modelId == qwen ? 2048 : 768);
+        }
+    }
+
+    void modelSwitchDiscardsOldWorkerPublication() {
+        TestEnvironment environment("service-model-late-worker");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/entry.txt", controlledDocument("modelgenerationkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        QVERIFY(workers.block(false, "entry.txt-0"));
+        auto dependencies = workers.dependencies(true);
+        dependencies.probeModel = [](const QString &, QString *) { return true; };
+        dependencies.workerShutdownGraceMs = 1000;
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        QTRY_COMPARE_WITH_TIMEOUT(workers.events(false, "extract").size(), 1, 5000);
+        QCOMPARE(workers.events(false, "extract").first().value("modelId").toString(), QStringLiteral("embeddinggemma-2"));
+        const QString qwen = QStringLiteral("qwen3-vl-embedding-8b");
+        QVERIFY(localCall(client, "settings.set", {{"modelId", qwen}, {"indexingPaused", true}}).value("ok").toBool());
+        QVERIFY(workers.release(false, "entry.txt-0"));
+        const auto status = [&] { return localCall(client, "status").value("result").toObject(); };
+        QTRY_VERIFY_WITH_TIMEOUT(status().value("catalogReady").toBool(), 5000);
+        QCOMPARE(status().value("dimensions").toInt(), 4096);
+        QCOMPARE(status().value("repository").toObject().value("vectors").toInteger(), qint64(0));
+        QVERIFY(localCall(client, "index.resume").value("ok").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(status().value("repository").toObject().value("vectors").toInteger(), qint64(1), 5000);
+        QCOMPARE(workers.events(false, "extract").size(), 2);
+        QCOMPARE(workers.events(false, "extract").last().value("modelId").toString(), qwen);
+        const auto semantic = localCall(client, "search", {{"query", "modelgenerationkeyword"}, {"semantic", true}});
+        QVERIFY2(semantic.value("ok").toBool(), qPrintable(QString::fromUtf8(QJsonDocument(semantic).toJson())));
+        QVERIFY(semantic.value("result").toObject().value("semantic").toBool());
+        client.disconnectFromService(); service.stop();
+        {
+            IndexRepository oldRepository;
+            QVERIFY2(oldRepository.open(paths, &error), qPrintable(error));
+            QVERIFY(oldRepository.fileSegments(environment.path("selected/entry.txt")).isEmpty());
+        }
+        {
+            IndexRepository selectedRepository;
+            QVERIFY2(selectedRepository.open(paths.forModelIndex(qwen), qwen, &error), qPrintable(error));
+            const auto segments = selectedRepository.fileSegments(environment.path("selected/entry.txt"));
+            QCOMPARE(segments.size(), 1);
+            QCOMPARE(segments.first().embedding.size(), 4096);
+        }
+    }
+
+    void retiredModelWorkerCannotOverwriteSelectedRuntimeStatus() {
+        TestEnvironment environment("service-retired-model-runtime");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/entry.txt", controlledDocument("runtimeidentitykeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        auto dependencies = workers.dependencies(true);
+        dependencies.probeModel = [](const QString &, QString *) { return true; };
+        dependencies.indexIdleMs = 60000;
+        std::unique_ptr<QSignalSpy> oldWorkerFinished;
+        const auto configureWorker = dependencies.configureWorker;
+        dependencies.configureWorker = [&](QProcess &worker, bool query) {
+            configureWorker(worker, query);
+            if (!query && !worker.property("qcsDeviceProbe").toBool() && !oldWorkerFinished)
+                oldWorkerFinished = std::make_unique<QSignalSpy>(&worker,
+                    qOverload<int, QProcess::ExitStatus>(&QProcess::finished));
+        };
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        const auto indexRuntime = [&] {
+            return localCall(client, "status").value("result").toObject()
+                .value("runtimeWorkers").toObject().value("index").toObject();
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(indexRuntime().value("loaded").toBool(), 5000);
+        QCOMPARE(indexRuntime().value("modelId").toString(), QStringLiteral("embeddinggemma-2"));
+        QVERIFY(oldWorkerFinished);
+        QVERIFY(oldWorkerFinished->isValid());
+        QTRY_COMPARE_WITH_TIMEOUT(localCall(client, "status").value("result").toObject()
+            .value("repository").toObject().value("vectors").toInteger(), qint64(1), 5000);
+        QVERIFY(oldWorkerFinished->isEmpty());
+        const QString qwen = QStringLiteral("qwen3-vl-embedding-2b");
+        QVERIFY(localCall(client, "settings.set", {{"modelId", qwen}, {"indexingPaused", true}}).value("ok").toBool());
+        // Pool reset terminates the old process. The service connected its
+        // finished handler first, so this proves runtimeStopped has run.
+        QTRY_COMPARE_WITH_TIMEOUT(oldWorkerFinished->size(), 1, 5000);
+        const auto selectedRuntime = indexRuntime();
+        QCOMPARE(selectedRuntime.value("modelId").toString(), qwen);
+        QCOMPARE(selectedRuntime.value("dimensions").toInt(), 2048);
+        QCOMPARE(selectedRuntime.value("embeddingFingerprint").toString(), modelPipelineFingerprint(qwen));
+        QVERIFY(selectedRuntime.value("probePassed").toBool());
+        QVERIFY(!selectedRuntime.value("loaded").toBool());
+        QCOMPARE(workers.events(false, "extract").size(), 1);
+        client.disconnectFromService(); service.stop();
+    }
+
+    void temporaryModelUnavailabilityPreservesVectorsAndDoesNotReextract() {
+        TestEnvironment environment("service-model-unavailable");
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile("selected/kept.txt", controlledDocument("retainedmodelvectorkeyword")));
+        const auto paths = environment.runtimePaths();
+        QString error;
+        QVERIFY2(paths.ensure(&error), qPrintable(error));
+        AppSettings settings; settings.roots = {environment.path("selected")};
+        QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+        ControlledWorkers workers(environment); QVERIFY(workers.valid);
+        bool available = true;
+        auto dependencies = workers.dependencies(true);
+        dependencies.probeModel = [](const QString &, QString *) { return true; };
+        dependencies.verifyModels = [&](QString *message) {
+            if (!available && message) *message = QStringLiteral("model cache temporarily absent");
+            return available;
+        };
+        ServiceServer service(paths, dependencies);
+        QVERIFY2(service.start(&error), qPrintable(error));
+        ServiceClient client(paths); client.setAutoStart(false); client.connectToService();
+        QTRY_VERIFY(client.isConnected());
+        const auto status = [&] { return localCall(client, "status").value("result").toObject(); };
+        QTRY_COMPARE_WITH_TIMEOUT(status().value("repository").toObject().value("vectors").toInteger(), qint64(1), 5000);
+        const auto originalPipeline = status().value("pipelineFingerprint").toString();
+        QCOMPARE(workers.events(false, "extract").size(), 1);
+        QVERIFY(localCall(client, "index.pause").value("ok").toBool());
+        available = false;
+        QVERIFY(localCall(client, "models.reload").value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(status().value("catalogReady").toBool(), 5000);
+        QVERIFY(!status().value("modelAvailable").toBool());
+        QCOMPARE(status().value("pipelineFingerprint").toString(), originalPipeline);
+        QCOMPARE(status().value("repository").toObject().value("vectors").toInteger(), qint64(1));
+        const auto keyword = localCall(client, "search", {{"query", "retainedmodelvectorkeyword"}, {"semantic", true}});
+        QVERIFY(keyword.value("ok").toBool());
+        QVERIFY(!keyword.value("result").toObject().value("semantic").toBool());
+        QCOMPARE(keyword.value("result").toObject().value("hits").toArray().size(), 1);
+        available = true;
+        QVERIFY(localCall(client, "models.reload").value("ok").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(status().value("catalogReady").toBool(), 5000);
+        QVERIFY(status().value("modelAvailable").toBool());
+        QCOMPARE(status().value("pipelineFingerprint").toString(), originalPipeline);
+        QCOMPARE(status().value("repository").toObject().value("vectors").toInteger(), qint64(1));
+        QCOMPARE(workers.events(false, "extract").size(), 1);
+        const auto semantic = localCall(client, "search", {{"query", "retainedmodelvectorkeyword"}, {"semantic", true}});
+        QVERIFY(semantic.value("ok").toBool());
+        QVERIFY(semantic.value("result").toObject().value("semantic").toBool());
         client.disconnectFromService(); service.stop();
     }
 
@@ -1661,7 +2206,6 @@ private slots:
         AppSettings settings;
         settings.roots = {environment.path("selected")}; settings.indexingPaused = true;
         QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
-        QString originalChangedVersion;
         {
             IndexRepository repository;
             QVERIFY2(repository.open(paths, &error), qPrintable(error));
@@ -1673,7 +2217,6 @@ private slots:
                 segment.kind = "text"; segment.modality = "text"; segment.text = "legacymetadatakeyword";
                 const QString version = file.fingerprint + "|legacy";
                 QVERIFY2(repository.replaceFile(file.path, version, {segment}, false, &error), qPrintable(error));
-                if (relative.endsWith("changed.txt")) originalChangedVersion = version;
             }
         }
         QVERIFY(environment.writeFile("selected/changed.txt", "A changed source whose old body must stay hidden while extraction is paused."));
@@ -1695,15 +2238,17 @@ private slots:
         QCOMPARE(hits.size(), 1);
         QCOMPARE(hits.first().toObject().value("path").toString(), environment.path("selected/healthy.txt"));
         const auto status = localCall(client, "status").value("result").toObject();
-        QCOMPARE(status.value("repository").toObject().value("files").toInt(), 2);
+        QCOMPARE(status.value("repository").toObject().value("files").toInt(), 1);
         QCOMPARE(status.value("repository").toObject().value("metadataPendingFiles").toInteger(), 0);
         QCOMPARE(status.value("progress").toObject().value("state").toString(), QStringLiteral("paused"));
         QVERIFY(workers.events(false, "started").isEmpty());
         client.disconnectFromService(); service.stop();
         IndexRepository repository;
         QVERIFY2(repository.open(paths, &error), qPrintable(error));
-        // Metadata refresh must never relabel old indexed content as the new source.
-        QCOMPARE(repository.fileVersion(environment.path("selected/changed.txt")), originalChangedVersion);
+        // Changed sources lose stale content even while inference is paused.
+        // Metadata refresh must never relabel the old body as the new source.
+        QVERIFY(repository.fileVersion(environment.path("selected/changed.txt")).isEmpty());
+        QVERIFY(repository.fileSegments(environment.path("selected/changed.txt")).isEmpty());
     }
 
     void independentSpacesRepairMetadataAndBrowseWithoutContent() {
@@ -1863,14 +2408,72 @@ private slots:
             offsets[event.value("path").toString()].append(event.value("offset").toInt());
         QCOMPARE(offsets.size(), 3);
         for (const auto &values : offsets) QCOMPARE(values, QList<int>({0, 40, 80}));
-        const auto settled = localCall(client, "status").value("result").toObject();
+        auto settled = localCall(client, "status").value("result").toObject();
         QCOMPARE(settled.value("indexDeviceCounts").toObject().value("failed").toInt(), 0);
         QCOMPARE(settled.value("progress").toObject().value("failed").toInt(), 0);
-        qint64 completedBatches = 0;
-        for (const auto &device : settled.value("indexDevices").toArray())
-            completedBatches += device.toObject().value("completedTasks").toInteger();
-        QCOMPARE(completedBatches, qint64(9));
+        // Three long files require nine batches. Reconciliation must reuse the
+        // completed files without issuing another extraction or counting them twice.
+        for (int scan = 0; scan <= 2; ++scan) {
+            if (scan > 0) {
+                QSignalSpy events(&client, &ServiceClient::eventReceived);
+                QVERIFY(localCall(client, "index.reconcile").value("ok").toBool());
+                QTRY_VERIFY_WITH_TIMEOUT(([&] {
+                    const bool catalogMerged = std::any_of(events.cbegin(), events.cend(), [](const auto &event) {
+                        return event.at(0).toString() == "indexChanged"
+                            && event.at(1).template value<QJsonObject>().value("path").toString().isEmpty();
+                    });
+                    settled = localCall(client, "status").value("result").toObject();
+                    return catalogMerged && settled.value("catalogReady").toBool()
+                        && settled.value("queuedFiles").toInt() == 0
+                        && settled.value("progress").toObject().value("state").toString() == "idle";
+                })(), 5000);
+            }
+            QCOMPARE(settled.value("progress").toObject().value("total").toInteger(), qint64(3));
+            QCOMPARE(settled.value("progress").toObject().value("completed").toInteger(), qint64(3));
+            QCOMPARE(settled.value("progress").toObject().value("segments").toInteger(), qint64(255));
+            const auto repositoryStatus = settled.value("repository").toObject();
+            QCOMPARE(repositoryStatus.value("files").toInteger(), qint64(3));
+            QCOMPARE(repositoryStatus.value("segments").toInteger(), qint64(255));
+            QCOMPARE(repositoryStatus.value("vectors").toInteger(), qint64(255));
+            QCOMPARE(workers.events(false, "extract").size(), 9);
+            qint64 completedBatches = 0;
+            for (const auto &device : settled.value("indexDevices").toArray())
+                completedBatches += device.toObject().value("completedTasks").toInteger();
+            QCOMPARE(completedBatches, qint64(9));
+        }
         client.disconnectFromService(); service.stop();
+
+        // Check the actual persisted segments, rather than only the progress
+        // counters, so duplicated prefixes cannot hide behind a correct file count.
+        IndexRepository repository;
+        QVERIFY2(repository.open(paths, &error), qPrintable(error));
+        const auto storedStatus = repository.status(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(storedStatus.value("files").toInteger(), qint64(3));
+        QCOMPARE(storedStatus.value("segments").toInteger(), qint64(255));
+        QCOMPARE(storedStatus.value("vectors").toInteger(), qint64(255));
+        for (const QString name : {QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c")}) {
+            const auto path = environment.path("selected/" + name + ".txt");
+            const auto segments = repository.fileSegments(path, false, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(segments.size(), 85);
+            QSet<QString> texts;
+            QSet<int> positions;
+            for (qsizetype i = 0; i < segments.size(); ++i) {
+                const auto &segment = segments.at(i);
+                QCOMPARE(segment.path, path);
+                QCOMPARE(segment.text, "parallel" + name + "keyword " + QString::number(i));
+                QCOMPARE(segment.lineStart, i + 1);
+                QCOMPARE(segment.lineEnd, i + 1);
+                QCOMPARE(segment.embedding.size(), embeddingDimensions);
+                QVERIFY(!texts.contains(segment.text));
+                QVERIFY(!positions.contains(segment.lineStart));
+                texts.insert(segment.text);
+                positions.insert(segment.lineStart);
+            }
+            QCOMPARE(texts.size(), 85);
+            QCOMPARE(positions.size(), 85);
+        }
     }
 
     void multiGpuPauseAndReconcileWaitForEveryActiveBatch() {

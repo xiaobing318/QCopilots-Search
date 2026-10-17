@@ -716,18 +716,12 @@ def remote_assets(api, release_id, expected, *, complete=False):
     return found
 
 
-def release_notes(document, tag, manifest_hash):
-    """Keep platform downloads prominent, with exact links to the frozen assets."""
-    candidate, version = document["identity"]["candidateHead"], document["version"]
+def release_notes(document, tag):
+    """List platform downloads and supporting assets with exact frozen filenames."""
     prefix = f"https://github.com/{REPOSITORY}/releases/download/{urllib.parse.quote(tag, safe='')}"
     def link(name, label):
         return f"[{label}]({prefix}/{urllib.parse.quote(name, safe='')})"
-    rows = [f"QCopilots Search {version} 支持本地文件的关键词与多模态语义搜索。", "",
-            "根据操作系统和显卡选择一种后端。CPU 包适合无兼容显卡的设备，CUDA 用于 NVIDIA，ROCm 用于 AMD，"
-            "Vulkan 使用其驱动可见的兼容设备，Metal 用于 Apple Silicon。", "",
-            "当前 ROCm 包仅包含 RDNA4 的 gfx1200、gfx1201 目标。Linux CPU 与 Vulkan 包以 Ubuntu 22.04 为基线，ROCm 与 CUDA 包以 Ubuntu 24.04 为基线。"
-            f"完整要求见[平台与依赖说明](https://github.com/{REPOSITORY}/blob/{candidate}/docs/dependencies.md)。", "",
-            "首次使用语义搜索时需要联网下载并校验模型。应用支持离线搜索已索引的本地内容。", ""]
+    rows = []
     for platform, title in (("windows", "Windows x64"), ("linux", "Linux x64"), ("macos", "macOS Apple Silicon")):
         rows += [f"### {title}", "", "| 后端 | 安装包 | 便携包 |", "|---|---|---|"]
         for configuration, selected in sorted(document["configurations"].items()):
@@ -746,24 +740,10 @@ def release_notes(document, tag, manifest_hash):
             rows.append(f"| {backend} | {' / '.join(installer) or '—'} | {' / '.join(portable) or '—'} |")
         rows.append("")
     source_name = next(item["name"] for item in document["assets"] if item.get("role") == "sources")
-    rows += ["### 安装与使用", "",
-        "- Windows：运行 EXE 安装器，或解压便携 ZIP 后启动 qcs-gui.exe。ROCm 若提供 ZIP 安装器，请完整解压安装器 ZIP，保持 setup.exe、payload-manifest.json 与 payload/ 的原有相对位置，再运行 setup.exe。",
-        "- Linux：安装 DEB，或解压 TAR.GZ 后运行包中的 qcs-gui。GPU 后端需要与所选版本兼容的宿主机显卡驱动。",
-        "- macOS：打开 DMG，将应用拖入 Applications。", "",
-        "### 校验与对应源码", "",
-        link("SHA256SUMS", "SHA256SUMS") + " 提供 21 个用户包和对应源码材料的 SHA-256。Windows 可使用 Get-FileHash，Linux 可使用 sha256sum -c SHA256SUMS，macOS 可使用 shasum -a 256 校验。",
-        "",
-        link(source_name, "对应源码材料") + " 包含此提交的项目源码、锁定的第三方源码及其许可信息。GPU SDK 覆盖范围以源码材料清单为准，不宣称包含完整的离线 GPU SDK 源码。",
-        "",
-        link(MANIFEST, "发布清单") + " 记录候选提交、CI run、原始成功 job、attempt、artifact ID、大小及摘要。",
-        f"发布清单 SHA-256：`{manifest_hash}`", "",
-        "### 签名与验证范围", "",
-        "本次发行未提供 Windows Authenticode 签名或 macOS 开发者签名与公证。macOS 包使用 ad-hoc 签名，操作系统可能要求确认应用来源。",
-        "",
-        "多 GPU 文件级调度已通过受控 worker 测试。双 AMD 或双 NVIDIA GPU 的实际吞吐与加速比尚未实测。"
-        "每张兼容 GPU 各自加载完整模型，单个文件由一个 GPU worker 顺序处理。", "",
-        f"源码提交：[`{candidate}`](https://github.com/{REPOSITORY}/commit/{candidate})",
-        f"CI：[run {document['runId']}，attempt {document['requestedAttempt']}](https://github.com/{REPOSITORY}/actions/runs/{document['runId']})", ""]
+    rows += ["### 其他下载", "",
+        "- " + link("SHA256SUMS", "SHA256SUMS"),
+        "- " + link(source_name, "对应源码材料"),
+        "- " + link(MANIFEST, "发布清单"), ""]
     return "\n".join(rows)
 
 
@@ -779,7 +759,7 @@ def upload_draft(manifest_path, source, tag, title=None, api=None):
     if release is None:
         release = api.request("POST", prefix + "/releases", {"tag_name": tag, "target_commitish": candidate,
             "name": title or "QCopilots Search " + tag, "draft": True, "prerelease": False, "generate_release_notes": False,
-            "body": release_notes(document, tag, manifest_hash)})
+            "body": release_notes(document, tag)})
     release_id = validate_draft(release, tag, candidate)
     existing = remote_assets(api, release_id, expected)
     uploaded, reused = [], sorted(existing)

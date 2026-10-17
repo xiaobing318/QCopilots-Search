@@ -55,7 +55,7 @@ macOS 使用 `macos-arm64-metal`。全部 11 个变体、系统基线与 GPU SDK
 ```text
 <build-root>/
   sdk/                        未指定 Qt 根时的 SDK
-  models/                     校验后的共享模型
+  models/                     校验后的共享模型缓存
   gpu-sdk/                    GPU SDK 默认根
   <variant>/
     Release/                  Release 构建树
@@ -82,6 +82,27 @@ macOS 使用 `macos-arm64-metal`。全部 11 个变体、系统基线与 GPU SDK
 ./qcs-dev.ps1 verify-package --variant $variant --build-root $buildRoot --qt-root $qtRoot --model-dir "$buildRoot/models"
 ```
 
+未指定模型时使用默认 `embeddinggemma-2`。`models` 可重复传入 `--model`，逐个下载并校验预设。`test-models` 必须显式选择 Qwen 预设，可重复传入 `--model`，通过 `qcs-tests-qwen-vectors` 执行独立黄金向量的真实推理比较。`verify-package` 每次接受一个模型，使用该预设检查最终包中的真实推理和服务链路：
+
+```powershell
+./qcs-dev.ps1 models --variant $variant --build-root $buildRoot --qt-root $qtRoot `
+  --model qwen3-vl-embedding-2b --model qwen3-vl-embedding-8b
+./qcs-dev.ps1 test-models --variant $variant --build-root $buildRoot --qt-root $qtRoot `
+  --model-dir "$buildRoot/models" --model qwen3-vl-embedding-2b --model qwen3-vl-embedding-8b
+./qcs-dev.ps1 verify-package --variant $variant --build-root $buildRoot --qt-root $qtRoot `
+  --model-dir "$buildRoot/models" --model qwen3-vl-embedding-2b
+```
+
+模型下载不会替代当前 profile 的模型选择。GUI 的模型管理或 `qcs-cli models select <id>` 才会切换当前模型及其独立索引。模型 ID、能力、固定来源和文件大小统一来自 `config/qcs-models.lock.json`，开发缓存与正式用户缓存均需为主模型和投影文件预留空间。8B 模型还需要足够的运行内存，不宜无差别加入每个平台的基础测试。
+
+扩展模型时按以下顺序修改和验证：
+
+1. 在模型锁文件中增加稳定且唯一的 ID，锁定主模型与投影的配对、revision、大小和完整 SHA-256，声明真实维度与能力。不同模型使用不同 ID，同一模型更换量化文件时更新对应文件契约。
+2. 在 `src/core/model_catalog.cpp` 和 `src/runtime/EmbeddingRuntime.cpp` 中补齐目录验证、推理适配与 `modelPipelineContract`。核对模板、pooling、上下文、图像预处理和不支持模态的行为。提示或计算契约变化必须反映在 fingerprint 中，不能只增加 JSON 条目，也不能修改锁定的第三方源码。
+3. 重新执行 `build` 后再运行 `models`。模型目录嵌入可执行文件，应用与服务需要重启才能使用新规格。`models` 会在下载前比较全部所选模型的 CLI manifest 与源码锁文件，陈旧 CLI 会被拒绝并提示重新构建。随后补齐目录、配置、索引切换和独立原权重参考测试，再执行真实推理、最终包及对应 CI 验收。
+
+同一 Qwen 模型的文件契约变化会使该模型旧向量失效并重新排队，保留已提取文本和关键词数据。其他模型的独立索引不受影响。新增维度或架构时还需检查存储边界与 schema 契约，不能沿用不兼容模型的 ID。
+
 `install` 形成完整 stage，`package` 自动部署 Qt、推理库、运行数据、许可证和图标，生成当前变体的用户包，无需手工复制。源码材料和符号分别通过 `sources`、`symbols` 生成，正式发布见[发布指南](releasing.md)。
 
 一次执行完整流程：
@@ -91,6 +112,13 @@ macOS 使用 `macos-arm64-metal`。全部 11 个变体、系统基线与 GPU SDK
 ```
 
 `check` 允许未提交修改，依次执行 `doctor → configure → build → models → test → install → package → verify-package → installers`，最后一项仅适用于有安装器验证的平台。报告记录阶段、命令、退出码、日志和工作区状态，失败后后续阶段不执行。报告位于 `<build-root>/<variant>/reports/<Config>/check-*/check-report.json`，`reports/<Config>/latest-check.json` 指向最近一次记录。开发检查通过与正式发布的干净提交、CI 来源要求分别判断。
+
+完整 `check` 始终保留默认 Gemma 的全部 CTest 和包验证。添加可重复的 `--model` 会准备相应模型，并在默认流程后逐个执行 `test-models → verify-package`。每款模型的结果分别保存为本次检查目录下的 `oracle-<id>.json` 和 `package-<id>/report.json`，例如：
+
+```powershell
+./qcs-dev.ps1 check --variant $variant --build-root $buildRoot --qt-root $qtRoot --jobs 4 `
+  --model qwen3-vl-embedding-2b --model qwen3-vl-embedding-8b
+```
 
 `test --test-label unit` 等筛选用于局部排查，完整 `check` 不接受缩小测试范围。更多测试说明及 GUI 检查清单见[测试指南](testing.md)。
 

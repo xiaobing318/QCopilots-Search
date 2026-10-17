@@ -1,4 +1,5 @@
 #include "core/model_files.h"
+#include "core/model_catalog.h"
 #include "core/runtime_paths.h"
 #include "core/types.h"
 #include "service/service_client.h"
@@ -155,22 +156,31 @@ Outcome modelOperation(const QStringList &arguments, const QCommandLineParser &p
                        const RuntimePaths &paths, int timeout)
 {
     const QString action = arguments.value(0, QStringLiteral("status"));
-    ModelFiles files(paths.modelDir);
+    const QString modelId = parser.value(QStringLiteral("model"));
+    const auto *descriptor = findModel(modelId);
+    if (!descriptor)
+        return failure(QStringLiteral("usage"), QStringLiteral("Unknown model: %1").arg(modelId));
+    ModelFiles files(paths.modelDir, modelId);
+    const QString directory = files.modelDirectory();
     QString error;
     if (action == QStringLiteral("status") || action == QStringLiteral("verify")) {
         if (arguments.size() > 1)
             return failure(QStringLiteral("usage"), QStringLiteral("model status/verify does not accept extra arguments"));
         const bool valid = files.verify(&error);
         QJsonArray artifacts;
-        for (const auto &artifact : ModelFiles::manifest()) {
-            const QFileInfo info(QDir(paths.modelDir).filePath(artifact.name));
+        for (const auto &artifact : ModelFiles::manifest(modelId)) {
+            const QFileInfo info(QDir(directory).filePath(artifact.name));
             artifacts.append(QJsonObject{{QStringLiteral("name"), artifact.name}, {QStringLiteral("present"), info.isFile()},
                                          {QStringLiteral("bytes"), info.size()}, {QStringLiteral("expectedBytes"), artifact.size},
                                          {QStringLiteral("sha256"), QString::fromLatin1(artifact.sha256)}});
         }
         if (action == QStringLiteral("verify") && !valid)
             return failure(QStringLiteral("model_invalid"), error);
-        return {{{QStringLiteral("directory"), paths.modelDir}, {QStringLiteral("valid"), valid},
+        return {{{QStringLiteral("modelId"), modelId}, {QStringLiteral("descriptor"), descriptor->toJson()},
+                 {QStringLiteral("dimensions"), descriptor->dimensions},
+                 {QStringLiteral("capabilities"), descriptor->toJson().value(QStringLiteral("capabilities"))},
+                 {QStringLiteral("directory"), directory}, {QStringLiteral("valid"), valid},
+                 {QStringLiteral("filesVerified"), valid},
                  {QStringLiteral("artifacts"), artifacts}, {QStringLiteral("detail"), error}}, {}, {}};
     }
     if (action == QStringLiteral("import")) {
@@ -181,7 +191,7 @@ Outcome modelOperation(const QStringList &arguments, const QCommandLineParser &p
         if (source.isDir()) {
             if (parser.isSet(QStringLiteral("name")))
                 return failure(QStringLiteral("usage"), QStringLiteral("--name applies only when importing a file"));
-            for (const auto &artifact : ModelFiles::manifest()) {
+            for (const auto &artifact : ModelFiles::manifest(modelId)) {
                 if (!files.importFile(QDir(source.absoluteFilePath()).filePath(artifact.name), artifact.name, &error))
                     return failure(QStringLiteral("model_import_failed"), error);
                 imported.append(artifact.name);
@@ -193,8 +203,8 @@ Outcome modelOperation(const QStringList &arguments, const QCommandLineParser &p
             imported.append(name);
         }
         const bool complete = files.verify(&error);
-        return {{{QStringLiteral("imported"), imported}, {QStringLiteral("complete"), complete},
-                 {QStringLiteral("directory"), paths.modelDir}}, {}, {}};
+        return {{{QStringLiteral("modelId"), modelId}, {QStringLiteral("imported"), imported},
+                 {QStringLiteral("complete"), complete}, {QStringLiteral("directory"), directory}}, {}, {}};
     }
     if (action == QStringLiteral("download")) {
         if (arguments.size() != 1)
@@ -227,7 +237,8 @@ Outcome modelOperation(const QStringList &arguments, const QCommandLineParser &p
             loop.exec();
         if (!success)
             return failure(timedOut ? QStringLiteral("timeout") : QStringLiteral("model_download_failed"), error);
-        return {{{QStringLiteral("complete"), true}, {QStringLiteral("directory"), paths.modelDir}}, {}, {}};
+        return {{{QStringLiteral("modelId"), modelId}, {QStringLiteral("complete"), true},
+                 {QStringLiteral("directory"), directory}}, {}, {}};
     }
     return failure(QStringLiteral("usage"), QStringLiteral("Unknown model operation: %1").arg(action));
 }
@@ -248,8 +259,11 @@ int main(int argc, char **argv)
         "  search QUERY                   Search selected sources\n"
         "  index [DIRECTORY ...]          Save optional source roots and start indexing\n"
         "  pause | resume | retry | reconcile\n"
-        "  config [get | set JSON]        Read or merge settings\n"
-        "  model [manifest | status | verify | download | reload]\n"
+        "  config [get | set JSON | reload] Read, merge or reload settings\n"
+        "  model list                     List supported models (offline)\n"
+        "  model select ID                Load a model and switch its independent index\n"
+        "  model [manifest | status | verify | download] [--model ID]\n"
+        "  model reload                   Reload the selected model in the service\n"
         "  model import FILE_OR_DIRECTORY Import and verify locked GGUF artifacts\n"
         "  import FILE_OR_DIRECTORY       Alias for model import\n"
         "  update                         Check public releases without installing\n"
@@ -258,6 +272,8 @@ int main(int argc, char **argv)
         "  qcs-cli --profile-dir \"profile space\" index \"documents\" --wait\n"
         "  qcs-cli search \"中文 查询\" --kind pdf --limit 20\n"
         "  qcs-cli model download --timeout 1800000 --progress\n"
+        "  qcs-cli model download --model qwen3-vl-embedding-2b --timeout 1800000\n"
+        "  qcs-cli model select qwen3-vl-embedding-2b\n"
         "  qcs-cli config set --file settings.json\n\n"
         "Exit codes: 0 success, 1 operation failed, 2 invalid arguments.\n"
         "The service is discovered beside this executable (or in its macOS bundle)."));
@@ -268,7 +284,8 @@ int main(int argc, char **argv)
     parser.addOptions({
         {{QStringLiteral("profile-dir")}, QStringLiteral("Explicit isolated profile directory"), QStringLiteral("path")},
         {{QStringLiteral("model-dir")}, QStringLiteral("Override shared model directory"), QStringLiteral("path")},
-        {{QStringLiteral("timeout")}, QStringLiteral("Operation timeout in milliseconds (1..86400000)"), QStringLiteral("ms"), QStringLiteral("30000")},
+        {{QStringLiteral("model")}, QStringLiteral("Model ID for offline manifest, status, verify, import or download"), QStringLiteral("id"), defaultModelId()},
+        {{QStringLiteral("timeout")}, QStringLiteral("Operation timeout in milliseconds (1..86400000, default 600000 for model/config changes, otherwise 30000)"), QStringLiteral("ms"), QStringLiteral("30000")},
         {{QStringLiteral("pretty")}, QStringLiteral("Indent JSON output")},
         {{QStringLiteral("json")}, QStringLiteral("JSON output (the default)")},
         {{QStringLiteral("no-start")}, QStringLiteral("Connect only, without starting a service")},
@@ -302,23 +319,47 @@ int main(int argc, char **argv)
     if (!commands.contains(command))
         return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("Unknown command: %1").arg(command)), pretty);
     bool validTimeout = false;
-    const int timeout = parser.value(QStringLiteral("timeout")).toInt(&validTimeout);
+    int timeout = parser.value(QStringLiteral("timeout")).toInt(&validTimeout);
     if (!validTimeout || timeout < 1 || timeout > 86400000)
         return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("--timeout must be 1..86400000 milliseconds")), pretty);
+    if (!parser.isSet(QStringLiteral("timeout"))
+        && (((command == QStringLiteral("model") || command == QStringLiteral("models"))
+             && (arguments.value(0) == QStringLiteral("select") || arguments.value(0) == QStringLiteral("reload")))
+            || (command == QStringLiteral("config")
+                && (arguments.value(0) == QStringLiteral("set") || arguments.value(0) == QStringLiteral("reload")))))
+        timeout = 600000;
+    const bool modelCommand = command == QStringLiteral("model") || command == QStringLiteral("models") || command == QStringLiteral("import");
+    if (parser.isSet(QStringLiteral("model")) && (!modelCommand
+        || (command != QStringLiteral("import") && (arguments.value(0) == QStringLiteral("select")
+            || arguments.value(0) == QStringLiteral("reload") || arguments.value(0) == QStringLiteral("list")))))
+        return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("--model applies only to model manifest/status/verify/import/download. Use model select ID to switch models.")), pretty);
     if (command == QStringLiteral("update")) {
         if (!arguments.isEmpty())
             return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("update does not accept extra arguments")), pretty);
         return printOutcome(checkUpdate(timeout), pretty);
     }
-    const bool modelCommand = command == QStringLiteral("model") || command == QStringLiteral("models") || command == QStringLiteral("import");
-    if (modelCommand && arguments == QStringList{QStringLiteral("manifest")}) {
+    const QString modelId = parser.value(QStringLiteral("model"));
+    if (modelCommand && !findModel(modelId))
+        return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("Unknown model: %1").arg(modelId)), pretty);
+    if (command != QStringLiteral("import") && modelCommand && arguments == QStringList{QStringLiteral("list")}) {
+        QJsonArray models;
+        for (const auto &model : modelCatalog())
+            models.append(model.toJson());
+        return printOutcome({{{QStringLiteral("defaultModelId"), defaultModelId()},
+                              {QStringLiteral("models"), models}}, {}, {}}, pretty);
+    }
+    if (command != QStringLiteral("import") && modelCommand && arguments == QStringList{QStringLiteral("manifest")}) {
+        const auto *descriptor = findModel(modelId);
         QJsonArray artifacts;
-        for (const auto &artifact : ModelFiles::manifest())
+        for (const auto &artifact : ModelFiles::manifest(modelId))
             artifacts.append(QJsonObject{{QStringLiteral("name"), artifact.name},
                                         {QStringLiteral("url"), artifact.url.toString()},
                                         {QStringLiteral("size"), artifact.size},
                                         {QStringLiteral("sha256"), QString::fromLatin1(artifact.sha256)}});
-        return printOutcome({{{QStringLiteral("artifacts"), artifacts}}, {}, {}}, pretty);
+        return printOutcome({{{QStringLiteral("modelId"), modelId}, {QStringLiteral("dimensions"), descriptor->dimensions},
+                              {QStringLiteral("capabilities"), descriptor->toJson().value(QStringLiteral("capabilities"))},
+                              {QStringLiteral("descriptor"), descriptor->toJson()},
+                              {QStringLiteral("artifacts"), artifacts}}, {}, {}}, pretty);
     }
     const auto paths = RuntimePaths::resolve(parser.value(QStringLiteral("profile-dir")), parser.value(QStringLiteral("model-dir")));
     QString error;
@@ -326,7 +367,7 @@ int main(int argc, char **argv)
         return printOutcome(failure(QStringLiteral("path_error"), error), pretty);
     if (command == QStringLiteral("import"))
         arguments.prepend(QStringLiteral("import"));
-    if (modelCommand && arguments.value(0) != QStringLiteral("reload")) {
+    if (modelCommand && arguments.value(0) != QStringLiteral("reload") && arguments.value(0) != QStringLiteral("select")) {
         return printOutcome(modelOperation(arguments, parser, paths, timeout), pretty);
     }
 
@@ -347,6 +388,8 @@ int main(int argc, char **argv)
         const QString action = arguments.isEmpty() ? QStringLiteral("get") : arguments.takeFirst();
         if (action == QStringLiteral("get") && arguments.isEmpty() && !parser.isSet(QStringLiteral("file")))
             method = QStringLiteral("settings.get");
+        else if (action == QStringLiteral("reload") && arguments.isEmpty() && !parser.isSet(QStringLiteral("file")))
+            method = QStringLiteral("settings.reload");
         else if (action == QStringLiteral("set")) {
             QByteArray bytes;
             if (parser.isSet(QStringLiteral("file"))) {
@@ -372,15 +415,22 @@ int main(int argc, char **argv)
             }
             method = QStringLiteral("settings.set");
         } else {
-            return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("Use config get or config set JSON/--file")), pretty);
+            return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("Use config get, config set JSON/--file or config reload")), pretty);
         }
     } else if (command == QStringLiteral("index")) {
         method = QStringLiteral("index.start");
     } else {
         if (modelCommand) {
-            if (arguments != QStringList{QStringLiteral("reload")})
-                return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("model reload does not accept extra arguments")), pretty);
-            method = QStringLiteral("models.reload");
+            if (arguments.value(0) == QStringLiteral("select")) {
+                if (arguments.size() != 2 || !findModel(arguments.value(1)))
+                    return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("model select requires one supported model ID. Use model list to see IDs.")), pretty);
+                method = QStringLiteral("models.select");
+                params.insert(QStringLiteral("modelId"), arguments.at(1));
+            } else {
+                if (arguments != QStringList{QStringLiteral("reload")})
+                    return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("model reload does not accept extra arguments")), pretty);
+                method = QStringLiteral("models.reload");
+            }
         } else {
             if (!arguments.isEmpty())
                 return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("%1 does not accept extra arguments").arg(command)), pretty);
@@ -407,6 +457,9 @@ int main(int argc, char **argv)
             return printOutcome(failure(QStringLiteral("usage"), QStringLiteral("config set requires settings JSON or --root/--exclude/--code")), pretty);
     }
 
+    QElapsedTimer selectionDeadline;
+    if (method == QStringLiteral("models.select"))
+        selectionDeadline.start();
     ServiceClient client(paths);
     if (parser.isSet(QStringLiteral("no-start"))) {
         client.setAutoStart(false);
@@ -418,6 +471,30 @@ int main(int argc, char **argv)
         const auto configured = call(client, QStringLiteral("settings.set"), params, timeout);
         if (!configured.ok()) return printOutcome(configured, pretty);
         params = {};
+    }
+    if (method == QStringLiteral("models.select")) {
+        // IPC can be ready while the service is still probing its configured
+        // model. Wait for that one startup transition before issuing select.
+        // Connection, readiness checks and selection share the CLI deadline.
+        while (true) {
+            const int remaining = timeout - int(selectionDeadline.elapsed());
+            if (remaining <= 0)
+                return printOutcome(failure(QStringLiteral("timeout"), QStringLiteral("The model selection deadline expired while waiting for the service model to finish loading")), pretty);
+            const auto ready = call(client, QStringLiteral("status"), {}, remaining);
+            if (!ready.ok())
+                return printOutcome(ready, pretty);
+            if (!ready.result.value(QStringLiteral("modelLoading")).toBool())
+                break;
+            const int wait = qMin(250, timeout - int(selectionDeadline.elapsed()));
+            if (wait > 0) {
+                QEventLoop delay;
+                QTimer::singleShot(wait, &delay, &QEventLoop::quit);
+                delay.exec();
+            }
+        }
+        timeout -= int(selectionDeadline.elapsed());
+        if (timeout <= 0)
+            return printOutcome(failure(QStringLiteral("timeout"), QStringLiteral("The model selection deadline expired before the service was ready")), pretty);
     }
     auto result = call(client, method, params, timeout);
     if (result.ok() && parser.isSet(QStringLiteral("wait"))

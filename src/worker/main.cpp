@@ -1,6 +1,7 @@
 #include "core/native_lock_path.h"
 #include "core/runtime_paths.h"
 #include "core/types.h"
+#include "core/model_catalog.h"
 #include "extraction/extractor.h"
 #include "runtime/EmbeddingRuntime.h"
 
@@ -10,6 +11,7 @@
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QGuiApplication>
+#include <QImage>
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QLockFile>
@@ -190,9 +192,9 @@ private:
 
 class Worker final : public QObject {
 public:
-    Worker(RuntimePaths paths, QString mode, QString tessdata, QJsonObject device, QObject *parent = nullptr)
+    Worker(RuntimePaths paths, QString mode, QString tessdata, QJsonObject device, QString modelId, QObject *parent = nullptr)
         : QObject(parent), paths_(std::move(paths)), mode_(std::move(mode)),
-          tessdata_(std::move(tessdata)), device_(std::move(device)), input_(this)
+          tessdata_(std::move(tessdata)), device_(std::move(device)), modelId_(std::move(modelId)), input_(this)
     {
         pool_.setMaxThreadCount(1);
         pool_.setExpiryTimeout(-1);
@@ -272,11 +274,13 @@ private:
             return;
         }
         if (operation != QStringLiteral("extract") && operation != QStringLiteral("query")
-            && operation != QStringLiteral("diagnostics") && operation != QStringLiteral("devices")) {
-            send(failure(id, QStringLiteral("unknown_operation"), QStringLiteral("Supported operations: extract, query, diagnostics, devices, cancel, shutdown")));
+            && operation != QStringLiteral("diagnostics") && operation != QStringLiteral("devices")
+            && operation != QStringLiteral("model.probe")) {
+            send(failure(id, QStringLiteral("unknown_operation"), QStringLiteral("Supported operations: extract, query, diagnostics, devices, model.probe, cancel, shutdown")));
             return;
         }
         if (operation != QStringLiteral("diagnostics") && operation != QStringLiteral("devices")
+            && operation != QStringLiteral("model.probe")
             && ((mode_ == QStringLiteral("query") && operation != QStringLiteral("query"))
                 || (mode_ == QStringLiteral("extract") && operation != QStringLiteral("extract")))) {
             send(failure(id, QStringLiteral("wrong_mode"), QStringLiteral("Operation is unavailable in this worker mode")));
@@ -298,12 +302,18 @@ private:
             catch (...) {
                 response = failure(request.value(QStringLiteral("id")), QStringLiteral("worker_error"), QStringLiteral("Unexpected worker failure"));
             }
+            // Extraction-only workers still identify the selected pipeline.
+            // Their keyword path must not load model weights for this metadata.
+            const QString key = response.value(QStringLiteral("ok")).toBool()
+                ? QStringLiteral("result") : QStringLiteral("error");
+            auto payload = response.value(key).toObject();
+            const auto* model = findModel(modelId_);
+            payload.insert(QStringLiteral("modelId"), modelId_);
+            payload.insert(QStringLiteral("dimensions"), model ? model->dimensions : 0);
+            payload.insert(QStringLiteral("embeddingFingerprint"), modelPipelineFingerprint(modelId_));
             // Read runtime state on its owner thread, including failed model
             // initialization. A strict GPU failure must remain an error reply.
             if (runtime_) {
-                const QString key = response.value(QStringLiteral("ok")).toBool()
-                    ? QStringLiteral("result") : QStringLiteral("error");
-                auto payload = response.value(key).toObject();
                 const auto diagnostic = runtime_->diagnostics();
                 payload.insert(QStringLiteral("runtime"), diagnostic);
                 if (!response.value(QStringLiteral("ok")).toBool()) {
@@ -312,15 +322,15 @@ private:
                     payload.insert(QStringLiteral("deviceFailure"), deviceFailure);
                     if (deviceFailure) payload.insert(QStringLiteral("code"), QStringLiteral("gpu_unavailable"));
                 }
-                response.insert(key, payload);
             }
+            response.insert(key, payload);
             return response;
         }));
     }
     void ensureRuntime()
     {
         if (!runtime_) {
-            runtime_ = std::make_unique<EmbeddingRuntime>();
+            runtime_ = std::make_unique<EmbeddingRuntime>(modelId_);
             runtime_->setThreadCount(qEnvironmentVariableIntValue("QCOPILOTS_SEARCH_THREADS"));
             runtime_->setCancellationCallback([this] { return cancelled_.load(); });
             QString error;
@@ -347,14 +357,22 @@ private:
     bool loadRuntime(bool textOnly, QString *error, const QJsonValue &id)
     {
         ensureRuntime();
-        if (runtime_->isLoaded() && runtime_->isTextOnly() == textOnly) return true;
-        return infer(id, [this, textOnly, error] { return runtime_->load(paths_.modelDir, textOnly, error); }, true);
+        if (runtime_->isLoaded() && runtime_->isTextOnly() == textOnly && runtime_->modelId() == modelId_) return true;
+        return infer(id, [this, textOnly, error] { return runtime_->load(paths_.modelDir, modelId_, textOnly, error); }, true);
     }
     QJsonObject run(const QJsonObject &request)
     {
         const auto id = request.value(QStringLiteral("id"));
         runtimeUsed_ = false;
         runtimeEvents_ = request.value(QStringLiteral("runtimeEvents")).toBool(false);
+        if (request.contains(QStringLiteral("modelId")) && request.value(QStringLiteral("modelId")).toString() != modelId_)
+            return failure(id, QStringLiteral("model_mismatch"), QStringLiteral("Request model does not match the worker model"));
+        if (request.contains(QStringLiteral("dimensions"))
+            && request.value(QStringLiteral("dimensions")).toInt(-1) != findModel(modelId_)->dimensions)
+            return failure(id, QStringLiteral("model_mismatch"), QStringLiteral("Request dimensions do not match the worker model"));
+        if (request.contains(QStringLiteral("embeddingFingerprint"))
+            && request.value(QStringLiteral("embeddingFingerprint")).toString() != modelPipelineFingerprint(modelId_))
+            return failure(id, QStringLiteral("model_mismatch"), QStringLiteral("Request fingerprint does not match the worker model"));
         if (cancelled_.load()) return failure(id, QStringLiteral("cancelled"), QStringLiteral("Job cancelled"));
         if (request.value(QStringLiteral("operation")).toString() == QStringLiteral("devices")) {
             QString error;
@@ -371,6 +389,33 @@ private:
                 return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("model_unavailable"), error);
             return success(id, {});
         }
+        if (request.value(QStringLiteral("operation")).toString() == QStringLiteral("model.probe")) {
+            QString error;
+            if (!loadRuntime(false, &error, id))
+                return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("model_unavailable"), error);
+            const auto text = infer(id, [&] { return runtime_->embedText(QStringLiteral("A red and blue geometric picture"), PromptKind::Query, {}, &error); });
+            if (text.size() != runtime_->dimensions())
+                return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("inference_error"), error);
+            QJsonObject probes{{QStringLiteral("text"), true}};
+            if (runtime_->capabilities().value(QStringLiteral("image")).toBool()) {
+                QTemporaryDir temporary(QDir(paths_.tempDir).filePath(QStringLiteral("qcs-model-probe-XXXXXX")));
+                if (!temporary.isValid()) return failure(id, QStringLiteral("temporary_directory"), temporary.errorString());
+                QImage image(64, 64, QImage::Format_RGB888);
+                for (int y = 0; y < image.height(); ++y)
+                    for (int x = 0; x < image.width(); ++x)
+                        image.setPixelColor(x, y, (x < 32) != (y < 32) ? QColor(Qt::red) : QColor(Qt::blue));
+                const auto path = QDir(temporary.path()).filePath(QStringLiteral("probe.png"));
+                if (!image.save(path, "PNG")) return failure(id, QStringLiteral("probe_image"), QStringLiteral("Cannot create model probe image"));
+                const auto vector = infer(id, [&] { return runtime_->embedImage(path, 70, &error); });
+                if (!temporary.remove()) return failure(id, QStringLiteral("temporary_directory"), QStringLiteral("Cannot remove model probe files"));
+                if (vector.size() != runtime_->dimensions())
+                    return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("inference_error"), error);
+                probes.insert(QStringLiteral("image"), true);
+            }
+            return success(id, {{QStringLiteral("status"), QStringLiteral("ready")},
+                {QStringLiteral("capabilities"), runtime_->capabilities()}, {QStringLiteral("probes"), probes},
+                {QStringLiteral("modelFingerprint"), runtime_->modelFingerprint()}});
+        }
         if (request.value(QStringLiteral("operation")).toString() == QStringLiteral("query")) {
             const auto text = request.value(QStringLiteral("query")).toString();
             if (text.trimmed().isEmpty() || text.size() > 65536)
@@ -381,11 +426,11 @@ private:
             const auto vector = infer(id, [&] { return runtime_->embedText(text, request.value(QStringLiteral("code")).toBool()
                 ? PromptKind::CodeQuery : PromptKind::Query, {}, &error); });
             if (cancelled_.load()) return failure(id, QStringLiteral("cancelled"), QStringLiteral("Query cancelled"));
-            if (vector.size() != embeddingDimensions) return failure(id, QStringLiteral("inference_error"), error);
+            if (vector.size() != runtime_->dimensions()) return failure(id, QStringLiteral("inference_error"), error);
             QJsonArray values;
             for (float value : vector) values.append(double(value));
             return success(id, {{QStringLiteral("embedding"), values},
-                                {QStringLiteral("modelFingerprint"), EmbeddingRuntime::fingerprint()},
+                                {QStringLiteral("modelFingerprint"), runtime_->modelFingerprint()},
                                 {QStringLiteral("extractionFingerprint"), Extractor::pipelineFingerprint()}});
         }
         const auto path = request.value(QStringLiteral("path")).toString();
@@ -430,6 +475,7 @@ private:
         options.cancelled = [this] { return cancelled_.load(); };
         auto result = Extractor::extract(path, options);
         QJsonArray embeddingErrors;
+        QJsonArray unsupportedModalities;
         for (qsizetype index = 0; index < result.segments.size(); ++index) {
             if (cancelled_.load()) {
                 result.state = QStringLiteral("cancelled");
@@ -443,6 +489,10 @@ private:
             if (segment.modality == QStringLiteral("image")) {
                 segment.embedding = infer(id, [&] { return runtime_->embedImage(segment.mediaPath, segment.imageBudget, &error); });
             } else if (segment.modality == QStringLiteral("audio")) {
+                if (!runtime_->capabilities().value(QStringLiteral("audio")).toBool()) {
+                    if (unsupportedModalities.isEmpty()) unsupportedModalities.append(QStringLiteral("audio"));
+                    continue;
+                }
                 segment.embedding = infer(id, [&] { return runtime_->embedAudio(segment.mediaPath, &error); });
             } else if (!segment.text.trimmed().isEmpty()) {
                 segment.embedding = infer(id, [&] { return runtime_->embedText(segment.text, PromptKind::Document, segment.title, &error); });
@@ -451,10 +501,10 @@ private:
                 // retrieval remains available for the original source name.
                 continue;
             }
-            if (segment.embedding.size() != embeddingDimensions
+            if (segment.embedding.size() != runtime_->dimensions()
                 && runtime_->diagnostics().value(QStringLiteral("deviceFailure")).toBool())
                 return failure(id, cancelled_.load() ? QStringLiteral("cancelled") : QStringLiteral("gpu_unavailable"), error);
-            if (segment.embedding.size() != embeddingDimensions)
+            if (segment.embedding.size() != runtime_->dimensions())
                 embeddingErrors.append(QJsonObject{{QStringLiteral("index"), qint64(index)},
                     {QStringLiteral("error"), error.isEmpty() ? QStringLiteral("No embedding produced") : error}});
         }
@@ -481,15 +531,17 @@ private:
             {QStringLiteral("sourceVersion"), before}, {QStringLiteral("next"), result.next},
             {QStringLiteral("complete"), result.complete}, {QStringLiteral("embedded"), embed},
             {QStringLiteral("embeddingErrors"), embeddingErrors},
+            {QStringLiteral("unsupportedModalities"), unsupportedModalities},
             {QStringLiteral("pipelineFingerprint"), request.value(QStringLiteral("pipelineFingerprint"))},
             {QStringLiteral("extractionFingerprint"), Extractor::pipelineFingerprint()},
-            {QStringLiteral("modelFingerprint"), embed ? EmbeddingRuntime::fingerprint() : QString()}});
+            {QStringLiteral("modelFingerprint"), embed ? runtime_->modelFingerprint() : QString()}});
     }
 
     RuntimePaths paths_;
     QString mode_;
     QString tessdata_;
     QJsonObject device_;
+    QString modelId_;
     QFile output_;
     InputPump input_;
     QThreadPool pool_;
@@ -517,13 +569,19 @@ int main(int argc, char **argv)
     parser.addHelpOption();
     parser.addVersionOption();
     parser.addOption({QStringLiteral("profile-dir"), QStringLiteral("Explicit writable instance profile."), QStringLiteral("directory")});
-    parser.addOption({QStringLiteral("model-dir"), QStringLiteral("Verified GGUF model directory."), QStringLiteral("directory")});
+    parser.addOption({QStringLiteral("model-dir"), QStringLiteral("Verified model cache root. Additional presets use their ID subdirectory."), QStringLiteral("directory")});
+    parser.addOption({QStringLiteral("model"), QStringLiteral("Embedding model preset ID."), QStringLiteral("id"), defaultModelId()});
     parser.addOption({QStringLiteral("tessdata-dir"), QStringLiteral("OCR language data directory."), QStringLiteral("directory")});
     parser.addOption({QStringLiteral("mode"), QStringLiteral("Worker mode: full, extract, query."), QStringLiteral("mode"), QStringLiteral("full")});
     parser.addOption({QStringLiteral("device"), QStringLiteral("Bind one device using JSON with backend, deviceId and name. Disables automatic CPU fallback."), QStringLiteral("json")});
     parser.addOption({QStringLiteral("threads"), QStringLiteral("CPU inference threads, from 1 to 32."), QStringLiteral("count"), QString::number(std::clamp(QThread::idealThreadCount() / 2, 1, 32))});
     parser.process(application);
     const auto mode = parser.value(QStringLiteral("mode"));
+    const auto modelId = parser.value(QStringLiteral("model"));
+    if (!findModel(modelId)) {
+        std::fputs("Unknown embedding model preset. Use --help.\n", stderr);
+        return 2;
+    }
     bool threadsOk = false;
     const int threads = parser.value(QStringLiteral("threads")).toInt(&threadsOk);
     if ((mode != QStringLiteral("full") && mode != QStringLiteral("extract") && mode != QStringLiteral("query"))
@@ -567,7 +625,7 @@ int main(int argc, char **argv)
             }
         }
     }
-    Worker worker(paths, mode, tessdata, device);
+    Worker worker(paths, mode, tessdata, device, modelId);
     worker.start();
     return application.exec();
 }

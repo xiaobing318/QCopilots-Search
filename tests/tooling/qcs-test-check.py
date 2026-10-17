@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Developer check orchestration contracts with isolated synthetic stages."""
 import argparse
+import copy
 from contextlib import contextmanager, redirect_stdout
 import importlib.util
 import io
@@ -61,6 +62,122 @@ class CheckTests(unittest.TestCase):
         latest = json.loads((self.reports / "latest-check.json").read_text(encoding="utf-8"))
         path = Path(latest["report"])
         return path, json.loads(path.read_text(encoding="utf-8"))
+
+    def model_response(self, identifier, *, verify=False):
+        model = workflow.helper_module("tools/qcs-model-catalog.py", "qcs_test_model_contract").selected(identifier)
+        result = {"modelId": identifier, "dimensions": model["dimensions"],
+                  "capabilities": {"text": True, "image": model["supportsVision"],
+                                   "videoFrames": model["supportsVision"], "audio": model["supportsAudio"]},
+                  "artifacts": copy.deepcopy(model["artifacts"])}
+        if verify:
+            directory = self.root / "shared-models"
+            if identifier != "embeddinggemma-2":
+                directory /= identifier
+            result.update(directory=str(directory), valid=True, filesVerified=True,
+                          artifacts=[{"name": row["name"], "present": True, "bytes": row["size"],
+                                      "expectedBytes": row["size"], "sha256": row["sha256"]}
+                                     for row in model["artifacts"]])
+        return {"ok": True, "result": result}
+
+    def execute_models(self, identifiers=None):
+        workflow.execute_action("models", self.args(model=identifiers, model_dir=self.root / "shared-models"),
+                                self.root, self.root / "build", self.root / "stage", self.reports,
+                                self.root / "SDK", self.root / "SDK/qt", self.environment)
+
+    def test_models_validate_current_lock_before_downloading_default_and_multiple_presets(self):
+        for identifiers in (None, ["embeddinggemma-2", "qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"]):
+            with self.subTest(identifiers=identifiers):
+                selected = identifiers or ["embeddinggemma-2"]
+                events = []
+                def response(command, **options):
+                    action = "verify" if "verify" in command else "manifest"
+                    identifier = command[command.index("--model") + 1]
+                    events.append((action, identifier))
+                    return subprocess.CompletedProcess(command, 0,
+                        json.dumps(self.model_response(identifier, verify=action == "verify")).encode("utf-8"), b"")
+                def download(command, **options):
+                    self.assertIn("download", command)
+                    events.append(("download", command[command.index("--model") + 1]))
+                with patch.object(workflow, "executable", return_value=self.root / "qcs-cli"), \
+                        patch.object(workflow.subprocess, "run", side_effect=response), \
+                        patch.object(workflow, "run", side_effect=download):
+                    self.execute_models(identifiers)
+                self.assertEqual(events, [("manifest", identifier) for identifier in selected] +
+                                 [(action, identifier) for identifier in selected for action in ("download", "verify")])
+                for identifier in selected:
+                    name = "models" if identifier == "embeddinggemma-2" else "models-" + identifier
+                    self.assertTrue((self.reports / (name + "-manifest.json")).is_file())
+                    self.assertTrue((self.reports / (name + ".json")).is_file())
+
+    def test_stale_cli_manifest_blocks_every_selected_download_and_requests_rebuild(self):
+        identifier = "qwen3-vl-embedding-8b"
+        original = self.model_response(identifier)
+        mutations = [
+            lambda row: row["artifacts"][0].update(name="stale.gguf"),
+            lambda row: row["artifacts"][0].update(url="https://example.invalid/old.gguf"),
+            lambda row: row["artifacts"][0].update(size=1),
+            lambda row: row["artifacts"][0].update(sha256="0" * 64),
+            lambda row: row.update(modelId="embeddinggemma-2"),
+            lambda row: row.update(dimensions=768),
+            lambda row: row["capabilities"].update(audio=True),
+            lambda row: row["capabilities"].update(text=1),
+            lambda row: row["artifacts"][0].update(size=float(row["artifacts"][0]["size"])),
+            lambda row: row["artifacts"].__setitem__(1, row["artifacts"][0]),
+            lambda row: row["artifacts"].pop(),
+        ]
+        for mutation in mutations:
+            changed = copy.deepcopy(original)
+            mutation(changed["result"])
+            with self.subTest(manifest=changed), \
+                    patch.object(workflow, "executable", return_value=self.root / "qcs-cli"), \
+                    patch.object(workflow.subprocess, "run", side_effect=[
+                        subprocess.CompletedProcess([], 0, json.dumps(self.model_response("embeddinggemma-2")).encode(), b""),
+                        subprocess.CompletedProcess([], 0, json.dumps(changed).encode(), b"")]), \
+                    patch.object(workflow, "run") as download:
+                with self.assertRaisesRegex(RuntimeError, "Run qcs-dev build"):
+                    self.execute_models(["embeddinggemma-2", identifier])
+                download.assert_not_called()
+
+    def test_failed_or_malformed_cli_manifest_never_starts_download(self):
+        for code, output in ((2, b""), (0, b"not JSON"), (0, b"[]"),
+                             (0, b'{"ok":false,"result":{}}'), (0, b'{"ok":true,"result":[]}')):
+            with self.subTest(code=code, output=output), \
+                    patch.object(workflow, "executable", return_value=self.root / "qcs-cli"), \
+                    patch.object(workflow.subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, b"old CLI")), \
+                    patch.object(workflow, "run") as download:
+                with self.assertRaisesRegex(RuntimeError, "Run qcs-dev build"):
+                    self.execute_models()
+                download.assert_not_called()
+
+    def test_exit_zero_model_verify_must_confirm_current_locked_files_and_directory(self):
+        identifier = "qwen3-vl-embedding-2b"
+        mutations = [
+            lambda row: row.update(valid=False), lambda row: row.update(filesVerified=False),
+            lambda row: row.update(modelId="embeddinggemma-2"), lambda row: row.update(dimensions=768),
+            lambda row: row.update(directory=str(self.root / "shared-models")),
+            lambda row: row["artifacts"][0].update(present=False),
+            lambda row: row["artifacts"][0].update(bytes=1),
+            lambda row: row["artifacts"][0].update(expectedBytes=1),
+            lambda row: row["artifacts"][0].update(sha256="0" * 64),
+            lambda row: row["artifacts"].__setitem__(1, row["artifacts"][0]),
+        ]
+        invalid = []
+        for mutation in mutations:
+            changed = self.model_response(identifier, verify=True)
+            mutation(changed["result"])
+            invalid.append(json.dumps(changed).encode())
+        invalid += [b"not JSON", b'{"ok":false,"result":{}}', b'{"ok":true,"result":{}}']
+        for output in invalid:
+            with self.subTest(output=output), \
+                    patch.object(workflow, "executable", return_value=self.root / "qcs-cli"), \
+                    patch.object(workflow.subprocess, "run", side_effect=[
+                        subprocess.CompletedProcess([], 0, json.dumps(self.model_response(identifier)).encode(), b""),
+                        subprocess.CompletedProcess([], 0, output, b"")]), \
+                    patch.object(workflow, "run") as download:
+                with self.assertRaisesRegex(RuntimeError, "CLI model verification"):
+                    self.execute_models([identifier])
+                download.assert_called_once()
+                self.assertEqual((self.reports / ("models-" + identifier + ".json")).read_bytes(), output)
 
     def test_doctor_records_running_python_and_handles_msvc_banner_exit(self):
         outputs = [("Python 3.12.10\n", "", 0),
@@ -284,6 +401,51 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(environment["QCOPILOTS_SEARCH_MODEL_DIR"], str(models))
             self.assertEqual(report, path.parent / ("tests" if action == "test" else "package"))
         self.assertNotIn("QCOPILOTS_SEARCH_MODEL_DIR", self.environment)
+
+    def test_additional_presets_keep_complete_default_workflow_and_separate_package_reports(self):
+        selected = []
+        def execute(action, args, *arguments):
+            selected.append((action, list(args.model), args.report_dir))
+        with self.workflow_fixture(execute=execute):
+            path = self.invoke_check(model=["qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"])
+        document = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(document["models"], ["embeddinggemma-2", "qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"])
+        self.assertEqual([action for action, _, _ in selected[:-4]], [action for action, _ in workflow.check_plan("Linux")])
+        self.assertEqual(next(ids for action, ids, _ in selected if action == "models"), document["models"])
+        self.assertEqual(selected[-4:], [
+            (action, [identifier], path.parent if action == "test-models" else path.parent / ("package-" + identifier))
+            for identifier in document["models"][1:] for action in ("test-models", "verify-package")])
+        self.assertTrue(document["fullVerificationPassed"])
+
+    def test_real_model_test_uses_requested_report_directory_and_model_roots(self):
+        identifiers = ["qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"]
+        source = self.root / "source"
+        fixtures = source / "tests/runtime/fixtures/qwen"
+        fixtures.mkdir(parents=True)
+        for identifier in identifiers:
+            (fixtures / (identifier + ".json")).write_text("{}", encoding="utf-8")
+        destination = self.root / "selected-reports"
+        arguments = self.args(model=identifiers, report_dir=destination, model_dir=self.root / "shared-models")
+        binary = self.root / "build/qcs-tests-qwen-vectors"
+        with patch.object(workflow, "SOURCE", source), \
+                patch.object(workflow, "model_ids", return_value=identifiers), \
+                patch.object(workflow, "executable", return_value=binary), \
+                patch.object(workflow, "run") as execute:
+            workflow.execute_action("test-models", arguments, self.root, self.root / "build",
+                                    self.root / "stage", self.reports, self.root / "SDK",
+                                    self.root / "SDK/qt", self.environment)
+        self.assertEqual(execute.call_count, 2)
+        for identifier, call in zip(identifiers, execute.call_args_list):
+            command = call.args[0]
+            self.assertEqual(command[command.index("--") + 1:],
+                             [binary, "--model", identifier, "--model-root", arguments.model_dir,
+                              "--fixtures", fixtures])
+            self.assertNotIn("--validate-only", command)
+            self.assertEqual(command[command.index("--timeout") + 1], "7200")
+            result = json.loads((destination / ("oracle-" + identifier + ".json")).read_text(encoding="utf-8"))
+            self.assertEqual(result["modelId"], identifier)
+            self.assertTrue(result["passed"] and result["realModel"])
+            self.assertFalse((self.reports / ("oracle-" + identifier + ".json")).exists())
 
     def test_partial_options_rejected_before_creating_report(self):
         for option, value in (("test_label", "unit"), ("keyword_only", True),

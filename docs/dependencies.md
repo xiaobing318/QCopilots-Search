@@ -63,14 +63,19 @@ libgit2 通过公开文件配置 API 使用应用级 `core.longpaths`，不修�
 
 ## 模型契约
 
-模型来自[固定 revision 的 EmbeddingGemma 2 GGUF](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/tree/bfcd298762cc34d0357ece5ebdd31791a3a374d8)。运行时下载或离线导入，发行包不嵌入权重。
+模型通过运行时下载或离线导入，发行包不嵌入权重。[模型锁文件](../config/qcs-models.lock.json) 统一记录预设、主模型与多模态投影文件、固定 revision、大小、SHA-256 和模型能力。应用与工具从这份清单取得准确文件要求，不能用任意同名 GGUF 替代。
 
-| 文件 | 大小（字节） | SHA-256 |
-| --- | ---: | --- |
-| `embeddinggemma-2-Q8_0.gguf` | 309855456 | `2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135` |
-| `mmproj-embeddinggemma-2-Q8_0.gguf` | 554821024 | `c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f` |
+| 模型 ID | 模型 | 向量维度 | 语义输入 |
+| --- | --- | ---: | --- |
+| `embeddinggemma-2` | EmbeddingGemma 2，默认 | 768 | 文本、图片、视频帧、音频 |
+| `qwen3-vl-embedding-2b` | Qwen3-VL-Embedding-2B | 2048 | 文本、图片、视频帧 |
+| `qwen3-vl-embedding-8b` | Qwen3-VL-Embedding-8B | 4096 | 文本、图片、视频帧 |
 
-`ModelFiles::manifest()` 为运行时清单，`qcs-cli models manifest` 输出相同内容。下载后检查大小与哈希，再发布最终文件。向量采用 768 维、mean pooling 和 L2 归一化。提示词、图像 token 预算与缩放、音频窗口保持固定，黄金夹具及原作者 MIT 归属位于 `tests/runtime/fixtures`。
+`qcs-cli models manifest --model <id>` 输出所选预设的文件要求。下载与导入检查大小和哈希，校验通过后才发布最终文件。Gemma 保留模型根目录中的原有两文件布局，Qwen 文件位于 `<model-root>/<model-id>/`，避免同名投影文件或不同模型互相覆盖。下载模型与选择当前模型分别执行，可以保留多款模型缓存，当前 profile 仅使用选中的模型进行索引和查询。
+
+三款模型均输出有限值、L2 归一化向量。Gemma 保持原有 mean pooling、提示和音频窗口契约，Qwen 使用专用查询/文档模板、last pooling 和相应图像预处理，不能直接复用 Gemma 的模板或固定 768 维检查。Qwen 不提供音频 embedding，音频文件和视频音轨不能被标为已完成音频语义索引。视频仍可通过实际解码帧建立视觉语义索引。
+
+llama.cpp 能加载某种架构不代表应用已经支持该架构的嵌入契约。新增预设需同时锁定文件、适配提示与 pooling、声明能力和维度、隔离索引并完成真实推理及最终包测试。默认 Gemma 的黄金夹具与原作者 MIT 归属继续保留在 `tests/runtime/fixtures`，各模型的实际验证范围见[测试指南](testing.md)。
 
 ## 格式范围
 

@@ -54,6 +54,133 @@ private slots:
         QFETCH(QString, title);
         QFETCH(QString, expected);
         QCOMPARE(EmbeddingRuntime::prompt(text, PromptKind(kind), title), expected);
+        QCOMPARE(EmbeddingRuntime::promptForModel(QStringLiteral("embeddinggemma-2"),
+                     text, PromptKind(kind), title), expected);
+    }
+
+    void qwenPromptContracts_data()
+    {
+        QTest::addColumn<QString>("modelId");
+        QTest::addColumn<QString>("text");
+        QTest::addColumn<int>("kind");
+        QTest::addColumn<QString>("title");
+        QTest::addColumn<QString>("expectedBody");
+        for (const auto& id : {QStringLiteral("qwen3-vl-embedding-2b"),
+                              QStringLiteral("qwen3-vl-embedding-8b")}) {
+            QTest::newRow(qPrintable(id + QStringLiteral("-query")))
+                << id << QStringLiteral("查找北京旅行照片") << int(PromptKind::Query)
+                << QStringLiteral("ignored") << QStringLiteral("查找北京旅行照片");
+            QTest::newRow(qPrintable(id + QStringLiteral("-code")))
+                << id << QStringLiteral("retry with backoff") << int(PromptKind::CodeQuery)
+                << QString{} << QStringLiteral("retry with backoff");
+            QTest::newRow(qPrintable(id + QStringLiteral("-titled-document")))
+                << id << QStringLiteral("Train to Kamakura") << int(PromptKind::Document)
+                << QStringLiteral("Tokyo itinerary") << QStringLiteral("Tokyo itinerary\nTrain to Kamakura");
+            QTest::newRow(qPrintable(id + QStringLiteral("-untitled-document")))
+                << id << QStringLiteral("A note\nwith a second line") << int(PromptKind::Document)
+                << QString{} << QStringLiteral("A note\nwith a second line");
+            QTest::newRow(qPrintable(id + QStringLiteral("-empty-document")))
+                << id << QString{} << int(PromptKind::Document) << QString{} << QString{};
+        }
+    }
+
+    void qwenPromptContracts()
+    {
+        QFETCH(QString, modelId);
+        QFETCH(QString, text);
+        QFETCH(int, kind);
+        QFETCH(QString, title);
+        QFETCH(QString, expectedBody);
+        const QString expected = QStringLiteral("<|im_start|>system\nRepresent the user's input.<|im_end|>\n"
+                                                 "<|im_start|>user\n")
+            + expectedBody + QStringLiteral("<|im_end|>\n<|im_start|>assistant\n<|endoftext|>");
+        // LAST pools the official tokenizer postprocessor's terminal token,
+        // which follows the complete assistant suffix and is not padding.
+        QCOMPARE(EmbeddingRuntime::promptForModel(modelId, text, PromptKind(kind), title), expected);
+    }
+
+    void rawQwenPromptsAreNotWrapped()
+    {
+        const QString raw = QStringLiteral("<|im_start|>user\n中文\n<|im_end|>\n");
+        for (const auto& id : {QStringLiteral("qwen3-vl-embedding-2b"),
+                              QStringLiteral("qwen3-vl-embedding-8b")}) {
+            QCOMPARE(EmbeddingRuntime::promptForModel(id, raw, PromptKind::Raw,
+                         QStringLiteral("ignored")), raw);
+        }
+        QVERIFY(EmbeddingRuntime::promptForModel(QStringLiteral("unknown-model"), raw,
+                    PromptKind::Query).isEmpty());
+        QVERIFY(EmbeddingRuntime::promptForModel(QStringLiteral("unknown-model"), raw,
+                    PromptKind::Raw).isEmpty());
+    }
+
+    void defaultModelIdentityBeforeLoad()
+    {
+        EmbeddingRuntime runtime;
+        QCOMPARE(runtime.modelId(), QStringLiteral("embeddinggemma-2"));
+        QCOMPARE(runtime.dimensions(), 768);
+        QCOMPARE(runtime.modelFingerprint(), EmbeddingRuntime::fingerprint());
+        QVERIFY(!runtime.modelFingerprint().isEmpty());
+        QCOMPARE(runtime.capabilities(), (QJsonObject{{"text", true}, {"image", true}, {"videoFrames", true}, {"audio", true}}));
+    }
+
+    void selectedModelIdentitySurvivesMissingFiles_data()
+    {
+        QTest::addColumn<QString>("modelId");
+        QTest::addColumn<int>("dimensions");
+        QTest::addColumn<bool>("textOnly");
+        QTest::newRow("2b-text") << QStringLiteral("qwen3-vl-embedding-2b") << 2048 << true;
+        QTest::newRow("2b-multimodal") << QStringLiteral("qwen3-vl-embedding-2b") << 2048 << false;
+        QTest::newRow("8b-text") << QStringLiteral("qwen3-vl-embedding-8b") << 4096 << true;
+        QTest::newRow("8b-multimodal") << QStringLiteral("qwen3-vl-embedding-8b") << 4096 << false;
+    }
+
+    void selectedModelDiagnosticsBeforeLoad()
+    {
+        EmbeddingRuntime runtime(QStringLiteral("qwen3-vl-embedding-2b"));
+        QVERIFY(!runtime.isLoaded());
+        const auto diagnostic = runtime.diagnostics();
+        QCOMPARE(diagnostic.value(QStringLiteral("modelId")).toString(), QStringLiteral("qwen3-vl-embedding-2b"));
+        QCOMPARE(diagnostic.value(QStringLiteral("dimensions")).toInt(), 2048);
+        QCOMPARE(diagnostic.value(QStringLiteral("embeddingFingerprint")).toString(), runtime.modelFingerprint());
+        QVERIFY(!diagnostic.value(QStringLiteral("capabilities")).toObject().value(QStringLiteral("audio")).toBool());
+    }
+
+    void selectedModelIdentitySurvivesMissingFiles()
+    {
+        QFETCH(QString, modelId);
+        QFETCH(int, dimensions);
+        QFETCH(bool, textOnly);
+        QString error;
+        auto directory = test::temporaryDirectory(&error);
+        QVERIFY2(directory != nullptr, qPrintable(error));
+        QVERIFY(!EmbeddingRuntime::verifyModels(directory->path(), modelId, textOnly, &error));
+        QVERIFY(!error.isEmpty());
+        error.clear();
+        EmbeddingRuntime runtime;
+        QVERIFY(!runtime.load(directory->path(), modelId, textOnly, &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(!runtime.isLoaded());
+        QCOMPARE(runtime.modelId(), modelId);
+        QCOMPARE(runtime.dimensions(), dimensions);
+        QCOMPARE(runtime.capabilities(), (QJsonObject{{"text", true}, {"image", true}, {"videoFrames", true}, {"audio", false}}));
+        QVERIFY(!runtime.modelFingerprint().isEmpty());
+        QVERIFY(runtime.modelFingerprint() != EmbeddingRuntime::fingerprint());
+        QVERIFY(!runtime.diagnostics().value(QStringLiteral("deviceFailure")).toBool());
+    }
+
+    void unknownModelIsRejectedExplicitly()
+    {
+        QString error;
+        auto directory = test::temporaryDirectory(&error);
+        QVERIFY2(directory != nullptr, qPrintable(error));
+        const QString modelId = QStringLiteral("unknown-model");
+        QVERIFY(!EmbeddingRuntime::verifyModels(directory->path(), modelId, true, &error));
+        QVERIFY2(error.contains(modelId), qPrintable(error));
+        error.clear();
+        EmbeddingRuntime runtime;
+        QVERIFY(!runtime.load(directory->path(), modelId, false, &error));
+        QVERIFY2(error.contains(modelId), qPrintable(error));
+        QVERIFY(!runtime.isLoaded());
     }
 
     void unloadedRuntimeReportsErrors()

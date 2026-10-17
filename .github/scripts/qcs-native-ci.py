@@ -501,7 +501,9 @@ def initialize_runner():
     directories = {"QCOPILOTS_SEARCH_BUILD_ROOT": parent,
                    "QCOPILOTS_SEARCH_VARIANT_ROOT": root,
                    "QCOPILOTS_SEARCH_QT_ROOT": parent / "sdk",
-                   "QCOPILOTS_SEARCH_MODEL_DIR": parent / "models",
+                   # actions/cache includes its path in the cache version.
+                   # Only immutable model files share a stable runner location.
+                   "QCOPILOTS_SEARCH_MODEL_DIR": temporary / "qcs-model-cache" / model_cache_group(selected["id"]),
                    "QCOPILOTS_SEARCH_TEST_ROOT": root / "runs/Release"}
     for directory in directories.values():
         directory.mkdir(parents=True, exist_ok=True)
@@ -527,6 +529,35 @@ def dev(action: str, *arguments: str, display=False):
     command += [action, "--build-root", BUILD_PARENT, "--variant", variant()["id"],
                 "--qt-root", QT, "--model-dir", MODELS, "--jobs", "3", *arguments]
     return run(command, display=display)
+
+
+def additional_models(identifier):
+    """Keep large-model inference off the 7 GB ARM runner and GPU SDK builders."""
+    return {
+        "windows-x64-cpu": ("qwen3-vl-embedding-2b",),
+        "linux-x64-cpu": ("qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"),
+        "macos-arm64-metal": ("qwen3-vl-embedding-2b",),
+    }.get(identifier, ())
+
+
+def model_cache_group(identifier):
+    """Match the workflow's cache key without restoring unneeded large models."""
+    return {
+        (): "gemma",
+        ("qwen3-vl-embedding-2b",): "gemma-qwen2b",
+        ("qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"): "gemma-qwen2b-qwen8b",
+    }[additional_models(identifier)]
+
+
+def multimodel():
+    selected = additional_models(variant()["id"])
+    if not selected:
+        raise RuntimeError("This native variant has no additional model acceptance assignment")
+    for identifier in selected:
+        dev("models", "--model", identifier)
+        dev("test-models", "--model", identifier)
+        dev("verify-package", "--model", identifier,
+            "--model-timeout", "1800", "--report-dir", str(REPORTS / ("package-" + identifier)), display=True)
 
 
 def find_program(name: str, *, installed: bool) -> Path:
@@ -604,7 +635,7 @@ def products():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["matrix", "initialize", "toolchain", "bootstrap", "doctor", "configure", "build",
-                        "install", "models", "test", "package", "installers", "products"])
+                        "install", "models", "test", "package", "multimodel", "installers", "products"])
     args = parser.parse_args()
     if args.action == "matrix":
         rows = [{**item, "container": item.get("container", "")} for item in variants().values()]
@@ -661,6 +692,8 @@ def main():
         for generator in selected["generators"]:
             dev("package", "--generator", generator)
         dev("verify-package", "--report-dir", str(REPORTS / "package"), display=True)
+    elif action == "multimodel":
+        multimodel()
     elif action == "installers":
         installers()
     elif action == "products":

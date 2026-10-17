@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QPointer>
 #include <QTimer>
 class QAction;
 class QCheckBox;
@@ -22,6 +23,7 @@ namespace qcopilots_search {
 class AppBackend;
 class PlatformIntegration;
 class PreviewPanel;
+class SettingsDialog;
 
 class SearchEdit final : public QLineEdit {
     Q_OBJECT
@@ -56,6 +58,7 @@ private:
     void applyLanguage();
     void createTray();
     void sendSearch(bool popup = false);
+    void refreshSearchForIndexChange(bool popup = false);
     void loadMoreFiles(bool popup = false);
     void updateBrowseControls(bool popup = false);
     void markFilesStale(bool popup = false);
@@ -68,7 +71,7 @@ private:
     void applySettings(const QJsonObject &json);
     void updateProgress(const QJsonObject &progress);
     void updateRuntimeStatus();
-    void showSettings(bool firstRun = false);
+    void showSettings(bool firstRun = false, bool modelsPage = false);
     void showModels();
     void openCurrent();
     void selectResult(int row);
@@ -107,6 +110,7 @@ private:
     struct ResultRequest {
         bool popup = false, browse = false, append = false;
         QJsonObject context;
+        bool refreshAfterResponse = false;
     };
     struct BrowseState {
         QString cursor, generation, visibilityEpoch, failure;
@@ -121,6 +125,7 @@ private:
     int modelReloadAttempts_ = 0;
     QList<SearchHit> hits_, popupHits_;
     QHash<QString, QString> pending_;
+    QHash<QString, QPointer<SettingsDialog>> settingsOperations_, modelStatusRequests_;
     QNetworkAccessManager *network_;
 };
 }

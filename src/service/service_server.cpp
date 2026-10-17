@@ -4,6 +4,7 @@
 #include "core/app_settings.h"
 #include "core/file_catalog.h"
 #include "core/model_files.h"
+#include "core/model_catalog.h"
 #include "core/native_lock_path.h"
 #include "core/pipeline_manifest.h"
 #include "storage/index_repository.h"
@@ -11,6 +12,7 @@
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
@@ -61,12 +63,13 @@ QString executablePath(const QString &name)
     return bin.filePath(executable);
 }
 
-QString pipelineVersion(bool models)
+QString pipelineVersion(const QString &modelId)
 {
     QByteArray material("qcopilots-search-pipeline-v1:");
     material += extractionPipelineFingerprint().toUtf8() + ':';
-    material += models ? embeddingPipelineFingerprint().toUtf8() : QByteArray("keyword-only");
-    if (models) for (const auto &artifact : ModelFiles::manifest()) material += ':' + artifact.sha256;
+    material += modelPipelineFingerprint(modelId).toUtf8();
+    if (const auto *model = findModel(modelId))
+        for (const auto &artifact : model->artifacts) material += ':' + artifact.sha256;
     return QString::fromLatin1(QCryptographicHash::hash(material, QCryptographicHash::Sha256).toHex());
 }
 
@@ -110,16 +113,19 @@ QString failureKey(const FileRecord &file)
 struct ScanPackage {
     ScanResult scan;
     QHash<QString, QString> versions;
+    QSet<QString> semanticFiles;
     QStringList generalRoots, codeRoots;
     quint64 generation = 0;
 };
 struct SearchPackage { QList<SearchHit> hits; QString error; };
+struct ModelCheck { bool available = false; QString error; QJsonObject runtime; bool filesVerified = false; };
 }
 
 class ServiceServer::Private {
 public:
     explicit Private(ServiceServer *owner, RuntimePaths value, ServiceDependencies dependencies) : q(owner), paths(std::move(value)),
-        repository(std::move(dependencies.storage)), modelVerifier(std::move(dependencies.verifyModels)),
+        storageOptions(std::move(dependencies.storage)), modelVerifier(std::move(dependencies.verifyModels)),
+        modelProbe(std::move(dependencies.probeModel)),
         listenFunction(std::move(dependencies.listen)),
         configureWorker(std::move(dependencies.configureWorker)), deviceSelections(std::move(dependencies.indexDevices)),
         indexIdleMs(qMax(1, dependencies.indexIdleMs)), queryIdleMs(qMax(1, dependencies.queryIdleMs)),
@@ -130,6 +136,7 @@ public:
         scanPool.setMaxThreadCount(1);
         writePool.setMaxThreadCount(1);
         searchPool.setMaxThreadCount(2);
+        modelPool.setMaxThreadCount(1);
         // Windows can emit newConnection synchronously from listen(). Register
         // once before listening so an early client is not left pending.
         QObject::connect(&server, &QLocalServer::newConnection, q, [this] { accept(); });
@@ -146,8 +153,11 @@ public:
     ServiceServer *q;
     RuntimePaths paths;
     AppSettings settings;
-    IndexRepository repository;
+    StorageOptions storageOptions;
+    std::shared_ptr<IndexRepository> repository;
+    QHash<QString, std::shared_ptr<IndexRepository>> repositories;
     std::function<bool(QString *)> modelVerifier;
+    std::function<bool(const QString &, QString *)> modelProbe;
     std::function<bool(QLocalServer &, const QString &)> listenFunction;
     std::function<void(QProcess &, bool)> configureWorker;
     QList<QJsonObject> deviceSelections;
@@ -204,7 +214,7 @@ public:
     bool queryGpuOperation = false;
     QString queryCpuFallback;
     IndexProgress progress;
-    QThreadPool scanPool, writePool, searchPool;
+    QThreadPool scanPool, writePool, searchPool, modelPool;
     std::mutex publicationConfigurationMutex;
     std::atomic_bool scanCancelled{false};
     quint64 generation = 1;
@@ -215,6 +225,12 @@ public:
     bool modelAvailable = false, pendingScan = false;
     bool pipelineReady = false, retryIncomplete = false;
     bool catalogReady = false, firstScan = true;
+    bool modelTransition = false;
+    bool startupProbePending = false;
+    bool modelFilesVerified = false;
+    std::atomic_bool modelCheckCancelled{false};
+    QString modelError;
+    QString loadingModelId;
     QString pipeline;
     QString pipelineError;
     QString watcherMode = QStringLiteral("periodic");
@@ -224,7 +240,259 @@ public:
     QStringList catalogRoots, catalogCodeRoots;
 
     QString tokenPath() const { return QDir(paths.profileDir).filePath(QStringLiteral("qcs-ipc-token")); }
-    QString journalPath() const { return QDir(paths.indexDir).filePath(QStringLiteral("qcs-progress.json")); }
+    QString journalPath() const { return QDir(paths.forModelIndex(settings.modelId).indexDir).filePath(QStringLiteral("qcs-progress.json")); }
+
+    void collectIdleRepositories() {
+        // Keep writer ownership on the service thread. A weak-only cache can
+        // expire before another thread finishes the repository destructor.
+        // Reclaim idle inactive ANN graphs without opening a second writer.
+        for (auto it = repositories.begin(); it != repositories.end();) {
+            if (it.value() != repository && it.value().use_count() == 1) it = repositories.erase(it);
+            else ++it;
+        }
+    }
+
+    std::shared_ptr<IndexRepository> openRepository(const QString &modelId, QString *error) {
+        if (auto existing = repositories.value(modelId)) return existing;
+        collectIdleRepositories();
+        auto selected = paths.forModelIndex(modelId);
+        if (!selected.ensure(error)) return {};
+        auto result = std::make_shared<IndexRepository>(storageOptions);
+        if (!result->open(selected, modelId, error)) return {};
+        repositories.insert(modelId, result);
+        return result;
+    }
+
+    QJsonObject capabilities(const QString &modelId) const {
+        const auto *model = findModel(modelId);
+        return {{"text", true}, {"image", model && model->supportsVision},
+                {"audio", model && model->supportsAudio}, {"videoFrames", model && model->supportsVision}};
+    }
+
+    int dimensions() const {
+        const auto *model = findModel(settings.modelId);
+        return model ? model->dimensions : 0;
+    }
+
+    bool workerModelMatches(const QJsonObject &result, bool embedded = true) const {
+        const auto fingerprint = modelPipelineFingerprint(settings.modelId);
+        const auto legacyFingerprint = result.value("modelFingerprint").toString();
+        return result.value("modelId").toString() == settings.modelId
+            && result.value("dimensions").toInt() == dimensions()
+            && result.value("embeddingFingerprint").toString() == fingerprint
+            && (legacyFingerprint == fingerprint || (!embedded && legacyFingerprint.isEmpty()));
+    }
+
+    QJsonObject modelStatus(const QString &modelId) const {
+        const auto *model = findModel(modelId);
+        if (!model) return {};
+        bool present = true;
+        const auto directory = modelDirectory(paths.modelDir, modelId);
+        for (const auto &artifact : model->artifacts) {
+            const QFileInfo file(QDir(directory).filePath(artifact.name));
+            present = present && file.isFile() && file.size() == artifact.size;
+        }
+        const bool current = modelId == settings.modelId;
+        const auto indexPaths = paths.forModelIndex(modelId);
+        QString indexState = QFileInfo::exists(indexPaths.databaseFile()) ? QStringLiteral("cached") : QStringLiteral("not-built");
+        if (current) {
+            if (!catalogReady) indexState = QStringLiteral("reconciling");
+            else if (knownVersions.isEmpty()) indexState = QStringLiteral("empty");
+            else if (!jobs.isEmpty() || activeIndexCount())
+                indexState = settings.indexingPaused ? QStringLiteral("pending") : QStringLiteral("indexing");
+            else if (!failedFiles.isEmpty()) indexState = QStringLiteral("partial");
+            else indexState = QStringLiteral("ready");
+        }
+        return {{"modelId", modelId}, {"configuredModelId", settings.modelId},
+                {"activeModelId", modelAvailable ? settings.modelId : QString{}},
+                {"dimensions", model->dimensions}, {"embeddingFingerprint", modelPipelineFingerprint(modelId)},
+                {"capabilities", capabilities(modelId)}, {"descriptor", model->toJson()},
+                {"filesPresent", present}, {"filesVerified", current && modelFilesVerified},
+                {"modelAvailable", current && modelAvailable}, {"loading", modelId == loadingModelId && modelTransition},
+                {"error", current ? modelError : QString{}},
+                {"indexDirectory", indexPaths.indexDir}, {"indexState", indexState}};
+    }
+
+    ModelCheck checkModel(const QString &modelId, bool cpuRetry = false) {
+        ModelCheck result;
+        const auto *model = findModel(modelId);
+        if (!model) { result.error = QStringLiteral("Unknown model: %1").arg(modelId); return result; }
+        ModelFiles files(modelDirectory(paths.modelDir, modelId), model->artifacts);
+        if (!(modelVerifier ? modelVerifier(&result.error) : files.verify(&result.error))) {
+            if (result.error.isEmpty()) result.error = QStringLiteral("Selected model files are unavailable: %1").arg(modelId);
+            return result;
+        }
+        result.filesVerified = true;
+        if (modelProbe || modelVerifier) {
+            result.available = !modelProbe || modelProbe(modelId, &result.error);
+            result.runtime = {{"modelId", modelId}, {"dimensions", model->dimensions},
+                {"embeddingFingerprint", modelPipelineFingerprint(modelId)}, {"loaded", false},
+                {"probePassed", result.available}};
+            return result;
+        }
+        // The probe lives on a dedicated thread and in an isolated process.
+        // Large decoder loads never block IPC or mutate the active index.
+        QProcess worker;
+        worker.setProgram(executablePath(QStringLiteral("qcs-worker")));
+        worker.setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir,
+                             "--model", modelId, "--mode", "full", "--threads", "2"});
+        if (cpuRetry) {
+            auto environment = QProcessEnvironment::systemEnvironment();
+            environment.insert("QCOPILOTS_SEARCH_BACKEND", "cpu"); worker.setProcessEnvironment(environment);
+        }
+        worker.start();
+        if (!worker.waitForStarted(3000)) { result.error = worker.errorString(); return result; }
+        worker.write("{\"id\":\"model-preflight\",\"operation\":\"model.probe\",\"runtimeEvents\":true}\n");
+        worker.waitForBytesWritten(3000);
+        QByteArray output, diagnostic;
+        QElapsedTimer timer; timer.start();
+        bool replied = false, gpuOperation = false;
+        while (!modelCheckCancelled.load() && timer.elapsed() < 10 * 60 * 1000) {
+            worker.waitForReadyRead(100);
+            output += worker.readAllStandardOutput();
+            diagnostic += worker.readAllStandardError();
+            if (diagnostic.size() > 16384) diagnostic = diagnostic.right(16384);
+            if (output.size() > maxMessageBytes) { result.error = QStringLiteral("Model probe output exceeded limit"); break; }
+            while (output.contains('\n')) {
+                const auto line = output.first(output.indexOf('\n'));
+                output.remove(0, line.size() + 1);
+                const auto message = QJsonDocument::fromJson(line).object();
+                if (message.value("id").toString() != QStringLiteral("model-preflight")) continue;
+                if (message.value("event").toString() == QStringLiteral("runtime")) {
+                    const auto data = message.value("data").toObject();
+                    const auto diagnostics = data.value("runtime").toObject();
+                    if (data.value("phase").toString() == QStringLiteral("inference-start")) {
+                        const auto packaged = diagnostics.value("packagedBackend").toString();
+                        gpuOperation = diagnostics.value("requestedBackend").toString().trimmed().compare("auto", Qt::CaseInsensitive) == 0
+                            && !packaged.isEmpty() && packaged != QStringLiteral("cpu")
+                            && (data.value("activity").toString() == QStringLiteral("model-load")
+                                || !diagnostics.value("loaded").toBool() || diagnostics.value("gpuSelected").toBool());
+                    } else if (data.value("phase").toString() == QStringLiteral("inference-end")) gpuOperation = false;
+                    continue;
+                }
+                if (!message.contains("ok")) continue;
+                replied = true;
+                if (!message.value("ok").toBool()) result.error = message.value("error").toObject().value("message").toString();
+                else {
+                    const auto payload = message.value("result").toObject();
+                    result.runtime = payload.value("runtime").toObject();
+                    result.available = payload.value("modelId").toString() == modelId
+                        && payload.value("dimensions").toInt() == model->dimensions
+                        && payload.value("embeddingFingerprint").toString() == modelPipelineFingerprint(modelId)
+                        && payload.value("probes").toObject().value("text").toBool()
+                        && (!model->supportsVision || payload.value("probes").toObject().value("image").toBool());
+                    if (!result.available) result.error = QStringLiteral("Model load probe returned an incompatible model contract");
+                }
+                break;
+            }
+            if (replied || worker.state() == QProcess::NotRunning) break;
+        }
+        const bool crashed = gpuOperation && !replied && worker.state() == QProcess::NotRunning && worker.exitCode() != 0;
+        if (worker.state() != QProcess::NotRunning) {
+            worker.write("{\"id\":\"shutdown\",\"operation\":\"shutdown\"}\n");
+            worker.closeWriteChannel();
+            if (!worker.waitForFinished(1000)) { worker.kill(); worker.waitForFinished(3000); }
+        }
+        const auto backend = qEnvironmentVariable("QCOPILOTS_SEARCH_BACKEND", "auto").trimmed().toLower();
+        if (crashed && !cpuRetry && !modelCheckCancelled.load() && (backend.isEmpty() || backend == "auto")) {
+            auto fallback = checkModel(modelId, true);
+            fallback.runtime.insert("fallbackReason", QStringLiteral("GPU model preflight exited during inference. Retried once on CPU."));
+            return fallback;
+        }
+        if (!result.available && result.error.isEmpty()) result.error = modelCheckCancelled.load()
+            ? QStringLiteral("Model load probe cancelled")
+            : QStringLiteral("Model load probe failed or timed out: %1").arg(QString::fromUtf8(diagnostic).trimmed());
+        if (!result.runtime.isEmpty()) {
+            result.runtime.insert("loaded", false);
+            result.runtime.insert("probePassed", result.available);
+        }
+        return result;
+    }
+
+    bool applySettings(const AppSettings &next, const ModelCheck *check, QString *error, bool persist = true) {
+        const bool modelChanged = next.modelId != settings.modelId;
+        auto target = repository;
+        if (modelChanged) {
+            target = openRepository(next.modelId, error);
+            if (!target || !target->setPipelineFingerprint(pipelineVersion(next.modelId), error)) return false;
+        }
+        // Save is the final fallible step. The old model, writer and queued
+        // requests remain active until the replacement has passed all checks.
+        if (persist && !next.save(paths.configFile, error)) return false;
+        const bool changed = modelChanged || next.fingerprint() != settings.fingerprint();
+        if (modelChanged) saveJournal();
+        previousRoots.append(settings.roots); previousRoots.removeDuplicates();
+        previousCodeRoots.append(settings.codeRoots); previousCodeRoots.removeDuplicates();
+        if (changed || check) {
+            ++visibilityEpoch;
+            invalidateIndexing();
+            if (modelChanged || check) {
+                for (const auto &key : requests.keys()) finishError(key, QStringLiteral("model_changed"), QStringLiteral("Model configuration changed"));
+                activeQuery.clear(); queryQueue.clear();
+                stopWorkerForRestart(true);
+            }
+        }
+        {
+            const std::lock_guard guard(publicationConfigurationMutex);
+            settings = next;
+            repository = std::move(target);
+            pipeline = pipelineVersion(settings.modelId);
+        }
+        collectIdleRepositories();
+        if (modelChanged) {
+            failures = {}; progress = {}; loadJournal();
+            previousRoots = settings.roots; previousCodeRoots = settings.codeRoots;
+        }
+        if (check) {
+            modelAvailable = check->available; modelError = check->error; modelFilesVerified = check->filesVerified;
+            pipelineReady = true; pipelineError.clear();
+            indexRuntime = check->runtime; queryRuntime = {}; latestRuntimeIsQuery = false;
+            quarantinedIndexDevices.clear(); queryGpuOperation = false; queryCpuFallback.clear();
+        }
+        updateWatchers();
+        event(QStringLiteral("settings"), settings.toJson());
+        event(QStringLiteral("runtime"), runtimeStatus());
+        if (changed || check) startScan(); else scheduleNext();
+        return true;
+    }
+
+    void changeSettings(const AppSettings &next, QLocalSocket *socket, const QString &id, bool reloadModel = false,
+                        bool statusResult = false, bool persist = true) {
+        if (modelTransition && !(startupProbePending && next.modelId == settings.modelId && !reloadModel)) {
+            sendError(socket, id, QStringLiteral("busy"), QStringLiteral("A model load verification is in progress")); return;
+        }
+        if (next.modelId == settings.modelId && !reloadModel) {
+            QString error;
+            if (!applySettings(next, nullptr, &error, persist)) sendError(socket, id, QStringLiteral("invalid_settings"), error);
+            else sendResult(socket, id, settings.toJson());
+            return;
+        }
+        modelTransition = true; loadingModelId = next.modelId; modelCheckCancelled.store(false);
+        const QPointer<QLocalSocket> client(socket);
+        const bool switching = next.modelId != settings.modelId;
+        const bool startupCheck = startupProbePending && !socket;
+        auto *watcher = new QFutureWatcher<ModelCheck>(q);
+        QObject::connect(watcher, &QFutureWatcher<ModelCheck>::finished, q, [this, watcher, client, id, next, switching, reloadModel, statusResult, persist, startupCheck] {
+            const auto check = watcher->result(); watcher->deleteLater(); modelTransition = false; startupProbePending = false; loadingModelId.clear();
+            if (stopping) return;
+            if ((switching || (reloadModel && !statusResult)) && !check.available) {
+                if (!switching) { modelError = check.error; modelFilesVerified = check.filesVerified; }
+                sendError(client, id, QStringLiteral("model_unavailable"), check.error.isEmpty() ? QStringLiteral("Selected model failed verification") : check.error);
+                return;
+            }
+            QString error;
+            // Ordinary folder/language/pause changes remain usable while the
+            // startup probe runs. It only publishes availability for the
+            // still-selected model, never restores its old settings snapshot.
+            const auto applied = startupCheck ? settings : next;
+            if (!applySettings(applied, &check, &error, persist)) {
+                sendError(client, id, QStringLiteral("pipeline_transition_failed"), error); return;
+            }
+            if (statusResult) sendResult(client, id, modelStatus(settings.modelId));
+            else sendResult(client, id, settings.toJson());
+        });
+        watcher->setFuture(QtConcurrent::run(&modelPool, [this, modelId = next.modelId] { return checkModel(modelId); }));
+    }
 
     void releaseClients() {
         // QLocalServer owns accepted sockets. Destroy them before Private's
@@ -267,7 +535,8 @@ public:
         // Only the authoritative profile-lock holder may remove a stale socket.
         // Reject symlinks and ordinary files instead of unlinking arbitrary data.
         if (!removeStaleIpcSocket(paths, error)) { lock.unlock(); return false; }
-        if (!repository.open(paths, error)) { lock.unlock(); return false; }
+        repository = openRepository(settings.modelId, error);
+        if (!repository) { lock.unlock(); return false; }
         if (settings.needsMigration() && !settings.save(paths.configFile, error)) { lock.unlock(); return false; }
         if (!refreshModels(error)) { lock.unlock(); return false; }
         token.resize(32);
@@ -315,6 +584,7 @@ public:
         started = true;
         reconcile.start();
         QTimer::singleShot(0, q, [this] { startScan(); });
+        if (startupProbePending) QTimer::singleShot(0, q, [this] { changeSettings(settings, nullptr, {}, true, true, false); });
         log(QStringLiteral("Service started for profile %1").arg(paths.profileDir));
         return true;
     }
@@ -331,6 +601,7 @@ public:
             slot->timeout.stop(); slot->idle.stop(); slot->shutdownGrace.stop(); slot->exit = ExitReason::Stop;
         }
         scanCancelled.store(true);
+        modelCheckCancelled.store(true);
         { const std::lock_guard guard(publicationConfigurationMutex); ++generation; }
         saveJournal();
         server.close();
@@ -348,9 +619,10 @@ public:
         for (auto worker : previews) if (worker) {
             worker->kill(); worker->waitForFinished(3000);
         }
-        scanPool.waitForDone(); writePool.waitForDone(); searchPool.waitForDone();
+        scanPool.waitForDone(); writePool.waitForDone(); searchPool.waitForDone(); modelPool.waitForDone();
         QString error;
-        if (!repository.flush(&error)) log(error);
+        for (const auto &retained : std::as_const(repositories)) if (!retained->flush(&error)) log(error);
+        repositories.clear();
         QFile::remove(tokenPath());
         lock.unlock();
         started = false;
@@ -412,7 +684,7 @@ public:
         auto payload = data;
         if (name == "indexChanged") {
             QString error;
-            const auto value = repository.browseGeneration(&error);
+            const auto value = repository->browseGeneration(&error);
             if (error.isEmpty() && value >= 0) payload.insert(QStringLiteral("browseGeneration"), QString::number(value));
             payload.insert(QStringLiteral("visibilityEpoch"), QString::number(visibilityEpoch));
         }
@@ -690,6 +962,7 @@ public:
         auto &diagnostics = query ? queryRuntime : slot->runtime;
         if (diagnostics.isEmpty() || !diagnostics.value("loaded").toBool()) return;
         diagnostics.insert("loaded", false);
+        if (!query && slot->retired) return;
         if (!query) indexRuntime = diagnostics;
         event(QStringLiteral("runtime"), runtimeStatus());
     }
@@ -773,11 +1046,19 @@ public:
             sendError(socket, id, QStringLiteral("busy"), QStringLiteral("Too many queued or running requests")); return;
         }
         const auto params = message.value("params").toObject();
+        if (modelTransition && !startupProbePending && (method == "index.pause" || method == "index.resume")) {
+            sendError(socket, id, QStringLiteral("busy"), QStringLiteral("A model load verification is in progress")); return;
+        }
         if (method == "status") {
             QString error;
-            const auto status = repository.status(&error);
+            const auto status = repository->status(&error);
             sendResult(socket, id, {{"progress", progress.toJson()}, {"repository", status}, {"settings", settings.toJson()},
                 {"modelAvailable", modelAvailable}, {"pipelineFingerprint", pipeline}, {"pipelineTransitionError", pipelineError},
+                {"modelId", settings.modelId}, {"configuredModelId", settings.modelId},
+                {"activeModelId", modelAvailable ? settings.modelId : QString{}}, {"dimensions", dimensions()},
+                {"embeddingFingerprint", modelPipelineFingerprint(settings.modelId)},
+                {"capabilities", capabilities(settings.modelId)}, {"modelError", modelError}, {"modelLoading", modelTransition},
+                {"loadingModelId", loadingModelId},
                 {"failures", failures}, {"warning", error},
                 {"watcherMode", watcherMode}, {"watcherWarning", watcherWarning}, {"reconcileIntervalMs", reconcile.interval()},
                 {"activeSearches", activeSearches.size()}, {"queuedQueries", queryQueue.size()},
@@ -801,21 +1082,33 @@ public:
             }
             AppSettings next;
             QString error;
-            if (!AppSettings::fromJson(json, &next, &error) || !next.save(paths.configFile, &error)) {
+            if (!AppSettings::fromJson(json, &next, &error)) {
                 sendError(socket, id, QStringLiteral("invalid_settings"), error); return;
             }
-            const bool changed = next.fingerprint() != settings.fingerprint();
-            previousRoots.append(settings.roots);
-            previousRoots.removeDuplicates();
-            previousCodeRoots.append(settings.codeRoots);
-            previousCodeRoots.removeDuplicates();
-            settings = next;
-            if (changed) { ++visibilityEpoch; invalidateIndexing(); }
-            updateWatchers();
-            sendResult(socket, id, settings.toJson());
-            event(QStringLiteral("settings"), settings.toJson());
-            if (changed) startScan();
-            else scheduleNext();
+            changeSettings(next, socket, id);
+        } else if (method == "settings.reload") {
+            AppSettings next;
+            QString error;
+            if (!next.load(paths.configFile, &error)) {
+                sendError(socket, id, QStringLiteral("invalid_settings"), error); return;
+            }
+            changeSettings(next, socket, id, false, false, false);
+        } else if (method == "models.select") {
+            auto json = settings.toJson(); json.insert("modelId", params.value("modelId"));
+            AppSettings next;
+            QString error;
+            if (!AppSettings::fromJson(json, &next, &error)) {
+                sendError(socket, id, QStringLiteral("invalid_settings"), error); return;
+            }
+            changeSettings(next, socket, id, next.modelId == settings.modelId && !modelAvailable);
+        } else if (method == "models.list") {
+            QJsonArray available;
+            for (const auto &model : modelCatalog()) available.append(model.toJson());
+            sendResult(socket, id, {{"models", available}, {"configuredModelId", settings.modelId}});
+        } else if (method == "models.status") {
+            const auto modelId = params.value("modelId").toString(settings.modelId);
+            if (!findModel(modelId)) { sendError(socket, id, QStringLiteral("invalid_model"), QStringLiteral("Unknown model: %1").arg(modelId)); return; }
+            sendResult(socket, id, modelStatus(modelId));
         } else if (method == "search") {
             if (params.value("code").toBool() && !settings.includeCode) {
                 sendError(socket, id, QStringLiteral("code_search_disabled"), QStringLiteral("Enable code search in folder settings before querying the code index")); return;
@@ -842,7 +1135,7 @@ public:
             });
             if (modelAvailable && params.value("semantic").toBool(true) && !params.value("query").toString().trimmed().isEmpty()) {
                 queryQueue.enqueue(internal); nextQuery();
-            } else runSearch(internal, {}, pipelineError);
+            } else runSearch(internal, {}, pipelineError.isEmpty() ? modelError : pipelineError);
         } else if (method == "files.list") {
             if (params.value("code").toBool() && !settings.includeCode) {
                 sendError(socket, id, QStringLiteral("code_search_disabled"), QStringLiteral("Enable code search before browsing the code index")); return;
@@ -886,18 +1179,7 @@ public:
             if (method == "index.retry") { failures = {}; retryIncomplete = true; }
             startScan(); sendResult(socket, id, progress.toJson());
         } else if (method == "models.reload") {
-            if (publishing) { sendError(socket, id, QStringLiteral("busy"), QStringLiteral("Index publication is in progress, retry shortly")); return; }
-            invalidateIndexing(false);
-            for (const auto &key : requests.keys()) finishError(key, QStringLiteral("model_changed"), QStringLiteral("Model configuration changed"));
-            activeQuery.clear(); queryQueue.clear();
-            stopWorkerForRestart(true);
-            QString error;
-            if (!refreshModels(&error)) {
-                progress.state = QStringLiteral("error"); progress.error = error; publishProgress();
-                sendError(socket, id, QStringLiteral("pipeline_transition_failed"), error); return;
-            }
-            sendResult(socket, id, {{"modelAvailable", modelAvailable}, {"fingerprint", pipeline}});
-            startScan();
+            changeSettings(settings, socket, id, true, true, false);
         } else if (method == "shutdown") {
             sendResult(socket, id, {{"stopping", true}});
             QTimer::singleShot(100, QCoreApplication::instance(), &QCoreApplication::quit);
@@ -911,11 +1193,23 @@ public:
         queryCpuFallback.clear();
         if (started) event(QStringLiteral("runtime"), runtimeStatus());
         QString verificationError;
-        ModelFiles models(paths.modelDir);
-        const bool available = modelVerifier ? modelVerifier(&verificationError) : models.verify(&verificationError);
-        const QString candidate = pipelineVersion(available);
+        const auto *descriptor = findModel(settings.modelId);
+        if (!descriptor) { if (error) *error = QStringLiteral("Unknown selected model"); return false; }
+        bool available = true;
+        if (modelVerifier) available = modelVerifier(&verificationError);
+        else {
+            // The service must establish IPC before hashing multi-gigabyte
+            // artifacts. Size checks only decide whether to schedule the real
+            // asynchronous verification, never whether inference is available.
+            for (const auto &artifact : descriptor->artifacts) {
+                const QFileInfo file(QDir(modelDirectory(paths.modelDir, settings.modelId)).filePath(artifact.name));
+                available = available && file.isFile() && file.size() == artifact.size;
+            }
+            if (!available) verificationError = QStringLiteral("Selected model files are missing or incomplete: %1").arg(settings.modelId);
+        }
+        const QString candidate = pipelineVersion(settings.modelId);
         QString transitionError;
-        if (!repository.setPipelineFingerprint(candidate, &transitionError)) {
+        if (!repository->setPipelineFingerprint(candidate, &transitionError)) {
             modelAvailable = false;
             pipelineReady = false;
             pipelineError = QStringLiteral("Cannot transition the index pipeline: %1").arg(transitionError);
@@ -924,7 +1218,12 @@ public:
             return false;
         }
         // Only a committed SQLite transition may publish a new inference space.
-        modelAvailable = available;
+        // Availability changes never alter index identity. A valid file pair
+        // still needs the asynchronous full-load probe before semantic use.
+        startupProbePending = available && (!modelVerifier || bool(modelProbe));
+        modelAvailable = available && bool(modelVerifier) && !modelProbe;
+        modelFilesVerified = available && bool(modelVerifier);
+        modelError = startupProbePending ? QStringLiteral("Model load verification pending") : verificationError;
         pipeline = candidate;
         pipelineReady = true;
         pipelineError.clear();
@@ -1007,28 +1306,44 @@ public:
         const bool retryCapped = std::exchange(retryIncomplete, false);
         for (const auto &file : result->scan.files) {
             const QString key = fileKey(file);
-            const QString version = file.fingerprint + u'|' + pipeline;
             const QString stored = result->versions.value(key);
+            const QString fullVersion = file.fingerprint + u'|' + pipeline;
+            const auto cappedVersion = [&stored](const QString &base) {
+                return stored == base + QStringLiteral("|capped:5000")
+                    || stored == base + QStringLiteral("|partial:5000");
+            };
+            // The terminal extraction limit is independent of model
+            // availability. Preserve both the original version layout and
+            // new keyword-only prefixes until a source/contract change or an
+            // explicit retry authorizes replacing the 5000 retained segments.
+            const bool storedCapped = cappedVersion(fullVersion)
+                || cappedVersion(fullVersion + QStringLiteral("|keyword-only"));
+            // Keep completed semantic content when a model temporarily becomes
+            // unavailable. Only fresh keyword-only publications need embedding
+            // work when the verified model becomes available again.
+            const bool preserveSemantic = !modelAvailable && (stored == fullVersion
+                || (result->semanticFiles.contains(key) && stored.startsWith(fullVersion + u'|')
+                    && !stored.startsWith(fullVersion + QStringLiteral("|keyword-only"))));
+            const QString version = fullVersion + (modelAvailable || preserveSemantic ? QString{} : QStringLiteral("|keyword-only"));
             (file.kind == "code" ? codePresent : generalPresent).insert(file.path);
             presentKeys.insert(key);
             metadata.append({file.path, file.kind == "code", file.modifiedMs, file.kind, file.fingerprint, stored});
             const bool unchanged = knownVersions.value(key) == version;
             knownVersions.insert(key, version);
             if (!unchanged) { completedFiles.remove(key); failedFiles.remove(key); }
-            if (unchanged && completedFiles.contains(key) && !retryCapped) continue;
-            if (!retryCapped && (stored == version + QStringLiteral("|capped:5000")
-                || stored == version + QStringLiteral("|partial:5000"))) {
+            if (!retryCapped && storedCapped) {
                 const QString message = QStringLiteral("Index limit reached: the first 5000 segments remain searchable. Change the file or explicitly retry to rebuild it.");
                 failures.insert(failureKey(file), message); failedFiles.insert(key); progress.error = message;
                 continue;
             }
+            if (preserveSemantic && !(retryCapped && storedCapped)) { completedFiles.insert(key); continue; }
+            if (unchanged && completedFiles.contains(key) && !retryCapped) continue;
             if (stored == version && !failures.contains(failureKey(file))) {
                 completedFiles.insert(key); failedFiles.remove(key); continue;
             }
             if (jobs.contains(key) && jobs.value(key).indexedVersion == version && !retryCapped) continue;
             Job job{file, sourceVersion(file.path), version, epoch};
-            job.retry = retryCapped && (stored == version + QStringLiteral("|capped:5000")
-                || stored == version + QStringLiteral("|partial:5000"));
+            job.retry = retryCapped && storedCapped;
             added.append(std::move(job));
         }
         std::stable_sort(added.begin(), added.end(), [](const Job &a, const Job &b) {
@@ -1101,14 +1416,15 @@ public:
             }
             refreshProgressCounts(); event(QStringLiteral("indexChanged"), {}); scheduleNext();
         });
-        writer->setFuture(QtConcurrent::run(&writePool, [this, generalRoots, codeRoots, generalPresent, codePresent,
+        writer->setFuture(QtConcurrent::run(&writePool, [this, repository = repository, generalRoots, codeRoots, generalPresent, codePresent,
                                                         metadata = std::move(metadata), epoch, includeCode] {
             QString error;
             const std::lock_guard guard(publicationConfigurationMutex);
             if (epoch != generation) return QString{};
-            if (!repository.updateFileMetadata(metadata, &error)) return error;
-            for (const auto &root : generalRoots) if (!repository.prune(root, generalPresent, false, &error)) return error;
-            if (includeCode) for (const auto &root : codeRoots) if (!repository.prune(root, codePresent, true, &error)) return error;
+            if (!repository->invalidateChangedFiles(metadata, &error)) return error;
+            if (!repository->updateFileMetadata(metadata, &error)) return error;
+            for (const auto &root : generalRoots) if (!repository->prune(root, generalPresent, false, &error)) return error;
+            if (includeCode) for (const auto &root : codeRoots) if (!repository->prune(root, codePresent, true, &error)) return error;
             return error;
         }));
         publishProgress();
@@ -1116,6 +1432,7 @@ public:
 
     void startScan() {
         if (stopping) return;
+        collectIdleRepositories();
         if (!pipelineReady) { progress.state = QStringLiteral("error"); progress.error = pipelineError; publishProgress(); return; }
         // Catalog reconciliation is metadata-only and remains available while
         // extraction is paused. One pending result bounds memory and merge work.
@@ -1127,6 +1444,7 @@ public:
         FolderRules code{settings.codeRoots, settings.codeExcludes, true};
         code.scope = FolderRules::Scope::Code;
         const bool includeCode = settings.includeCode;
+        const bool preserveEmbeddings = !modelAvailable;
         scanProtectedGeneral.clear(); scanProtectedCode.clear();
         for (const auto &job : std::as_const(jobs)) protectForScan(job);
         for (auto &slot : indexSlots) if (slot->current) protectForScan(*slot->current);
@@ -1140,7 +1458,7 @@ public:
             pendingCatalog = std::make_unique<ScanPackage>(std::move(result));
             mergeCatalog();
         });
-        watcher->setFuture(QtConcurrent::run(&scanPool, [this, general, code, includeCode, epoch] {
+        watcher->setFuture(QtConcurrent::run(&scanPool, [this, repository = repository, general, code, includeCode, preserveEmbeddings, epoch] {
             ScanPackage result; result.generation = epoch;
             QSet<QString> seen;
             const auto scanSpace = [this, &result, &seen](const FolderRules &rules, QStringList &successfulRoots) {
@@ -1172,7 +1490,9 @@ public:
             if (includeCode && !result.scan.cancelled) scanSpace(code, result.codeRoots);
             for (const auto &file : result.scan.files) {
                 if (scanCancelled.load()) { result.scan.cancelled = true; break; }
-                result.versions.insert(fileKey(file), repository.fileVersion(file.path, file.kind == "code"));
+                result.versions.insert(fileKey(file), repository->fileVersion(file.path, file.kind == "code"));
+                if (preserveEmbeddings && repository->fileHasEmbeddings(file.path, file.kind == "code"))
+                    result.semanticFiles.insert(fileKey(file));
             }
             return result;
         }));
@@ -1298,6 +1618,7 @@ public:
         if (worker.state() == QProcess::Starting) return false;
         worker.setProgram(executablePath(QStringLiteral("qcs-worker")));
         worker.setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir,
+                             "--model", settings.modelId,
                              "--mode", query ? "query" : (modelAvailable ? "full" : "extract"), "--threads", query ? "4" : "2"});
         worker.setProcessEnvironment(QProcessEnvironment::systemEnvironment());
         if (configureWorker) configureWorker(worker, query);
@@ -1334,6 +1655,7 @@ public:
         }
         if (pendingScan && !scanning) startScan();
         if (!pipelineReady) { progress.state = QStringLiteral("error"); progress.error = pipelineError; publishProgress(); return; }
+        if (startupProbePending) { progress.state = QStringLiteral("loading-model"); publishProgress(); updateIdleWorkers(); return; }
         if (settings.indexingPaused) { progress.state = QStringLiteral("paused"); publishProgress(); updateIdleWorkers(); return; }
         if (jobs.isEmpty() && !activeIndexCount()) {
             progress.state = scanning ? QStringLiteral("scanning")
@@ -1383,7 +1705,7 @@ public:
         slot.current = std::make_unique<Job>(jobs.take(key));
         if (slot.current->generation != generation) { slot.current.reset(); QTimer::singleShot(0, q, [this] { scheduleNext(); }); return; }
         QString error;
-        const auto stored = repository.fileVersion(slot.current->file.path, slot.current->file.kind == "code", &error);
+        const auto stored = repository->fileVersion(slot.current->file.path, slot.current->file.kind == "code", &error);
         if (!error.isEmpty()) { failCurrent(slot, error); return; }
         if (!slot.current->retry && stored == slot.current->indexedVersion && !failures.contains(failureKey(slot.current->file))) {
             completedFiles.insert(key); failedFiles.remove(key); refreshProgressCounts(); slot.current.reset();
@@ -1420,6 +1742,7 @@ public:
         slot.requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         const QJsonObject request{{"id", slot.requestId}, {"operation", "extract"}, {"path", slot.current->file.path},
             {"expectedVersion", slot.current->workerVersion}, {"code", slot.current->file.kind == "code"}, {"embed", modelAvailable},
+            {"modelId", settings.modelId}, {"dimensions", dimensions()}, {"embeddingFingerprint", modelPipelineFingerprint(settings.modelId)},
             {"offset", slot.current->offset}, {"maxSegments", 40}, {"pipelineFingerprint", pipeline}, {"runtimeEvents", true}};
         slot.worker.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
         slot.timeout.start(10 * 60 * 1000);
@@ -1452,7 +1775,7 @@ public:
             return;
         }
         if (result.value("extractionFingerprint").toString() != extractionPipelineFingerprint()
-            || (modelAvailable && result.value("modelFingerprint").toString() != embeddingPipelineFingerprint())) {
+            || !workerModelMatches(result, modelAvailable)) {
             failCurrent(slot, QStringLiteral("Worker pipeline fingerprint differs from the service build")); return;
         }
         if (!currentSourceMatches(slot)
@@ -1468,6 +1791,9 @@ public:
         const qsizetype previousCount = slot.current->segments.size();
         for (const auto &value : result.value("segments").toArray()) {
             auto segment = Segment::fromJson(value.toObject());
+            if (!modelAvailable && !segment.embedding.isEmpty()) {
+                failCurrent(slot, QStringLiteral("Keyword-only worker unexpectedly returned a semantic vector")); return;
+            }
             segment.path = slot.current->file.path;
             segment.mediaPath.clear(); // Worker temporary files are never persisted as preview paths.
             slot.current->segments.append(std::move(segment));
@@ -1523,7 +1849,7 @@ public:
                 QTimer::singleShot(0, q, [this] { scheduleNext(); });
             } else failCurrent(slot, extractionError.isEmpty() ? QStringLiteral("Worker returned a partial result without a continuation") : extractionError);
         });
-        watcher->setFuture(QtConcurrent::run(&writePool, [this, job, version] {
+        watcher->setFuture(QtConcurrent::run(&writePool, [this, repository = repository, job, version] {
             QString error;
             // The lease is held only across the SQLite transaction. ANN rebuilding
             // happens after its release, so configuration and IPC remain responsive.
@@ -1534,7 +1860,7 @@ public:
                     || now.fingerprint != job.file.fingerprint) return {};
                 return lease;
             };
-            if (!repository.replaceFile(job.file.path, version, job.segments, job.file.kind == "code", &error, gate,
+            if (!repository->replaceFile(job.file.path, version, job.segments, job.file.kind == "code", &error, gate,
                                         job.file.modifiedMs, job.file.kind)) return error;
             return QString{};
         }));
@@ -1559,15 +1885,21 @@ public:
             if (error.isEmpty()) { protectForScan(job); event(QStringLiteral("indexChanged"), {{"path", job.file.path}}); }
             failCurrent(slot, error.isEmpty() ? failure : failure + QStringLiteral("\nCannot preserve filename index: ") + error);
         });
-        watcher->setFuture(QtConcurrent::run(&writePool, [this, job] {
+        watcher->setFuture(QtConcurrent::run(&writePool, [this, repository = repository, pipeline = pipeline, job] {
             QString error;
             auto segments = job.segments;
             if (segments.isEmpty()) {
-                const auto stored = repository.fileVersion(job.file.path, job.file.kind == "code", &error);
+                const auto stored = repository->fileVersion(job.file.path, job.file.kind == "code", &error);
                 if (!error.isEmpty()) return error;
-                if (stored == job.indexedVersion || stored.startsWith(job.indexedVersion + u'|')) {
-                    segments = repository.fileSegments(job.file.path, job.file.kind == "code", &error);
+                if (stored == job.indexedVersion || stored.startsWith(job.indexedVersion + u'|')
+                    || stored.startsWith(job.file.fingerprint + u'|')) {
+                    segments = repository->fileSegments(job.file.path, job.file.kind == "code", &error);
                     if (!error.isEmpty()) return error;
+                    // A source-stable prefix remains useful after moving from
+                    // a legacy keyword version. Never copy an incompatible
+                    // semantic contract into the current publication.
+                    if (!stored.startsWith(job.file.fingerprint + u'|' + pipeline))
+                        for (auto &segment : segments) segment.embedding.clear();
                 }
             }
             if (segments.isEmpty()) {
@@ -1584,7 +1916,7 @@ public:
                     || now.fingerprint != job.file.fingerprint) return {};
                 return lease;
             };
-            repository.replaceFile(job.file.path, job.indexedVersion + QStringLiteral("|failed:%1").arg(job.offset),
+            repository->replaceFile(job.file.path, job.indexedVersion + QStringLiteral("|failed:%1").arg(job.offset),
                 segments, job.file.kind == "code", &error, gate, job.file.modifiedMs, job.file.kind);
             return error;
         }));
@@ -1643,6 +1975,7 @@ public:
         const auto params = requests.value(activeQuery).params;
         queryIdle.stop();
         const QJsonObject request{{"id", activeQuery}, {"operation", "query"}, {"query", params.value("query")},
+            {"modelId", settings.modelId}, {"dimensions", dimensions()}, {"embeddingFingerprint", modelPipelineFingerprint(settings.modelId)},
             {"code", params.value("code").toBool()}, {"runtimeEvents", true}};
         queryWorker.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
         queryTimeout.start(90000);
@@ -1657,10 +1990,10 @@ public:
         QString warning;
         if (message.value("ok").toBool()) {
             const auto result = message.value("result").toObject();
-            if (result.value("modelFingerprint").toString() != embeddingPipelineFingerprint())
+            if (!workerModelMatches(result))
                 warning = QStringLiteral("Query encoder pipeline fingerprint differs from the service build");
             else for (const auto &value : result.value("embedding").toArray()) embedding.append(float(value.toDouble()));
-            if (embedding.size() != embeddingDimensions) { embedding.clear(); warning = QStringLiteral("Query encoder returned an invalid vector"); }
+            if (embedding.size() != dimensions()) { embedding.clear(); warning = QStringLiteral("Query encoder returned an invalid vector"); }
             if (strictGpu() && (!queryRuntime.value("gpuSelected").toBool() || !queryRuntime.value("loaded").toBool()
                 || !queryRuntime.value("gpuSelfTestPassed").toBool() || !queryRuntime.value("textWarmupCompleted").toBool())) {
                 embedding.clear(); warning = QStringLiteral("Strict GPU inference did not confirm a loaded GPU backend");
@@ -1737,7 +2070,7 @@ public:
             payload.insert(QStringLiteral("visibilityEpoch"), QString::number(requestVisibility));
             sendResult(pending.socket, pending.id, payload);
         });
-        watcher->setFuture(QtConcurrent::run(&searchPool, [this, options] { return repository.listFiles(options); }));
+        watcher->setFuture(QtConcurrent::run(&searchPool, [repository = repository, options] { return repository->listFiles(options); }));
         QTimer::singleShot(120000, q, [this, id] {
             finishError(id, QStringLiteral("timeout"), QStringLiteral("File browsing timed out"));
         });
@@ -1782,10 +2115,10 @@ public:
             const auto pending = requests.take(id);
             sendResult(pending.socket, pending.id, {{"hits", hits}, {"semantic", semantic}, {"warning", warning}});
         });
-        watcher->setFuture(QtConcurrent::run(&searchPool, [this, options] {
+        watcher->setFuture(QtConcurrent::run(&searchPool, [repository = repository, options] {
             SearchPackage result;
             if (options.cancelled && options.cancelled->load()) { result.error = QStringLiteral("Search cancelled"); return result; }
-            result.hits = repository.search(options, &result.error); return result;
+            result.hits = repository->search(options, &result.error); return result;
         }));
     }
 
@@ -1918,7 +2251,7 @@ public:
         // journal is diagnostic, so losing it cannot invalidate resumable data.
         // Native source fingerprint, pipeline and code space were checked above.
         QString error;
-        auto segments = repository.fileSegments(job.file.path, job.file.kind == "code", &error);
+        auto segments = repository->fileSegments(job.file.path, job.file.kind == "code", &error);
         if (error.isEmpty()) { job.offset = offset; job.segments = std::move(segments); }
         return error;
     }

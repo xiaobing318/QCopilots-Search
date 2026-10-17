@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,8 @@ sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("qcs_release", Path(__file__).resolve().parents[2] / "tools/qcs-release.py")
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
+VERSION = release.project_version(release.SOURCE)
+TAG = "v" + VERSION
 CANDIDATE = "1" * 40
 IDENTITY = {"candidateHead": CANDIDATE, "checkoutCommit": CANDIDATE, "sourceTree": "2" * 40,
             "workingTreeModified": False}
@@ -155,7 +158,7 @@ class FreezeTests(ExternalTest):
         self.assertEqual(document["configurations"]["windows-x64-cpu"]["sourceAttempt"], 2)
         self.assertEqual(document["configurations"]["linux-x64-cpu"]["sourceAttempt"], 1)
         package = document["configurations"]["linux-x64-cpu"]["packages"][0]["filename"]
-        self.assertEqual(package, "qcs-0.1.0-linux-x64-cpu.deb")
+        self.assertEqual(package, f"qcs-{VERSION}-linux-x64-cpu.deb")
 
     def test_failed_latest_job_cannot_borrow_old_success(self):
         self.api.partial_retry()
@@ -386,10 +389,10 @@ class UploadTests(ExternalTest):
         self.document = release.read_json(self.manifest)
 
     def upload(self):
-        return release.upload_draft(self.manifest, release.SOURCE, "v0.1.0", api=self.api)
+        return release.upload_draft(self.manifest, release.SOURCE, TAG, api=self.api)
 
     def publish(self):
-        return release.publish(self.manifest, release.SOURCE, "v0.1.0", api=self.api)
+        return release.publish(self.manifest, release.SOURCE, TAG, api=self.api)
 
     def test_create_and_reuse_draft_checks_all_twenty_four_assets_without_redownload(self):
         first = self.upload()
@@ -489,7 +492,7 @@ class UploadTests(ExternalTest):
         self.assertTrue(second["alreadyPublished"])
         self.assertEqual(len(first["assets"]), 24)
         patches = [data for method, _, data in self.api.calls if method == "PATCH"]
-        self.assertEqual(patches, [{"tag_name": "v0.1.0", "target_commitish": CANDIDATE,
+        self.assertEqual(patches, [{"tag_name": TAG, "target_commitish": CANDIDATE,
                                   "draft": False, "prerelease": False, "make_latest": "true"}])
         self.assertEqual(len(self.api.download_calls), 21)
 
@@ -550,7 +553,7 @@ class UploadTests(ExternalTest):
         self.publish()
         mutations = [(method, endpoint, data) for method, endpoint, data in self.api.calls if method in ("POST", "PATCH")]
         self.assertEqual(mutations[-2][1], f"/repos/{release.REPOSITORY}/git/refs")
-        self.assertEqual(mutations[-2][2], {"ref": "refs/tags/v0.1.0", "sha": CANDIDATE})
+        self.assertEqual(mutations[-2][2], {"ref": "refs/tags/" + TAG, "sha": CANDIDATE})
         self.assertEqual(mutations[-1][0], "PATCH")
 
     def test_tag_create_concurrent_same_commit_and_lost_response_are_recoverable(self):
@@ -559,7 +562,7 @@ class UploadTests(ExternalTest):
             with self.subTest(error=str(error)):
                 self.api.tag_sha = None
                 self.api.tag_create_error = error
-                release.ensure_release_tag(self.api, "v0.1.0", CANDIDATE)
+                release.ensure_release_tag(self.api, TAG, CANDIDATE)
                 self.assertEqual(self.api.tag_sha, CANDIDATE)
 
     def test_incomplete_assets_do_not_create_a_tag(self):
@@ -593,17 +596,22 @@ class UploadTests(ExternalTest):
 
     def test_tag_must_match_package_version(self):
         with self.assertRaisesRegex(ValueError, "frozen project version"):
-            release.upload_draft(self.manifest, release.SOURCE, "v0.2.0", api=self.api)
+            release.upload_draft(self.manifest, release.SOURCE, TAG + "-mismatch", api=self.api)
         self.assertIsNone(self.api.release)
 
-    def test_notes_have_twenty_one_exact_downloads_and_validation_limits(self):
+    def test_notes_only_contain_categories_and_all_twenty_four_exact_downloads(self):
         self.upload()
         notes = self.api.release["body"]
-        for item in self.document["assets"]:
-            self.assertIn("/" + item["name"] + ")", notes)
-        for text in ("Windows x64", "Linux x64", "macOS Apple Silicon", "尚未实测", "未提供 Windows Authenticode", "首次使用", "payload-manifest.json", "gfx1200", "ad-hoc"):
-            self.assertIn(text, notes)
-        self.assertNotIn("attempt1.zip", notes)
+        prefix = f"https://github.com/{release.REPOSITORY}/releases/download/{TAG}/"
+        expected_names = [item["name"] for item in self.document["assets"]] + [release.MANIFEST]
+        self.assertEqual(len(expected_names), 24)
+        self.assertCountEqual(re.findall(r"\]\(([^)]+)\)", notes), [prefix + name for name in expected_names])
+        self.assertEqual([line for line in notes.splitlines() if line.startswith("### ")],
+                         ["### Windows x64", "### Linux x64", "### macOS Apple Silicon", "### 其他下载"])
+        for line in filter(None, notes.splitlines()):
+            self.assertTrue(line.startswith(("### ", "|", "- [")), line)
+        for text in ("安装与使用", "签名与验证范围", "首次使用", "payload-manifest.json", "源码提交", "CI：", "attempt1.zip"):
+            self.assertNotIn(text, notes)
 
     def test_rocm_setup_notes_use_selected_installer_name(self):
         document = deepcopy(self.document)
@@ -611,9 +619,9 @@ class UploadTests(ExternalTest):
         for item in packages:
             if item["filename"].endswith(".exe"):
                 item["filename"] = item["filename"].removesuffix(".exe") + "-setup.zip"
-        notes = release.release_notes(document, "v0.1.0", "f" * 64)
-        self.assertIn("qcs-0.1.0-windows-x64-rocm-setup.zip)", notes)
-        self.assertNotIn("qcs-0.1.0-windows-x64-rocm.exe)", notes)
+        notes = release.release_notes(document, TAG)
+        self.assertIn(f"[ZIP 安装器](https://github.com/{release.REPOSITORY}/releases/download/{TAG}/qcs-{VERSION}-windows-x64-rocm-setup.zip)", notes)
+        self.assertNotIn(f"qcs-{VERSION}-windows-x64-rocm.exe)", notes)
 
 
 class GitNormalizationTests(ExternalTest):

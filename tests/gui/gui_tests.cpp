@@ -5,6 +5,7 @@
 #include "app/preview_panel.h"
 #include "app/settings_dialog.h"
 #include "core/app_settings.h"
+#include "core/model_catalog.h"
 #include "support/test_environment.h"
 #include <QAbstractItemView>
 #include <QApplication>
@@ -91,6 +92,8 @@ public:
     bool autoFiles = true;
     bool autoStatus = true;
     bool autoPreview = true;
+    bool autoModelApply = true;
+    bool modelFilesPresent = false;
     int next = 1;
     FakeBackend() { settings.language = "en"; settings.checkUpdates = false; settings.minimizeToTray = false; }
     void start() override { QTimer::singleShot(0, this, [this] { emit connected(); }); }
@@ -98,11 +101,20 @@ public:
         const QString id = QString::number(next++);
         requests.append({id, method, params});
         QTimer::singleShot(0, this, [this, id, method, params] {
-            if (method == "settings.get") emit response(id, settings.toJson());
+            if (method == "settings.get" || method == "settings.reload") emit response(id, settings.toJson());
             else if (method == "settings.set") {
                 auto updated = settings.toJson();
                 for (auto it = params.begin(); it != params.end(); ++it) updated.insert(it.key(), it.value());
                 QString error; AppSettings::fromJson(updated, &settings, &error); emit response(id, settings.toJson());
+            }
+            else if (method == "models.select" && autoModelApply) {
+                settings.modelId = params.value("modelId").toString();
+                emit response(id, settings.toJson());
+            }
+            else if (method == "models.status") {
+                const QString modelId = params.value("modelId").toString(settings.modelId);
+                emit response(id, {{"modelId", modelId}, {"configuredModelId", settings.modelId},
+                    {"activeModelId", QString()}, {"filesPresent", modelFilesPresent}, {"filesVerified", false}, {"modelAvailable", false}});
             }
             else if (method == "status" && autoStatus) emit response(id, {{"modelAvailable", false}, {"progress", QJsonObject{{"state", "idle"}, {"total", 2}, {"completed", 2}}}});
             else if (method == "search" && autoSearch) {
@@ -506,8 +518,9 @@ private slots:
         QVERIFY(status->text().contains("Indexing: HIP"));
         QVERIFY(status->text().contains("2/2 GPU available"));
         QVERIFY(status->text().contains("1 busy"));
-        QVERIFY(status->text().contains("AMD Radeon 0 · busy · 4 batches completed · report.txt"));
-        QVERIFY(status->text().contains("AMD Radeon 1 · ready · 3 batches completed"));
+        QVERIFY(status->text().contains("AMD Radeon 0 · busy · 4 cumulative batches completed · report.txt"));
+        QVERIFY(status->text().contains("AMD Radeon 1 · ready · 3 cumulative batches completed"));
+        QVERIFY(status->toolTip().contains("Batch counts are cumulative, not file counts."));
         QVERIFY(status->toolTip().contains("0000:02:00.0"));
         QVERIFY(status->toolTip().contains(env.path("documents/report.txt")));
         second.insert("state", "failed");
@@ -519,7 +532,8 @@ private slots:
         backend.settings.language = "zh_CN";
         emit backend.eventReceived("settings", backend.settings.toJson());
         QVERIFY(status->text().contains(QString::fromUtf8("1/2 GPU 可用")));
-        QVERIFY(status->text().contains(QString::fromUtf8("已完成 4 批次")));
+        QVERIFY(status->text().contains(QString::fromUtf8("累计完成 4 批次")));
+        QVERIFY(status->toolTip().contains(QString::fromUtf8("批次数是累计处理量，不是文件数。")));
         emit backend.disconnected();
         QVERIFY(status->text().contains(QString::fromUtf8("0/2 GPU 可用")));
         QVERIFY(status->text().contains(QString::fromUtf8("已断开")));
@@ -816,6 +830,122 @@ private slots:
         QCOMPARE(preview->currentHit().path, selected.path);
         QCOMPARE(window.findChild<QTextBrowser *>("textPreview")->toPlainText(), expanded);
         QVERIFY(results->verticalScrollBar()->value() > 0);
+    }
+    void indexChangesCoalesceWhileSemanticQueryIsPending_data() {
+        QTest::addColumn<bool>("popup");
+        QTest::newRow("main-window") << false;
+        QTest::newRow("quick-search") << true;
+    }
+    void indexChangesCoalesceWhileSemanticQueryIsPending() {
+        QFETCH(bool, popup);
+        TestEnvironment env("gui-coalesce-cold-query"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        if (popup) window.showQuickSearch();
+        auto *query = window.findChild<SearchEdit *>(popup ? "quickSearchInput" : "searchInput");
+        query->setText("a cold semantic query");
+        QTRY_COMPARE(backend.count("search"), 1);
+        const QString first = backend.last("search").id;
+        for (int n = 0; n < 3; ++n) {
+            emit backend.eventReceived("indexChanged", {{"browseGeneration", QString::number(n + 1)}});
+            // Wait beyond the debounce. Reconciliation must not restart the
+            // still-loading query encoder, even across repeated publications.
+            QTest::qWait(300);
+            QCOMPARE(backend.count("search"), 1);
+            QVERIFY(!backend.cancelled.contains(first));
+        }
+        emit backend.response(first, {{"hits", QJsonArray{}}, {"semantic", true}});
+        QTRY_COMPARE(backend.count("search"), 2);
+        const QString refresh = backend.last("search").id;
+        QVERIFY(refresh != first);
+        QVERIFY(!backend.cancelled.contains(first));
+        emit backend.response(refresh, {{"hits", QJsonArray{}}, {"semantic", true}});
+        QTest::qWait(350);
+        QCOMPARE(backend.count("search"), 2);
+    }
+    void pendingIndexRefreshDoesNotRetryFailedQuery_data() {
+        QTest::addColumn<bool>("popup");
+        QTest::newRow("main-window") << false;
+        QTest::newRow("quick-search") << true;
+    }
+    void hiddenQuickSearchDoesNotSendDeferredIndexRefresh() {
+        TestEnvironment env("gui-hidden-coalesced-query"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        window.showQuickSearch();
+        auto *popup = window.findChild<QDialog *>("quickSearchWindow"); QVERIFY(popup);
+        auto *query = window.findChild<SearchEdit *>("quickSearchInput"); QVERIFY(query);
+        query->setText("query before hiding");
+        QTRY_COMPARE(backend.count("search"), 1);
+        const QString first = backend.last("search").id;
+        emit backend.eventReceived("indexChanged", {});
+        emit backend.response(first, {{"hits", QJsonArray{}}, {"semantic", true}});
+        // The response schedules the merged refresh while the popup is visible.
+        // Hiding it before the debounce expires must suppress that send.
+        popup->hide();
+        QTest::qWait(350);
+        QCOMPARE(backend.count("search"), 1);
+        QVERIFY(!backend.cancelled.contains(first));
+        window.showQuickSearch();
+        QTRY_COMPARE(backend.count("search"), 2);
+        QCOMPARE(backend.last("search").params.value("query").toString(), QString("query before hiding"));
+    }
+    void pendingIndexRefreshDoesNotRetryFailedQuery() {
+        QFETCH(bool, popup);
+        TestEnvironment env("gui-coalesced-query-failure"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        if (popup) window.showQuickSearch();
+        auto *query = window.findChild<SearchEdit *>(popup ? "quickSearchInput" : "searchInput");
+        query->setText("first query");
+        QTRY_COMPARE(backend.count("search"), 1);
+        const QString first = backend.last("search").id;
+        emit backend.eventReceived("indexChanged", {});
+        emit backend.eventReceived("indexChanged", {});
+        emit backend.failed(first, "timeout", "Query encoder timed out");
+        QTest::qWait(350);
+        QCOMPARE(backend.count("search"), 1);
+        query->setText("a new query");
+        QTRY_COMPARE(backend.count("search"), 2);
+        emit backend.response(backend.last("search").id, {{"hits", QJsonArray{}}, {"semantic", true}});
+        QTest::qWait(350);
+        QCOMPARE(backend.count("search"), 2);
+    }
+    void userEditCancelsQueryAndClearsPendingIndexRefresh_data() {
+        QTest::addColumn<bool>("popup");
+        QTest::newRow("main-window") << false;
+        QTest::newRow("quick-search") << true;
+    }
+    void userEditCancelsQueryAndClearsPendingIndexRefresh() {
+        QFETCH(bool, popup);
+        TestEnvironment env("gui-coalesced-query-edit"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        if (popup) window.showQuickSearch();
+        auto *query = window.findChild<SearchEdit *>(popup ? "quickSearchInput" : "searchInput");
+        query->setText("old query");
+        QTRY_COMPARE(backend.count("search"), 1);
+        const QString first = backend.last("search").id;
+        emit backend.eventReceived("indexChanged", {});
+        emit backend.eventReceived("indexChanged", {});
+        query->setText("changed by the user");
+        QTRY_COMPARE(backend.count("search"), 2);
+        QVERIFY(backend.cancelled.contains(first));
+        const QString current = backend.last("search").id;
+        QCOMPARE(backend.last("search").params.value("query").toString(), QString("changed by the user"));
+        emit backend.response(first, {{"hits", QJsonArray{}}, {"semantic", true}});
+        emit backend.response(current, {{"hits", QJsonArray{}}, {"semantic", true}});
+        QTest::qWait(350);
+        QCOMPARE(backend.count("search"), 2);
+        QVERIFY(!backend.cancelled.contains(current));
     }
     void indexPublicationPreservesDocumentContinuation_data() {
         QTest::addColumn<QString>("initialVersion");
@@ -1982,22 +2112,191 @@ private slots:
         QVERIFY(dialog.findChild<QPushButton *>("downloadModelButton")->isEnabled());
         QVERIFY(dialog.findChild<QLabel *>("modelStatus")->text().contains("Keyword search"));
     }
-    void verifiedModelRetriesPublicationBusy() {
+    void downloadedModelDoesNotSwitchUntilExplicitApply() {
         TestEnvironment env("gui-model-reload"); QVERIFY(env.isValid());
         FakeBackend backend;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
         QTRY_VERIFY(backend.count("settings.get") == 1);
         QTest::mouseClick(window.findChild<QPushButton *>("modelsButton"), Qt::LeftButton);
-        auto *dialog = window.findChild<ModelDialog *>(); QVERIFY(dialog);
+        auto *settings = window.findChild<SettingsDialog *>(); QVERIFY(settings);
+        auto *selection = settings->findChild<QComboBox *>("modelCombo"); QVERIFY(selection);
+        QCOMPARE(selection->count(), 3);
+        selection->setCurrentIndex(selection->findData("qwen3-vl-embedding-2b"));
+        QCOMPARE(backend.settings.modelId, defaultModelId());
+        settings->findChild<QPushButton *>("manageSelectedModelButton")->click();
+        auto *dialog = settings->findChild<ModelDialog *>(); QVERIFY(dialog);
         QTRY_VERIFY(dialog->findChild<QPushButton *>("importModelButton")->isEnabled());
+        QVERIFY(dialog->findChild<QLabel *>("modelDescription")->text().contains("2048"));
+        QVERIFY(dialog->findChild<QLabel *>("modelDescription")->text().contains("does not support audio semantic search"));
+        QVERIFY(dialog->findChild<QLabel *>("modelDirectory")->text().contains("qwen3-vl-embedding-2b"));
+        backend.modelFilesPresent = true;
         QVERIFY(QMetaObject::invokeMethod(dialog, "modelsReady"));
-        QCOMPARE(backend.count("models.reload"), 1);
-        emit backend.failed(backend.last("models.reload").id, "busy", "Publication in progress");
-        QTRY_COMPARE(backend.count("models.reload"), 2);
-        emit backend.response(backend.last("models.reload").id, {{"modelAvailable", true}});
-        QCOMPARE(window.findChild<QPushButton *>("modelsButton")->text(), QString("Model ready"));
-        QTRY_VERIFY(backend.count("index.start") == 1);
+        QCOMPARE(backend.count("models.reload"), 0);
+        QCOMPARE(backend.count("models.select"), 0);
+        QCOMPARE(backend.settings.modelId, defaultModelId());
+        QTRY_VERIFY(settings->findChild<QLabel *>("selectedModelStatus")->text().contains("Files verified"));
+        dialog->findChild<QPushButton *>("closeModelButton")->click();
+        settings->findChild<QPushButton *>("applySelectedModelButton")->click();
+        QCOMPARE(backend.last("models.select").params.value("modelId").toString(), QString("qwen3-vl-embedding-2b"));
+        QTRY_COMPARE(backend.settings.modelId, QString("qwen3-vl-embedding-2b"));
+        QTRY_VERIFY(settings->findChild<QPushButton *>("applySelectedModelButton")->isEnabled());
+        QCOMPARE(backend.count("models.reload"), 0);
+    }
+    void modelLoadingFailureRetainsSelectionAndDisplaysError() {
+        TestEnvironment env("gui-model-load-failure"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoModelApply = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_VERIFY(backend.count("settings.get") == 1);
+        window.findChild<QPushButton *>("modelsButton")->click();
+        auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
+        auto *selection = dialog->findChild<QComboBox *>("modelCombo");
+        selection->setCurrentIndex(selection->findData("qwen3-vl-embedding-8b"));
+        auto *apply = dialog->findChild<QPushButton *>("applySelectedModelButton");
+        apply->click();
+        QVERIFY(!apply->isEnabled());
+        QVERIFY(!dialog->findChild<QPushButton *>("saveSettingsButton")->isEnabled());
+        const QString message = "The selected model cannot be loaded";
+        emit backend.failed(backend.last("models.select").id, "model_invalid", message);
+        QVERIFY(apply->isEnabled());
+        QCOMPARE(dialog->findChild<QLabel *>("selectedModelStatus")->text(), message);
+        QCOMPARE(backend.settings.modelId, defaultModelId());
+        QCOMPARE(selection->currentData().toString(), QString("qwen3-vl-embedding-8b"));
+    }
+    void modelAvailabilityDistinguishesFilesFromLoadedModel() {
+        AppSettings config; config.language = "en";
+        SettingsDialog dialog(config, false, {});
+        auto *selection = dialog.findChild<QComboBox *>("modelCombo");
+        selection->setCurrentIndex(selection->findData("qwen3-vl-embedding-8b"));
+        auto *status = dialog.findChild<QLabel *>("selectedModelStatus");
+        dialog.setModelStatus({{"modelId", "qwen3-vl-embedding-8b"}, {"configuredModelId", defaultModelId()},
+            {"activeModelId", defaultModelId()}, {"filesPresent", true}, {"filesVerified", false}, {"modelAvailable", false},
+            {"indexDirectory", "isolated-qwen-index"}});
+        QVERIFY(status->text().contains("Verification and loading have not completed"));
+        QVERIFY(!status->text().contains("Loading preflight passed"));
+        QVERIFY(status->text().contains("EmbeddingGemma 2"));
+        QVERIFY(status->text().contains("isolated-qwen-index"));
+        const QString previous = status->text();
+        dialog.setModelStatus({{"modelId", defaultModelId()}, {"modelAvailable", true}});
+        QCOMPARE(status->text(), previous);
+        QCOMPARE(dialog.settings().modelId, QString("qwen3-vl-embedding-8b"));
+    }
+    void modelStatusShowsPreflightWithoutClaimingResidentRuntime() {
+        AppSettings config; config.language = "en";
+        SettingsDialog dialog(config, false, {});
+        auto *status = dialog.findChild<QLabel *>("selectedModelStatus");
+        QJsonObject state{{"modelId", defaultModelId()}, {"configuredModelId", defaultModelId()},
+            {"filesPresent", true}, {"loading", true}, {"modelAvailable", false}, {"indexState", "reconciling"}};
+        dialog.setModelStatus(state);
+        QVERIFY(status->text().contains("checking model loading"));
+        QVERIFY(status->text().contains("Index status: Checking folders"));
+        QVERIFY(!status->text().contains("have not completed"));
+        state.insert("loading", false);
+        state.insert("modelAvailable", true);
+        state.insert("activeModelId", defaultModelId());
+        state.insert("runtime", QJsonObject{{"loaded", false}});
+        dialog.setModelStatus(state);
+        QVERIFY(status->text().contains("Loading preflight passed. Available for search."));
+        QVERIFY(status->text().contains("Current model: EmbeddingGemma 2"));
+        QVERIFY(!status->text().contains("Actually loaded"));
+        QVERIFY(!status->text().contains("Loaded and available"));
+    }
+    void independentModelIndexStates_data() {
+        QTest::addColumn<QString>("state");
+        QTest::addColumn<QString>("description");
+        QTest::newRow("not-built") << QString("not-built") << QString("Not built yet");
+        QTest::newRow("cached") << QString("cached") << QString("Saved cache, checked when selected");
+        QTest::newRow("reconciling") << QString("reconciling") << QString("Checking folders");
+        QTest::newRow("empty") << QString("empty") << QString("No files in selected folders");
+        QTest::newRow("pending") << QString("pending") << QString("Paused with pending files");
+        QTest::newRow("indexing") << QString("indexing") << QString("Indexing");
+        QTest::newRow("partial") << QString("partial") << QString("Some files failed");
+        QTest::newRow("ready") << QString("ready") << QString("Ready");
+    }
+    void independentModelIndexStates() {
+        QFETCH(QString, state);
+        QFETCH(QString, description);
+        AppSettings config; config.language = "en";
+        SettingsDialog dialog(config, false, {});
+        dialog.setModelStatus({{"modelId", defaultModelId()}, {"configuredModelId", defaultModelId()},
+            {"indexState", state}, {"indexDirectory", "model-specific-index"}});
+        const auto *status = dialog.findChild<QLabel *>("selectedModelStatus");
+        QVERIFY(status->text().contains("Index status: " + description));
+        QVERIFY(status->text().contains("model-specific-index"));
+    }
+    void reloadConfigurationUsesServiceAndReopensUpdatedSettings() {
+        TestEnvironment env("gui-settings-reload"); QVERIFY(env.isValid());
+        FakeBackend backend;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_VERIFY(backend.count("settings.get") == 1);
+        window.findChild<QPushButton *>("modelsButton")->click();
+        auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
+        QPointer<SettingsDialog> previous(dialog);
+        backend.settings.modelId = "qwen3-vl-embedding-2b";
+        dialog->findChild<QPushButton *>("reloadSettingsButton")->click();
+        QTRY_COMPARE(backend.count("settings.reload"), 1);
+        QTRY_VERIFY(previous.isNull());
+        QTRY_VERIFY(window.findChild<SettingsDialog *>() != nullptr);
+        QCOMPARE(window.findChild<SettingsDialog *>()->selectedModelId(), QString("qwen3-vl-embedding-2b"));
+        QCOMPARE(backend.count("settings.set"), 0);
+    }
+    void openSettingsPreserveExternalModelSelection_data() {
+        QTest::addColumn<bool>("userChangedModel");
+        QTest::newRow("preferences-only-follows-external-model") << false;
+        QTest::newRow("explicit-model-choice-remains-pending") << true;
+    }
+    void openSettingsPreserveExternalModelSelection() {
+        QFETCH(bool, userChangedModel);
+        TestEnvironment env("gui-external-model-selection"); QVERIFY(env.isValid());
+        FakeBackend backend;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        window.findChild<QPushButton *>("modelsButton")->click();
+        auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
+        auto *selection = dialog->findChild<QComboBox *>("modelCombo"); QVERIFY(selection);
+        dialog->findChild<QListWidget *>("rootFolders")->addItem(env.root());
+        if (userChangedModel) selection->setCurrentIndex(selection->findData("qwen3-vl-embedding-2b"));
+        const int statusRequests = backend.count("models.status");
+        backend.settings.modelId = "qwen3-vl-embedding-8b";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        const QString expected = userChangedModel ? "qwen3-vl-embedding-2b" : "qwen3-vl-embedding-8b";
+        QCOMPARE(dialog->selectedModelId(), expected);
+        QCOMPARE(dialog->findChild<QListWidget *>("rootFolders")->count(), 1);
+        QCOMPARE(backend.count("models.status"), statusRequests + 1);
+        QCOMPARE(backend.last("models.status").params.value("modelId").toString(), expected);
+        QTRY_VERIFY(dialog->findChild<QLabel *>("selectedModelStatus")->text().contains("Configured: Qwen3-VL-Embedding-8B"));
+        const QString currentStatus = dialog->findChild<QLabel *>("selectedModelStatus")->text();
+        dialog->setModelStatus({{"modelId", expected}, {"configuredModelId", defaultModelId()},
+            {"activeModelId", defaultModelId()}, {"filesPresent", true}});
+        QCOMPARE(dialog->findChild<QLabel *>("selectedModelStatus")->text(), currentStatus);
+        auto *language = dialog->findChild<QComboBox *>("languageCombo");
+        language->setCurrentIndex(language->findData("zh_CN"));
+        dialog->findChild<QPushButton *>("saveSettingsButton")->click();
+        QTRY_COMPARE(backend.settings.language, QString("zh_CN"));
+        QCOMPARE(backend.settings.modelId, expected);
+        QCOMPARE(backend.settings.roots, QStringList{env.root()});
+        QCOMPARE(backend.last("settings.set").params.contains("modelId"), userChangedModel);
+        if (userChangedModel) QCOMPARE(backend.last("settings.set").params.value("modelId").toString(), expected);
+    }
+    void modelSwitchInvalidatesResultsAndDropsOldResponses() {
+        TestEnvironment env("gui-model-results"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoSearch = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_VERIFY(backend.count("settings.get") == 1);
+        window.findChild<SearchEdit *>("searchInput")->setText("query");
+        QTRY_COMPARE(backend.count("search"), 1);
+        const QString request = backend.last("search").id;
+        backend.settings.modelId = "qwen3-vl-embedding-2b";
+        emit backend.eventReceived("settings", backend.settings.toJson());
+        QVERIFY(backend.cancelled.contains(request));
+        SearchHit stale; stale.path = env.path("old.txt"); stale.title = "Old model result";
+        emit backend.response(request, {{"hits", QJsonArray{stale.toJson()}}});
+        QCOMPARE(window.findChild<QListWidget *>("searchResults")->count(), 0);
+        QTRY_COMPARE(backend.count("search"), 2);
     }
     void editorAndRevealRejectMissingFiles() {
         TestEnvironment env("gui-platform"); QVERIFY(env.isValid()); SearchHit hit; hit.path = env.path("missing file.cpp"); hit.lineStart = 7;

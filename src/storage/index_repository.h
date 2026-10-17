@@ -54,6 +54,10 @@ public:
   IndexRepository &operator=(const IndexRepository &) = delete;
 
   bool open(const RuntimePaths &paths, QString *error = nullptr);
+  // Paths already select the model's independent index directory. An opened
+  // instance keeps its model identity and dimensions for its entire lifetime.
+  bool open(const RuntimePaths &paths, const QString &modelId,
+            QString *error = nullptr);
   bool replaceFile(const QString &path, const QString &version,
                    const QVector<Segment> &segments, bool code = false,
                    QString *error = nullptr,
@@ -79,12 +83,19 @@ public:
   bool updateFileMetadata(const QVector<FileMetadata> &files,
                           QString *error = nullptr,
                           const PublicationGate &publicationGate = {});
+  // Remove stale content before a reactivated model index becomes searchable.
+  // The scan's exact indexed version prevents deleting a newer publication.
+  bool invalidateChangedFiles(const QVector<FileMetadata> &files,
+                              QString *error = nullptr,
+                              const PublicationGate &publicationGate = {});
   // Each page owns a short read snapshot. Cursors become stale when file
   // membership or sorting metadata changes, never on segment-only progress.
   FileListPage listFiles(const FileListOptions &options) const;
   qint64 browseGeneration(QString *error = nullptr) const;
   QString fileVersion(const QString &path, bool code = false,
                       QString *error = nullptr) const;
+  bool fileHasEmbeddings(const QString &path, bool code = false,
+                         QString *error = nullptr) const;
   QVector<Segment> fileSegments(const QString &path, bool code = false,
                                 QString *error = nullptr) const;
   QList<SearchHit> search(const SearchOptions &options,

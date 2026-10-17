@@ -113,7 +113,7 @@ add_library(qcs-runtime STATIC EmbeddingRuntime.cpp EmbeddingRuntime.h ImageSizi
   BackendSelection.cpp BackendSelection.h BackendLoader.cpp BackendLoader.h)
 target_compile_features(qcs-runtime PUBLIC cxx_std_20)
 target_include_directories(qcs-runtime PUBLIC "${PROJECT_SOURCE_DIR}/src")
-target_link_libraries(qcs-runtime PUBLIC Qt6::Core Qt6::Gui PRIVATE llama mtmd)
+target_link_libraries(qcs-runtime PUBLIC Qt6::Core Qt6::Gui PRIVATE qcs-core llama mtmd)
 target_compile_definitions(qcs-runtime PRIVATE
   QCOPILOTS_SEARCH_GPU_BACKEND="${QCOPILOTS_SEARCH_GPU_BACKEND}"
   QCOPILOTS_SEARCH_BUILD_VARIANT="${QCOPILOTS_SEARCH_VARIANT}")

@@ -1497,6 +1497,24 @@ private slots:
         QCOMPARE(unchanged.value(QStringLiteral("generation")), published.value(QStringLiteral("generation")));
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
 
+        // Reactivating an inactive model must remove its stale best match
+        // before querying, even while that label remains in the ANN graph.
+        QVERIFY2(repository.invalidateChangedFiles({
+            {newPath, false, 3, QStringLiteral("text"), QStringLiteral("changed-source"), QStringLiteral("new-c")}
+        }, &error), qPrintable(error));
+        QCOMPARE(repository.status(&error).value(QStringLiteral("annVectors")),
+                 published.value(QStringLiteral("annVectors")));
+        auto reactivated = liveOptions;
+        reactivated.limit = 2;
+        const auto freshMatches = repository.search(reactivated, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(hitPaths(freshMatches), (QStringList{sentinelA, sentinelD}));
+        const auto remainingKeyword = repository.search(
+            SearchOptions{.query = QStringLiteral("new-c-token")}, &error);
+        QVERIFY(!distinctPaths(remainingKeyword).contains(newPath));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
+
         qInfo().noquote() << "ANN aggregation/filter/snapshot fixture:" << liveFiles + sentinelFiles
                           << "initial live vectors," << dominantSegments << "deleted graph labels,"
                           << elapsed.elapsed() << "ms, observed logical file bytes"

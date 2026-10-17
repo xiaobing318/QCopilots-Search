@@ -34,10 +34,10 @@ WORKER_STDERR_HEAD = 4 * 1024
 WINDOWS_PRODUCT_KEY = r"Software\QCopilots\qcopilots-search"
 WINDOWS_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\qcopilots-search"
 SOURCE = Path(__file__).resolve().parent.parent
-MODEL_ARTIFACTS = {
-    "embeddinggemma-2-Q8_0.gguf": (309855456, "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"),
-    "mmproj-embeddinggemma-2-Q8_0.gguf": (554821024, "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f"),
-}
+_model_spec = importlib.util.spec_from_file_location("qcs_package_model_catalog", SOURCE / "tools/qcs-model-catalog.py")
+MODEL_CATALOG = importlib.util.module_from_spec(_model_spec)
+_model_spec.loader.exec_module(MODEL_CATALOG)
+MODEL_ARTIFACTS = MODEL_CATALOG.artifacts()
 REFERENCE_HASHES = {
     "screen.png": "a8a0c831fe4746d00c95e3ab436d53e4cc9046a774fe4f0f6edb73d1a7d55f9b",
     "speech.wav": "bfbc029af6c0bacdbaccfa6c695d6772373453249386fa6a62a7b02a31d33e1f",
@@ -141,20 +141,24 @@ def validate_installed_package_source(package, installed_root, installed_manifes
         raise RuntimeError("Installed-tree verification requires Linux, the original DEB and its package-manager file manifest")
 
 
-def model_verification(result, directory):
+def model_verification(result, directory, model_id=None):
     """The installed CLI hashes its read-only cache against its compiled lock."""
-    if result.get("valid") is not True or Path(result.get("directory", "")).resolve() != directory.resolve():
+    model = MODEL_CATALOG.selected(model_id)
+    expected_artifacts = MODEL_CATALOG.artifacts(model["id"])
+    actual_directory = directory if model["id"] == "embeddinggemma-2" else directory / model["id"]
+    if (result.get("valid") is not True or Path(result.get("directory", "")).resolve() != actual_directory.resolve()
+            or result.get("modelId") != model["id"] or result.get("dimensions") != model["dimensions"]):
         raise RuntimeError("Installed CLI did not verify the explicit model cache")
     artifacts = result.get("artifacts", [])
-    if len(artifacts) != len(MODEL_ARTIFACTS):
-        raise RuntimeError("Installed model manifest does not contain both locked GGUF files")
+    if len(artifacts) != len(expected_artifacts):
+        raise RuntimeError("Installed model manifest does not contain the selected preset's locked GGUF files")
     for artifact in artifacts:
-        expected = MODEL_ARTIFACTS.get(artifact.get("name"))
+        expected = expected_artifacts.get(artifact.get("name"))
         if (not expected or artifact.get("present") is not True or
                 (artifact.get("bytes"), artifact.get("sha256")) != expected or
                 artifact.get("expectedBytes") != expected[0]):
             raise RuntimeError(f"Installed model manifest differs from the locked artifacts: {artifact}")
-    if {artifact["name"] for artifact in artifacts} != set(MODEL_ARTIFACTS):
+    if {artifact["name"] for artifact in artifacts} != set(expected_artifacts):
         raise RuntimeError("Installed model manifest repeats a GGUF artifact")
     return result
 
@@ -175,20 +179,20 @@ def reference_inputs(destination):
     return references["vectors"]
 
 
-def validate_vector(embedding, expected):
+def validate_vector(embedding, expected, dimensions=768, minimum_cosine=0.999):
     def norm(values):
-        if (not isinstance(values, list) or len(values) != 768 or
+        if (not isinstance(values, list) or len(values) != dimensions or
                 any(type(value) not in (int, float) or not math.isfinite(value) for value in values)):
-            raise RuntimeError("Packaged inference must produce 768 finite numeric components")
+            raise RuntimeError(f"Packaged inference must produce {dimensions} finite numeric components")
         length = math.sqrt(math.fsum(value * value for value in values))
         if abs(length - 1.0) > 0.0001:
             raise RuntimeError(f"Packaged inference vector is not L2 normalized: {length}")
         return length
     actual_norm, expected_norm = norm(embedding), norm(expected)
     cosine = math.fsum(a * b for a, b in zip(embedding, expected)) / (actual_norm * expected_norm)
-    if cosine < 0.999:
+    if cosine < minimum_cosine:
         raise RuntimeError(f"Packaged inference differs from the immutable reference: cosine {cosine}")
-    return {"dimensions": 768, "l2Norm": actual_norm, "cosine": cosine,
+    return {"dimensions": dimensions, "l2Norm": actual_norm, "cosine": cosine,
             "embedding": embedding, "expectedEmbedding": expected}
 
 
@@ -313,8 +317,78 @@ def force_stop(process):
     return None
 
 
+def wait_service_ready(service, invoke, model, require_model, timeout):
+    """IPC readiness precedes the service's asynchronous real-model probe."""
+    deadline = time.monotonic() + max(30, timeout)
+    last_error = "Service did not expose IPC status"
+    while True:
+        if service.poll() is not None:
+            raise RuntimeError(f"Packaged service exited before readiness: {service.returncode}")
+        try:
+            status = invoke("status", "--timeout", "1000")
+        except RuntimeError as error:
+            last_error = str(error)
+        else:
+            if status.get("modelLoading") is not True:
+                if not require_model:
+                    return status
+                if (status.get("modelAvailable") is True and status.get("modelId") == model["id"]
+                        and status.get("configuredModelId") == model["id"] and status.get("activeModelId") == model["id"]
+                        and status.get("dimensions") == model["dimensions"]):
+                    return status
+                if status.get("modelError"):
+                    raise RuntimeError("Packaged service model preflight failed: " + str(status["modelError"]))
+                last_error = "Packaged service did not activate the selected model: " + json.dumps(status)
+            else:
+                last_error = "Packaged service model preflight is still running"
+        if time.monotonic() >= deadline:
+            raise RuntimeError(last_error)
+        time.sleep(0.2)
+
+
+def pause_index_workers_before_query(service, invoke, timeout=90):
+    """Release indexed models through the service's normal idle shutdown."""
+    started = time.monotonic()
+    deadline = started + timeout
+    if service.poll() is not None:
+        raise RuntimeError(f"Packaged service exited before pausing indexing: {service.returncode}")
+    paused = invoke("pause", "--timeout", "10000", process_timeout=min(15, timeout))
+    if not isinstance(paused, dict) or paused.get("state") != "paused":
+        raise RuntimeError(f"Packaged service did not acknowledge paused indexing: {paused}")
+    last_states = []
+    while True:
+        if service.poll() is not None:
+            raise RuntimeError(f"Packaged service exited while waiting for index workers: {service.returncode}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"Packaged index workers did not exit before semantic query: {last_states}")
+        status = invoke("status", "--timeout", "1000", process_timeout=min(5, remaining))
+        if (not isinstance(status, dict) or not isinstance(status.get("settings"), dict)
+                or status["settings"].get("indexingPaused") is not True):
+            raise RuntimeError(f"Packaged service did not keep indexing paused: {status}")
+        devices = status.get("indexDevices")
+        if (not isinstance(devices, list) or not devices
+                or any(not isinstance(device, dict) or device.get("state") not in
+                       ("idle", "ready", "busy", "discovered", "failed") for device in devices)):
+            raise RuntimeError(f"Packaged service returned invalid index worker states: {devices}")
+        last_states = [device["state"] for device in devices]
+        if "failed" in last_states:
+            raise RuntimeError(f"Packaged index worker failed before semantic query: {devices}")
+        # Only idle proves QProcess::NotRunning. ready, discovered and an empty
+        # activePath do not prove that the full indexing model was released.
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout:
+            raise RuntimeError(f"Packaged index workers did not exit before semantic query: {last_states}")
+        if all(state == "idle" for state in last_states):
+            return {"indexingPaused": True, "indexDevices": devices, "waitSeconds": round(elapsed, 3)}
+        time.sleep(min(0.5, timeout - elapsed))
+
+
 def real_model_smoke(worker, replies, executable, application, work, report_dir, verified_models, installed_files=None,
                      timeout=600, build_identity=None):
+    if verified_models["modelId"] != "embeddinggemma-2":
+        return qwen_model_smoke(worker, replies, executable, application, work, report_dir,
+                                verified_models, installed_files, timeout, build_identity)
     fixtures = work / "model-references"
     references = reference_inputs(fixtures)
     vectors = []
@@ -349,9 +423,111 @@ def real_model_smoke(worker, replies, executable, application, work, report_dir,
     if build_identity:
         validate_backend_diagnostics(diagnostics, build_identity, "auto")
     return {"passed": True, "dimensions": 768, "minimumCosine": 0.999,
+            "modelId": verified_models["modelId"], "queryText": "payment declined error",
             "modelDirectory": verified_models["directory"], "modelVerification": verified_models,
             "referenceHashes": REFERENCE_HASHES, "vectors": vectors,
             "runtime": inference_runtime_origins(worker, executable, application, installed_files, diagnostics)}
+
+
+def qwen_reference_inputs(model_id, destination):
+    model = MODEL_CATALOG.selected(model_id)
+    fixture_root = SOURCE / "tests/runtime/fixtures"
+    manifest = fixture_root / "qwen" / (model_id + ".json")
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    if (document.get("schemaVersion") != 1 or document.get("modelId") != model_id
+            or document.get("dimensions") != model["dimensions"] or not document.get("provenance")
+            or type(document.get("minimumCosine")) not in (int, float)
+            or not 0.9 <= document["minimumCosine"] <= 1.0):
+        raise RuntimeError("Qwen reference identity or numerical policy differs from the selected model")
+    inputs = document.get("inputs", [])
+    by_id = {item["id"]: item for item in inputs}
+    if len(by_id) != len(inputs):
+        raise RuntimeError("Qwen reference repeats an input identifier")
+    document_id = "document-package" if "document-package" in by_id else "document-en"
+    expected = {"query-en": "query", document_id: "document", "image-screen-640": "image"}
+    destination.mkdir()
+    copied = {}
+    for identifier, kind in expected.items():
+        item = by_id.get(identifier, {})
+        if item.get("kind") != kind:
+            raise RuntimeError("Qwen package reference is absent: " + identifier)
+        validate_vector(item.get("vector"), item.get("vector"), model["dimensions"])
+        if kind == "image":
+            source = (manifest.parent / item["image"]).resolve()
+            if fixture_root.resolve() not in source.parents or item.get("budget") != 280:
+                raise RuntimeError("Qwen screenshot reference path or image budget is invalid")
+            if file_digest(source) != item.get("sha256"):
+                raise RuntimeError("Qwen screenshot reference bytes changed")
+            target = destination / "Screenshot golden.png"
+            shutil.copyfile(source, target)
+            copied[identifier] = target
+        else:
+            if hashlib.sha256(item.get("text", "").encode("utf-8")).hexdigest() != item.get("sha256"):
+                raise RuntimeError("Qwen reference text bytes changed: " + identifier)
+            if kind == "document":
+                title = item.get("title", "")
+                if Path(title).name != title or not title.endswith(".txt") or "/" in title or "\\" in title:
+                    raise RuntimeError("Qwen package document reference requires a plain .txt filename as its title")
+                target = destination / title
+                target.write_bytes(item["text"].encode("utf-8"))
+                copied[identifier] = target
+    (destination / "vectors.json").write_text(json.dumps({"vectors": {"query": by_id["query-en"]["vector"]}}), encoding="utf-8")
+    return document, by_id, copied, document_id, file_digest(manifest)
+
+
+def qwen_model_smoke(worker, replies, executable, application, work, report_dir, verified_models,
+                     installed_files, timeout, build_identity):
+    model_id = verified_models["modelId"]
+    model = MODEL_CATALOG.selected(model_id)
+    document, references, files, document_id, manifest_hash = qwen_reference_inputs(model_id, work / "model-references")
+    dimensions, minimum_cosine = model["dimensions"], document["minimumCosine"]
+    vectors = []
+    query, raw = worker_request(worker, replies, {"id": "model-query", "operation": "query",
+        "query": references["query-en"]["text"]}, report_dir, timeout=timeout)
+    vectors.append({"name": "query-en", "modality": "text", "rawReply": raw,
+                    "modelFingerprint": query.get("modelFingerprint"),
+                    **validate_vector(query.get("embedding"), references["query-en"]["vector"], dimensions, minimum_cosine)})
+    for identifier, modality in ((document_id, "text"), ("image-screen-640", "image")):
+        result, raw = worker_request(worker, replies, {"id": "model-" + identifier, "operation": "extract",
+            "path": str(files[identifier]), "embed": True, "enableOcr": False, "maxSegments": 8}, report_dir, timeout=timeout)
+        segments = result.get("segments", [])
+        if (result.get("complete") is not True or result.get("state") != "complete" or result.get("error")
+                or result.get("embeddingErrors") or len(segments) != 1 or segments[0].get("modality") != modality):
+            raise RuntimeError(f"Packaged Qwen extraction did not complete: {identifier}: {result}")
+        if modality == "image" and segments[0].get("imageBudget") != 280:
+            raise RuntimeError("Packaged Qwen screenshot budget differs from its reference")
+        if modality == "text" and (segments[0].get("title") != references[identifier]["title"]
+                                    or segments[0].get("text") != references[identifier]["text"]):
+            raise RuntimeError("Packaged Qwen document prompt input differs from its reference")
+        vectors.append({"name": identifier, "modality": modality, "rawReply": raw,
+                        "modelFingerprint": result.get("modelFingerprint"),
+                        **validate_vector(segments[0].get("embedding"), references[identifier]["vector"], dimensions, minimum_cosine)})
+    fingerprints = {item["modelFingerprint"] for item in vectors}
+    if len(fingerprints) != 1 or not next(iter(fingerprints)):
+        raise RuntimeError("Packaged Qwen query and documents disagree on model fingerprint")
+    video, video_raw = worker_request(worker, replies, {"id": "model-video", "operation": "extract",
+        "path": str(work / "samples/package.avi"), "embed": True, "enableOcr": False, "maxSegments": 8}, report_dir, timeout=timeout)
+    frames = [item for item in video.get("segments", []) if item.get("modality") == "image"]
+    if not frames or video.get("complete") is not True or video.get("error") or video.get("embeddingErrors"):
+        raise RuntimeError("Packaged Qwen video frame inference failed")
+    for frame in frames:
+        validate_vector(frame.get("embedding"), frame.get("embedding"), dimensions)
+    audio_result, audio_raw = worker_request(worker, replies, {"id": "model-unsupported-audio", "operation": "extract",
+        "path": str(work / "samples/package.wav"), "embed": True, "enableOcr": False, "maxSegments": 8}, report_dir, timeout=timeout)
+    audio_segments = [item for item in audio_result.get("segments", []) if item.get("modality") == "audio"]
+    if (audio_result.get("complete") is not True or "audio" not in audio_result.get("unsupportedModalities", [])
+            or not audio_segments or any(item.get("embedding") for item in audio_segments)):
+        raise RuntimeError("Packaged Qwen audio capability was not reported without fabricated embeddings")
+    diagnostics, _ = worker_request(worker, replies, {"id": "runtime-diagnostics", "operation": "diagnostics"}, report_dir)
+    runtime = diagnostics.get("runtime")
+    if build_identity:
+        validate_backend_diagnostics(runtime, build_identity, "auto")
+    return {"passed": True, "modelId": model_id, "dimensions": dimensions, "minimumCosine": minimum_cosine,
+            "queryText": references["query-en"]["text"], "modelDirectory": verified_models["directory"],
+            "modelVerification": verified_models, "referenceManifestSha256": manifest_hash, "vectors": vectors,
+            "videoFrames": {"count": len(frames), "rawReply": video_raw},
+            "unsupportedAudio": {"passed": True, "rawReply": audio_raw},
+            "runtime": inference_runtime_origins(worker, executable, application, installed_files, runtime)}
 
 
 def verify_license_materials(binary, application, report_dir, installed_files=None):
@@ -661,7 +837,8 @@ def verify_gpu_payload(binary, application, identity, installed_files=None):
 
 
 def verify_backend_modes(executable, application, work, report_dir, environment, model_arguments,
-                         identity, reference, installed_files, timeout, *, outcomes=None):
+                         identity, reference, installed_files, timeout, *, outcomes=None,
+                         dimensions=768, minimum_cosine=0.999, query_text="payment declined error"):
     if outcomes is None:
         outcomes = {}
     for mode in ("cpu", "gpu"):
@@ -675,7 +852,7 @@ def verify_backend_modes(executable, application, work, report_dir, environment,
             reader.start()
             try:
                 reply, raw = worker_request(child, replies, {"id": "backend-" + mode, "operation": "query",
-                    "query": "payment declined error"}, report_dir, timeout, accept_failure=True)
+                    "query": query_text}, report_dir, timeout, accept_failure=True)
                 key = "strictGpu" if mode == "gpu" else "cpu"
                 payload = reply.get("result" if reply.get("ok") is True else "error", {})
                 # Preserve the actual response before validation can reject it.
@@ -686,7 +863,7 @@ def verify_backend_modes(executable, application, work, report_dir, environment,
                 if reply.get("ok") is True:
                     result = reply.get("result", {})
                     diagnostics = validate_backend_diagnostics(result.get("runtime"), identity, mode)
-                    numerical = validate_vector(result.get("embedding"), reference)
+                    numerical = validate_vector(result.get("embedding"), reference, dimensions, minimum_cosine)
                     origins = inference_runtime_origins(child, executable, application, installed_files, diagnostics)
                     outcome = {"passed": True, "diagnostics": diagnostics, "rawReply": raw,
                                "numericalCosine": numerical["cosine"], "runtime": origins}
@@ -880,7 +1057,9 @@ def package_source_identity(source=None, environment=None):
 
 
 def verify(package, build_root, explicit_report=None, installed_root=None, explicit_profile=None, installed_manifest=None,
-           model_dir=None, keyword_only=False, model_timeout=600, expected_variant=None):
+           model_dir=None, keyword_only=False, model_timeout=600, expected_variant=None, model_id=None):
+    selected_model = MODEL_CATALOG.selected(model_id)
+    model_id = selected_model["id"]
     source_identity = package_source_identity()
     run_id = str(uuid.uuid4())
     if explicit_report:
@@ -899,6 +1078,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
               "runId":run_id, "workingDirectory":str(work), "checks":[], "passed":False,
               "verificationScope": "keyword-only" if keyword_only else "full",
               "realModelRequired": not keyword_only, "fullVerificationPassed": False}
+    report["modelId"] = model_id
     report.update(source_identity)
     if package:
         package_hash = hashlib.sha256()
@@ -922,9 +1102,9 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     report["applicationRoot"] = str(application)
     installed_files = {Path(line).resolve() for line in installed_manifest.read_text(encoding="utf-8").splitlines()
                        if line.startswith("/")} if installed_manifest else None
-    def invoke(*arguments):
+    def invoke(*arguments, process_timeout=None):
         completed = subprocess.run([str(cli),"--profile-dir",str(profile), *model_arguments,
-                                    "--no-start",*map(str,arguments)],cwd=work,env=environment,capture_output=True,text=True,encoding="utf-8",timeout=180)
+                                    "--no-start",*map(str,arguments)],cwd=work,env=environment,capture_output=True,text=True,encoding="utf-8",timeout=process_timeout or max(180, model_timeout + 30))
         (report_dir / (str(len(report["checks"]))+"-cli.log")).write_text(completed.stdout+completed.stderr,encoding="utf-8")
         if completed.returncode:
             raise RuntimeError(f"CLI failed: {arguments}: {completed.stderr} {completed.stdout}")
@@ -934,9 +1114,10 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         return result["result"]
     try:
         if not keyword_only and (model_dir is None or not model_dir.is_dir()):
-            raise RuntimeError("Full package verification requires --model-dir with both locked GGUF files. Use --keyword-only only for an explicitly partial developer check.")
+            raise RuntimeError("Full package verification requires --model-dir with the selected preset's locked GGUF files. Use --keyword-only only for an explicitly partial developer check.")
         validate_installed_package_source(package, installed_root, installed_manifest)
         model_arguments = ["--model-dir", str(model_dir)] if model_dir and not keyword_only else []
+        worker_model_arguments = [*model_arguments, "--model", model_id]
         if installed_root:
             report["checks"].append("validating the actual installed package tree")
         elif package.suffix.lower() == ".exe":
@@ -996,29 +1177,15 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
             if completed.returncode:
                 raise RuntimeError(f"Packaged program failed to load: {name}: {completed.stderr}")
         report["checks"].append("all four relocated executables load without SDK environment")
-        verified_models = model_verification(invoke("model", "verify"), model_dir) if not keyword_only else None
-        service_log = (report_dir/"service.log").open("w",encoding="utf-8"); logs.append(service_log)
-        service = subprocess.Popen([str(binary/(PRODUCT+"-service"+suffix)), "--profile-dir", str(profile), *model_arguments],
-                                   cwd=work, env=environment, stdout=service_log, stderr=service_log)
-        readiness_deadline = time.monotonic() + 30
-        while True:
-            if service.poll() is not None:
-                raise RuntimeError(f"Packaged service exited before IPC readiness: {service.returncode}")
-            try:
-                invoke("status", "--timeout", "1000")
-                service_started = True
-                break
-            except RuntimeError:
-                if time.monotonic() >= readiness_deadline:
-                    raise
-                time.sleep(0.1)
-        report["checks"].append("isolated service IPC status")
+        verified_models = model_verification(invoke("model", "verify", "--model", model_id), model_dir, model_id) if not keyword_only else None
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "qcs-settings.json").write_text(json.dumps({"version": 3, "modelId": model_id}), encoding="utf-8")
         fixtures=work/"samples"
         create_fixtures(fixtures)
         error_log=(report_dir/"worker.log").open("w",encoding="utf-8"); logs.append(error_log)
         worker_environment=environment.copy(); worker_environment["QT_QPA_PLATFORM"]="offscreen"
         worker=subprocess.Popen([str(binary/(PRODUCT+"-worker"+suffix)),"--mode","extract" if keyword_only else "full",
-                                 "--profile-dir",str(work/"worker-profile"), *model_arguments],cwd=work,env=worker_environment,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=error_log,text=True,encoding="utf-8")
+                                 "--profile-dir",str(work/"worker-profile"), *worker_model_arguments],cwd=work,env=worker_environment,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=error_log,text=True,encoding="utf-8")
         replies=queue.Queue()
         reader=threading.Thread(target=read_worker_replies,args=(worker,replies),daemon=True)
         reader.start()
@@ -1034,26 +1201,42 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         if not keyword_only:
             report["modelSmoke"] = real_model_smoke(worker, replies, binary/(PRODUCT+"-worker"+suffix),
                 application, work, report_dir, verified_models, installed_files, model_timeout, report["buildIdentity"])
-            report["checks"].append("installed inference runtime matched immutable text, image and audio reference vectors")
+            report["checks"].append("installed inference runtime matched selected model reference vectors and modality capabilities")
         stop_worker(worker, replies, reader, report_dir)
         worker = None
         if not keyword_only:
             reference = json.loads((work / "model-references/vectors.json").read_text(encoding="utf-8"))["vectors"]["query"]
             report["backendVerification"] = {}
             verify_backend_modes(binary / (PRODUCT + "-worker" + suffix),
-                application, work, report_dir, environment, model_arguments, report["buildIdentity"], reference,
-                installed_files, model_timeout, outcomes=report["backendVerification"])
+                application, work, report_dir, environment, worker_model_arguments, report["buildIdentity"], reference,
+                installed_files, model_timeout, outcomes=report["backendVerification"],
+                dimensions=selected_model["dimensions"], minimum_cosine=report["modelSmoke"]["minimumCosine"],
+                query_text=report["modelSmoke"]["queryText"])
             report["checks"].append("explicit CPU inference and strict GPU acceptance or rejection verified")
-        invoke("index",fixtures,"--wait","--timeout","120000")
+        # Keep the packaged inference probes sequential. In particular, a 2B
+        # model must not coexist in a probe worker and the service on ARM CI.
+        service_log = (report_dir/"service.log").open("w",encoding="utf-8"); logs.append(service_log)
+        service = subprocess.Popen([str(binary/(PRODUCT+"-service"+suffix)), "--profile-dir", str(profile), *model_arguments],
+                                   cwd=work, env=environment, stdout=service_log, stderr=service_log)
+        service_started = True
+        startup = wait_service_ready(service, invoke, selected_model, not keyword_only, model_timeout)
+        report["serviceStartup"] = {key: startup.get(key) for key in
+            ("modelId", "configuredModelId", "activeModelId", "dimensions", "modelLoading", "modelAvailable", "modelError")}
+        report["checks"].append("isolated service IPC and selected model preflight completed")
+        request_timeout = 120000 if model_id == "embeddinggemma-2" else model_timeout * 1000
+        invoke("index",fixtures,"--wait","--timeout",str(request_timeout))
         hits=invoke("search","qcopilots_package_4317","--keyword-only").get("hits",[])
         if not any(hit.get("path","").endswith("中文 package notes.txt") for hit in hits):
             raise RuntimeError("Packaged index/search did not retrieve its text fixture")
         report["checks"].append("packaged service index and exact keyword retrieval")
         if not keyword_only:
+            if model_id != "embeddinggemma-2":
+                report["modelSmoke"]["indexWorkersReleased"] = pause_index_workers_before_query(service, invoke)
+                report["checks"].append("Qwen indexing paused and index workers exited before query inference")
             # None of these terms occurs in the fixture text. Require a real
             # stored-vector candidate, without imposing a relevance threshold.
             semantic = invoke("search", "A coastal lighthouse beneath moonlit clouds", "--root", fixtures,
-                              "--timeout", "120000")
+                              "--timeout", str(request_timeout))
             semantic_hits = semantic.get("hits", [])
             if (semantic.get("semantic") is not True or semantic.get("warning") or not semantic_hits
                     or any(hit.get("matchSource") != "semantic" or fixtures.resolve() not in Path(hit.get("path", "")).resolve().parents
@@ -1105,7 +1288,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
                         report.setdefault("cleanupErrors", []).append(str(error))
                         report["passed"] = False
         if cli is not None and service_started:
-            try: invoke("shutdown","--timeout","10000")
+            try: invoke("shutdown","--timeout","10000", process_timeout=15)
             except Exception as error:
                 report["cleanupError"]=str(error)
                 report["passed"]=False
@@ -1166,6 +1349,7 @@ def main():
     parser.add_argument("--installed-manifest",type=Path,help="Absolute file list from the OS package manager, such as dpkg -L")
     parser.add_argument("--profile-dir",type=Path,help="Fresh dedicated test profile retained after verification")
     parser.add_argument("--model-dir",type=Path,help="Read-only cache of both locked GGUF artifacts, required for full verification")
+    parser.add_argument("--model", help="Preset from config/qcs-models.lock.json (default: embeddinggemma-2)")
     parser.add_argument("--keyword-only",action="store_true",help="Explicit partial developer verification without real model inference, insufficient for full verification")
     parser.add_argument("--model-timeout",type=int,default=600,help="Seconds allowed for each real-model worker request (default 600)")
     parser.add_argument("--variant", help="Require the downloaded package to match this build variant")
@@ -1192,11 +1376,11 @@ def main():
         raise RuntimeError("Package-test profile must be an isolated directory outside the checkout")
     manifest = args.installed_manifest.expanduser().resolve() if args.installed_manifest else None
     model_dir = args.model_dir.expanduser().resolve() if args.model_dir else None
-    if args.keyword_only and args.model_dir:
+    if args.keyword_only and (args.model_dir or args.model):
         raise RuntimeError("Choose full verification with --model-dir or partial --keyword-only, not both")
     if args.model_timeout < 1 or args.model_timeout > 3600:
         raise RuntimeError("--model-timeout must be between 1 and 3600 seconds")
-    verify(package.resolve() if package else None,root,report,installed,profile,manifest,model_dir,args.keyword_only,args.model_timeout,args.variant)
+    verify(package.resolve() if package else None,root,report,installed,profile,manifest,model_dir,args.keyword_only,args.model_timeout,args.variant,args.model)
 
 
 if __name__=="__main__":

@@ -1,6 +1,6 @@
 # 多模态功能测试
 
-`qcs-tests-semantic` 使用 12 个固定输入验证正式提取、真实模型编码、索引持久化、关闭后重载和语义搜索。默认 CTest 运行包含此测试，必须提供锁定模型和 OCR 数据，缺失依赖会明确失败。
+`qcs-tests-semantic` 使用默认 EmbeddingGemma 2 和 12 个固定输入验证正式提取、真实模型编码、索引持久化、关闭后重载和语义搜索。默认 CTest 运行包含此测试，必须提供锁定的 Gemma 模型和 OCR 数据，缺失依赖会明确失败。新增 Qwen 预设不替代这个包含音频的完整回归，Qwen 的专项模型与最终包检查见[测试指南](../../docs/testing.md)。
 
 | 输入标识 | 内容 | 验证的提取通道与定位 |
 | --- | --- | --- |
@@ -34,4 +34,4 @@ ctest --test-dir '<变体构建目录>' --output-on-failure
 
 单独排查可直接执行 `qcs-tests-semantic --model-dir <路径> --tessdata-dir <路径> --report <路径>`。`--preserve` 保留该次独立输入与索引。`--validate-only` 只校验素材和生成输入，退出成功不代表已完成真实模型测试，其报告保持 `passed: false`、`realModel: false`。单项排查不作为完整候选验收。
 
-完整功能报告使用 `schema: 2` 和 `test: "multimodal-functional"`。成功时 `mode` 为 `functional`，`passed`、`realModel`、`persisted`、`reloaded` 均为 `true`。`files` 记录 12 个输入的片段数量、实际提取通道和文件哈希，`queries` 记录 24 次查询的 `fixtureId`、语言、实际来源和定位校验。报告同时记录模型指纹、提取指纹、固定素材清单哈希与生成器源码哈希，供候选身份核对。报告只保留在本地或 CI 工作目录，不作为用户包 Artifact 上传。
+完整功能报告使用 `schema: 2` 和 `test: "multimodal-functional"`。成功时 `mode` 为 `functional`，`passed`、`realModel`、`persisted`、`reloaded` 均为 `true`。`files` 记录 12 个输入的片段数量、实际提取通道和文件哈希，`queries` 记录 24 次查询的 `fixtureId`、语言、实际来源和定位校验。报告同时记录 `modelId`、`embeddingDimensions`、模型指纹、提取指纹、固定素材清单哈希与生成器源码哈希，供候选身份核对。报告只保留在本地或 CI 工作目录，不作为用户包 Artifact 上传。

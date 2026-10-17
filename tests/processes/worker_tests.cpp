@@ -1,4 +1,5 @@
 #include "core/native_lock_path.h"
+#include "core/model_catalog.h"
 #include "support/test_environment.h"
 #include <QDir>
 #include <QElapsedTimer>
@@ -27,17 +28,19 @@ public:
             process.waitForFinished(5000);
         }
     }
-    bool start(const TestEnvironment &environment, const QString &mode = QStringLiteral("extract"))
+    bool start(const TestEnvironment &environment, const QString &mode = QStringLiteral("extract"),
+               const QString &modelId = {})
     {
-        return start(environment, environment.runtimePaths(), mode);
+        return start(environment, environment.runtimePaths(), mode, modelId);
     }
     bool start(const TestEnvironment &environment, const RuntimePaths &paths,
-               const QString &mode = QStringLiteral("extract"))
+               const QString &mode = QStringLiteral("extract"), const QString &modelId = {})
     {
         process.setWorkingDirectory(environment.root());
-        process.start(QString::fromUtf8(QCOPILOTS_SEARCH_TEST_WORKER_PATH),
-            {QStringLiteral("--mode"), mode, QStringLiteral("--profile-dir"), paths.profileDir,
-             QStringLiteral("--model-dir"), paths.modelDir, QStringLiteral("--threads"), QStringLiteral("1")});
+        QStringList arguments{QStringLiteral("--mode"), mode, QStringLiteral("--profile-dir"), paths.profileDir,
+            QStringLiteral("--model-dir"), paths.modelDir, QStringLiteral("--threads"), QStringLiteral("1")};
+        if (!modelId.isEmpty()) arguments.append({QStringLiteral("--model"), modelId});
+        process.start(QString::fromUtf8(QCOPILOTS_SEARCH_TEST_WORKER_PATH), arguments);
         return process.waitForStarted(10000);
     }
     void send(const QJsonObject &object)
@@ -245,6 +248,105 @@ private slots:
         request.insert(QStringLiteral("maxSegments"), 257);
         worker.send(request);
         QCOMPARE(errorCode(worker.receive()), QStringLiteral("invalid_limits"));
+    }
+    void qwenKeywordExtractionReportsIdentityWithoutLoadingModels()
+    {
+        TestEnvironment environment(QStringLiteral("worker qwen keyword"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QString modelId = QStringLiteral("qwen3-vl-embedding-8b");
+        const QString fingerprint = qcopilots_search::modelPipelineFingerprint(modelId);
+        QVERIFY(!fingerprint.isEmpty());
+        const auto paths = environment.runtimePaths();
+        QVERIFY(!QFileInfo::exists(paths.modelDir));
+        const QString source = QStringLiteral("资料/八十亿模型未下载.txt");
+        QVERIFY(environment.writeFile(source, QStringLiteral("模型未下载也能提取关键词。Payment declined troubleshooting.").toUtf8()));
+        WorkerProcess worker;
+        QVERIFY(worker.start(environment, QStringLiteral("full"), modelId));
+        auto request = extract(QStringLiteral("keyword-only"), environment.path(source));
+        request.insert(QStringLiteral("modelId"), modelId);
+        request.insert(QStringLiteral("dimensions"), 4096);
+        request.insert(QStringLiteral("embeddingFingerprint"), fingerprint);
+        request.insert(QStringLiteral("runtimeEvents"), true);
+        worker.send(request);
+        const auto reply = worker.receive();
+        QVERIFY2(reply.value(QStringLiteral("ok")).toBool(),
+            qPrintable(worker.errors() + QString::fromUtf8(QJsonDocument(reply).toJson())));
+        QCOMPARE(reply.value(QStringLiteral("id")).toString(), QStringLiteral("keyword-only"));
+        QVERIFY(!reply.contains(QStringLiteral("event")));
+        const auto result = reply.value(QStringLiteral("result")).toObject();
+        QCOMPARE(result.value(QStringLiteral("modelId")).toString(), modelId);
+        QCOMPARE(result.value(QStringLiteral("dimensions")).toInt(), 4096);
+        QCOMPARE(result.value(QStringLiteral("embeddingFingerprint")).toString(), fingerprint);
+        QVERIFY(result.contains(QStringLiteral("modelFingerprint")));
+        QVERIFY(result.value(QStringLiteral("modelFingerprint")).toString().isEmpty());
+        QVERIFY(!result.contains(QStringLiteral("runtime")));
+        QVERIFY(!result.value(QStringLiteral("embedded")).toBool());
+        QVERIFY(result.value(QStringLiteral("complete")).toBool());
+        QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("complete"));
+        const auto segments = result.value(QStringLiteral("segments")).toArray();
+        QVERIFY(!segments.isEmpty());
+        for (const auto& value : segments) {
+            const auto segment = value.toObject();
+            QVERIFY(segment.value(QStringLiteral("embedding")).toArray().isEmpty());
+            QCOMPARE(segment.value(QStringLiteral("path")).toString(), environment.path(source));
+        }
+        QVERIFY(segments.first().toObject().value(QStringLiteral("text")).toString().contains(QStringLiteral("模型未下载")));
+        QVERIFY(QDir(paths.modelDir).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty());
+        worker.send({{QStringLiteral("id"), QStringLiteral("state")}, {QStringLiteral("operation"), QStringLiteral("diagnostics")}});
+        const auto diagnosticReply = worker.receive();
+        QVERIFY(diagnosticReply.value(QStringLiteral("ok")).toBool());
+        const auto diagnostic = diagnosticReply.value(QStringLiteral("result")).toObject().value(QStringLiteral("runtime")).toObject();
+        QVERIFY(!diagnostic.isEmpty());
+        QVERIFY(!diagnostic.value(QStringLiteral("loaded")).toBool());
+        QCOMPARE(diagnostic.value(QStringLiteral("modelId")).toString(), modelId);
+        QCOMPARE(diagnostic.value(QStringLiteral("dimensions")).toInt(), 4096);
+        QCOMPARE(diagnostic.value(QStringLiteral("embeddingFingerprint")).toString(), fingerprint);
+    }
+    void mismatchedRequestIdentityIsRejected_data()
+    {
+        QTest::addColumn<QString>("field");
+        QTest::newRow("different-model") << QStringLiteral("modelId");
+        QTest::newRow("different-dimensions") << QStringLiteral("dimensions");
+        QTest::newRow("different-fingerprint") << QStringLiteral("embeddingFingerprint");
+    }
+    void mismatchedRequestIdentityIsRejected()
+    {
+        QFETCH(QString, field);
+        TestEnvironment environment(QStringLiteral("worker model identity"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        QVERIFY(environment.writeFile(QStringLiteral("sample.txt"), "Keyword extraction after an invalid model contract."));
+        const QString modelId = QStringLiteral("qwen3-vl-embedding-8b");
+        const QString fingerprint = qcopilots_search::modelPipelineFingerprint(modelId);
+        WorkerProcess worker;
+        QVERIFY(worker.start(environment, QStringLiteral("full"), modelId));
+        auto valid = extract(QStringLiteral("recovered"), environment.path(QStringLiteral("sample.txt")));
+        valid.insert(QStringLiteral("modelId"), modelId);
+        valid.insert(QStringLiteral("dimensions"), 4096);
+        valid.insert(QStringLiteral("embeddingFingerprint"), fingerprint);
+        auto invalid = valid;
+        invalid.insert(QStringLiteral("id"), QStringLiteral("mismatch"));
+        if (field == QStringLiteral("modelId")) invalid.insert(field, QStringLiteral("qwen3-vl-embedding-2b"));
+        else if (field == QStringLiteral("dimensions")) invalid.insert(field, 2048);
+        else invalid.insert(field, qcopilots_search::modelPipelineFingerprint(QStringLiteral("embeddinggemma-2")));
+        worker.send(invalid);
+        const auto rejected = worker.receive();
+        QCOMPARE(rejected.value(QStringLiteral("id")).toString(), QStringLiteral("mismatch"));
+        QVERIFY(!rejected.value(QStringLiteral("ok")).toBool());
+        QCOMPARE(errorCode(rejected), QStringLiteral("model_mismatch"));
+        const auto error = rejected.value(QStringLiteral("error")).toObject();
+        QCOMPARE(error.value(QStringLiteral("modelId")).toString(), modelId);
+        QCOMPARE(error.value(QStringLiteral("dimensions")).toInt(), 4096);
+        QCOMPARE(error.value(QStringLiteral("embeddingFingerprint")).toString(), fingerprint);
+        QVERIFY(!error.contains(QStringLiteral("runtime")));
+        worker.send(valid);
+        const auto recovered = worker.receive();
+        QVERIFY2(recovered.value(QStringLiteral("ok")).toBool(), qPrintable(QString::fromUtf8(QJsonDocument(recovered).toJson())));
+        const auto result = recovered.value(QStringLiteral("result")).toObject();
+        QCOMPARE(result.value(QStringLiteral("modelId")).toString(), modelId);
+        QCOMPARE(result.value(QStringLiteral("dimensions")).toInt(), 4096);
+        QCOMPARE(result.value(QStringLiteral("embeddingFingerprint")).toString(), fingerprint);
+        QVERIFY(!result.value(QStringLiteral("embedded")).toBool());
+        QVERIFY(!result.contains(QStringLiteral("runtime")));
     }
     void persistentCursorAndIsolatedProfiles()
     {

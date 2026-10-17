@@ -8,9 +8,9 @@
 
 原生 CI 读取 `config/build-variants.json`，对 11 个变体执行构建、功能测试、安装、打包和最终包验证。矩阵详情见[依赖说明](dependencies.md)。每次成功选择包含 21 个单文件 artifacts：Windows 五个变体各提供安装器和便携 ZIP，Linux 五个变体各提供 DEB 和便携 TGZ，macOS 提供一个 DMG。Windows ROCm 仅在 NSIS 数据块触及大小限制时使用带完整 payload 的 `-setup.zip` 安装包。
 
-每个 artifact 直接保存一个已验证用户包的原始字节，不额外套一层 ZIP。文件名统一为 `qcs-<版本>-<变体>.<扩展名>`，例如 `qcs-0.1.0-windows-x64-rocm.exe` 和 `qcs-0.1.0-windows-x64-rocm.zip`。完整提交、工作区状态、attempt 与依赖锁摘要仍保留在包内。诊断保留在 GitHub 原生日志，源码与可选符号独立生成。无 GPU runner 的 CPU 回退验证不代表 GPU 硬件执行已验证，GUI 与桌面操作检查见[测试指南](testing.md)。
+每个 artifact 直接保存一个已验证用户包的原始字节，不额外套一层 ZIP。文件名统一为 `qcs-<版本>-<变体>.<扩展名>`，例如 `qcs-0.2.0-windows-x64-rocm.exe` 和 `qcs-0.2.0-windows-x64-rocm.zip`。完整提交、工作区状态、attempt 与依赖锁摘要仍保留在包内。诊断保留在 GitHub 原生日志，源码与可选符号独立生成。无 GPU runner 的 CPU 回退验证不代表 GPU 硬件执行已验证，GUI 与桌面操作检查见[测试指南](testing.md)。
 
-本次 `v0.1.0` 的开发提交和合并提交使用 `[skip ci]`，本机完整检查后以 merge commit 合并到 `main`，再对准确的合并提交执行一次 `workflow_dispatch`。核对返回 run 的 `head_sha`，等待全部 11 个变体和汇总检查成功。正常 PR 与 `main` 自动 CI 规则保留，tag 和 Release 发布不会重复触发全量构建。若验收失败，先修复并重新验收，再准备发布。
+推送 `main` 后由原生 CI 自动构建，无需为同一提交再次手动触发。仅在需要补跑时使用 `workflow_dispatch`。核对 run 的 `head_sha` 与候选提交一致，等待全部 11 个变体和汇总检查成功。正常 PR 也会自动运行 CI，tag 和 Release 发布不会重复触发全量构建。若验收失败，先修复并重新验收，再准备发布。
 
 ## 2. 生成本机安装包
 
@@ -76,14 +76,14 @@ macOS / Linux 使用 `bash qcs-dev.sh release-prepare` 和相同参数。核心�
 ```powershell
 & "$qcsSource/qcs-dev.ps1" release-upload-draft `
   --manifest "$qcsOutput/qcs-release-manifest.json" `
-  --tag v0.1.0 --title 'QCopilots Search v0.1.0'
+  --tag v0.2.0 --title 'QCopilots Search v0.2.0'
 ```
 
 将示例 tag 和标题替换为本次实际版本。上传前重新读取远端 CI 身份、原始 artifact 摘要和本地文件字节，不再次完整下载全部包。对应 artifacts 必须仍可用且与准备时一致。已存在的 tag 必须指向同一提交。此命令仅接受草稿，已公开发布或指向其他提交时拒绝修改。
 
 同名远端资产仅在状态、大小和 SHA-256 一致时复用，缺失项继续上传，同名异内容或未完成资产明确报错，不自动覆盖。中断后重复相同命令即可重新校验并补齐缺项。附件共 24 个，包括 21 个用户包、一份源码包、校验和及发布清单。
 
-发布说明从冻结资产生成，参考 [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 按 Windows、Linux 和 macOS 分组。每个后端分别列出安装器和便携包链接，并说明安装、首次模型下载、校验和、源码材料、签名状态和验证范围。
+发布说明从冻结资产生成，按 Windows、Linux 和 macOS 分类列出各后端的安装器和便携包链接。“其他下载”仅列出 `SHA256SUMS`、对应源码材料和发布清单链接。正文只保留下载分类与附件链接，GitHub 自动展示完整 Assets 列表。安装、模型配置、平台要求及验证范围保留在仓库文档和测试记录中。
 
 ## 5. 公开正式版本
 
@@ -91,11 +91,11 @@ macOS / Linux 使用 `bash qcs-dev.sh release-prepare` 和相同参数。核心�
 
 ```powershell
 & "$qcsSource/qcs-dev.ps1" release-publish `
-  --manifest "$qcsOutput/qcs-release-manifest.json" --tag v0.1.0
+  --manifest "$qcsOutput/qcs-release-manifest.json" --tag v0.2.0
 ```
 
 命令重新验证候选、远端 `main`、成功 CI、tag 和全部 24 个附件。缺失资产应先通过 `release-upload-draft` 续传，同名异内容、tag 冲突或 CI 身份变化都会阻止发布。验证通过后设为正式版和最新 Release，不额外触发构建。
 
 发布重试具有幂等性。若上次公开已成功但响应丢失，命令会核对同一提交、tag 和完整资产集后返回成功，不改写已公开内容。
 
-草稿或 Release 存在不代表全部人工场景、GPU 硬件或最低系统版本已经测试。当前开发机只有 VMware 虚拟显示设备，本轮未实测双 AMD 或双 NVIDIA GPU 的实际吞吐，发布说明必须明确保留此限制。工具回归位于 `tests/tooling`，模拟 API 测试不代替真实 CI 和上传结果。
+草稿或 Release 存在不代表全部人工场景、GPU 硬件或最低系统版本已经测试。测试记录必须准确区分 CPU 回退、受控 worker 与真实 GPU 推理验收，并标明尚未实测的硬件和场景。工具回归位于 `tests/tooling`，模拟 API 测试不代替真实 CI 和上传结果。

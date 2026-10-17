@@ -2,6 +2,15 @@ set(_qcopilots_runtime_tests
   "image-sizing|image_sizing_test.cpp|unit"
   "runtime|runtime_unit_test.cpp|unit"
   "reference-vectors|reference_vectors_test.cpp|real-model")
+add_executable(qcs-tests-qwen-vectors qwen_vectors_test.cpp)
+target_link_libraries(qcs-tests-qwen-vectors PRIVATE qcs-runtime qcs-test-support)
+target_compile_definitions(qcs-tests-qwen-vectors PRIVATE
+  QCOPILOTS_SEARCH_QWEN_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/qwen")
+# Weight-heavy acceptance is explicit. CTest always validates the independent
+# golden data without downloading or loading either Qwen model.
+qcopilots_search_add_test(NAME qcs-tests-qwen-manifest EVIDENCE_KIND program
+  COMMAND "$<TARGET_FILE:qcs-tests-qwen-vectors>" --validate-only)
+set_tests_properties(qcs-tests-qwen-manifest PROPERTIES LABELS "unit;runtime" TIMEOUT 60)
 add_executable(qcs-tests-backend-layout backend_layout_test.cpp)
 target_include_directories(qcs-tests-backend-layout PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(qcs-tests-backend-layout PRIVATE qcs-test-support Qt6::Core Qt6::Test)

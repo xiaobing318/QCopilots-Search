@@ -1,6 +1,7 @@
 #include "index_repository.h"
 #include "core/file_catalog.h"
 #include "core/embedding_math.h"
+#include "core/model_catalog.h"
 #include "text_index.h"
 #include "vector_index.h"
 #include <QDir>
@@ -21,7 +22,7 @@
 
 namespace qcopilots_search {
 namespace {
-constexpr int schemaVersion = 3;
+constexpr int schemaVersion = 4;
 constexpr int shardCount = 16;
 constexpr qint64 exactSubsetLimit = 20000;
 constexpr qint64 deltaLimit = 2048;
@@ -180,8 +181,8 @@ QString keyForPath(const QString &path) {
 #endif
   return result;
 }
-QVector<float> normalized(const QVector<float> &values) {
-  return embedding_math::normalized(values);
+QVector<float> normalized(const QVector<float> &values, int dimensions) {
+  return embedding_math::normalized(values, dimensions);
 }
 double cosine(const QVector<float> &a, const QVector<float> &b) {
   return embedding_math::cosine(a, b);
@@ -273,6 +274,8 @@ void report(QString *error, const std::exception &e) {
 class IndexRepository::Impl {
 public:
   RuntimePaths paths;
+  QString modelId;
+  int dimensions = 0;
   Connection writer;
   mutable std::mutex publication;
   std::mutex maintenanceMutex;
@@ -361,13 +364,13 @@ public:
       q.bind(1, qint64(shard));
       while (q.next()) {
         auto vector = decodeFloat16(q.bytes(1), error);
-        if (vector.size() != embeddingDimensions)
+        if (vector.size() != dimensions)
           throw std::runtime_error("Invalid persisted vector");
         records.append({q.integer(0), std::move(vector)});
       }
       transaction->commit();
       diskGuard(qint64(records.size()) *
-                (embeddingDimensions * sizeof(float) + 256));
+                (dimensions * sizeof(float) + 256));
     }
     // The SQLite read transaction is closed before the expensive graph build,
     // which prevents a long build from retaining an unbounded WAL file.
@@ -406,12 +409,22 @@ IndexRepository::IndexRepository(StorageOptions options)
 IndexRepository::~IndexRepository() = default;
 
 bool IndexRepository::open(const RuntimePaths &paths, QString *error) {
+  return open(paths, defaultModelId(), error);
+}
+
+bool IndexRepository::open(const RuntimePaths &paths, const QString &modelId,
+                           QString *error) {
   if (error)
     error->clear();
   try {
     std::lock_guard lock(d->publication);
     if (d->opened)
       throw std::runtime_error("Index repository is already open");
+    const auto *model = findModel(modelId);
+    if (!model)
+      throw std::runtime_error("Unknown index model identifier");
+    if (model->dimensions < 1 || model->dimensions > 8192)
+      throw std::runtime_error("Model embedding dimensions are outside the supported range");
     if (d->options.diskReserveBytes < 0)
       throw std::runtime_error("Disk reserve must not be negative");
     if (d->options.maxWalBytes <= 0)
@@ -419,6 +432,8 @@ bool IndexRepository::open(const RuntimePaths &paths, QString *error) {
     if (!paths.ensure(error))
       return false;
     d->paths = paths;
+    d->modelId = modelId;
+    d->dimensions = model->dimensions;
     const QFileInfo databaseInfo(paths.databaseFile());
     const bool newDatabase = !databaseInfo.exists() || databaseInfo.size() == 0;
     d->writer.open(paths.databaseFile(), true);
@@ -427,6 +442,13 @@ bool IndexRepository::open(const RuntimePaths &paths, QString *error) {
     if (version > schemaVersion)
       throw std::runtime_error(
           "Database schema was created by a newer QCopilots Search version");
+    // Databases predating model identities could only contain Gemma vectors.
+    // A rolled-back first initialization can leave an empty SQLite header, so
+    // permit that empty file to retry initialization for its requested model.
+    const bool uninitialized = version == 0 && scalar(db,
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'") == 0;
+    if (!newDatabase && !uninitialized && version < 4 && modelId != defaultModelId())
+      throw std::runtime_error("A legacy index belongs to EmbeddingGemma 2");
     // A 768-dimensional FP16 vector and its text metadata often exceed half
     // of a 4 KiB page. Larger pages pack several such rows instead of leaving
     // nearly half of each page unused. Existing databases retain their layout,
@@ -464,16 +486,25 @@ CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE OF terms,han ON segments B
     execute(db, "CREATE INDEX IF NOT EXISTS files_browse ON files(code,modified_ms DESC,id DESC);"
                 "CREATE INDEX IF NOT EXISTS files_browse_kind ON files(code,kind,modified_ms DESC,id DESC);"
                 "CREATE INDEX IF NOT EXISTS files_pending_metadata ON files(code) WHERE modified_ms IS NULL OR kind='';"
-                "INSERT OR IGNORE INTO meta VALUES('browse_generation','0');"
-                "PRAGMA user_version=3");
+                "INSERT OR IGNORE INTO meta VALUES('browse_generation','0');");
+    if (version < 4) {
+      putMeta(db, QStringLiteral("model_id"), modelId);
+      putMeta(db, QStringLiteral("embedding_dimensions"), QString::number(d->dimensions));
+    } else if (meta(db, QStringLiteral("model_id")) != modelId
+               || meta(db, QStringLiteral("embedding_dimensions")) != QString::number(d->dimensions)) {
+      throw std::runtime_error("Index model identity or embedding dimensions do not match the selected model");
+    }
+    execute(db, "PRAGMA user_version=4");
     if (meta(db, QStringLiteral("index_uuid")).isEmpty())
       putMeta(db, QStringLiteral("index_uuid"),
               QUuid::createUuid().toString(QUuid::WithoutBraces));
+    if (version < 4 && d->options.faultHook)
+      d->options.faultHook(QStringLiteral("before-model-schema-commit"));
     transaction.commit();
     const auto annRoot = QDir(paths.indexDir)
                              .filePath(QStringLiteral("qcs-ann-") +
                                        meta(db, QStringLiteral("index_uuid")));
-    d->ann = std::make_unique<VectorIndex>(annRoot, embeddingDimensions,
+    d->ann = std::make_unique<VectorIndex>(annRoot, d->dimensions,
                                            d->options.faultHook);
     if (!d->ann->loadManifest(error)) {
       // An ANN manifest is derived state. Reopen with an empty in-memory
@@ -486,7 +517,7 @@ CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE OF terms,han ON segments B
       d->recoveryWarning =
           QStringLiteral("ANN generation is newer than this database snapshot. "
                          "Rebuild is required.");
-      d->ann = std::make_unique<VectorIndex>(annRoot, embeddingDimensions,
+      d->ann = std::make_unique<VectorIndex>(annRoot, d->dimensions,
                                              d->options.faultHook);
     }
     d->published = d->ann->snapshot();
@@ -549,7 +580,7 @@ bool IndexRepository::replaceFiles(const QVector<IndexedFile> &files,
       for (const auto &segment : file.segments) {
         auto encoded = segment.embedding.isEmpty()
                            ? QByteArray()
-                           : encodeFloat16(normalized(segment.embedding));
+                           : encodeFloat16(normalized(segment.embedding, d->dimensions));
         estimate += encoded.size() + segment.text.size() * 4 + 4096;
         prepared.vectors.append(std::move(encoded));
         prepared.text.append(tokenizeForIndex(
@@ -838,6 +869,60 @@ bool IndexRepository::updateFileMetadata(const QVector<FileMetadata> &files,
   }
 }
 
+bool IndexRepository::invalidateChangedFiles(const QVector<FileMetadata> &files,
+                                              QString *error,
+                                              const PublicationGate &publicationGate) {
+  if (error) error->clear();
+  try {
+    if (files.isEmpty()) return true;
+    std::lock_guard lock(d->publication);
+    const auto lease = publicationGate ? publicationGate() : std::shared_ptr<void>();
+    if (publicationGate && !lease)
+      throw std::runtime_error("Discarded obsolete source invalidation before publication");
+    d->requireOpen();
+    d->diskGuard(qint64(files.size()) * 1024);
+    d->checkpoint();
+    auto *db = d->writer.db;
+    Transaction transaction(db, true);
+    const auto gen = d->generation() + 1;
+    Statement current(db, "SELECT id,source_version,version FROM files WHERE path_key=? AND code=?");
+    Statement event(db, "INSERT INTO ann_events SELECT ?,shard,id,'delete' FROM "
+                        "segments WHERE file_id=? AND embedding IS NOT NULL");
+    Statement remove(db, "DELETE FROM files WHERE id=?");
+    bool changed = false;
+    for (const auto &file : files) {
+      if (file.path.isEmpty() || file.sourceFingerprint.isEmpty())
+        throw std::runtime_error("Source invalidation requires a nonempty path and source fingerprint");
+      current.bind(1, keyForPath(file.path));
+      current.bind(2, qint64(file.code));
+      if (current.next() && current.string(2) == file.expectedIndexedVersion
+          && !current.string(1).startsWith(file.sourceFingerprint + u'|')) {
+        const auto id = current.integer(0);
+        event.bind(1, gen);
+        event.bind(2, id);
+        event.run();
+        event.reset();
+        remove.bind(1, id);
+        remove.run();
+        remove.reset();
+        changed = true;
+      }
+      current.reset();
+    }
+    if (changed) {
+      putMeta(db, QStringLiteral("generation"), QString::number(gen));
+      advanceBrowseGeneration(db);
+    }
+    if (d->options.faultHook)
+      d->options.faultHook(QStringLiteral("before-source-invalidation-commit"));
+    transaction.commit();
+    return true;
+  } catch (const std::exception &e) {
+    report(error, e);
+    return false;
+  }
+}
+
 qint64 IndexRepository::browseGeneration(QString *error) const {
   if (error) error->clear();
   try {
@@ -1011,6 +1096,24 @@ QString IndexRepository::fileVersion(const QString &path, bool code,
   }
 }
 
+bool IndexRepository::fileHasEmbeddings(const QString &path, bool code,
+                                        QString *error) const {
+  if (error) error->clear();
+  try {
+    std::lock_guard lock(d->publication);
+    d->requireOpen();
+    Statement query(d->writer.db,
+        "SELECT EXISTS(SELECT 1 FROM files f JOIN segments s ON s.file_id=f.id "
+        "WHERE f.path_key=? AND f.code=? AND s.embedding IS NOT NULL)");
+    query.bind(1, keyForPath(path));
+    query.bind(2, qint64(code));
+    return query.next() && query.integer(0) != 0;
+  } catch (const std::exception &e) {
+    report(error, e);
+    return false;
+  }
+}
+
 QVector<Segment> IndexRepository::fileSegments(const QString &path, bool code,
                                                QString *error) const {
   if (error)
@@ -1049,7 +1152,7 @@ QVector<Segment> IndexRepository::fileSegments(const QString &path, bool code,
       const auto bytes = q.bytes(13);
       if (!bytes.isEmpty()) {
         s.embedding = decodeFloat16(bytes, error);
-        if (s.embedding.size() != embeddingDimensions)
+        if (s.embedding.size() != d->dimensions)
           throw std::runtime_error("Invalid persisted embedding");
       }
       result.append(std::move(s));
@@ -1146,7 +1249,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
         throw std::runtime_error(
             "Semantic search is unavailable during an offline bulk import. "
             "Complete ANN maintenance with flush before querying.");
-      const auto query = normalized(options.queryEmbedding);
+      const auto query = normalized(options.queryEmbedding, d->dimensions);
       Statement count(
           db,
           QStringLiteral("SELECT count(*) FROM (SELECT 1 FROM segments s JOIN files f ON "
@@ -1160,7 +1263,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
         while (q.next()) {
           checkCancelled();
           const auto vec = decodeFloat16(q.bytes(1), error);
-          if (vec.size() != embeddingDimensions)
+          if (vec.size() != d->dimensions)
             throw std::runtime_error("Invalid persisted embedding");
           scores.insert(q.integer(0), cosine(query, vec));
         }
@@ -1243,7 +1346,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
             filter.bind(get, 2);
             if (get.next()) {
               const auto vec = decodeFloat16(get.bytes(1), error);
-              if (vec.size() != embeddingDimensions)
+              if (vec.size() != d->dimensions)
                 throw std::runtime_error("Invalid persisted embedding");
               scores.insert(get.integer(0), cosine(query, vec));
               candidatePaths.insert(get.string(2));
@@ -1374,6 +1477,8 @@ QJsonObject IndexRepository::status(QString *error) const {
         {"annGeneration", qint64(d->published->generation())},
         {"annEfSearch", VectorIndex::searchEf},
         {"schemaVersion", schemaVersion},
+        {"modelId", d->modelId},
+        {"embeddingDimensions", d->dimensions},
         {"pendingShards",
          scalar(db, "SELECT count(DISTINCT shard) FROM ann_events")},
         {"pipelineFingerprint", meta(db, "pipeline_fingerprint")},

@@ -1308,11 +1308,51 @@ class RunnerIsolationTests(unittest.TestCase):
                 self.assertEqual(identity["runId"], environment["GITHUB_RUN_ID"])
                 self.assertEqual(identity["runAttempt"], environment["GITHUB_RUN_ATTEMPT"])
                 self.assertEqual(identity["configuration"], "windows-x64-cpu")
-                for path in (parent / "sdk", parent / "models", root / "runs/Release"):
+                for path in (parent / "sdk", temporary / "qcs-model-cache/gemma-qwen2b", root / "runs/Release"):
                     self.assertTrue(path.is_dir())
             exported = (temporary / "environment").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(exported), 10)
             self.assertEqual(sum(line.startswith("QCOPILOTS_SEARCH_TEST_ROOT=") for line in exported), 2)
+
+    def test_model_cache_is_stable_per_required_set_while_run_data_stays_unique(self):
+        with tempfile.TemporaryDirectory(prefix="qcs-cache-中文 ",
+                dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as directory:
+            temporary = Path(directory).resolve()
+            expected_groups = {"windows-x64-cpu": "gemma-qwen2b",
+                               "linux-x64-cpu": "gemma-qwen2b-qwen8b",
+                               "macos-arm64-metal": "gemma-qwen2b"}
+            roots, caches = set(), {}
+            developer = native.developer_workflow()
+            for identifier in native.variants():
+                group = expected_groups.get(identifier, "gemma")
+                for attempt in (1, 2):
+                    with self.subTest(variant=identifier, attempt=attempt):
+                        environment = {**self.environment(temporary), "QCOPILOTS_SEARCH_CI_ID": identifier,
+                                       "GITHUB_RUN_ID": str(100 + attempt), "GITHUB_RUN_ATTEMPT": str(attempt)}
+                        with mock.patch.dict(os.environ, environment, clear=True), \
+                                mock.patch("sys.stdout", new_callable=io.StringIO):
+                            parent = native.initialize_runner()
+                        self.assertNotIn(parent, roots)
+                        roots.add(parent)
+                        root = parent / identifier
+                        identity = json.loads((root / "reports/Release/runner-identity.json").read_text(encoding="utf-8"))
+                        paths = {key: Path(value) for key, value in identity["directories"].items()}
+                        cache = paths["QCOPILOTS_SEARCH_MODEL_DIR"]
+                        self.assertEqual(cache, temporary / "qcs-model-cache" / group)
+                        self.assertNotIn(parent, cache.parents)
+                        self.assertEqual(paths["QCOPILOTS_SEARCH_TEST_ROOT"], root / "runs/Release")
+                        self.assertEqual(paths["QCOPILOTS_SEARCH_QT_ROOT"], parent / "sdk")
+                        developer.protect_input_paths(root, None, cache, None)
+                        marker = cache / "existing-cache-test-marker"
+                        if group in caches:
+                            self.assertEqual(cache, caches[group])
+                            self.assertEqual(marker.read_text(encoding="utf-8"), group)
+                        else:
+                            caches[group] = cache
+                            marker.write_text(group, encoding="utf-8")
+            self.assertEqual(len(set(caches.values())), 3)
+            self.assertEqual({path.name for path in (temporary / "qcs-model-cache").iterdir()},
+                             {"gemma", "gemma-qwen2b", "gemma-qwen2b-qwen8b"})
 
     def test_initialized_ci_root_is_accepted_by_real_developer_bootstrap_guard(self):
         with tempfile.TemporaryDirectory(prefix="qcs-owner-中文 ",
@@ -1964,7 +2004,7 @@ class NativeStageDependencyTests(unittest.TestCase):
     """Verify workflow ordering and default failure propagation before upload."""
 
     ACTIONS = ("initialize", "toolchain", "bootstrap", "doctor", "configure", "build", "models",
-               "test", "install", "package", "installers", "products")
+               "test", "install", "package", "multimodel", "installers", "products")
 
     def setUp(self):
         self.workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
@@ -1987,8 +2027,36 @@ class NativeStageDependencyTests(unittest.TestCase):
             with self.subTest(action=action):
                 conditions = re.findall(r"^        if: (.+)$", self.step(action), re.MULTILINE)
                 expected = {"installers": ["runner.os == 'Windows' || runner.os == 'Linux'"],
-                            "toolchain": ["matrix.container != ''"]}
+                            "toolchain": ["matrix.container != ''"],
+                            "multimodel": ["matrix.id == 'windows-x64-cpu' || matrix.id == 'linux-x64-cpu' || matrix.id == 'macos-arm64-metal'"]}
                 self.assertEqual(conditions, expected.get(action, []))
+
+    def test_additional_models_verify_final_packages_in_a_bounded_sequence(self):
+        expected = {"windows-x64-cpu": ("qwen3-vl-embedding-2b",),
+                    "linux-x64-cpu": ("qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"),
+                    "macos-arm64-metal": ("qwen3-vl-embedding-2b",)}
+        for identifier in native.variants():
+            self.assertEqual(native.additional_models(identifier), expected.get(identifier, ()))
+        with mock.patch.object(native, "variant", return_value={"id": "linux-x64-cpu"}), \
+                mock.patch.object(native, "REPORTS", Path("external-reports"), create=True), \
+                mock.patch.object(native, "dev") as dev:
+            native.multimodel()
+        self.assertEqual(dev.call_args_list, [
+            mock.call("models", "--model", "qwen3-vl-embedding-2b"),
+            mock.call("test-models", "--model", "qwen3-vl-embedding-2b"),
+            mock.call("verify-package", "--model", "qwen3-vl-embedding-2b",
+                      "--model-timeout", "1800", "--report-dir", str(Path("external-reports/package-qwen3-vl-embedding-2b")), display=True),
+            mock.call("models", "--model", "qwen3-vl-embedding-8b"),
+            mock.call("test-models", "--model", "qwen3-vl-embedding-8b"),
+            mock.call("verify-package", "--model", "qwen3-vl-embedding-8b",
+                      "--model-timeout", "1800", "--report-dir", str(Path("external-reports/package-qwen3-vl-embedding-8b")), display=True)])
+        self.assertIn("hashFiles('qcs-src/config/qcs-models.lock.json')", self.workflow)
+        cache = next(step for step in self.steps if step.startswith("Restore immutable model cache"))
+        self.assertIn("path: ${{ env.QCOPILOTS_SEARCH_MODEL_DIR }}", cache)
+        self.assertNotIn("restore-keys:", cache)
+        for identifier in native.variants():
+            group = native.model_cache_group(identifier)
+            self.assertIn("'" + group + "'", cache)
 
     def test_container_toolchain_is_selected_after_python_and_before_configure(self):
         python = next(step for step in self.steps if "uses: actions/setup-python@" in step)
@@ -2057,12 +2125,15 @@ class NativeStageDependencyTests(unittest.TestCase):
 
 
 class NativePackageProductsTests(unittest.TestCase):
+    def setUp(self):
+        self.version = native.artifact_selection.project_version(native.SOURCE)
+
     def package_set(self, root, identifier="windows-x64-cpu"):
         selected = native.variants()[identifier]
         suffixes = {"NSIS": ".exe", "ZIP": ".zip", "DEB": ".deb", "TGZ": ".tar.gz", "DragNDrop": ".dmg"}
         files = []
         for generator in selected["generators"]:
-            path = root / f"qcs-0.1.0-{identifier}{suffixes[generator]}"
+            path = root / f"qcs-{self.version}-{identifier}{suffixes[generator]}"
             path.write_bytes(b"synthetic package bytes for output contract only")
             files.append(path)
         return selected, files
@@ -2110,7 +2181,7 @@ class NativePackageProductsTests(unittest.TestCase):
                             "checksums": "qcs-SHA256SUMS"}[mutation]
                     (root / name).write_bytes(b"not a user package")
                 elif mutation == "duplicate":
-                    files[0].with_name(files[0].name.replace("0.1.0", "0.2.0")).write_bytes(b"duplicate")
+                    files[0].with_name(files[0].name.replace(self.version, "9999.0.0")).write_bytes(b"duplicate")
                 else:
                     files[0].write_bytes(b"")
                 with self.assertRaises(RuntimeError):
@@ -2142,7 +2213,7 @@ class NativePackageProductsTests(unittest.TestCase):
                 selected, files = self.package_set(root, identifier)
                 if any(path.suffix == ".exe" for path in files):
                     next(path for path in files if path.suffix == ".exe").unlink()
-                setup = root / f"qcs-0.1.0-{identifier}-setup.zip"
+                setup = root / f"qcs-{self.version}-{identifier}-setup.zip"
                 setup.write_bytes(b"unsupported installer fallback")
                 with self.assertRaisesRegex(RuntimeError, "Unexpected package output"):
                     native.package_files(root, selected)
@@ -2154,7 +2225,7 @@ class NativePackageProductsTests(unittest.TestCase):
                 root = Path(temporary)
                 selected, files = self.package_set(root, "windows-x64-rocm")
                 installer = next(path for path in files if path.suffix == ".exe")
-                name = installer.name.replace("0.1.0", "0.2.0")
+                name = installer.name.replace(self.version, "9999.0.0")
                 if fallback:
                     name = name.removesuffix(".exe") + "-setup.zip"
                 installer.rename(installer.with_name(name))

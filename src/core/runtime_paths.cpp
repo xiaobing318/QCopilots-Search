@@ -1,4 +1,5 @@
 #include "runtime_paths.h"
+#include "model_catalog.h"
 #include "ipc_directory.h"
 
 #include <QCryptographicHash>
@@ -389,5 +390,26 @@ bool RuntimePaths::validateProfileLayout(QString *error) const
 QString RuntimePaths::databaseFile() const
 {
     return QDir(indexDir).filePath(QStringLiteral("qcs.sqlite3"));
+}
+
+RuntimePaths RuntimePaths::forModelIndex(const QString &modelId) const
+{
+    RuntimePaths result = *this;
+    if (!findModel(modelId)) {
+        result.resolutionError = QStringLiteral("Unsupported modelId: %1").arg(modelId);
+        return result;
+    }
+    // Always derive from the profile, so repeated mapping never nests indexes.
+    const QString originalIndex = QDir(profileDir).filePath(QStringLiteral("index"));
+    RuntimePaths original = *this;
+    original.indexDir = originalIndex;
+    QString layoutError;
+    if (!original.validateProfileLayout(&layoutError)) {
+        result.resolutionError = layoutError;
+        return result;
+    }
+    result.indexDir = modelId == defaultModelId() ? originalIndex
+        : QDir(originalIndex).filePath(QStringLiteral("models/") + modelId);
+    return result;
 }
 } // namespace qcopilots_search

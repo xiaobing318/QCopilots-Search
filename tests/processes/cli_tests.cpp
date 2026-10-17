@@ -2,12 +2,18 @@
 
 #include <QDir>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QProcess>
+#include <QSet>
 #include <QStandardPaths>
+#include <QTimer>
+#include <QtEndian>
 #include <QtTest>
 
 using namespace qcopilots_search::test;
@@ -22,7 +28,7 @@ struct Invocation {
     QJsonObject json() const { return QJsonDocument::fromJson(output).object(); }
 };
 
-Invocation invoke(const TestEnvironment &environment, const QStringList &arguments)
+Invocation invoke(const TestEnvironment &environment, const QStringList &arguments, bool processEvents = false)
 {
     QProcess process;
     process.setProgram(QStringLiteral(QCOPILOTS_SEARCH_TEST_CLI_PATH));
@@ -36,7 +42,21 @@ Invocation invoke(const TestEnvironment &environment, const QStringList &argumen
         result.errors = process.errorString().toUtf8();
         return result;
     }
-    result.finished = process.waitForFinished(15000);
+    if (processEvents) {
+        // A hermetic IPC fixture runs in this process. Keep its socket and
+        // timers responsive while waiting for the real CLI child to finish.
+        QEventLoop loop;
+        QTimer deadline;
+        deadline.setSingleShot(true);
+        QObject::connect(&process, &QProcess::finished, &loop, &QEventLoop::quit);
+        QObject::connect(&deadline, &QTimer::timeout, &loop, &QEventLoop::quit);
+        deadline.start(15000);
+        if (process.state() != QProcess::NotRunning)
+            loop.exec();
+        result.finished = process.state() == QProcess::NotRunning;
+    } else {
+        result.finished = process.waitForFinished(15000);
+    }
     if (!result.finished) {
         // Only the child created above is stopped, never another application.
         process.kill();
@@ -81,6 +101,93 @@ public:
     QProcess process;
 private:
     const TestEnvironment &environment_;
+};
+
+class ModelSelectionService final {
+public:
+    bool start(const TestEnvironment &environment)
+    {
+        const auto paths = qcopilots_search::RuntimePaths::resolve(
+            environment.path(QStringLiteral("用户 profile")), environment.path(QStringLiteral("模型 cache")));
+        if (!paths.ensure(&error)
+            || !environment.writeFile(QStringLiteral("用户 profile/qcs-ipc-token"), token, &error))
+            return false;
+        server.setSocketOptions(QLocalServer::UserAccessOption);
+        QObject::connect(&server, &QLocalServer::newConnection, &server, [this] {
+            while (auto *socket = server.nextPendingConnection()) {
+                auto buffer = std::make_shared<QByteArray>();
+                QObject::connect(socket, &QLocalSocket::readyRead, socket, [this, socket, buffer] {
+                    buffer->append(socket->readAll());
+                    while (buffer->size() >= 4) {
+                        const quint32 length = qFromBigEndian<quint32>(buffer->constData());
+                        if (length > 16 * 1024 * 1024 || length == 0) {
+                            error = QStringLiteral("Invalid CLI frame length");
+                            socket->abort();
+                            return;
+                        }
+                        if (buffer->size() < qsizetype(length) + 4)
+                            return;
+                        const auto request = QJsonDocument::fromJson(buffer->mid(4, length)).object();
+                        buffer->remove(0, length + 4);
+                        if (request.value(QStringLiteral("protocol")).toInt() != 1
+                            || request.value(QStringLiteral("token")).toString().toUtf8() != token) {
+                            error = QStringLiteral("Invalid CLI authentication or protocol");
+                            socket->abort();
+                            return;
+                        }
+                        const QString method = request.value(QStringLiteral("method")).toString();
+                        methods.append(method);
+                        if (method == QStringLiteral("cancel"))
+                            continue;
+                        QJsonObject reply{{QStringLiteral("protocol"), 1},
+                            {QStringLiteral("id"), request.value(QStringLiteral("id"))}, {QStringLiteral("ok"), true}};
+                        int delay = 0;
+                        if (method == QStringLiteral("status")) {
+                            ++statusRequests;
+                            reply.insert(QStringLiteral("result"), QJsonObject{{QStringLiteral("modelLoading"),
+                                loadingReplies < 0 || statusRequests <= loadingReplies}});
+                        } else if (method == QStringLiteral("models.select")) {
+                            ++selectRequests;
+                            selectedId = request.value(QStringLiteral("params")).toObject().value(QStringLiteral("modelId")).toString();
+                            delay = selectionDelay;
+                            if (selectionBusy) {
+                                reply.insert(QStringLiteral("ok"), false);
+                                reply.insert(QStringLiteral("error"), QJsonObject{{QStringLiteral("code"), QStringLiteral("busy")},
+                                    {QStringLiteral("message"), QStringLiteral("A different transition is in progress")}});
+                            } else {
+                                reply.insert(QStringLiteral("result"), QJsonObject{{QStringLiteral("modelId"), selectedId}});
+                            }
+                        } else {
+                            error = QStringLiteral("Unexpected CLI method: %1").arg(method);
+                            socket->abort();
+                            return;
+                        }
+                        const QByteArray payload = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+                        QByteArray frame(4, '\0');
+                        qToBigEndian<quint32>(quint32(payload.size()), frame.data());
+                        frame.append(payload);
+                        QTimer::singleShot(delay, socket, [socket, frame] { socket->write(frame); });
+                    }
+                });
+            }
+        });
+        if (server.listen(paths.ipcName))
+            return true;
+        error = server.errorString();
+        return false;
+    }
+
+    int loadingReplies = 2;
+    int selectionDelay = 0;
+    bool selectionBusy = false;
+    int statusRequests = 0;
+    int selectRequests = 0;
+    QString selectedId;
+    QStringList methods;
+    QString error;
+private:
+    const QByteArray token = QByteArray(64, 'f');
+    QLocalServer server;
 };
 }
 
@@ -127,6 +234,15 @@ private slots:
         QTest::newRow("invalid-config") << QStringList{QStringLiteral("config"), QStringLiteral("set"), QStringLiteral("{invalid}")};
         QTest::newRow("array-config") << QStringList{QStringLiteral("config"), QStringLiteral("set"), QStringLiteral("[]")};
         QTest::newRow("missing-import-source") << QStringList{QStringLiteral("model"), QStringLiteral("import")};
+        QTest::newRow("unknown-model") << QStringList{QStringLiteral("model"), QStringLiteral("manifest"), QStringLiteral("--model"), QStringLiteral("unknown")};
+        QTest::newRow("missing-model-selection") << QStringList{QStringLiteral("model"), QStringLiteral("select")};
+        QTest::newRow("unknown-model-selection") << QStringList{QStringLiteral("model"), QStringLiteral("select"), QStringLiteral("unknown")};
+        QTest::newRow("extra-model-selection") << QStringList{QStringLiteral("model"), QStringLiteral("select"), QStringLiteral("embeddinggemma-2"), QStringLiteral("extra")};
+        QTest::newRow("model-option-on-selection") << QStringList{QStringLiteral("model"), QStringLiteral("select"), QStringLiteral("embeddinggemma-2"), QStringLiteral("--model"), QStringLiteral("qwen3-vl-embedding-2b")};
+        QTest::newRow("model-option-on-reload") << QStringList{QStringLiteral("model"), QStringLiteral("reload"), QStringLiteral("--model"), QStringLiteral("qwen3-vl-embedding-2b")};
+        QTest::newRow("model-option-on-search") << QStringList{QStringLiteral("search"), QStringLiteral("query"), QStringLiteral("--model"), QStringLiteral("qwen3-vl-embedding-2b")};
+        QTest::newRow("extra-config-reload") << QStringList{QStringLiteral("config"), QStringLiteral("reload"), QStringLiteral("extra")};
+        QTest::newRow("file-config-reload") << QStringList{QStringLiteral("config"), QStringLiteral("reload"), QStringLiteral("--file"), QStringLiteral("settings.json")};
     }
 
     void usageErrorsAreMachineReadable()
@@ -142,15 +258,32 @@ private slots:
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcs-ipc-token"))));
     }
 
+    void manifestIsOfflineAndDoesNotCreateProfile_data()
+    {
+        QTest::addColumn<QString>("modelId");
+        QTest::addColumn<int>("dimensions");
+        QTest::newRow("default-gemma") << QString{} << 768;
+        QTest::newRow("explicit-gemma") << QStringLiteral("embeddinggemma-2") << 768;
+        QTest::newRow("qwen-2b") << QStringLiteral("qwen3-vl-embedding-2b") << 2048;
+        QTest::newRow("qwen-8b") << QStringLiteral("qwen3-vl-embedding-8b") << 4096;
+    }
+
     void manifestIsOfflineAndDoesNotCreateProfile()
     {
+        QFETCH(QString, modelId);
+        QFETCH(int, dimensions);
         TestEnvironment environment(QStringLiteral("cli-manifest"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        const auto result = invoke(environment, {QStringLiteral("models"), QStringLiteral("manifest")});
+        QStringList arguments{QStringLiteral("models"), QStringLiteral("manifest")};
+        if (!modelId.isEmpty()) arguments.append({QStringLiteral("--model"), modelId});
+        const auto result = invoke(environment, arguments);
         QVERIFY2(result.started && result.finished, result.errors.constData());
         QCOMPARE(result.exitCode, 0);
         QVERIFY(result.json().value(QStringLiteral("ok")).toBool());
-        const auto artifacts = result.json().value(QStringLiteral("result")).toObject().value(QStringLiteral("artifacts")).toArray();
+        const auto manifest = result.json().value(QStringLiteral("result")).toObject();
+        QCOMPARE(manifest.value(QStringLiteral("modelId")).toString(), modelId.isEmpty() ? QStringLiteral("embeddinggemma-2") : modelId);
+        QCOMPARE(manifest.value(QStringLiteral("dimensions")).toInt(), dimensions);
+        const auto artifacts = manifest.value(QStringLiteral("artifacts")).toArray();
         QCOMPARE(artifacts.size(), 2);
         for (const auto &value : artifacts) {
             const auto artifact = value.toObject();
@@ -159,27 +292,78 @@ private slots:
             QVERIFY(artifact.value(QStringLiteral("url")).toString().startsWith(QStringLiteral("https://")));
         }
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile"))));
+        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("模型 cache"))));
+    }
+
+    void modelListIsOfflineAndDoesNotCreateProfile()
+    {
+        TestEnvironment environment(QStringLiteral("cli-model-list"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto result = invoke(environment, {QStringLiteral("model"), QStringLiteral("list")});
+        QVERIFY2(result.started && result.finished, result.errors.constData());
+        QCOMPARE(result.exitCode, 0);
+        const auto catalog = result.json().value(QStringLiteral("result")).toObject();
+        QCOMPARE(catalog.value(QStringLiteral("defaultModelId")).toString(), QStringLiteral("embeddinggemma-2"));
+        const auto models = catalog.value(QStringLiteral("models")).toArray();
+        QCOMPARE(models.size(), 3);
+        QSet<QString> identities;
+        QSet<int> dimensions;
+        for (const auto &entry : models) {
+            const auto model = entry.toObject();
+            identities.insert(model.value(QStringLiteral("id")).toString());
+            dimensions.insert(model.value(QStringLiteral("dimensions")).toInt());
+        }
+        QCOMPARE(identities, (QSet<QString>{QStringLiteral("embeddinggemma-2"), QStringLiteral("qwen3-vl-embedding-2b"), QStringLiteral("qwen3-vl-embedding-8b")}));
+        QCOMPARE(dimensions, (QSet<int>{768, 2048, 4096}));
+        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile"))));
+        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("模型 cache"))));
+    }
+
+    void modelStatusUsesUnicodeOverride_data()
+    {
+        QTest::addColumn<QString>("modelId");
+        QTest::addColumn<int>("dimensions");
+        QTest::newRow("gemma") << QStringLiteral("embeddinggemma-2") << 768;
+        QTest::newRow("qwen-2b") << QStringLiteral("qwen3-vl-embedding-2b") << 2048;
+        QTest::newRow("qwen-8b") << QStringLiteral("qwen3-vl-embedding-8b") << 4096;
     }
 
     void modelStatusUsesUnicodeOverride()
     {
+        QFETCH(QString, modelId);
+        QFETCH(int, dimensions);
         TestEnvironment environment(QStringLiteral("cli-model-status"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        const auto result = invoke(environment, {QStringLiteral("models"), QStringLiteral("status"), QStringLiteral("--pretty")});
+        const auto result = invoke(environment, {QStringLiteral("models"), QStringLiteral("status"), QStringLiteral("--pretty"), QStringLiteral("--model"), modelId});
         QVERIFY2(result.started && result.finished, result.errors.constData());
         QCOMPARE(result.exitCode, 0);
         const auto model = result.json().value(QStringLiteral("result")).toObject();
         QCOMPARE(model.value(QStringLiteral("valid")).toBool(true), false);
+        QCOMPARE(model.value(QStringLiteral("filesVerified")).toBool(true), false);
+        QCOMPARE(model.value(QStringLiteral("modelId")).toString(), modelId);
+        QCOMPARE(model.value(QStringLiteral("dimensions")).toInt(), dimensions);
+        QVERIFY(!model.contains(QStringLiteral("modelAvailable")));
+        const QString directory = modelId == QStringLiteral("embeddinggemma-2")
+            ? environment.path(QStringLiteral("模型 cache")) : environment.path(QStringLiteral("模型 cache/") + modelId);
         QCOMPARE(QDir::cleanPath(model.value(QStringLiteral("directory")).toString()),
-                 QDir::cleanPath(environment.path(QStringLiteral("模型 cache"))));
+                 QDir::cleanPath(directory));
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcs-ipc-token"))));
+    }
+
+    void incompleteModelVerificationFails_data()
+    {
+        QTest::addColumn<QString>("modelId");
+        QTest::newRow("gemma") << QStringLiteral("embeddinggemma-2");
+        QTest::newRow("qwen-2b") << QStringLiteral("qwen3-vl-embedding-2b");
+        QTest::newRow("qwen-8b") << QStringLiteral("qwen3-vl-embedding-8b");
     }
 
     void incompleteModelVerificationFails()
     {
+        QFETCH(QString, modelId);
         TestEnvironment environment(QStringLiteral("cli-model-verify"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        const auto result = invoke(environment, {QStringLiteral("model"), QStringLiteral("verify")});
+        const auto result = invoke(environment, {QStringLiteral("model"), QStringLiteral("verify"), QStringLiteral("--model"), modelId});
         QVERIFY2(result.started && result.finished, result.errors.constData());
         QCOMPARE(result.exitCode, 1);
         QCOMPARE(result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString(), QStringLiteral("model_invalid"));
@@ -196,6 +380,21 @@ private slots:
         QCOMPARE(result.exitCode, 1);
         QCOMPARE(result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString(), QStringLiteral("model_import_failed"));
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("模型 cache/embeddinggemma-2-Q8_0.gguf"))));
+    }
+
+    void importCannotUseAnotherModelsProjector()
+    {
+        TestEnvironment environment(QStringLiteral("cli-wrong-projector"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QString fileName = QStringLiteral("Qwen3-VL-Embedding-2B.mmproj-f16.gguf");
+        QVERIFY(environment.writeFile(fileName, "not the selected model's projector"));
+        const auto result = invoke(environment, {QStringLiteral("model"), QStringLiteral("import"), environment.path(fileName),
+            QStringLiteral("--model"), QStringLiteral("qwen3-vl-embedding-8b")});
+        QVERIFY2(result.started && result.finished, result.errors.constData());
+        QCOMPARE(result.exitCode, 1);
+        QCOMPARE(result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString(), QStringLiteral("model_import_failed"));
+        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("模型 cache/qwen3-vl-embedding-8b/") + fileName)));
+        QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcs-settings.json"))));
     }
 
     void blockedProfileFailsWithoutFallback()
@@ -221,6 +420,122 @@ private slots:
         QVERIFY(result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString()
                 != QStringLiteral("service_start_failed"));
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("用户 profile/qcs-ipc-token"))));
+    }
+
+    void modelSelectWaitsForStartupProbe()
+    {
+        TestEnvironment environment(QStringLiteral("cli-model-startup"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ModelSelectionService service;
+        QVERIFY2(service.start(environment), qPrintable(service.error));
+        const auto result = invoke(environment, {QStringLiteral("model"), QStringLiteral("select"), QStringLiteral("qwen3-vl-embedding-2b"),
+            QStringLiteral("--timeout"), QStringLiteral("3000")}, true);
+        QVERIFY2(result.started && result.finished, result.errors.constData());
+        QVERIFY2(service.error.isEmpty(), qPrintable(service.error));
+        QCOMPARE(result.exitCode, 0);
+        QCOMPARE(service.methods, (QStringList{QStringLiteral("status"), QStringLiteral("status"),
+            QStringLiteral("status"), QStringLiteral("models.select")}));
+        QCOMPARE(service.selectRequests, 1);
+        QCOMPARE(service.selectedId, QStringLiteral("qwen3-vl-embedding-2b"));
+        QCOMPARE(result.json().value(QStringLiteral("result")).toObject().value(QStringLiteral("modelId")).toString(), service.selectedId);
+    }
+
+    void modelSelectStartupTimeoutDoesNotSelect()
+    {
+        TestEnvironment environment(QStringLiteral("cli-model-startup-timeout"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ModelSelectionService service;
+        service.loadingReplies = -1;
+        QVERIFY2(service.start(environment), qPrintable(service.error));
+        const auto result = invoke(environment, {QStringLiteral("model"), QStringLiteral("select"), QStringLiteral("qwen3-vl-embedding-2b"),
+            QStringLiteral("--timeout"), QStringLiteral("350")}, true);
+        QVERIFY2(result.started && result.finished, result.errors.constData());
+        QVERIFY2(service.error.isEmpty(), qPrintable(service.error));
+        QCOMPARE(result.exitCode, 1);
+        QCOMPARE(result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString(), QStringLiteral("timeout"));
+        QVERIFY(service.statusRequests >= 1);
+        QCOMPARE(service.selectRequests, 0);
+    }
+
+    void modelSelectSharesStartupAndSelectionDeadline()
+    {
+        TestEnvironment environment(QStringLiteral("cli-model-selection-deadline"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ModelSelectionService service;
+        service.selectionDelay = 2700;
+        QVERIFY2(service.start(environment), qPrintable(service.error));
+        const auto result = invoke(environment, {QStringLiteral("model"), QStringLiteral("select"), QStringLiteral("qwen3-vl-embedding-2b"),
+            QStringLiteral("--timeout"), QStringLiteral("3000")}, true);
+        QVERIFY2(result.started && result.finished, result.errors.constData());
+        QVERIFY2(service.error.isEmpty(), qPrintable(service.error));
+        QCOMPARE(result.exitCode, 1);
+        const QString code = result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString();
+        QVERIFY2(code == QStringLiteral("timeout") || code == QStringLiteral("request_timeout"), result.output.constData());
+        QCOMPARE(service.statusRequests, 3);
+        QCOMPARE(service.selectRequests, 1);
+    }
+
+    void modelSelectDoesNotRetryOtherBusyFailures()
+    {
+        TestEnvironment environment(QStringLiteral("cli-model-selection-busy"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        ModelSelectionService service;
+        service.loadingReplies = 0;
+        service.selectionBusy = true;
+        QVERIFY2(service.start(environment), qPrintable(service.error));
+        const auto result = invoke(environment, {QStringLiteral("model"), QStringLiteral("select"), QStringLiteral("qwen3-vl-embedding-2b"),
+            QStringLiteral("--timeout"), QStringLiteral("3000")}, true);
+        QVERIFY2(result.started && result.finished, result.errors.constData());
+        QVERIFY2(service.error.isEmpty(), qPrintable(service.error));
+        QCOMPARE(result.exitCode, 1);
+        QCOMPARE(result.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString(), QStringLiteral("busy"));
+        QCOMPARE(service.statusRequests, 1);
+        QCOMPARE(service.selectRequests, 1);
+    }
+
+    void unavailableModelSelectionKeepsCurrentSettings()
+    {
+        TestEnvironment environment(QStringLiteral("cli-model-select"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        OwnedService service(environment);
+        QVERIFY2(service.start(), service.process.readAllStandardError().constData());
+        const auto before = invoke(environment, {QStringLiteral("config"), QStringLiteral("get"), QStringLiteral("--no-start")});
+        QCOMPARE(before.exitCode, 0);
+        const auto original = before.json().value(QStringLiteral("result")).toObject();
+        QCOMPARE(original.value(QStringLiteral("modelId")).toString(), QStringLiteral("embeddinggemma-2"));
+        const auto selected = invoke(environment, {QStringLiteral("model"), QStringLiteral("select"), QStringLiteral("qwen3-vl-embedding-2b"),
+            QStringLiteral("--no-start"), QStringLiteral("--timeout"), QStringLiteral("3000")});
+        QVERIFY2(selected.started && selected.finished, selected.errors.constData());
+        QCOMPARE(selected.exitCode, 1);
+        const auto errorCode = selected.json().value(QStringLiteral("error")).toObject().value(QStringLiteral("code")).toString();
+        QCOMPARE(errorCode, QStringLiteral("model_unavailable"));
+        const auto after = invoke(environment, {QStringLiteral("config"), QStringLiteral("get"), QStringLiteral("--no-start")});
+        QCOMPARE(after.exitCode, 0);
+        QCOMPARE(after.json().value(QStringLiteral("result")).toObject(), original);
+    }
+
+    void configReloadReadsDiskAndRejectsInvalidJson()
+    {
+        TestEnvironment environment(QStringLiteral("cli-config-reload"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        OwnedService service(environment);
+        QVERIFY2(service.start(), service.process.readAllStandardError().constData());
+        const auto initial = invoke(environment, {QStringLiteral("config"), QStringLiteral("get"), QStringLiteral("--no-start")});
+        QCOMPARE(initial.exitCode, 0);
+        auto edited = initial.json().value(QStringLiteral("result")).toObject();
+        edited.insert(QStringLiteral("indexingPaused"), true);
+        QVERIFY(environment.writeFile(QStringLiteral("用户 profile/qcs-settings.json"), QJsonDocument(edited).toJson()));
+        const auto reloaded = invoke(environment, {QStringLiteral("config"), QStringLiteral("reload"), QStringLiteral("--no-start"),
+            QStringLiteral("--timeout"), QStringLiteral("3000")});
+        QCOMPARE(reloaded.exitCode, 0);
+        QCOMPARE(reloaded.json().value(QStringLiteral("result")).toObject(), edited);
+        QVERIFY(environment.writeFile(QStringLiteral("用户 profile/qcs-settings.json"), "{invalid-json"));
+        const auto invalid = invoke(environment, {QStringLiteral("config"), QStringLiteral("reload"), QStringLiteral("--no-start"),
+            QStringLiteral("--timeout"), QStringLiteral("3000")});
+        QCOMPARE(invalid.exitCode, 1);
+        const auto unchanged = invoke(environment, {QStringLiteral("config"), QStringLiteral("get"), QStringLiteral("--no-start")});
+        QCOMPARE(unchanged.exitCode, 0);
+        QCOMPARE(unchanged.json().value(QStringLiteral("result")).toObject(), edited);
     }
 
     void newProfileCodeIndexUsesIndependentRoots_data()

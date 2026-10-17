@@ -238,8 +238,8 @@ QList<Input> prepare(const QString &root) {
     require(files.size() == 12, "The functional set must contain exactly twelve inputs");
     return files;
 }
-void validateVector(const QVector<float> &vector, const QString &context, double tolerance) {
-    require(vector.size() == embeddingDimensions, context + ": expected 768 values");
+void validateVector(const QVector<float> &vector, int dimensions, const QString &context, double tolerance) {
+    require(vector.size() == dimensions, context + QString(": expected %1 values").arg(dimensions));
     double squaredNorm = 0;
     for (const float value : vector) {
         require(std::isfinite(value), context + ": non-finite embedding");
@@ -323,8 +323,13 @@ int main(int argc, char **argv) {
             runtime.setThreadCount(4);
             QString error;
             require(runtime.load(parser.value("model-dir"), false, &error), error);
+            require(runtime.modelId() == QStringLiteral("embeddinggemma-2")
+                        && runtime.dimensions() == embeddingDimensions,
+                    "The full multimodal regression requires the default EmbeddingGemma 2 contract");
             report["realModel"] = true;
-            report["modelFingerprint"] = EmbeddingRuntime::fingerprint();
+            report["modelId"] = runtime.modelId();
+            report["embeddingDimensions"] = runtime.dimensions();
+            report["modelFingerprint"] = runtime.modelFingerprint();
             report["extractionFingerprint"] = Extractor::pipelineFingerprint();
             const auto paths = environment->runtimePaths();
             require(paths.ensure(&error), error);
@@ -333,7 +338,7 @@ int main(int argc, char **argv) {
             {
                 IndexRepository index;
                 require(index.open(paths, &error), error);
-                require(index.setPipelineFingerprint(EmbeddingRuntime::fingerprint() + "|" + Extractor::pipelineFingerprint(), &error), error);
+                require(index.setPipelineFingerprint(runtime.modelFingerprint() + "|" + Extractor::pipelineFingerprint(), &error), error);
                 for (const auto &input : inputs) {
                     ExtractionOptions options;
                     options.tempDir = environment->path("media/" + input.id);
@@ -362,7 +367,7 @@ int main(int argc, char **argv) {
                         else
                             segment.embedding = runtime.embedText(segment.text, PromptKind::Document, segment.title, &error);
                         require(error.isEmpty(), "Encoding failed for " + input.id + ": " + error);
-                        validateVector(segment.embedding, input.id, .001);
+                        validateVector(segment.embedding, runtime.dimensions(), input.id, .001);
                         segments.append(segment);
                         ++embedded;
                     }
@@ -375,7 +380,8 @@ int main(int argc, char **argv) {
                     require(index.replaceFiles({IndexedFile{input.file, extraction.sourceVersion, input.code, segments}}, &error, true), error);
                     const auto stored = index.fileSegments(input.file, input.code, &error);
                     require(error.isEmpty() && stored.size() == segments.size(), "Cannot read persisted segments: " + error);
-                    for (const auto &segment : stored) validateVector(segment.embedding, input.id + " persisted", .002);
+                    for (const auto &segment : stored)
+                        validateVector(segment.embedding, runtime.dimensions(), input.id + " persisted", .002);
                     files.append(QJsonObject{{"id", input.id}, {"file", QDir(corpus).relativeFilePath(input.file)},
                         {"modality", input.modality}, {"code", input.code}, {"segments", segments.size()},
                         {"extractedModalities", modalities}, {"extractedTextCharacters", textCharacters},
@@ -399,12 +405,13 @@ int main(int argc, char **argv) {
             for (const auto &input : inputs) {
                 const auto stored = reloaded.fileSegments(input.file, input.code, &error);
                 require(error.isEmpty() && !stored.isEmpty(), "Reload lost file segments: " + error);
-                for (const auto &segment : stored) validateVector(segment.embedding, input.id + " reloaded", .002);
+                for (const auto &segment : stored)
+                    validateVector(segment.embedding, runtime.dimensions(), input.id + " reloaded", .002);
                 for (const auto &language : {QStringLiteral("en"), QStringLiteral("zh")}) {
                     const QString query = language == "en" ? input.en : input.zh;
                     const auto embedding = runtime.embedText(query, input.code ? PromptKind::CodeQuery : PromptKind::Query, {}, &error);
                     require(error.isEmpty(), "Query encoding failed: " + error);
-                    validateVector(embedding, input.id + " query", .001);
+                    validateVector(embedding, runtime.dimensions(), input.id + " query", .001);
                     SearchOptions options;
                     // Empty query disables keyword fallback. Each directory contains
                     // one source, exercising the ordinary production semantic path

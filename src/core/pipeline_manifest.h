@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model_catalog.h"
+
 #include <QCryptographicHash>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -10,18 +12,20 @@ namespace qcopilots_search {
 // Bump the contract revision whenever preprocessing, prompts, extraction or
 // model behavior changes. Services can inspect these without loading inference
 // or parser libraries. Tokenizer/index fingerprints are maintained separately.
-inline constexpr char embeddingModelRevision[] = "bfcd298762cc34d0357ece5ebdd31791a3a374d8";
-inline constexpr char embeddingTextSha256[] = "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135";
-inline constexpr char embeddingMediaSha256[] = "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f";
-
 inline QJsonObject embeddingPipelineContract()
 {
+    const auto *model = findModel(defaultModelId());
+    const auto digest = [model](const QString &name) {
+        for (const auto &artifact : model->artifacts)
+            if (artifact.name == name) return QString::fromLatin1(artifact.sha256);
+        return QString{};
+    };
     return {
         {QStringLiteral("revision"), 1},
         {QStringLiteral("model"), QStringLiteral("embeddinggemma-2-Q8_0+mmproj-Q8_0")},
-        {QStringLiteral("modelRevision"), QString::fromLatin1(embeddingModelRevision)},
-        {QStringLiteral("textSha256"), QString::fromLatin1(embeddingTextSha256)},
-        {QStringLiteral("mediaSha256"), QString::fromLatin1(embeddingMediaSha256)},
+        {QStringLiteral("modelRevision"), model->revision},
+        {QStringLiteral("textSha256"), digest(model->textFile)},
+        {QStringLiteral("mediaSha256"), digest(model->mediaFile)},
         {QStringLiteral("llamaCpp"), QStringLiteral("620d2225cc436ab0b001e3200e590e3b286ef9ab")},
         {QStringLiteral("queryPrompt"), QStringLiteral("task: search result | query: {text}")},
         {QStringLiteral("codeQueryPrompt"), QStringLiteral("task: code retrieval | query: {text}")},

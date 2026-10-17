@@ -196,8 +196,12 @@ def run_test(args: argparse.Namespace) -> int:
         else:
             options["start_new_session"] = True
         child = subprocess.Popen(args.command, **options)
-        report["childExitCode"] = child.wait()
+        report["childExitCode"] = child.wait(timeout=getattr(args, "timeout", None))
         report["exitCode"] = report["childExitCode"]
+    except subprocess.TimeoutExpired:
+        report["error"] = "Test exceeded its explicit timeout"
+        report["timedOut"] = True
+        report["exitCode"] = FAILURE
     except KeyboardInterrupt:
         report["error"] = "Test execution interrupted"
         report["signal"] = interrupted[0] if interrupted else signal.SIGINT
@@ -264,11 +268,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--label", required=True)
     parser.add_argument("--root", required=True)
+    parser.add_argument("--timeout", type=float, help="Optional execution limit in seconds, with child-process cleanup")
     parser.add_argument("--keep-failed", action="store_true")
     parser.add_argument("--keep-success", action="store_true",
                         help="Retain successful test artifacts for downstream acceptance checks")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.timeout is not None and not 0 < args.timeout <= 86400:
+        parser.error("--timeout must be greater than zero and at most 86400 seconds")
     if args.command and args.command[0] == "--":
         args.command.pop(0)
     if not args.command:

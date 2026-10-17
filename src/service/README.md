@@ -15,13 +15,17 @@ macOS 使用 `getpeereid`、Linux 使用 `SO_PEERCRED` 双向验证对端有效 
 | `status` | 空对象 | `progress`、`repository`、`settings`、模型状态、监控能力及失败文件 |
 | `settings.get` | 空对象 | 版本化设置对象 |
 | `settings.set` | 要修改的设置字段 | 验证、原子保存后的完整设置 |
+| `settings.reload` | 空对象 | 重新读取配置文件并通过统一验证入口应用，不回写文件 |
 | `search` | `query`、`kind`、`root`、`code`、`limit`、`semantic` | `hits`、是否执行语义查询及降级原因 |
 | `files.list` | `code`、`kind`、`root`、`limit`、可选 `cursor`，每页最多 100 项 | `files`、`nextCursor`、`hasMore`、`browseGeneration`、`metadataPending`、`visibilityEpoch` |
 | `document.preview` | `path`、`code`、`start`、`maxSegments`，最多 100 个片段 | `segments`、`text`、`partial`、`next`、`state` |
 | `index.start`、`index.reconcile` | 空对象 | 索引进度 |
 | `index.pause`、`index.resume` | 空对象 | 持久化暂停状态及索引进度 |
 | `index.retry` | 空对象 | 清除已记录失败后重新扫描 |
-| `models.reload` | 空对象 | 校验后的模型可用性及管线指纹 |
+| `models.list` | 空对象 | 三款内置模型目录和当前配置模型 ID |
+| `models.status` | 可选 `modelId` | 目标文件状态、能力、维度、索引目录和活动模型身份 |
+| `models.select` | `modelId` | 校验并实际加载预检后应用模型，返回完整设置 |
+| `models.reload` | 空对象 | 重新校验当前模型，返回模型状态，不改变选择 |
 | `cancel` | `id` 为被取消请求的 ID | 是否找到并取消请求 |
 | `shutdown` | 空对象 | 接受退出请求后关闭本配置的服务 |
 
@@ -41,6 +45,16 @@ GPU 初始化或推理故障会隔离对应设备，将未完成文件交给健�
 
 默认使用全部兼容 GPU。开发和性能验证可重复传入 `--index-device '{"backend":"HIP","deviceId":"设备 ID","name":"设备名称"}'` 限定参与索引的设备，选择器应来自 `devices` 探测结果。有 ID 时按后端和 ID 匹配，没有 ID 时只接受唯一名称，找不到设备或名称歧义会明确报告。进度日志版本 2 保存多个活动任务，仍可读取版本 1 的失败记录，恢复游标和已提交片段以数据库为准。
 
-单个文件达到 5000 个片段上限时，已有前缀保持可搜索，状态明确报告部分索引。持久化终态阻止周期性对账从头覆盖这些片段，只有文件版本变化、管线变化或显式 `index.retry` 才重新处理。模型管线切换先提交数据库事务，再发布内存中的模型空间。切换失败返回 `pipeline_transition_failed` 并停止推理和索引，关键词检索保持可用，`models.reload` 可在故障排除后重试。
+单个文件达到 5000 个片段上限时，已有前缀保持可搜索，状态明确报告部分索引。持久化终态阻止周期性对账从头覆盖这些片段，只有文件版本变化、管线变化或显式 `index.retry` 才重新处理。
+
+`modelId` 默认是 `embeddinggemma-2`，也可选择 `qwen3-vl-embedding-2b` 或 `qwen3-vl-embedding-8b`。每个模型拥有独立的 SQLite、关键词索引、ANN 和进度日志。Gemma 保留原索引目录，其他模型位于按 ID 命名的子目录。切回已有模型时先核对文件元数据，删除变化文件的过期内容，复用未变化文件的索引。这个核对在暂停提取时仍会运行。暂时离线目录的磁盘缓存保留，但未经本轮核对的结果不可见。
+
+切换请求先异步校验文件摘要，再通过隔离 worker 的 `model.probe` 完成实际模型加载、文本及图片自检。只有目标索引打开和设置原子保存也成功，才发布新模型和索引。预检失败保留原活动设置及索引。加载预检可能持续数分钟，客户端可为相关请求设置十分钟超时。下载或导入文件本身不切换模型。
+
+`status` 的 `configuredModelId` 表示配置目标，`activeModelId` 仅在模型已通过加载预检时非空。`dimensions`、`embeddingFingerprint` 和 `capabilities` 描述当前索引契约，能力字段为 `text`、`image`、`videoFrames` 和 `audio`。`models.status` 的 `filesPresent` 仅检查文件大小，`filesVerified` 表示已完成完整校验，不应将文件存在解释为可加载。Qwen 不支持音频语义，音频仍可按文件名检索，视频保留画面语义检索。
+
+`models.status.indexState` 区分尚未建立的 `not-built`、非活动且需要核对的 `cached`、正在核对的 `reconciling`、当前目录没有文件的 `empty`、暂停且有待处理文件的 `pending`、正在建立的 `indexing`、存在失败文件的 `partial` 及已完成的 `ready`。这些状态使用当前服务维护的目录与任务信息，查看未选模型不会打开另一个数据库写入者。
+
+模型暂缺或当前模型重载失败时，服务保留所选模型的索引身份和已有向量，以关键词模式处理新内容。新生成的关键词版本单独标记，恢复模型后只补做这些文件。所有异步数据库任务持有原索引的共享引用，任务代次阻止迟到结果进入新的索引，快速切回时复用仍存活的数据库实例。
 
 测试入口为 `qcs-tests-client` 和 `qcs-tests-service`。前者使用模拟本地服务验证传输与客户端契约，后者启动实际服务和实际工作进程，验证隔离、恢复、索引、预览及分类切换。模型切换故障测试通过 `qcs-service-core` 的 C++ 构造接口注入存储提交失败，并通过真实 IPC 验证错误、降级与恢复。每个用例使用独立 `TestEnvironment`，测试不会连接正常应用的运行配置。

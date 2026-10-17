@@ -48,6 +48,7 @@ class TestRunner(unittest.TestCase):
     def invoke(self, code: str, *, root: Path | None = None,
                env: dict[str, str] | None = None, keep: bool = False,
                keep_success: bool = False,
+               timeout: float | None = None,
                label: str = "portable 中文", cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         command = [sys.executable, str(RUNNER), "--label", label,
                    "--root", str(root or self.root)]
@@ -55,6 +56,8 @@ class TestRunner(unittest.TestCase):
             command.append("--keep-failed")
         if keep_success:
             command.append("--keep-success")
+        if timeout is not None:
+            command.extend(["--timeout", str(timeout)])
         command.extend(["--", sys.executable, "-c", code])
         return subprocess.run(command, cwd=cwd or self.base, env=env or self.env,
                               encoding="utf-8", errors="replace", capture_output=True,
@@ -72,6 +75,16 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(report["childExitCode"], 0)
         self.assertTrue(report["cleanup"]["succeeded"])
         self.assertFalse(report["retained"])
+        self.assertFalse(Path(report["runDirectory"]).exists())
+
+    def test_timeout_stops_the_child_and_cleans_its_owned_directory(self) -> None:
+        result = self.invoke("import time; time.sleep(10)", timeout=0.1)
+        self.assertNotEqual(result.returncode, 0)
+        report, = self.reports()
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["timedOut"])
+        self.assertTrue(report["cleanup"]["succeeded"])
+        self.assertIsNotNone(report["childExitCode"])
         self.assertFalse(Path(report["runDirectory"]).exists())
         self.assertEqual(Path(report["workingDirectory"]).name, "cwd")
 

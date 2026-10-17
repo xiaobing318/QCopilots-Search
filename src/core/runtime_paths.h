@@ -30,6 +30,8 @@ struct RuntimePaths {
     bool ensureIpcDirectory(QString *error = nullptr) const;
     bool validateIpcDirectory(QString *error = nullptr) const;
     QString databaseFile() const;
+    // Retains the profile/IPC owner and maps only its model-specific index.
+    RuntimePaths forModelIndex(const QString &modelId) const;
 };
 
 } // namespace qcopilots_search

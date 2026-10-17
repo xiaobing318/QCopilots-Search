@@ -1,4 +1,5 @@
 #include "model_files.h"
+#include "model_catalog.h"
 #include "native_lock_path.h"
 #include "pipeline_manifest.h"
 
@@ -37,6 +38,9 @@ constexpr qint64 copyBufferBytes = 1024 * 1024;
 ModelFiles::ModelFiles(QString modelDir, QObject* parent)
     : ModelFiles(std::move(modelDir), manifest(), parent) {}
 
+ModelFiles::ModelFiles(QString modelRoot, const QString& modelId, QObject* parent)
+    : ModelFiles(qcopilots_search::modelDirectory(modelRoot, modelId), manifest(modelId), parent) {}
+
 ModelFiles::ModelFiles(QString modelDir, QList<ModelArtifact> artifacts, QObject* parent)
     : QObject(parent), modelDir_(modelDir.trimmed().isEmpty() ? QString{} : QDir(modelDir).absolutePath()),
       artifacts_(std::move(artifacts)), network_(new QNetworkAccessManager(this)) {}
@@ -52,14 +56,13 @@ ModelFiles::~ModelFiles()
 
 QList<ModelArtifact> ModelFiles::manifest()
 {
-    const QString prefix = QStringLiteral("https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/")
-        + QString::fromLatin1(embeddingModelRevision) + QLatin1Char('/');
-    return {
-        {QStringLiteral("embeddinggemma-2-Q8_0.gguf"), QUrl(prefix + QStringLiteral("embeddinggemma-2-Q8_0.gguf")),
-         309855456, QByteArray(embeddingTextSha256)},
-        {QStringLiteral("mmproj-embeddinggemma-2-Q8_0.gguf"), QUrl(prefix + QStringLiteral("mmproj-embeddinggemma-2-Q8_0.gguf")),
-         554821024, QByteArray(embeddingMediaSha256)}
-    };
+    return manifest(defaultModelId());
+}
+
+QList<ModelArtifact> ModelFiles::manifest(const QString& modelId)
+{
+    const auto *model = findModel(modelId);
+    return model ? model->artifacts : QList<ModelArtifact>{};
 }
 
 bool ModelFiles::validateManifest(QString* error) const
