@@ -5,7 +5,6 @@
 #include "app/preview_panel.h"
 #include "app/settings_dialog.h"
 #include "core/app_settings.h"
-#include "core/model_catalog.h"
 #include "support/test_environment.h"
 #include <QAbstractItemView>
 #include <QApplication>
@@ -92,8 +91,7 @@ public:
     bool autoFiles = true;
     bool autoStatus = true;
     bool autoPreview = true;
-    bool autoModelApply = true;
-    bool modelFilesPresent = false;
+    bool autoSettingsReload = true;
     int next = 1;
     FakeBackend() { settings.language = "en"; settings.checkUpdates = false; settings.minimizeToTray = false; }
     void start() override { QTimer::singleShot(0, this, [this] { emit connected(); }); }
@@ -101,20 +99,11 @@ public:
         const QString id = QString::number(next++);
         requests.append({id, method, params});
         QTimer::singleShot(0, this, [this, id, method, params] {
-            if (method == "settings.get" || method == "settings.reload") emit response(id, settings.toJson());
+            if (method == "settings.get" || (method == "settings.reload" && autoSettingsReload)) emit response(id, settings.toJson());
             else if (method == "settings.set") {
                 auto updated = settings.toJson();
                 for (auto it = params.begin(); it != params.end(); ++it) updated.insert(it.key(), it.value());
                 QString error; AppSettings::fromJson(updated, &settings, &error); emit response(id, settings.toJson());
-            }
-            else if (method == "models.select" && autoModelApply) {
-                settings.modelId = params.value("modelId").toString();
-                emit response(id, settings.toJson());
-            }
-            else if (method == "models.status") {
-                const QString modelId = params.value("modelId").toString(settings.modelId);
-                emit response(id, {{"modelId", modelId}, {"configuredModelId", settings.modelId},
-                    {"activeModelId", QString()}, {"filesPresent", modelFilesPresent}, {"filesVerified", false}, {"modelAvailable", false}});
             }
             else if (method == "status" && autoStatus) emit response(id, {{"modelAvailable", false}, {"progress", QJsonObject{{"state", "idle"}, {"total", 2}, {"completed", 2}}}});
             else if (method == "search" && autoSearch) {
@@ -2112,191 +2101,150 @@ private slots:
         QVERIFY(dialog.findChild<QPushButton *>("downloadModelButton")->isEnabled());
         QVERIFY(dialog.findChild<QLabel *>("modelStatus")->text().contains("Keyword search"));
     }
-    void downloadedModelDoesNotSwitchUntilExplicitApply() {
+    void verifiedModelRetriesPublicationBusy() {
         TestEnvironment env("gui-model-reload"); QVERIFY(env.isValid());
         FakeBackend backend;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
         QTRY_VERIFY(backend.count("settings.get") == 1);
         QTest::mouseClick(window.findChild<QPushButton *>("modelsButton"), Qt::LeftButton);
-        auto *settings = window.findChild<SettingsDialog *>(); QVERIFY(settings);
-        auto *selection = settings->findChild<QComboBox *>("modelCombo"); QVERIFY(selection);
-        QCOMPARE(selection->count(), 3);
-        selection->setCurrentIndex(selection->findData("qwen3-vl-embedding-2b"));
-        QCOMPARE(backend.settings.modelId, defaultModelId());
-        settings->findChild<QPushButton *>("manageSelectedModelButton")->click();
-        auto *dialog = settings->findChild<ModelDialog *>(); QVERIFY(dialog);
+        auto *dialog = window.findChild<ModelDialog *>(); QVERIFY(dialog);
         QTRY_VERIFY(dialog->findChild<QPushButton *>("importModelButton")->isEnabled());
-        QVERIFY(dialog->findChild<QLabel *>("modelDescription")->text().contains("2048"));
-        QVERIFY(dialog->findChild<QLabel *>("modelDescription")->text().contains("does not support audio semantic search"));
-        QVERIFY(dialog->findChild<QLabel *>("modelDirectory")->text().contains("qwen3-vl-embedding-2b"));
-        backend.modelFilesPresent = true;
-        QVERIFY(QMetaObject::invokeMethod(dialog, "modelsReady"));
-        QCOMPARE(backend.count("models.reload"), 0);
-        QCOMPARE(backend.count("models.select"), 0);
-        QCOMPARE(backend.settings.modelId, defaultModelId());
-        QTRY_VERIFY(settings->findChild<QLabel *>("selectedModelStatus")->text().contains("Files verified"));
-        dialog->findChild<QPushButton *>("closeModelButton")->click();
-        settings->findChild<QPushButton *>("applySelectedModelButton")->click();
-        QCOMPARE(backend.last("models.select").params.value("modelId").toString(), QString("qwen3-vl-embedding-2b"));
-        QTRY_COMPARE(backend.settings.modelId, QString("qwen3-vl-embedding-2b"));
-        QTRY_VERIFY(settings->findChild<QPushButton *>("applySelectedModelButton")->isEnabled());
-        QCOMPARE(backend.count("models.reload"), 0);
+        QVERIFY(QMetaObject::invokeMethod(dialog, "modelFilesInstalled"));
+        QCOMPARE(backend.count("models.reload"), 1);
+        emit backend.failed(backend.last("models.reload").id, "busy", "Publication in progress");
+        QTRY_COMPARE(backend.count("models.reload"), 2);
+        emit backend.response(backend.last("models.reload").id, {{"modelAvailable", true}});
+        QCOMPARE(window.findChild<QPushButton *>("modelsButton")->text(), QString("Model ready"));
+        QTRY_VERIFY(backend.count("index.start") == 1);
     }
-    void modelLoadingFailureRetainsSelectionAndDisplaysError() {
-        TestEnvironment env("gui-model-load-failure"); QVERIFY(env.isValid());
-        FakeBackend backend; backend.autoModelApply = false;
+    void modelManagementUsesStandaloneSingleModelDialog() {
+        TestEnvironment env("gui-single-model"); QVERIFY(env.isValid());
+        FakeBackend backend;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
-        QTRY_VERIFY(backend.count("settings.get") == 1);
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        QCOMPARE(window.findChild<QPushButton *>("modelsButton")->text(), QString("Add model"));
         window.findChild<QPushButton *>("modelsButton")->click();
-        auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
-        auto *selection = dialog->findChild<QComboBox *>("modelCombo");
-        selection->setCurrentIndex(selection->findData("qwen3-vl-embedding-8b"));
-        auto *apply = dialog->findChild<QPushButton *>("applySelectedModelButton");
-        apply->click();
-        QVERIFY(!apply->isEnabled());
-        QVERIFY(!dialog->findChild<QPushButton *>("saveSettingsButton")->isEnabled());
-        const QString message = "The selected model cannot be loaded";
-        emit backend.failed(backend.last("models.select").id, "model_invalid", message);
-        QVERIFY(apply->isEnabled());
-        QCOMPARE(dialog->findChild<QLabel *>("selectedModelStatus")->text(), message);
-        QCOMPARE(backend.settings.modelId, defaultModelId());
-        QCOMPARE(selection->currentData().toString(), QString("qwen3-vl-embedding-8b"));
+        auto *models = window.findChild<ModelDialog *>(); QVERIFY(models);
+        QVERIFY(!window.findChild<SettingsDialog *>());
+        QVERIFY(!models->findChild<QComboBox *>());
+        QTRY_VERIFY(models->findChild<QPushButton *>("importModelButton")->isEnabled());
+        models->findChild<QPushButton *>("closeModelButton")->click();
+        window.findChild<QPushButton *>("settingsButton")->click();
+        auto *settings = window.findChild<SettingsDialog *>(); QVERIFY(settings);
+        const auto *tabs = settings->findChild<QTabWidget *>("settingsTabs"); QVERIFY(tabs);
+        QCOMPARE(tabs->count(), 4);
+        for (int i = 0; i < tabs->count(); ++i) QVERIFY(tabs->tabText(i) != "Models");
+        QVERIFY(!settings->findChild<QComboBox *>("modelCombo"));
+        QVERIFY(!settings->settings().toJson().contains("modelId"));
     }
-    void modelAvailabilityDistinguishesFilesFromLoadedModel() {
-        AppSettings config; config.language = "en";
-        SettingsDialog dialog(config, false, {});
-        auto *selection = dialog.findChild<QComboBox *>("modelCombo");
-        selection->setCurrentIndex(selection->findData("qwen3-vl-embedding-8b"));
-        auto *status = dialog.findChild<QLabel *>("selectedModelStatus");
-        dialog.setModelStatus({{"modelId", "qwen3-vl-embedding-8b"}, {"configuredModelId", defaultModelId()},
-            {"activeModelId", defaultModelId()}, {"filesPresent", true}, {"filesVerified", false}, {"modelAvailable", false},
-            {"indexDirectory", "isolated-qwen-index"}});
-        QVERIFY(status->text().contains("Verification and loading have not completed"));
-        QVERIFY(!status->text().contains("Loading preflight passed"));
-        QVERIFY(status->text().contains("EmbeddingGemma 2"));
-        QVERIFY(status->text().contains("isolated-qwen-index"));
-        const QString previous = status->text();
-        dialog.setModelStatus({{"modelId", defaultModelId()}, {"modelAvailable", true}});
-        QCOMPARE(status->text(), previous);
-        QCOMPARE(dialog.settings().modelId, QString("qwen3-vl-embedding-8b"));
+    void explicitModelInstallReloadsWithoutReloadingOnOpen_data() {
+        QTest::addColumn<bool>("alreadyAvailable");
+        QTest::newRow("first-install") << false;
+        QTest::newRow("replace-available-model") << true;
     }
-    void modelStatusShowsPreflightWithoutClaimingResidentRuntime() {
-        AppSettings config; config.language = "en";
-        SettingsDialog dialog(config, false, {});
-        auto *status = dialog.findChild<QLabel *>("selectedModelStatus");
-        QJsonObject state{{"modelId", defaultModelId()}, {"configuredModelId", defaultModelId()},
-            {"filesPresent", true}, {"loading", true}, {"modelAvailable", false}, {"indexState", "reconciling"}};
-        dialog.setModelStatus(state);
-        QVERIFY(status->text().contains("checking model loading"));
-        QVERIFY(status->text().contains("Index status: Checking folders"));
-        QVERIFY(!status->text().contains("have not completed"));
-        state.insert("loading", false);
-        state.insert("modelAvailable", true);
-        state.insert("activeModelId", defaultModelId());
-        state.insert("runtime", QJsonObject{{"loaded", false}});
-        dialog.setModelStatus(state);
-        QVERIFY(status->text().contains("Loading preflight passed. Available for search."));
-        QVERIFY(status->text().contains("Current model: EmbeddingGemma 2"));
-        QVERIFY(!status->text().contains("Actually loaded"));
-        QVERIFY(!status->text().contains("Loaded and available"));
-    }
-    void independentModelIndexStates_data() {
-        QTest::addColumn<QString>("state");
-        QTest::addColumn<QString>("description");
-        QTest::newRow("not-built") << QString("not-built") << QString("Not built yet");
-        QTest::newRow("cached") << QString("cached") << QString("Saved cache, checked when selected");
-        QTest::newRow("reconciling") << QString("reconciling") << QString("Checking folders");
-        QTest::newRow("empty") << QString("empty") << QString("No files in selected folders");
-        QTest::newRow("pending") << QString("pending") << QString("Paused with pending files");
-        QTest::newRow("indexing") << QString("indexing") << QString("Indexing");
-        QTest::newRow("partial") << QString("partial") << QString("Some files failed");
-        QTest::newRow("ready") << QString("ready") << QString("Ready");
-    }
-    void independentModelIndexStates() {
-        QFETCH(QString, state);
-        QFETCH(QString, description);
-        AppSettings config; config.language = "en";
-        SettingsDialog dialog(config, false, {});
-        dialog.setModelStatus({{"modelId", defaultModelId()}, {"configuredModelId", defaultModelId()},
-            {"indexState", state}, {"indexDirectory", "model-specific-index"}});
-        const auto *status = dialog.findChild<QLabel *>("selectedModelStatus");
-        QVERIFY(status->text().contains("Index status: " + description));
-        QVERIFY(status->text().contains("model-specific-index"));
+    void explicitModelInstallReloadsWithoutReloadingOnOpen() {
+        QFETCH(bool, alreadyAvailable);
+        TestEnvironment env("gui-explicit-model-install"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoStatus = false;
+        MainWindow window(env.runtimePaths(), &backend, false, false);
+        window.show(); window.start();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        emit backend.response(backend.last("status").id, {{"modelAvailable", alreadyAvailable}});
+        window.findChild<QPushButton *>("modelsButton")->click();
+        auto *dialog = window.findChild<ModelDialog *>(); QVERIFY(dialog);
+        QSignalSpy installed(dialog, &ModelDialog::modelFilesInstalled);
+        QTRY_VERIFY(dialog->findChild<QPushButton *>("importModelButton")->isEnabled());
+        QCOMPARE(installed.count(), 0);
+        QCOMPARE(backend.count("models.reload"), 0);
+        QVERIFY(QMetaObject::invokeMethod(dialog, "modelFilesInstalled"));
+        QCOMPARE(installed.count(), 1);
+        QCOMPARE(backend.count("models.reload"), 1);
+        emit backend.response(backend.last("models.reload").id, {{"modelAvailable", true}});
+        QCOMPARE(window.findChild<QPushButton *>("modelsButton")->text(), QString("Model ready"));
+        QCOMPARE(backend.count("index.start"), 1);
+        QCoreApplication::processEvents();
+        QCOMPARE(backend.count("models.reload"), 1);
     }
     void reloadConfigurationUsesServiceAndReopensUpdatedSettings() {
         TestEnvironment env("gui-settings-reload"); QVERIFY(env.isValid());
         FakeBackend backend;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
-        QTRY_VERIFY(backend.count("settings.get") == 1);
-        window.findChild<QPushButton *>("modelsButton")->click();
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        window.findChild<QPushButton *>("settingsButton")->click();
         auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
         QPointer<SettingsDialog> previous(dialog);
-        backend.settings.modelId = "qwen3-vl-embedding-2b";
+        backend.settings.roots = {env.path("new sources")};
         dialog->findChild<QPushButton *>("reloadSettingsButton")->click();
         QTRY_COMPARE(backend.count("settings.reload"), 1);
         QTRY_VERIFY(previous.isNull());
         QTRY_VERIFY(window.findChild<SettingsDialog *>() != nullptr);
-        QCOMPARE(window.findChild<SettingsDialog *>()->selectedModelId(), QString("qwen3-vl-embedding-2b"));
+        QCOMPARE(window.findChild<SettingsDialog *>()->settings().roots, backend.settings.roots);
         QCOMPARE(backend.count("settings.set"), 0);
     }
-    void openSettingsPreserveExternalModelSelection_data() {
-        QTest::addColumn<bool>("userChangedModel");
-        QTest::newRow("preferences-only-follows-external-model") << false;
-        QTest::newRow("explicit-model-choice-remains-pending") << true;
-    }
-    void openSettingsPreserveExternalModelSelection() {
-        QFETCH(bool, userChangedModel);
-        TestEnvironment env("gui-external-model-selection"); QVERIFY(env.isValid());
-        FakeBackend backend;
+    void reloadFailureKeepsDialogAndUnsavedPreferences() {
+        TestEnvironment env("gui-settings-reload-failure"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoSettingsReload = false;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
         QTRY_COMPARE(backend.count("settings.get"), 1);
-        window.findChild<QPushButton *>("modelsButton")->click();
+        window.findChild<QPushButton *>("settingsButton")->click();
         auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
-        auto *selection = dialog->findChild<QComboBox *>("modelCombo"); QVERIFY(selection);
+        const auto original = backend.settings.toJson();
         dialog->findChild<QListWidget *>("rootFolders")->addItem(env.root());
-        if (userChangedModel) selection->setCurrentIndex(selection->findData("qwen3-vl-embedding-2b"));
-        const int statusRequests = backend.count("models.status");
-        backend.settings.modelId = "qwen3-vl-embedding-8b";
-        emit backend.eventReceived("settings", backend.settings.toJson());
-        const QString expected = userChangedModel ? "qwen3-vl-embedding-2b" : "qwen3-vl-embedding-8b";
-        QCOMPARE(dialog->selectedModelId(), expected);
-        QCOMPARE(dialog->findChild<QListWidget *>("rootFolders")->count(), 1);
-        QCOMPARE(backend.count("models.status"), statusRequests + 1);
-        QCOMPARE(backend.last("models.status").params.value("modelId").toString(), expected);
-        QTRY_VERIFY(dialog->findChild<QLabel *>("selectedModelStatus")->text().contains("Configured: Qwen3-VL-Embedding-8B"));
-        const QString currentStatus = dialog->findChild<QLabel *>("selectedModelStatus")->text();
-        dialog->setModelStatus({{"modelId", expected}, {"configuredModelId", defaultModelId()},
-            {"activeModelId", defaultModelId()}, {"filesPresent", true}});
-        QCOMPARE(dialog->findChild<QLabel *>("selectedModelStatus")->text(), currentStatus);
-        auto *language = dialog->findChild<QComboBox *>("languageCombo");
-        language->setCurrentIndex(language->findData("zh_CN"));
-        dialog->findChild<QPushButton *>("saveSettingsButton")->click();
-        QTRY_COMPARE(backend.settings.language, QString("zh_CN"));
-        QCOMPARE(backend.settings.modelId, expected);
-        QCOMPARE(backend.settings.roots, QStringList{env.root()});
-        QCOMPARE(backend.last("settings.set").params.contains("modelId"), userChangedModel);
-        if (userChangedModel) QCOMPARE(backend.last("settings.set").params.value("modelId").toString(), expected);
+        auto *reload = dialog->findChild<QPushButton *>("reloadSettingsButton");
+        reload->click();
+        QVERIFY(!reload->isEnabled());
+        QVERIFY(!dialog->findChild<QPushButton *>("saveSettingsButton")->isEnabled());
+        const QString message = "Configuration format version 4 is required";
+        emit backend.failed(backend.last("settings.reload").id, "invalid_settings", message);
+        QCOMPARE(window.findChild<SettingsDialog *>(), dialog);
+        QCOMPARE(dialog->settings().roots, QStringList{env.root()});
+        QCOMPARE(backend.settings.toJson(), original);
+        QVERIFY(reload->isEnabled());
+        QVERIFY(dialog->findChild<QPushButton *>("saveSettingsButton")->isEnabled());
+        QCOMPARE(dialog->findChild<QLabel *>("reloadSettingsStatus")->text(), message);
     }
-    void modelSwitchInvalidatesResultsAndDropsOldResponses() {
-        TestEnvironment env("gui-model-results"); QVERIFY(env.isValid());
-        FakeBackend backend; backend.autoSearch = false;
+    void successfulReloadClearsOnlyItsOwnError_data() {
+        QTest::addColumn<bool>("unrelatedError");
+        QTest::newRow("clear-recovered-reload-error") << false;
+        QTest::newRow("preserve-unrelated-error-with-same-text") << true;
+    }
+    void successfulReloadClearsOnlyItsOwnError() {
+        QFETCH(bool, unrelatedError);
+        TestEnvironment env("gui-settings-reload-error-recovery"); QVERIFY(env.isValid());
+        FakeBackend backend; backend.autoSettingsReload = false; backend.autoStatus = false;
         MainWindow window(env.runtimePaths(), &backend, false, false);
         window.show(); window.start();
-        QTRY_VERIFY(backend.count("settings.get") == 1);
-        window.findChild<SearchEdit *>("searchInput")->setText("query");
-        QTRY_COMPARE(backend.count("search"), 1);
-        const QString request = backend.last("search").id;
-        backend.settings.modelId = "qwen3-vl-embedding-2b";
-        emit backend.eventReceived("settings", backend.settings.toJson());
-        QVERIFY(backend.cancelled.contains(request));
-        SearchHit stale; stale.path = env.path("old.txt"); stale.title = "Old model result";
-        emit backend.response(request, {{"hits", QJsonArray{stale.toJson()}}});
-        QCOMPARE(window.findChild<QListWidget *>("searchResults")->count(), 0);
-        QTRY_COMPARE(backend.count("search"), 2);
+        QTRY_COMPARE(backend.count("settings.get"), 1);
+        window.findChild<QPushButton *>("settingsButton")->click();
+        auto *dialog = window.findChild<SettingsDialog *>(); QVERIFY(dialog);
+        auto *reload = dialog->findChild<QPushButton *>("reloadSettingsButton");
+        reload->click();
+        const QString message = "Unsupported or missing settings version: expected version 4";
+        emit backend.failed(backend.last("settings.reload").id, "invalid_settings", message);
+        auto *banner = window.findChild<QLabel *>("applicationError"); QVERIFY(banner);
+        QCOMPARE(banner->text(), message);
+        QVERIFY(!banner->isHidden());
+        if (unrelatedError) {
+            emit backend.eventReceived("progress", {{"state", "partial"}, {"error", message}});
+        }
+        QPointer<SettingsDialog> previous(dialog);
+        reload->click();
+        QCOMPARE(backend.count("settings.reload"), 2);
+        emit backend.response(backend.last("settings.reload").id, backend.settings.toJson());
+        QTRY_VERIFY(previous.isNull());
+        QTRY_VERIFY(window.findChild<SettingsDialog *>() != nullptr);
+        if (unrelatedError) {
+            QCOMPARE(banner->text(), message);
+            QVERIFY(!banner->isHidden());
+        } else {
+            QVERIFY(banner->text().isEmpty());
+            QVERIFY(banner->isHidden());
+        }
+        QVERIFY(window.findChild<SettingsDialog *>()->findChild<QLabel *>("reloadSettingsStatus")->text().isEmpty());
     }
     void editorAndRevealRejectMissingFiles() {
         TestEnvironment env("gui-platform"); QVERIFY(env.isValid()); SearchHit hit; hit.path = env.path("missing file.cpp"); hit.lineStart = 7;

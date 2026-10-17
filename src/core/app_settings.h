@@ -15,7 +15,6 @@ struct ExternalOpenerSettings {
 };
 
 struct AppSettings {
-    QString modelId = QStringLiteral("embeddinggemma-2");
     QStringList roots;
     QStringList excludes;
     GeneralFileRules generalFileRules;
@@ -39,8 +38,8 @@ struct AppSettings {
     static bool fromJson(const QJsonObject &object, AppSettings *settings,
                          QString *error = nullptr);
     QString fingerprint() const;
-    // Loading older/incomplete settings changes memory only. The profile owner
-    // persists the complete v3 configuration after locking.
+    // Loading incomplete current-version settings changes memory only. The
+    // profile owner persists explicit rule defaults after locking.
     bool needsMigration() const { return migrationPending_; }
 
 private:

@@ -15,9 +15,9 @@ struct ServiceDependencies {
     // C++ construction interface, never enabled by environment or IPC requests.
     std::function<bool(QString *)> verifyModels;
     // Construction-only load probe. Production uses an isolated full worker
-    // self-check before publishing a selected model. Tests can reject a model
-    // deterministically without loading multi-gigabyte weights.
-    std::function<bool(const QString &, QString *)> probeModel;
+    // self-check before publishing model availability. Tests can reject the
+    // probe deterministically without loading model weights.
+    std::function<bool(QString *)> probeModel;
     // Empty uses QLocalServer::listen. Construction-only injection lets tests
     // deliver a real connection before the listen operation returns.
     std::function<bool(QLocalServer &, const QString &)> listen;

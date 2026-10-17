@@ -27,7 +27,7 @@ Qt PDF 使用其配套独立模块版本，不能把模块版本直接替换为 
 
 ## 平台与 GPU 变体
 
-`config/build-variants.json` 是开发入口、CMake、CI、验包和发布的共同清单。`--variant` 对应 CMake 的 `QCOPILOTS_SEARCH_VARIANT`。11 个变体产生 21 个用户文件，全部保留 CPU 后备能力。
+`config/build-variants.json` 是开发入口、CMake、CI、验包和发布的共同清单。`--variant` 对应 CMake 的 `QCOPILOTS_SEARCH_VARIANT`，内部变体 ID 保持稳定。包文件名使用清单的 `packageVariant` 字段，ROCm 与 Vulkan 在 ID 后追加锁定 SDK 版本，其他变体保持原命名。11 个变体产生 21 个用户文件，全部保留 CPU 后备能力。
 
 | 变体 | GPU SDK 或目标 | 系统基线 | 用户文件 |
 | --- | --- | --- | --- |
@@ -44,6 +44,8 @@ Qt PDF 使用其配套独立模块版本，不能把模块版本直接替换为 
 | `macos-arm64-metal` | Metal | macOS 14.4 | DMG |
 
 表中 Windows 版本是应用的 Qt 基线，具体 GPU SDK、显卡与驱动还有各自要求。最低系统版本和硬件支持必须通过实际设备验证，不能由编译成功推断。
+
+v0.3.0 的 ROCm 包名包含 `rocm-10.0.0`，Windows Vulkan 包名包含 `vulkan-1.4.357.0`，Linux Vulkan 包名包含 `vulkan-1.4.313.0`。Release 下载表中的 ROCm/Vulkan 标签也标明这些 SDK 版本，它们不是显卡驱动版本。
 
 GPU 构建配方固定到与运行时相同的 [llama.cpp 提交](https://github.com/ggml-org/llama.cpp/blob/620d2225cc436ab0b001e3200e590e3b286ef9ab/.github/workflows/release.yml)。CUDA 架构采用锁定上游选择，ROCm 仅覆盖两个指定 RDNA4 目标。Windows 主程序使用 MSVC 和 Qt kit，CUDA/HIP 后端通过外置子构建和 ggml C ABI 接入，最终包只部署主构建的一份 `ggml-base`。
 
@@ -63,19 +65,17 @@ libgit2 通过公开文件配置 API 使用应用级 `core.longpaths`，不修�
 
 ## 模型契约
 
-模型通过运行时下载或离线导入，发行包不嵌入权重。[模型锁文件](../config/qcs-models.lock.json) 统一记录预设、主模型与多模态投影文件、固定 revision、大小、SHA-256 和模型能力。应用与工具从这份清单取得准确文件要求，不能用任意同名 GGUF 替代。
+应用只支持 EmbeddingGemma 2，通过运行时下载或离线导入获取权重，发行包不嵌入权重。[模型锁文件](../config/qcs-models.lock.json) 统一记录主模型与多模态投影文件、固定 revision、大小、SHA-256 和模型能力。应用与工具从这份清单取得准确文件要求，不能用任意同名 GGUF 替代。
 
 | 模型 ID | 模型 | 向量维度 | 语义输入 |
 | --- | --- | ---: | --- |
-| `embeddinggemma-2` | EmbeddingGemma 2，默认 | 768 | 文本、图片、视频帧、音频 |
-| `qwen3-vl-embedding-2b` | Qwen3-VL-Embedding-2B | 2048 | 文本、图片、视频帧 |
-| `qwen3-vl-embedding-8b` | Qwen3-VL-Embedding-8B | 4096 | 文本、图片、视频帧 |
+| `embeddinggemma-2` | EmbeddingGemma 2 | 768 | 文本、图片、视频帧、音频 |
 
-`qcs-cli models manifest --model <id>` 输出所选预设的文件要求。下载与导入检查大小和哈希，校验通过后才发布最终文件。Gemma 保留模型根目录中的原有两文件布局，Qwen 文件位于 `<model-root>/<model-id>/`，避免同名投影文件或不同模型互相覆盖。下载模型与选择当前模型分别执行，可以保留多款模型缓存，当前 profile 仅使用选中的模型进行索引和查询。
+`qcs-cli model manifest` 离线输出文件要求，不创建 profile。下载与导入检查大小和哈希，校验通过后才发布最终文件。模型根目录直接存放 Gemma 的主模型和投影两份文件，两者均为 Q8_0，总下载约 0.81 GiB。默认位置为 `<base>/profiles/v4/models`，也可通过 `--model-dir` 显式指定。
 
-三款模型均输出有限值、L2 归一化向量。Gemma 保持原有 mean pooling、提示和音频窗口契约，Qwen 使用专用查询/文档模板、last pooling 和相应图像预处理，不能直接复用 Gemma 的模板或固定 768 维检查。Qwen 不提供音频 embedding，音频文件和视频音轨不能被标为已完成音频语义索引。视频仍可通过实际解码帧建立视觉语义索引。
+Gemma 保持原有 mean pooling、提示、图像预处理和音频窗口契约，输出有限值、768 维、L2 归一化向量。运行时、worker 与存储分别验证维度和指纹，不能用填零或裁剪替代符合契约的真实结果。视频通过实际解码帧及音轨建立语义索引。
 
-llama.cpp 能加载某种架构不代表应用已经支持该架构的嵌入契约。新增预设需同时锁定文件、适配提示与 pooling、声明能力和维度、隔离索引并完成真实推理及最终包测试。默认 Gemma 的黄金夹具与原作者 MIT 归属继续保留在 `tests/runtime/fixtures`，各模型的实际验证范围见[测试指南](testing.md)。
+llama.cpp 包含的其他架构不属于应用公开支持的模型，不能仅修改清单或配置来启用它们。Gemma 的黄金夹具与原作者 MIT 归属继续保留在 `tests/runtime/fixtures`，实际验证范围见[测试指南](testing.md)。
 
 ## 格式范围
 

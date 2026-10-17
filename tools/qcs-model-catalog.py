@@ -32,18 +32,16 @@ def catalog():
         if not artifacts or {model.get("textFile"), model.get("mediaFile")} != names:
             raise ValueError("Model lock must bind its text and projection artifacts")
         models[identifier] = model
-    if document.get("defaultModelId") not in models:
-        raise ValueError("Model catalog has no valid default")
+    if (document.get("defaultModelId") != "embeddinggemma-2" or set(models) != {"embeddinggemma-2"}
+            or models["embeddinggemma-2"]["dimensions"] != 768):
+        raise ValueError("Model catalog must contain only the supported 768-dimensional EmbeddingGemma 2 model")
     return document["defaultModelId"], models
 
 
-def selected(identifier=None):
+def selected():
     default, models = catalog()
-    identifier = identifier or default
-    if identifier not in models:
-        raise ValueError("Unknown model preset: " + identifier)
-    return models[identifier]
+    return models[default]
 
 
-def artifacts(identifier=None):
-    return {row["name"]: (row["size"], row["sha256"]) for row in selected(identifier)["artifacts"]}
+def artifacts():
+    return {row["name"]: (row["size"], row["sha256"]) for row in selected()["artifacts"]}

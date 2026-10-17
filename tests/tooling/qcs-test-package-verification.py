@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import copy
+from contextlib import ExitStack, redirect_stdout
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -34,6 +39,63 @@ def complete_report():
 
 
 class FullPackageVerificationTests(unittest.TestCase):
+    def test_package_model_check_uses_base_and_writes_only_versioned_settings(self):
+        configured = os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None
+        if configured:
+            Path(configured).mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="qcs-package-profile-", dir=configured) as temporary:
+            root = Path(temporary)
+            archive = root / "qcs-0.3.0-windows-x64-cpu.zip"
+            archive.write_bytes(b"synthetic package, never executed")
+            profile_base = None
+            legacy = b'{"version":3,"legacyMarker":"preserve"}'
+            identity = {"variant": "windows-x64-cpu", "packageVariant": "windows-x64-cpu",
+                        "toolkitVersion": "", "version": "0.3.0", "attempt": 1}
+            def unpack(unused, application):
+                nonlocal profile_base
+                binary = application / "bin"
+                binary.mkdir(parents=True)
+                suffix = ".exe" if os.name == "nt" else ""
+                (binary / ("qcs-cli" + suffix)).write_bytes(b"synthetic")
+                for name in ("msvcp140.dll", "vcruntime140.dll", "vcomp140.dll", "eng.traineddata",
+                             "chi_sim.traineddata", "chi_tra.traineddata", "jieba.dict.utf8"):
+                    (binary / name).write_bytes(b"synthetic")
+                profile_base = application.parent / "profile"
+                profile_base.mkdir()
+                (profile_base / "qcs-settings.json").write_bytes(legacy)
+            def run(command, **kwargs):
+                if "--version" in command:
+                    return subprocess.CompletedProcess(command, 0, "0.3.0", "")
+                self.assertEqual(command[command.index("--profile-dir") + 1], str(profile_base))
+                self.assertNotIn("--model", command)
+                result = {"valid": True, "directory": str(root), "modelId": "embeddinggemma-2", "dimensions": 768,
+                          "artifacts": [{"name": name, "present": True, "bytes": size,
+                                         "expectedBytes": size, "sha256": digest}
+                                        for name, (size, digest) in package.MODEL_ARTIFACTS.items()]}
+                return subprocess.CompletedProcess(command, 0, json.dumps({"ok": True, "result": result}), "")
+            def stop_before_inference(unused):
+                self.assertEqual((profile_base / "qcs-settings.json").read_bytes(), legacy)
+                self.assertEqual(json.loads((profile_base / "profiles/v4/qcs-settings.json").read_text(encoding="utf-8")),
+                                 {"version": 4})
+                self.assertFalse((profile_base / "profiles/v4/profiles").exists())
+                raise RuntimeError("synthetic stop before inference")
+            with ExitStack() as stack:
+                for name, replacement in {
+                    "package_source_identity": lambda: {}, "unpack": unpack,
+                    "validate_build_identity": lambda *args: identity,
+                    "installed_program_inventory": lambda *args: {},
+                    "verify_gpu_payload": lambda *args: {}, "verify_license_materials": lambda *args: {},
+                    "verify_program_stability": lambda *args: None, "create_fixtures": stop_before_inference,
+                }.items():
+                    stack.enter_context(patch.object(package, name, replacement))
+                stack.enter_context(patch.object(package.subprocess, "run", side_effect=run))
+                start = stack.enter_context(patch.object(package.subprocess, "Popen"))
+                stack.enter_context(patch.dict(os.environ, {"QCOPILOTS_SEARCH_TEST_ROOT": str(root / "runs")}))
+                stack.enter_context(redirect_stdout(io.StringIO()))
+                with self.assertRaisesRegex(RuntimeError, "synthetic stop before inference"):
+                    package.verify(archive, root, explicit_report=root / "report", model_dir=root)
+                start.assert_not_called()
+
     def test_uncommitted_package_can_pass_full_functional_verification(self):
         report = complete_report()
         report["workingTreeModified"] = True

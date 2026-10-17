@@ -165,15 +165,15 @@ private slots:
         TestEnvironment environment(QStringLiteral("platform-startup"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
         const auto paths = environment.runtimePaths();
-        QVERIFY(!PlatformIntegration::canSetStartAtLogin(paths.profileDir, paths.modelDir));
+        QVERIFY(!PlatformIntegration::canSetStartAtLogin(paths.profileBaseDir, paths.modelDir));
         QString error;
-        QVERIFY(!PlatformIntegration::setStartAtLogin(true, paths.profileDir, paths.modelDir, &error));
+        QVERIFY(!PlatformIntegration::setStartAtLogin(true, paths.profileBaseDir, paths.modelDir, &error));
         QVERIFY(!error.isEmpty());
-        QVERIFY(!PlatformIntegration::setStartAtLogin(false, paths.profileDir, paths.modelDir, &error));
+        QVERIFY(!PlatformIntegration::setStartAtLogin(false, paths.profileBaseDir, paths.modelDir, &error));
         QCOMPARE(PlatformIntegration::startAtLoginState().status, LoginStartupStatus::Unavailable);
         QVERIFY(!PlatformIntegration::supportsStartAtLogin());
         QVERIFY(!PlatformIntegration::canSetStartAtLogin(QStringLiteral("relative"), paths.modelDir));
-        QVERIFY(!PlatformIntegration::canSetStartAtLogin(paths.profileDir, QStringLiteral("relative")));
+        QVERIFY(!PlatformIntegration::canSetStartAtLogin(paths.profileBaseDir, QStringLiteral("relative")));
         QVERIFY(!PlatformIntegration::canSetStartAtLogin({}, paths.modelDir));
         QVERIFY(!PlatformIntegration::setStartAtLogin(true, &error));
     }
@@ -182,7 +182,7 @@ private slots:
         TestEnvironment environment(QStringLiteral("platform-custom-startup"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
         const auto paths = environment.runtimePaths();
-        qcopilots_search::test::ScopedEnvironment customHome("QCS_HOME", paths.profileDir.toUtf8());
+        qcopilots_search::test::ScopedEnvironment customHome("QCS_HOME", paths.profileBaseDir.toUtf8());
         qcopilots_search::test::ScopedEnvironment customModels("QCOPILOTS_SEARCH_MODEL_DIR", paths.modelDir.toUtf8());
         struct RestoreTestMode {
             ~RestoreTestMode() { QStandardPaths::setTestModeEnabled(true); }
@@ -190,11 +190,11 @@ private slots:
         // Windows support and path validation are pure. Do not query or update
         // the user's native startup state while test mode is disabled.
         QStandardPaths::setTestModeEnabled(false);
-        QVERIFY(PlatformIntegration::canSetStartAtLogin(paths.profileDir, paths.modelDir));
+        QVERIFY(PlatformIntegration::canSetStartAtLogin(paths.profileBaseDir, paths.modelDir));
         for (const QString &invalid : {QString(), QStringLiteral("relative"), QStringLiteral("/root"),
                  QStringLiteral("\\root"), QStringLiteral("C:relative"), QStringLiteral(":/resource")}) {
             QVERIFY(!PlatformIntegration::canSetStartAtLogin(invalid, paths.modelDir));
-            QVERIFY(!PlatformIntegration::canSetStartAtLogin(paths.profileDir, invalid));
+            QVERIFY(!PlatformIntegration::canSetStartAtLogin(paths.profileBaseDir, invalid));
         }
     }
     void windowsBatchWrappersCannotReinterpretFileArguments() {

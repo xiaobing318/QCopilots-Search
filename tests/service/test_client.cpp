@@ -108,6 +108,97 @@ private slots:
                 || code == QStringLiteral("ipc_directory_unavailable"));
         QVERIFY(!QFileInfo::exists(paths.profileDir));
     }
+    void failedEnsureConnectionDoesNotCreateBusinessDirectories() {
+        test::TestEnvironment environment(QStringLiteral("ipc-failed-ensure"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto paths = RuntimePaths::resolve(environment.path(QStringLiteral("data base 中文")),
+                                                 environment.path(QStringLiteral("models")));
+        QVERIFY(QDir().mkpath(paths.profileDir));
+        QVERIFY(paths.ensureIpcDirectory());
+        QFile token(QDir(paths.profileDir).filePath(QStringLiteral("qcs-ipc-token")));
+        QVERIFY(token.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+        QCOMPARE(token.write("invalid"), qint64(7)); token.close();
+        const auto entries = QDir(paths.profileDir).entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot);
+        // A listening peer with an invalid token causes ensureService to fail
+        // authentication without spawning any detached service process.
+        QLocalServer server;
+        server.setSocketOptions(QLocalServer::UserAccessOption);
+        QVERIFY(server.listen(paths.ipcName));
+        ServiceClient client(paths);
+        QSignalSpy failure(&client, &ServiceClient::failed);
+        const auto id = client.request(QStringLiteral("status"), {}, 100);
+        QTRY_COMPARE(failure.size(), 1);
+        QCOMPARE(failure.first().first().toString(), id);
+        QVERIFY(!client.isConnected());
+        client.disconnectFromService();
+        QCOMPARE(QDir(paths.profileDir).entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot), entries);
+        for (const auto &directory : {paths.indexDir, paths.modelDir, paths.cacheDir, paths.logDir, paths.tempDir})
+            QVERIFY2(!QFileInfo::exists(directory), qPrintable(directory));
+    }
+    void coldStartReportsInvalidConfigurationWithoutCreatingState_data() {
+        QTest::addColumn<QByteArray>("bytes");
+        QTest::addColumn<QString>("diagnostic");
+        QTest::newRow("invalid-json") << QByteArray("{not json") << QStringLiteral("Invalid settings JSON");
+        QTest::newRow("old-version") << QByteArray("{\"version\":3}") << QStringLiteral("requires version 4");
+        QTest::newRow("future-version") << QByteArray("{\"version\":5}") << QStringLiteral("requires version 4");
+        QTest::newRow("removed-selection") << QByteArray("{\"version\":4,\"modelId\":\"embeddinggemma-2\"}")
+            << QStringLiteral("modelId");
+    }
+    void coldStartReportsInvalidConfigurationWithoutCreatingState() {
+        QFETCH(QByteArray, bytes);
+        QFETCH(QString, diagnostic);
+        test::TestEnvironment environment(QStringLiteral("ipc-invalid-cold-start"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto paths = RuntimePaths::resolve(environment.path(QStringLiteral("data base 中文")),
+                                                 environment.path(QStringLiteral("models")));
+        QVERIFY(QDir().mkpath(paths.profileDir));
+        QFile configuration(paths.configFile);
+        QVERIFY(configuration.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+        QCOMPARE(configuration.write(bytes), qint64(bytes.size())); configuration.close();
+        const auto entries = QDir(paths.profileDir).entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot);
+        ServiceClient client(paths);
+        QSignalSpy failure(&client, &ServiceClient::failed);
+        QSignalSpy response(&client, &ServiceClient::response);
+        const auto id = client.request(QStringLiteral("status"));
+        QTRY_COMPARE_WITH_TIMEOUT(failure.size(), 1, 2000);
+        QCOMPARE(failure.first().at(0).toString(), id);
+        QCOMPARE(failure.first().at(1).toString(), QStringLiteral("service_start_failed"));
+        QVERIFY2(failure.first().at(2).toString().contains(diagnostic), qPrintable(failure.first().at(2).toString()));
+        QVERIFY(response.isEmpty());
+        QVERIFY(!client.isConnected());
+        client.disconnectFromService();
+        QCOMPARE(QDir(paths.profileDir).entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot), entries);
+        for (const auto &directory : {paths.indexDir, paths.modelDir, paths.cacheDir, paths.logDir, paths.tempDir})
+            QVERIFY2(!QFileInfo::exists(directory), qPrintable(directory));
+        QVERIFY(!QFileInfo::exists(paths.lockFile));
+        QVERIFY(configuration.open(QIODevice::ReadOnly));
+        QCOMPARE(configuration.readAll(), bytes);
+    }
+    void liveServiceRemainsReachableWithInvalidConfiguration_data() {
+        coldStartReportsInvalidConfigurationWithoutCreatingState_data();
+    }
+    void liveServiceRemainsReachableWithInvalidConfiguration() {
+        QFETCH(QByteArray, bytes);
+        Fixture fixture;
+        QVERIFY(fixture.start());
+        QFile configuration(fixture.paths.configFile);
+        QVERIFY(configuration.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+        QCOMPARE(configuration.write(bytes), qint64(bytes.size())); configuration.close();
+        // Active services keep their last valid settings. A bad pending edit
+        // must not prevent connecting to report or recover from that edit.
+        ServiceClient client(fixture.paths);
+        QSignalSpy failure(&client, &ServiceClient::failed);
+        QSignalSpy response(&client, &ServiceClient::response);
+        const auto id = client.request(QStringLiteral("status"));
+        QTRY_COMPARE(fixture.requests.size(), 1);
+        QVERIFY(client.isConnected());
+        fixture.reply(id);
+        QTRY_COMPARE(response.size(), 1);
+        QCOMPARE(response.first().first().toString(), id);
+        QVERIFY(failure.isEmpty());
+        QVERIFY(configuration.open(QIODevice::ReadOnly));
+        QCOMPARE(configuration.readAll(), bytes);
+    }
     void legacyProfileIsRejectedBeforeConnectingToExistingEndpoint() {
         Fixture fixture;
         QVERIFY2(fixture.root.isValid(), qPrintable(fixture.root.error()));
@@ -171,7 +262,7 @@ private slots:
         QVERIFY(QFile::encodeName(fixture.paths.ipcName).size() + 1 <= qsizetype(sizeof(address.sun_path)));
         {
             test::ScopedEnvironment differentTemporary("TMPDIR", environment.root().toUtf8());
-            QCOMPARE(RuntimePaths::resolve(fixture.paths.profileDir, fixture.paths.modelDir).ipcName,
+            QCOMPARE(RuntimePaths::resolve(fixture.paths.profileBaseDir, fixture.paths.modelDir).ipcName,
                      fixture.paths.ipcName);
         }
         ServiceClient client(fixture.paths);

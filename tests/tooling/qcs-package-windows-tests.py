@@ -50,6 +50,35 @@ class PayloadFixture(unittest.TestCase):
 
 
 class PayloadTests(PayloadFixture):
+    @unittest.skipUnless(os.name == "nt", "Windows CPack entry point")
+    def test_cpack_filename_must_match_exact_variant_sdk_and_software_version(self):
+        build = self.work / "build"
+        build.mkdir()
+        expected = "qcs-0.3.0-windows-x64-rocm-10.0.0"
+        for wrong in ("qcs-0.3.0-windows-x64-rocm", "qcs-0.3.0-windows-x64-rocm-9.0.0",
+                      expected + "-extra", "qcs-0.2.0-windows-x64-rocm-10.0.0"):
+            with self.subTest(name=wrong):
+                (build / "CPackConfig.cmake").write_text(
+                    f'set(CPACK_PACKAGE_FILE_NAME "{wrong}")\nset(CPACK_PACKAGE_VERSION "0.3.0")\n', encoding="utf-8")
+                with mock.patch.object(package.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "locked SDK"):
+                    package._package_in_directory(build, self.work / "output", "Release", package.ROCM_VARIANT)
+                run.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows CPack entry point")
+    def test_cpack_accepts_exact_versioned_rocm_installer_name(self):
+        build = self.work / "build"
+        build.mkdir()
+        name = "qcs-0.3.0-windows-x64-rocm-10.0.0"
+        (build / "CPackConfig.cmake").write_text(
+            f'set(CPACK_PACKAGE_FILE_NAME "{name}")\nset(CPACK_PACKAGE_VERSION "0.3.0")\n', encoding="utf-8")
+        output = self.work / "output"
+        def run_cpack(*args, **kwargs):
+            (output / (name + ".exe")).write_bytes(b"synthetic CPack result")
+            return subprocess.CompletedProcess(args[0], 0)
+        with mock.patch.object(package.subprocess, "run", side_effect=run_cpack):
+            self.assertEqual(package._package_in_directory(build, output, "Release", package.ROCM_VARIANT),
+                             output / (name + ".exe"))
+
     def test_manifest_binds_every_byte_and_unicode_path(self):
         self.assertEqual(len(self.manifest["files"]), 2)
         for item in self.manifest["files"]:

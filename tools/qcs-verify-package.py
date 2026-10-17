@@ -141,17 +141,16 @@ def validate_installed_package_source(package, installed_root, installed_manifes
         raise RuntimeError("Installed-tree verification requires Linux, the original DEB and its package-manager file manifest")
 
 
-def model_verification(result, directory, model_id=None):
+def model_verification(result, directory):
     """The installed CLI hashes its read-only cache against its compiled lock."""
-    model = MODEL_CATALOG.selected(model_id)
-    expected_artifacts = MODEL_CATALOG.artifacts(model["id"])
-    actual_directory = directory if model["id"] == "embeddinggemma-2" else directory / model["id"]
-    if (result.get("valid") is not True or Path(result.get("directory", "")).resolve() != actual_directory.resolve()
+    model = MODEL_CATALOG.selected()
+    expected_artifacts = MODEL_CATALOG.artifacts()
+    if (result.get("valid") is not True or Path(result.get("directory", "")).resolve() != directory.resolve()
             or result.get("modelId") != model["id"] or result.get("dimensions") != model["dimensions"]):
         raise RuntimeError("Installed CLI did not verify the explicit model cache")
     artifacts = result.get("artifacts", [])
     if len(artifacts) != len(expected_artifacts):
-        raise RuntimeError("Installed model manifest does not contain the selected preset's locked GGUF files")
+        raise RuntimeError("Installed model manifest does not contain both locked GGUF files")
     for artifact in artifacts:
         expected = expected_artifacts.get(artifact.get("name"))
         if (not expected or artifact.get("present") is not True or
@@ -333,12 +332,11 @@ def wait_service_ready(service, invoke, model, require_model, timeout):
                 if not require_model:
                     return status
                 if (status.get("modelAvailable") is True and status.get("modelId") == model["id"]
-                        and status.get("configuredModelId") == model["id"] and status.get("activeModelId") == model["id"]
                         and status.get("dimensions") == model["dimensions"]):
                     return status
                 if status.get("modelError"):
                     raise RuntimeError("Packaged service model preflight failed: " + str(status["modelError"]))
-                last_error = "Packaged service did not activate the selected model: " + json.dumps(status)
+                last_error = "Packaged service did not activate EmbeddingGemma 2: " + json.dumps(status)
             else:
                 last_error = "Packaged service model preflight is still running"
         if time.monotonic() >= deadline:
@@ -402,9 +400,6 @@ def pause_index_workers_before_query(service, invoke, timeout=90):
 
 def real_model_smoke(worker, replies, executable, application, work, report_dir, verified_models, installed_files=None,
                      timeout=600, build_identity=None):
-    if verified_models["modelId"] != "embeddinggemma-2":
-        return qwen_model_smoke(worker, replies, executable, application, work, report_dir,
-                                verified_models, installed_files, timeout, build_identity)
     fixtures = work / "model-references"
     references = reference_inputs(fixtures)
     vectors = []
@@ -443,107 +438,6 @@ def real_model_smoke(worker, replies, executable, application, work, report_dir,
             "modelDirectory": verified_models["directory"], "modelVerification": verified_models,
             "referenceHashes": REFERENCE_HASHES, "vectors": vectors,
             "runtime": inference_runtime_origins(worker, executable, application, installed_files, diagnostics)}
-
-
-def qwen_reference_inputs(model_id, destination):
-    model = MODEL_CATALOG.selected(model_id)
-    fixture_root = SOURCE / "tests/runtime/fixtures"
-    manifest = fixture_root / "qwen" / (model_id + ".json")
-    document = json.loads(manifest.read_text(encoding="utf-8"))
-    if (document.get("schemaVersion") != 1 or document.get("modelId") != model_id
-            or document.get("dimensions") != model["dimensions"] or not document.get("provenance")
-            or type(document.get("minimumCosine")) not in (int, float)
-            or not 0.9 <= document["minimumCosine"] <= 1.0):
-        raise RuntimeError("Qwen reference identity or numerical policy differs from the selected model")
-    inputs = document.get("inputs", [])
-    by_id = {item["id"]: item for item in inputs}
-    if len(by_id) != len(inputs):
-        raise RuntimeError("Qwen reference repeats an input identifier")
-    document_id = "document-package" if "document-package" in by_id else "document-en"
-    expected = {"query-en": "query", document_id: "document", "image-screen-640": "image"}
-    destination.mkdir()
-    copied = {}
-    for identifier, kind in expected.items():
-        item = by_id.get(identifier, {})
-        if item.get("kind") != kind:
-            raise RuntimeError("Qwen package reference is absent: " + identifier)
-        validate_vector(item.get("vector"), item.get("vector"), model["dimensions"])
-        if kind == "image":
-            source = (manifest.parent / item["image"]).resolve()
-            if fixture_root.resolve() not in source.parents or item.get("budget") != 280:
-                raise RuntimeError("Qwen screenshot reference path or image budget is invalid")
-            if file_digest(source) != item.get("sha256"):
-                raise RuntimeError("Qwen screenshot reference bytes changed")
-            target = destination / "Screenshot golden.png"
-            shutil.copyfile(source, target)
-            copied[identifier] = target
-        else:
-            if hashlib.sha256(item.get("text", "").encode("utf-8")).hexdigest() != item.get("sha256"):
-                raise RuntimeError("Qwen reference text bytes changed: " + identifier)
-            if kind == "document":
-                title = item.get("title", "")
-                if Path(title).name != title or not title.endswith(".txt") or "/" in title or "\\" in title:
-                    raise RuntimeError("Qwen package document reference requires a plain .txt filename as its title")
-                target = destination / title
-                target.write_bytes(item["text"].encode("utf-8"))
-                copied[identifier] = target
-    (destination / "vectors.json").write_text(json.dumps({"vectors": {"query": by_id["query-en"]["vector"]}}), encoding="utf-8")
-    return document, by_id, copied, document_id, file_digest(manifest)
-
-
-def qwen_model_smoke(worker, replies, executable, application, work, report_dir, verified_models,
-                     installed_files, timeout, build_identity):
-    model_id = verified_models["modelId"]
-    model = MODEL_CATALOG.selected(model_id)
-    document, references, files, document_id, manifest_hash = qwen_reference_inputs(model_id, work / "model-references")
-    dimensions, minimum_cosine = model["dimensions"], document["minimumCosine"]
-    vectors = []
-    query, raw = worker_request(worker, replies, {"id": "model-query", "operation": "query",
-        "query": references["query-en"]["text"]}, report_dir, timeout=timeout)
-    vectors.append({"name": "query-en", "modality": "text", "rawReply": raw,
-                    "modelFingerprint": query.get("modelFingerprint"),
-                    **validate_vector(query.get("embedding"), references["query-en"]["vector"], dimensions, minimum_cosine)})
-    for identifier, modality in ((document_id, "text"), ("image-screen-640", "image")):
-        result, raw = worker_request(worker, replies, {"id": "model-" + identifier, "operation": "extract",
-            "path": str(files[identifier]), "embed": True, "enableOcr": False, "maxSegments": 8}, report_dir, timeout=timeout)
-        segments = result.get("segments", [])
-        if (result.get("complete") is not True or result.get("state") != "complete" or result.get("error")
-                or result.get("embeddingErrors") or len(segments) != 1 or segments[0].get("modality") != modality):
-            raise RuntimeError(f"Packaged Qwen extraction did not complete: {identifier}: {result}")
-        if modality == "image" and segments[0].get("imageBudget") != 280:
-            raise RuntimeError("Packaged Qwen screenshot budget differs from its reference")
-        if modality == "text" and (segments[0].get("title") != references[identifier]["title"]
-                                    or segments[0].get("text") != references[identifier]["text"]):
-            raise RuntimeError("Packaged Qwen document prompt input differs from its reference")
-        vectors.append({"name": identifier, "modality": modality, "rawReply": raw,
-                        "modelFingerprint": result.get("modelFingerprint"),
-                        **validate_vector(segments[0].get("embedding"), references[identifier]["vector"], dimensions, minimum_cosine)})
-    fingerprints = {item["modelFingerprint"] for item in vectors}
-    if len(fingerprints) != 1 or not next(iter(fingerprints)):
-        raise RuntimeError("Packaged Qwen query and documents disagree on model fingerprint")
-    video, video_raw = worker_request(worker, replies, {"id": "model-video", "operation": "extract",
-        "path": str(work / "samples/package.avi"), "embed": True, "enableOcr": False, "maxSegments": 8}, report_dir, timeout=timeout)
-    frames = [item for item in video.get("segments", []) if item.get("modality") == "image"]
-    if not frames or video.get("complete") is not True or video.get("error") or video.get("embeddingErrors"):
-        raise RuntimeError("Packaged Qwen video frame inference failed")
-    for frame in frames:
-        validate_vector(frame.get("embedding"), frame.get("embedding"), dimensions)
-    audio_result, audio_raw = worker_request(worker, replies, {"id": "model-unsupported-audio", "operation": "extract",
-        "path": str(work / "samples/package.wav"), "embed": True, "enableOcr": False, "maxSegments": 8}, report_dir, timeout=timeout)
-    audio_segments = [item for item in audio_result.get("segments", []) if item.get("modality") == "audio"]
-    if (audio_result.get("complete") is not True or "audio" not in audio_result.get("unsupportedModalities", [])
-            or not audio_segments or any(item.get("embedding") for item in audio_segments)):
-        raise RuntimeError("Packaged Qwen audio capability was not reported without fabricated embeddings")
-    diagnostics, _ = worker_request(worker, replies, {"id": "runtime-diagnostics", "operation": "diagnostics"}, report_dir)
-    runtime = diagnostics.get("runtime")
-    if build_identity:
-        validate_backend_diagnostics(runtime, build_identity, "auto")
-    return {"passed": True, "modelId": model_id, "dimensions": dimensions, "minimumCosine": minimum_cosine,
-            "queryText": references["query-en"]["text"], "modelDirectory": verified_models["directory"],
-            "modelVerification": verified_models, "referenceManifestSha256": manifest_hash, "vectors": vectors,
-            "videoFrames": {"count": len(frames), "rawReply": video_raw},
-            "unsupportedAudio": {"passed": True, "rawReply": audio_raw},
-            "runtime": inference_runtime_origins(worker, executable, application, installed_files, runtime)}
 
 
 def verify_license_materials(binary, application, report_dir, installed_files=None):
@@ -761,6 +655,17 @@ def validate_build_identity(binary, application, source_identity, expected_varia
         raise RuntimeError("Packaged build identity has an unknown variant or invalid metadata")
     if expected_variant and identity["variant"] != expected_variant:
         raise RuntimeError("Packaged variant differs from the requested verification variant")
+    selected = matching[0]
+    toolkit = selected.get("toolkitVersion", "")
+    package_variant = selected["id"]
+    if selected["backend"] in ("hip", "vulkan"):
+        if not isinstance(toolkit, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", toolkit):
+            raise RuntimeError("Packaged SDK version is missing or invalid")
+        package_variant += "-" + toolkit
+    if (selected.get("packageVariant") != package_variant
+            or identity.get("packageVariant") != package_variant
+            or identity.get("toolkitVersion") != toolkit):
+        raise RuntimeError("Packaged packageVariant or SDK version differs from the variant manifest")
     if file_digest(manifest) != identity.get("variantsSha256"):
         raise RuntimeError("Packaged variant manifest differs from its build identity")
     for filename, field in (("dependencies.lock.json", "dependencyLockSha256"),
@@ -776,6 +681,27 @@ def validate_build_identity(binary, application, source_identity, expected_varia
     if identity.get("workingTreeModified") is not None and type(identity["workingTreeModified"]) is not bool:
         raise RuntimeError("Packaged source modification state is invalid")
     return identity
+
+
+def validate_package_name(package, identity):
+    """Bind the downloaded filename to the installed software and SDK identity."""
+    version = identity["version"]
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version):
+        raise RuntimeError("Packaged software version is invalid")
+    stem = "qcs-" + version + "-" + identity["packageVariant"]
+    variant = identity["variant"]
+    if variant.startswith("windows-"):
+        names = {stem + ".exe", stem + ".zip"}
+        if variant == "windows-x64-rocm":
+            names.add(stem + "-setup.zip")
+    elif variant.startswith("linux-"):
+        names = {stem + ".deb", stem + ".tar.gz"}
+    elif variant.startswith("macos-"):
+        names = {stem + ".dmg"}
+    else:
+        raise RuntimeError("Packaged variant has an unsupported operating system")
+    if package.name not in names:
+        raise RuntimeError("Package filename differs from the installed software, variant or SDK version")
 
 
 def validate_backend_diagnostics(diagnostics, identity, requested, loaded=True):
@@ -1073,8 +999,8 @@ def package_source_identity(source=None, environment=None):
 
 
 def verify(package, build_root, explicit_report=None, installed_root=None, explicit_profile=None, installed_manifest=None,
-           model_dir=None, keyword_only=False, model_timeout=600, expected_variant=None, model_id=None):
-    selected_model = MODEL_CATALOG.selected(model_id)
+           model_dir=None, keyword_only=False, model_timeout=600, expected_variant=None):
+    selected_model = MODEL_CATALOG.selected()
     model_id = selected_model["id"]
     source_identity = package_source_identity()
     run_id = str(uuid.uuid4())
@@ -1110,16 +1036,18 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
     program_inventory = None
     logs = []
     environment = isolated_environment()
-    profile = explicit_profile or work / "profile"
+    profile_base = explicit_profile or work / "profile"
+    profile = profile_base / "profiles/v4"
+    report["profileBaseDirectory"] = str(profile_base)
     report["profileDirectory"] = str(profile)
-    if explicit_profile and profile.exists() and (not profile.is_dir() or any(profile.iterdir())):
+    if explicit_profile and profile_base.exists() and (not profile_base.is_dir() or any(profile_base.iterdir())):
         raise RuntimeError("Explicit package-test profile must be a new or empty dedicated directory")
     application = installed_root or work/"application"
     report["applicationRoot"] = str(application)
     installed_files = {Path(line).resolve() for line in installed_manifest.read_text(encoding="utf-8").splitlines()
                        if line.startswith("/")} if installed_manifest else None
     def invoke(*arguments, process_timeout=None):
-        completed = subprocess.run([str(cli),"--profile-dir",str(profile), *model_arguments,
+        completed = subprocess.run([str(cli), *profile_arguments,
                                     "--no-start",*map(str,arguments)],cwd=work,env=environment,capture_output=True,text=True,encoding="utf-8",timeout=process_timeout or max(180, model_timeout + 30))
         (report_dir / (str(len(report["checks"]))+"-cli.log")).write_text(completed.stdout+completed.stderr,encoding="utf-8")
         if completed.returncode:
@@ -1130,10 +1058,11 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         return result["result"]
     try:
         if not keyword_only and (model_dir is None or not model_dir.is_dir()):
-            raise RuntimeError("Full package verification requires --model-dir with the selected preset's locked GGUF files. Use --keyword-only only for an explicitly partial developer check.")
+            raise RuntimeError("Full package verification requires --model-dir with both locked GGUF files. Use --keyword-only only for an explicitly partial developer check.")
         validate_installed_package_source(package, installed_root, installed_manifest)
         model_arguments = ["--model-dir", str(model_dir)] if model_dir and not keyword_only else []
-        worker_model_arguments = [*model_arguments, "--model", model_id]
+        profile_arguments = ["--profile-dir", str(profile_base), *model_arguments]
+        worker_model_arguments = model_arguments
         if installed_root:
             report["checks"].append("validating the actual installed package tree")
         elif package.suffix.lower() == ".exe":
@@ -1162,6 +1091,8 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         cli=candidates[0]
         binary=cli.parent
         report["buildIdentity"] = validate_build_identity(binary, application, source_identity, expected_variant)
+        if package:
+            validate_package_name(package, report["buildIdentity"])
         expected_attempt = os.environ.get("QCOPILOTS_SEARCH_CANDIDATE_ATTEMPT") or os.environ.get("QCOPILOTS_SEARCH_ATTEMPT")
         if expected_attempt and (not re.fullmatch(r"[1-9][0-9]*", expected_attempt)
                                  or report["buildIdentity"]["attempt"] != int(expected_attempt)):
@@ -1193,9 +1124,9 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
             if completed.returncode:
                 raise RuntimeError(f"Packaged program failed to load: {name}: {completed.stderr}")
         report["checks"].append("all four relocated executables load without SDK environment")
-        verified_models = model_verification(invoke("model", "verify", "--model", model_id), model_dir, model_id) if not keyword_only else None
+        verified_models = model_verification(invoke("model", "verify"), model_dir) if not keyword_only else None
         profile.mkdir(parents=True, exist_ok=True)
-        (profile / "qcs-settings.json").write_text(json.dumps({"version": 3, "modelId": model_id}), encoding="utf-8")
+        (profile / "qcs-settings.json").write_text(json.dumps({"version": 4}), encoding="utf-8")
         fixtures=work/"samples"
         create_fixtures(fixtures)
         error_log=(report_dir/"worker.log").open("w",encoding="utf-8"); logs.append(error_log)
@@ -1217,7 +1148,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
         if not keyword_only:
             report["modelSmoke"] = real_model_smoke(worker, replies, binary/(PRODUCT+"-worker"+suffix),
                 application, work, report_dir, verified_models, installed_files, model_timeout, report["buildIdentity"])
-            report["checks"].append("installed inference runtime matched selected model reference vectors and modality capabilities")
+            report["checks"].append("installed inference runtime matched EmbeddingGemma 2 reference vectors and modality capabilities")
         stop_worker(worker, replies, reader, report_dir)
         worker = None
         if not keyword_only:
@@ -1229,26 +1160,22 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
                 dimensions=selected_model["dimensions"], minimum_cosine=report["modelSmoke"]["minimumCosine"],
                 query_text=report["modelSmoke"]["queryText"])
             report["checks"].append("explicit CPU inference and strict GPU acceptance or rejection verified")
-        # Keep the packaged inference probes sequential. In particular, a 2B
-        # model must not coexist in a probe worker and the service on ARM CI.
+        # Keep the packaged inference probes sequential to bound runtime memory.
         service_log = (report_dir/"service.log").open("w",encoding="utf-8"); logs.append(service_log)
-        service = subprocess.Popen([str(binary/(PRODUCT+"-service"+suffix)), "--profile-dir", str(profile), *model_arguments],
+        service = subprocess.Popen([str(binary/(PRODUCT+"-service"+suffix)), *profile_arguments],
                                    cwd=work, env=environment, stdout=service_log, stderr=service_log)
         service_started = True
         startup = wait_service_ready(service, invoke, selected_model, not keyword_only, model_timeout)
         report["serviceStartup"] = {key: startup.get(key) for key in
-            ("modelId", "configuredModelId", "activeModelId", "dimensions", "modelLoading", "modelAvailable", "modelError")}
-        report["checks"].append("isolated service IPC and selected model preflight completed")
-        request_timeout = 120000 if model_id == "embeddinggemma-2" else model_timeout * 1000
+            ("modelId", "dimensions", "modelLoading", "modelAvailable", "modelError")}
+        report["checks"].append("isolated service IPC and EmbeddingGemma 2 preflight completed")
+        request_timeout = 120000
         invoke("index",fixtures,"--wait","--timeout",str(request_timeout))
         hits=invoke("search","qcopilots_package_4317","--keyword-only").get("hits",[])
         if not any(hit.get("path","").endswith("中文 package notes.txt") for hit in hits):
             raise RuntimeError("Packaged index/search did not retrieve its text fixture")
         report["checks"].append("packaged service index and exact keyword retrieval")
         if not keyword_only:
-            if model_id != "embeddinggemma-2":
-                report["modelSmoke"]["indexWorkersReleased"] = pause_index_workers_before_query(service, invoke)
-                report["checks"].append("Qwen indexing paused and index workers exited before query inference")
             # None of these terms occurs in the fixture text. Require a real
             # stored-vector candidate, without imposing a relevance threshold.
             semantic = invoke("search", "A coastal lighthouse beneath moonlit clouds", "--root", fixtures,
@@ -1264,7 +1191,7 @@ def verify(package, build_root, explicit_report=None, installed_root=None, expli
             raise RuntimeError("The explicitly started package-test service exited unexpectedly")
         report["serviceLibraries"]=verify_library_origins(service,application,installed_files)
         gui_log=(report_dir/"gui.log").open("w",encoding="utf-8"); logs.append(gui_log)
-        gui=subprocess.Popen([str(binary/(GUI_EXECUTABLE+suffix)),"--profile-dir",str(profile),*model_arguments,
+        gui=subprocess.Popen([str(binary/(GUI_EXECUTABLE+suffix)), *profile_arguments,
                               "--no-onboarding","--no-tray"],cwd=work,env=environment,stdout=gui_log,stderr=gui_log)
         time.sleep(3)
         if gui.poll() is not None:
@@ -1363,9 +1290,8 @@ def main():
     parser.add_argument("--report-dir",type=Path)
     parser.add_argument("--installed-root",type=Path,help="Verify an already installed package in place, without deleting it")
     parser.add_argument("--installed-manifest",type=Path,help="Absolute file list from the OS package manager, such as dpkg -L")
-    parser.add_argument("--profile-dir",type=Path,help="Fresh dedicated test profile retained after verification")
+    parser.add_argument("--profile-dir",type=Path,help="Fresh dedicated data base directory, with test profile in profiles/v4")
     parser.add_argument("--model-dir",type=Path,help="Read-only cache of both locked GGUF artifacts, required for full verification")
-    parser.add_argument("--model", help="Preset from config/qcs-models.lock.json (default: embeddinggemma-2)")
     parser.add_argument("--keyword-only",action="store_true",help="Explicit partial developer verification without real model inference, insufficient for full verification")
     parser.add_argument("--model-timeout",type=int,default=600,help="Seconds allowed for each real-model worker request (default 600)")
     parser.add_argument("--variant", help="Require the downloaded package to match this build variant")
@@ -1392,11 +1318,11 @@ def main():
         raise RuntimeError("Package-test profile must be an isolated directory outside the checkout")
     manifest = args.installed_manifest.expanduser().resolve() if args.installed_manifest else None
     model_dir = args.model_dir.expanduser().resolve() if args.model_dir else None
-    if args.keyword_only and (args.model_dir or args.model):
+    if args.keyword_only and args.model_dir:
         raise RuntimeError("Choose full verification with --model-dir or partial --keyword-only, not both")
     if args.model_timeout < 1 or args.model_timeout > 3600:
         raise RuntimeError("--model-timeout must be between 1 and 3600 seconds")
-    verify(package.resolve() if package else None,root,report,installed,profile,manifest,model_dir,args.keyword_only,args.model_timeout,args.variant,args.model)
+    verify(package.resolve() if package else None,root,report,installed,profile,manifest,model_dir,args.keyword_only,args.model_timeout,args.variant)
 
 
 if __name__=="__main__":

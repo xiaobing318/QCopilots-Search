@@ -8,6 +8,7 @@ namespace qcopilots_search {
 // Resolution does not create directories or read settings.
 struct RuntimePaths {
     QString resolutionError;
+    QString profileBaseDir; // User-selected base, forwarded to child processes.
     QString profileDir;
     QString modelDir;
     QString indexDir;
@@ -18,10 +19,11 @@ struct RuntimePaths {
     QString lockFile;
     QString ipcName; // Windows pipe name, Unix absolute socket pathname.
 
-    static RuntimePaths resolve(const QString &profileDir = {}, const QString &modelDir = {});
+    // --profile-dir and QCS_HOME select the base. Writable state is in profiles/vN.
+    static RuntimePaths resolve(const QString &profileBaseDir = {}, const QString &modelDir = {});
     // Excludes Qt resources, embedded NULs and Windows drive-relative paths.
     static bool isAbsoluteFilesystemPath(const QString &path);
-    // Platform data root, independent of profile selection environment variables.
+    // Platform data base, independent of profile selection environment variables.
     // This does not create or inspect any profile files.
     static QString defaultProfileDirectory();
     // Reject a legacy writable profile without creating or migrating files.
@@ -30,8 +32,6 @@ struct RuntimePaths {
     bool ensureIpcDirectory(QString *error = nullptr) const;
     bool validateIpcDirectory(QString *error = nullptr) const;
     QString databaseFile() const;
-    // Retains the profile/IPC owner and maps only its model-specific index.
-    RuntimePaths forModelIndex(const QString &modelId) const;
 };
 
 } // namespace qcopilots_search

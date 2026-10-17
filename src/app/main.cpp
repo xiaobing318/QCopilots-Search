@@ -3,6 +3,7 @@
 #include "main_window.h"
 #include "login_startup.h"
 #include "core/runtime_paths.h"
+#include "core/app_settings.h"
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QLocale>
@@ -51,7 +52,7 @@ int main(int argc, char **argv) {
     parser.setApplicationDescription(QStringLiteral("QCopilots Search — local multimodal file search"));
     parser.addHelpOption();
     parser.addVersionOption();
-    parser.addOption({QStringLiteral("profile-dir"), QStringLiteral("Isolated configuration and index directory."), QStringLiteral("directory")});
+    parser.addOption({QStringLiteral("profile-dir"), QStringLiteral("Data base directory. Configuration and index use profiles/v4 beneath it."), QStringLiteral("directory")});
     parser.addOption({QStringLiteral("model-dir"), QStringLiteral("Model directory."), QStringLiteral("directory")});
     parser.addOption({QStringLiteral("no-tray"), QStringLiteral("Disable tray and global shortcut integration.")});
     parser.addOption({QStringLiteral("no-onboarding"), QStringLiteral("Do not open first-run setup automatically.")});
@@ -91,7 +92,8 @@ int main(int argc, char **argv) {
         const auto paths = qcopilots_search::resolveLoginStartupPaths(
             parser.value("profile-dir"), parser.value("model-dir"), loginLaunch);
         QString error;
-        if (!paths.ensure(&error)) {
+        qcopilots_search::AppSettings initialSettings;
+        if (!paths.validateProfileLayout(&error) || !initialSettings.load(paths.configFile, &error) || !paths.ensure(&error)) {
             writeCommandLineOutput(error + QLatin1Char('\n'), true);
             QMessageBox prompt(QMessageBox::Critical, QStringLiteral("QCopilots Search"), error, QMessageBox::Ok);
             prompt.button(QMessageBox::Ok)->setText(QLocale::system().language() == QLocale::Chinese ? QStringLiteral("确定") : QStringLiteral("OK"));

@@ -181,8 +181,8 @@ QString keyForPath(const QString &path) {
 #endif
   return result;
 }
-QVector<float> normalized(const QVector<float> &values, int dimensions) {
-  return embedding_math::normalized(values, dimensions);
+QVector<float> normalized(const QVector<float> &values) {
+  return embedding_math::normalized(values);
 }
 double cosine(const QVector<float> &a, const QVector<float> &b) {
   return embedding_math::cosine(a, b);
@@ -409,22 +409,12 @@ IndexRepository::IndexRepository(StorageOptions options)
 IndexRepository::~IndexRepository() = default;
 
 bool IndexRepository::open(const RuntimePaths &paths, QString *error) {
-  return open(paths, defaultModelId(), error);
-}
-
-bool IndexRepository::open(const RuntimePaths &paths, const QString &modelId,
-                           QString *error) {
   if (error)
     error->clear();
   try {
     std::lock_guard lock(d->publication);
     if (d->opened)
       throw std::runtime_error("Index repository is already open");
-    const auto *model = findModel(modelId);
-    if (!model)
-      throw std::runtime_error("Unknown index model identifier");
-    if (model->dimensions < 1 || model->dimensions > 8192)
-      throw std::runtime_error("Model embedding dimensions are outside the supported range");
     if (d->options.diskReserveBytes < 0)
       throw std::runtime_error("Disk reserve must not be negative");
     if (d->options.maxWalBytes <= 0)
@@ -432,8 +422,8 @@ bool IndexRepository::open(const RuntimePaths &paths, const QString &modelId,
     if (!paths.ensure(error))
       return false;
     d->paths = paths;
-    d->modelId = modelId;
-    d->dimensions = model->dimensions;
+    d->modelId = defaultModelId();
+    d->dimensions = embeddingDimensions;
     const QFileInfo databaseInfo(paths.databaseFile());
     const bool newDatabase = !databaseInfo.exists() || databaseInfo.size() == 0;
     d->writer.open(paths.databaseFile(), true);
@@ -442,13 +432,6 @@ bool IndexRepository::open(const RuntimePaths &paths, const QString &modelId,
     if (version > schemaVersion)
       throw std::runtime_error(
           "Database schema was created by a newer QCopilots Search version");
-    // Databases predating model identities could only contain Gemma vectors.
-    // A rolled-back first initialization can leave an empty SQLite header, so
-    // permit that empty file to retry initialization for its requested model.
-    const bool uninitialized = version == 0 && scalar(db,
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'") == 0;
-    if (!newDatabase && !uninitialized && version < 4 && modelId != defaultModelId())
-      throw std::runtime_error("A legacy index belongs to EmbeddingGemma 2");
     // A 768-dimensional FP16 vector and its text metadata often exceed half
     // of a 4 KiB page. Larger pages pack several such rows instead of leaving
     // nearly half of each page unused. Existing databases retain their layout,
@@ -488,11 +471,11 @@ CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE OF terms,han ON segments B
                 "CREATE INDEX IF NOT EXISTS files_pending_metadata ON files(code) WHERE modified_ms IS NULL OR kind='';"
                 "INSERT OR IGNORE INTO meta VALUES('browse_generation','0');");
     if (version < 4) {
-      putMeta(db, QStringLiteral("model_id"), modelId);
+      putMeta(db, QStringLiteral("model_id"), d->modelId);
       putMeta(db, QStringLiteral("embedding_dimensions"), QString::number(d->dimensions));
-    } else if (meta(db, QStringLiteral("model_id")) != modelId
+    } else if (meta(db, QStringLiteral("model_id")) != d->modelId
                || meta(db, QStringLiteral("embedding_dimensions")) != QString::number(d->dimensions)) {
-      throw std::runtime_error("Index model identity or embedding dimensions do not match the selected model");
+      throw std::runtime_error("Index model identity or embedding dimensions do not match EmbeddingGemma 2");
     }
     execute(db, "PRAGMA user_version=4");
     if (meta(db, QStringLiteral("index_uuid")).isEmpty())
@@ -580,7 +563,7 @@ bool IndexRepository::replaceFiles(const QVector<IndexedFile> &files,
       for (const auto &segment : file.segments) {
         auto encoded = segment.embedding.isEmpty()
                            ? QByteArray()
-                           : encodeFloat16(normalized(segment.embedding, d->dimensions));
+                           : encodeFloat16(normalized(segment.embedding));
         estimate += encoded.size() + segment.text.size() * 4 + 4096;
         prepared.vectors.append(std::move(encoded));
         prepared.text.append(tokenizeForIndex(
@@ -1249,7 +1232,7 @@ QList<SearchHit> IndexRepository::search(const SearchOptions &options,
         throw std::runtime_error(
             "Semantic search is unavailable during an offline bulk import. "
             "Complete ANN maintenance with flush before querying.");
-      const auto query = normalized(options.queryEmbedding, d->dimensions);
+      const auto query = normalized(options.queryEmbedding);
       Statement count(
           db,
           QStringLiteral("SELECT count(*) FROM (SELECT 1 FROM segments s JOIN files f ON "

@@ -1,5 +1,4 @@
 #include "settings_dialog.h"
-#include "core/model_catalog.h"
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -15,7 +14,6 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
-#include <QSignalBlocker>
 #include <QTabWidget>
 #include <QVBoxLayout>
 
@@ -32,7 +30,6 @@ SettingsDialog::SettingsDialog(const AppSettings &settings, bool firstRun, const
     intro->setWordWrap(true);
     layout->addWidget(intro);
     auto *tabs = new QTabWidget(this);
-    tabs_ = tabs;
     tabs->setObjectName("settingsTabs");
     auto *folders = new QWidget(tabs);
     auto *folderLayout = new QVBoxLayout(folders);
@@ -85,52 +82,6 @@ SettingsDialog::SettingsDialog(const AppSettings &settings, bool firstRun, const
     connect(code_, &QCheckBox::toggled, codeRootsGroup, &QWidget::setEnabled);
     connect(code_, &QCheckBox::toggled, codeExcludesGroup, &QWidget::setEnabled);
     tabs->addTab(codeFolders, text("Source code", "源代码"));
-    modelsPage_ = new QWidget(tabs);
-    auto *modelLayout = new QVBoxLayout(modelsPage_);
-    auto *modelForm = new QFormLayout;
-    model_ = new QComboBox(modelsPage_);
-    model_->setObjectName("modelCombo");
-    for (const auto &model : modelCatalog()) model_->addItem(model.name, model.id);
-    model_->setCurrentIndex(qMax(0, model_->findData(settings.modelId)));
-    modelForm->addRow(text("Semantic model", "语义模型"), model_);
-    modelLayout->addLayout(modelForm);
-    modelDescription_ = new QLabel(modelsPage_);
-    modelDescription_->setObjectName("selectedModelDescription");
-    modelDescription_->setWordWrap(true);
-    modelLayout->addWidget(modelDescription_);
-    modelStatus_ = new QLabel(text("Checking model availability…", "正在查看模型可用性…"), modelsPage_);
-    modelStatus_->setObjectName("selectedModelStatus");
-    modelStatus_->setWordWrap(true);
-    modelStatus_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    modelLayout->addWidget(modelStatus_);
-    auto *modelActions = new QHBoxLayout;
-    manageModel_ = new QPushButton(text("Download / import / verify…", "下载 / 导入 / 校验…"), modelsPage_);
-    manageModel_->setObjectName("manageSelectedModelButton");
-    applyModel_ = new QPushButton(text("Apply selected model", "应用所选模型"), modelsPage_);
-    applyModel_->setObjectName("applySelectedModelButton");
-    modelActions->addWidget(manageModel_);
-    modelActions->addWidget(applyModel_);
-    modelActions->addStretch();
-    modelLayout->addLayout(modelActions);
-    auto *modelHelp = new QLabel(text("Downloading or importing a model does not change the active model. Apply verifies and loads the selected model before switching. Each model keeps an independent index and uses additional disk space. Its first use builds an index, and switching back reuses unchanged files after checking your folders.", "下载或导入模型不会更改当前使用的模型。应用时会先校验并加载所选模型，成功后再切换。每个模型保存独立索引并占用额外磁盘空间，首次使用需要建立索引，切回时会先核对文件夹并复用未变化的文件。"), modelsPage_);
-    modelHelp->setObjectName("modelIndexHelp");
-    modelHelp->setWordWrap(true);
-    modelLayout->addWidget(modelHelp);
-    reloadSettings_ = new QPushButton(text("Reload configuration file", "重新读取配置文件"), modelsPage_);
-    reloadSettings_->setObjectName("reloadSettingsButton");
-    reloadSettings_->setToolTip(text("Apply edits saved in the configuration file. This replaces unsaved changes in this dialog after a successful reload.", "应用已保存到配置文件的修改。重新读取成功后，会替换此窗口尚未保存的修改。"));
-    modelLayout->addWidget(reloadSettings_, 0, Qt::AlignLeft);
-    modelLayout->addStretch();
-    tabs->addTab(modelsPage_, text("Models", "模型"));
-    connect(model_, &QComboBox::currentIndexChanged, this, [this] {
-        updateModelDescription();
-        modelStatus_->setText(label("Checking model availability…", "正在查看模型可用性…"));
-        emit modelStatusRequested(selectedModelId());
-    });
-    connect(manageModel_, &QPushButton::clicked, this, [this] { emit manageModelRequested(selectedModelId()); });
-    connect(applyModel_, &QPushButton::clicked, this, [this] { setModelOperationPending(true); emit applyModelRequested(selectedModelId()); });
-    connect(reloadSettings_, &QPushButton::clicked, this, [this] { setModelOperationPending(true); emit reloadSettingsRequested(); });
-    updateModelDescription();
     auto *externalScroll = new QScrollArea(tabs);
     externalScroll->setWidgetResizable(true);
     externalScroll->setFrameShape(QFrame::NoFrame);
@@ -355,6 +306,15 @@ SettingsDialog::SettingsDialog(const AppSettings &settings, bool firstRun, const
     updates_->setChecked(settings.checkUpdates);
     updates_->setObjectName("checkUpdatesCheck");
     form->addRow(updates_);
+    reloadSettings_ = new QPushButton(text("Reload configuration file", "重新读取配置文件"), preferences);
+    reloadSettings_->setObjectName("reloadSettingsButton");
+    reloadSettings_->setToolTip(text("Apply saved configuration edits. A successful reload replaces unsaved changes in this dialog.", "应用已保存的配置修改。重新读取成功后，会替换此窗口尚未保存的修改。"));
+    form->addRow(reloadSettings_);
+    reloadStatus_ = new QLabel(preferences);
+    reloadStatus_->setObjectName("reloadSettingsStatus");
+    reloadStatus_->setWordWrap(true);
+    form->addRow(reloadStatus_);
+    connect(reloadSettings_, &QPushButton::clicked, this, [this] { setReloadPending(true); emit reloadSettingsRequested(); });
     tabs->addTab(preferences, text("Preferences", "偏好设置"));
     layout->addWidget(tabs, 1);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, this);
@@ -379,7 +339,6 @@ AppSettings SettingsDialog::settings() const {
     for (int i = 0; i < codeRoots_->count(); ++i) result.codeRoots << codeRoots_->item(i)->text();
     for (int i = 0; i < codeExcludes_->count(); ++i) result.codeExcludes << codeExcludes_->item(i)->text();
     result.language = language_->currentData().toString();
-    result.modelId = selectedModelId();
     result.includeCode = code_->isChecked();
     result.editorCommand = editor_->text().trimmed();
     const auto readOpener = [](const ExternalOpenerSettings &original, const QComboBox *preset, const QLineEdit *program, const QPlainTextEdit *arguments) {
@@ -399,88 +358,14 @@ AppSettings SettingsDialog::settings() const {
     if (startupStatusKnown_ || startupChangeRequested_) result.startAtLogin = startup_->isChecked();
     return result;
 }
-QString SettingsDialog::label(const char *en, const char *zh) const {
-    const QString language = original_.language == "system" ? QLocale::system().name() : original_.language;
-    return QString::fromUtf8(language.startsWith("zh") ? zh : en);
-}
-QString SettingsDialog::selectedModelId() const { return model_->currentData().toString(); }
-bool SettingsDialog::modelChangeRequested() const { return selectedModelId() != original_.modelId; }
-void SettingsDialog::updateConfiguredModel(const QString &modelId) {
-    const bool userChangedModel = modelChangeRequested();
-    original_.modelId = modelId;
-    if (!userChangedModel) {
-        const QSignalBlocker blocker(model_);
-        model_->setCurrentIndex(model_->findData(modelId));
-        updateModelDescription();
-    }
-    // Keep other unsaved preferences and an explicit pending model choice.
-    // Refresh the actual service state even when the selected model stays put.
-    if (!modelOperationPending_) modelStatus_->setText(label("Checking model availability…", "正在查看模型可用性…"));
-    emit modelStatusRequested(selectedModelId());
-}
-void SettingsDialog::showModelsPage() { tabs_->setCurrentWidget(modelsPage_); }
-void SettingsDialog::updateModelDescription() {
-    const auto *model = findModel(selectedModelId());
-    if (!model) return;
-    qint64 bytes = 0;
-    for (const auto &artifact : model->artifacts) bytes += artifact.size;
-    const QString capabilities = model->supportsAudio
-        ? label("Text, images, audio and video", "文字、图像、音频与视频")
-        : label("Text, images and video frames. Audio supports keyword search only.", "文字、图像与视频画面。音频仅支持关键词搜索。");
-    modelDescription_->setText(label("%1\n%2 dimensions · Download: %3 GiB\n%4", "%1\n%2 维向量 · 下载量：%3 GiB\n%4")
-        .arg(model->name).arg(model->dimensions).arg(double(bytes) / (1024.0 * 1024 * 1024), 0, 'f', 2).arg(capabilities));
-}
-void SettingsDialog::setModelStatus(const QJsonObject &status) {
-    if (modelOperationPending_ || status.value("modelId").toString() != selectedModelId()) return;
-    const QString configured = status.value("configuredModelId").toString(original_.modelId);
-    if (configured != original_.modelId) return;
-    const QString active = status.value("activeModelId").toString();
-    const auto modelName = [](const QString &id) { const auto *model = findModel(id); return model ? model->name : id; };
-    QString state;
-    if (status.value("loading").toBool())
-        state = label("Verifying files and checking model loading…", "正在校验文件并进行模型加载预检…");
-    else if (status.value("modelAvailable").toBool() && active == selectedModelId())
-        state = label("Loading preflight passed. Available for search.", "加载预检通过，可以使用。");
-    else if (status.value("filesVerified").toBool()
-        || (status.value("filesPresent").toBool() && verifiedModels_.contains(selectedModelId())))
-        state = label("Files verified. Apply to check loading.", "文件已校验。请应用以检查是否能加载。");
-    else if (status.value("filesPresent").toBool())
-        state = label("Files present. Verification and loading have not completed.", "文件已存在，尚未完成校验和加载。");
-    else state = label("Model files missing. Download or import them first.", "缺少模型文件，请先下载或导入。");
-    QString text = label("Configured: %1\nCurrent model: %2\nSelected model: %3", "配置目标：%1\n当前使用：%2\n所选模型：%3")
-        .arg(modelName(configured), active.isEmpty() ? label("None (keyword search)", "无（关键词搜索）") : modelName(active), state);
-    const QString indexState = status.value("indexState").toString();
-    QString indexStatus;
-    if (indexState == "not-built") indexStatus = label("Not built yet", "尚未建立");
-    else if (indexState == "cached") indexStatus = label("Saved cache, checked when selected", "已有缓存，切回时核对");
-    else if (indexState == "reconciling") indexStatus = label("Checking folders", "正在核对文件夹");
-    else if (indexState == "empty") indexStatus = label("No files in selected folders", "所选目录中没有文件");
-    else if (indexState == "pending") indexStatus = label("Paused with pending files", "已暂停，仍有文件待处理");
-    else if (indexState == "indexing") indexStatus = label("Indexing", "正在建立索引");
-    else if (indexState == "partial") indexStatus = label("Some files failed", "部分文件处理失败");
-    else if (indexState == "ready") indexStatus = label("Ready", "已就绪");
-    if (!indexStatus.isEmpty()) text += label("\nIndex status: ", "\n索引状态：") + indexStatus;
-    const QString directory = status.value("indexDirectory").toString();
-    if (!directory.isEmpty()) text += label("\nIndependent index: ", "\n独立索引：") + QDir::toNativeSeparators(directory);
-    const QString error = status.value("error").toString();
-    if (!error.isEmpty()) text += QLatin1Char('\n') + error;
-    modelStatus_->setText(text);
-}
-void SettingsDialog::setModelOperationPending(bool pending) {
-    modelOperationPending_ = pending;
-    model_->setEnabled(!pending);
-    manageModel_->setEnabled(!pending);
-    applyModel_->setEnabled(!pending);
+void SettingsDialog::setReloadPending(bool pending) {
     reloadSettings_->setEnabled(!pending);
     save_->setEnabled(!pending);
-    if (pending) modelStatus_->setText(label("Verifying and loading the model. Large models may take several minutes. The current model remains active until the switch succeeds.", "正在校验并加载模型。大模型可能需要几分钟，切换成功前保留当前模型。"));
+    const bool chinese = (original_.language == "system" ? QLocale::system().name() : original_.language).startsWith("zh");
+    reloadStatus_->setText(pending ? QString::fromUtf8(chinese ? "正在重新读取配置文件…" : "Reloading configuration file…") : QString());
 }
-void SettingsDialog::setModelError(const QString &error) {
-    setModelOperationPending(false);
-    modelStatus_->setText(error);
-}
-void SettingsDialog::noteVerifiedModel(const QString &modelId) { verifiedModels_.insert(modelId); }
-void SettingsDialog::setModelStatusError(const QString &error) {
-    if (!modelOperationPending_) modelStatus_->setText(error);
+void SettingsDialog::setReloadError(const QString &error) {
+    setReloadPending(false);
+    reloadStatus_->setText(error);
 }
 }

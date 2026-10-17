@@ -55,7 +55,7 @@ Segment Segment::fromJson(const QJsonObject &value)
     segment.mediaPath = value.value(QStringLiteral("mediaPath")).toString();
     segment.imageBudget = value.value(QStringLiteral("imageBudget")).toInt(140);
     const auto values = value.value(QStringLiteral("embedding")).toArray();
-    if (values.size() <= maximumEmbeddingDimensions) {
+    if (values.size() <= embeddingDimensions) {
         segment.embedding.reserve(values.size());
         for (const auto &component : values) {
             const float converted = static_cast<float>(component.toDouble());

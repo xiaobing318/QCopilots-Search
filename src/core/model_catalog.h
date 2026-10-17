@@ -23,7 +23,7 @@ struct ModelDescriptor {
 QString defaultModelId();
 const QList<ModelDescriptor> &modelCatalog();
 const ModelDescriptor *findModel(const QString &id);
-// The default model keeps its original flat cache layout. Unknown IDs fail closed.
+// The sole supported model keeps its original flat cache layout. Unknown IDs fail closed.
 QString modelDirectory(const QString &root, const QString &id);
 QJsonObject modelPipelineContract(const QString &id);
 QString modelPipelineFingerprint(const QString &id);

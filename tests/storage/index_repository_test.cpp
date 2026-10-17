@@ -121,35 +121,23 @@ private slots:
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
     }
 
-    void independentModelIndexes_data()
+    void persistedGemmaVectorsKeepTheirIdentityAndDimensions()
     {
-        QTest::addColumn<QString>("modelId");
-        QTest::addColumn<int>("dimensions");
-        QTest::newRow("gemma") << QStringLiteral("embeddinggemma-2") << 768;
-        QTest::newRow("qwen-2b") << QStringLiteral("qwen3-vl-embedding-2b") << 2048;
-        QTest::newRow("qwen-8b") << QStringLiteral("qwen3-vl-embedding-8b") << 4096;
-    }
-
-    void independentModelIndexes()
-    {
-        QFETCH(QString, modelId);
-        QFETCH(int, dimensions);
-        TestEnvironment environment(QStringLiteral("storage-model-spaces"));
+        TestEnvironment environment(QStringLiteral("storage-vector-identity"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        const auto paths = environment.runtimePaths().forModelIndex(modelId);
+        const auto paths = environment.runtimePaths();
         const QString path = environment.path(QStringLiteral("document.txt"));
-        QVector<float> vector(dimensions, 0.0f);
-        vector[0] = 1.0f;
+        const auto vector = basis(0);
         QString error;
         QJsonArray original;
         {
             IndexRepository repository;
-            QVERIFY2(repository.open(paths, modelId, &error), qPrintable(error));
-            QCOMPARE(repository.status(&error).value("modelId").toString(), modelId);
-            QCOMPARE(repository.status(&error).value("embeddingDimensions").toInt(), dimensions);
-            QVERIFY2(repository.setPipelineFingerprint(modelId + "-pipeline", &error), qPrintable(error));
-            QVERIFY2(repository.replaceFile(path, "source|" + modelId + "-pipeline",
-                {segment("modelspaceword", "text", vector)}, false, &error, {}, 1, "text"), qPrintable(error));
+            QVERIFY2(repository.open(paths, &error), qPrintable(error));
+            QCOMPARE(repository.status(&error).value("modelId").toString(), defaultModelId());
+            QCOMPARE(repository.status(&error).value("embeddingDimensions").toInt(), embeddingDimensions);
+            QVERIFY2(repository.setPipelineFingerprint("retained-pipeline", &error), qPrintable(error));
+            QVERIFY2(repository.replaceFile(path, "source|retained-pipeline",
+                {segment("persistedvectorword", "text", vector)}, false, &error, {}, 1, "text"), qPrintable(error));
             QVERIFY2(repository.flush(&error), qPrintable(error));
             QVERIFY2(repository.fileHasEmbeddings(path, false, &error), qPrintable(error));
             QVERIFY(!repository.fileHasEmbeddings(path, true, &error));
@@ -167,28 +155,11 @@ private slots:
             QCOMPARE(segmentSnapshots(repository.fileSegments(path, false, &error)), original);
             QVERIFY2(error.isEmpty(), qPrintable(error));
         }
-        // Another model can index the same source path without changing the
-        // first model's content, vectors, pipeline or ANN files.
-        const QString otherId = modelId == defaultModelId()
-            ? QStringLiteral("qwen3-vl-embedding-2b") : defaultModelId();
-        {
-            IndexRepository other;
-            const auto otherPaths = environment.runtimePaths().forModelIndex(otherId);
-            QVERIFY(otherPaths.databaseFile() != paths.databaseFile());
-            QVERIFY2(other.open(otherPaths, otherId, &error), qPrintable(error));
-            QVERIFY2(other.setPipelineFingerprint("other-pipeline", &error), qPrintable(error));
-            QVERIFY2(other.replaceFile(path, "changed|other-pipeline",
-                {segment("othermodelword")}, false, &error, {}, 2, "text"), qPrintable(error));
-            QVERIFY(!other.fileHasEmbeddings(path, false, &error));
-            QVERIFY2(error.isEmpty(), qPrintable(error));
-            QVERIFY(other.search(query("modelspaceword"), &error).isEmpty());
-            QVERIFY2(error.isEmpty(), qPrintable(error));
-        }
         IndexRepository reopened;
-        QVERIFY2(reopened.open(paths, modelId, &error), qPrintable(error));
-        QCOMPARE(reopened.pipelineFingerprint(&error), modelId + "-pipeline");
+        QVERIFY2(reopened.open(paths, &error), qPrintable(error));
+        QCOMPARE(reopened.pipelineFingerprint(&error), QStringLiteral("retained-pipeline"));
         QCOMPARE(segmentSnapshots(reopened.fileSegments(path, false, &error)), original);
-        QVERIFY(reopened.search(query("othermodelword"), &error).isEmpty());
+        QCOMPARE(reopened.search(query("persistedvectorword"), &error).size(), qsizetype(1));
         SearchOptions semantic;
         semantic.queryEmbedding = vector;
         QCOMPARE(reopened.search(semantic, &error).size(), qsizetype(1));
@@ -203,21 +174,21 @@ private slots:
         const auto paths = environment.runtimePaths();
         QString error;
         {
-            IndexRepository unknown;
-            QVERIFY(!unknown.open(paths, QStringLiteral("unknown-model"), &error));
-            QVERIFY(!QFileInfo::exists(paths.databaseFile()));
             IndexRepository repository;
             QVERIFY2(repository.open(paths, &error), qPrintable(error));
             QVERIFY2(repository.replaceFile(environment.path("kept.txt"), "original",
                 {segment("identitysurvivor", "text", basis(0))}, false, &error), qPrintable(error));
         }
+        QVERIFY2(executeSql(paths.databaseFile(),
+            "UPDATE meta SET value='unsupported-model' WHERE key='model_id';", &error), qPrintable(error));
         {
             IndexRepository wrong;
-            QVERIFY(!wrong.open(paths, QStringLiteral("qwen3-vl-embedding-2b"), &error));
+            QVERIFY(!wrong.open(paths, &error));
             QVERIFY(error.contains("identity"));
         }
         QVERIFY2(executeSql(paths.databaseFile(),
-            "UPDATE meta SET value='4096' WHERE key='embedding_dimensions';", &error), qPrintable(error));
+            "UPDATE meta SET value='embeddinggemma-2' WHERE key='model_id';"
+            "UPDATE meta SET value='769' WHERE key='embedding_dimensions';", &error), qPrintable(error));
         {
             IndexRepository wrong;
             QVERIFY(!wrong.open(paths, &error));
@@ -229,6 +200,53 @@ private slots:
         QVERIFY2(recovered.open(paths, &error), qPrintable(error));
         QCOMPARE(recovered.search(query("identitysurvivor"), &error).size(), qsizetype(1));
         QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
+    void independentProfilesKeepSeparateContentAndVectors()
+    {
+        TestEnvironment environment(QStringLiteral("storage-profile-isolation"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const auto firstPaths = RuntimePaths::resolve(environment.path("first profile"), environment.path("first models"));
+        const auto secondPaths = RuntimePaths::resolve(environment.path("second profile"), environment.path("second models"));
+        QVERIFY(firstPaths.databaseFile() != secondPaths.databaseFile());
+        const QString path = environment.path("same-source.txt");
+        QString error;
+        QJsonArray original;
+        {
+            IndexRepository first;
+            IndexRepository second;
+            QVERIFY2(first.open(firstPaths, &error), qPrintable(error));
+            QVERIFY2(second.open(secondPaths, &error), qPrintable(error));
+            QVERIFY2(first.setPipelineFingerprint("first-pipeline", &error), qPrintable(error));
+            QVERIFY2(second.setPipelineFingerprint("second-pipeline", &error), qPrintable(error));
+            QVERIFY2(first.replaceFile(path, "first|first-pipeline",
+                {segment("firstprofileword", "text", basis(0))}, false, &error), qPrintable(error));
+            QVERIFY2(second.replaceFile(path, "second|second-pipeline",
+                {segment("secondprofileword", "text", basis(1))}, false, &error), qPrintable(error));
+            original = segmentSnapshots(first.fileSegments(path, false, &error));
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            for (IndexRepository *repository : {&first, &second}) {
+                QVERIFY2(repository->flush(&error), qPrintable(error));
+                SearchOptions semantic;
+                semantic.queryEmbedding = basis(repository == &first ? 0 : 1);
+                const auto hits = repository->search(semantic, &error);
+                QVERIFY2(error.isEmpty(), qPrintable(error));
+                QCOMPARE(hits.size(), qsizetype(1));
+                QCOMPARE(hits.first().sourceVersion,
+                    repository == &first ? QStringLiteral("first|first-pipeline")
+                                         : QStringLiteral("second|second-pipeline"));
+            }
+            QVERIFY(first.search(query("secondprofileword"), &error).isEmpty());
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY(second.search(query("firstprofileword"), &error).isEmpty());
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+        }
+        IndexRepository reopened;
+        QVERIFY2(reopened.open(firstPaths, &error), qPrintable(error));
+        QCOMPARE(reopened.pipelineFingerprint(&error), QStringLiteral("first-pipeline"));
+        QCOMPARE(segmentSnapshots(reopened.fileSegments(path, false, &error)), original);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY2(reopened.checkIntegrity(&error), qPrintable(error));
     }
 
     void schemaThreeAdoptsGemmaWithoutRebuilding()
@@ -253,11 +271,6 @@ private slots:
         QVERIFY2(executeSql(paths.databaseFile(),
             "DELETE FROM meta WHERE key IN ('model_id','embedding_dimensions');"
             "PRAGMA user_version=3;", &error), qPrintable(error));
-        {
-            IndexRepository wrong;
-            QVERIFY(!wrong.open(paths, QStringLiteral("qwen3-vl-embedding-2b"), &error));
-            QVERIFY(error.contains("legacy"));
-        }
         {
             StorageOptions options;
             options.faultHook = [](const QString &point) {
@@ -345,27 +358,26 @@ private slots:
         QVERIFY2(repository.checkIntegrity(&error), qPrintable(error));
     }
 
-    void interruptedNewModelInitializationCanRetry()
+    void interruptedIndexInitializationCanRetry()
     {
-        TestEnvironment environment(QStringLiteral("storage-new-model-retry"));
+        TestEnvironment environment(QStringLiteral("storage-new-index-retry"));
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
-        const QString modelId = QStringLiteral("qwen3-vl-embedding-2b");
-        const auto paths = environment.runtimePaths().forModelIndex(modelId);
+        const auto paths = environment.runtimePaths();
         QString error;
         {
             StorageOptions options;
             options.faultHook = [](const QString &point) {
                 if (point == "before-model-schema-commit")
-                    throw std::runtime_error("Interrupted new model index");
+                    throw std::runtime_error("Interrupted new index");
             };
             IndexRepository interrupted(options);
-            QVERIFY(!interrupted.open(paths, modelId, &error));
+            QVERIFY(!interrupted.open(paths, &error));
             QVERIFY(error.contains("Interrupted"));
         }
         IndexRepository retry;
-        QVERIFY2(retry.open(paths, modelId, &error), qPrintable(error));
-        QCOMPARE(retry.status(&error).value("modelId").toString(), modelId);
-        QCOMPARE(retry.status(&error).value("embeddingDimensions").toInt(), 2048);
+        QVERIFY2(retry.open(paths, &error), qPrintable(error));
+        QCOMPARE(retry.status(&error).value("modelId").toString(), defaultModelId());
+        QCOMPARE(retry.status(&error).value("embeddingDimensions").toInt(), embeddingDimensions);
         QVERIFY2(retry.checkIntegrity(&error), qPrintable(error));
     }
 

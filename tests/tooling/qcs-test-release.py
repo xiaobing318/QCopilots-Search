@@ -297,12 +297,27 @@ class FreezeTests(ExternalTest):
             self.prepare()
         self.assertEqual(self.api.download_calls, [])
 
+    def test_source_archive_is_moved_and_disk_budget_precedes_packages(self):
+        with mock.patch.object(release, "require_free_space", wraps=release.require_free_space) as budget:
+            manifest = self.prepare()
+        self.assertFalse(self.source_bundle.exists())
+        expected = sum(row["size_in_bytes"] for row in self.api.artifacts)
+        self.assertEqual(budget.call_args.args[1], expected)
+        self.assertTrue((manifest.parent / "assets" / self.source_bundle.name).is_file())
+
+    def test_insufficient_disk_space_prevents_package_downloads(self):
+        with mock.patch.object(release.shutil, "disk_usage", return_value=types.SimpleNamespace(free=release.SPACE_RESERVE)):
+            with self.assertRaisesRegex(ValueError, "Insufficient release disk"):
+                self.prepare()
+        self.assertEqual(self.api.download_calls, [])
+        self.assertFalse(self.output.exists())
+
 
 class PackageContractTests(ExternalTest):
     def test_rocm_setup_zip_replaces_only_installer(self):
         options = release.package_name_options("windows-x64-rocm", "0.1.0")
-        self.assertEqual(options, [{"qcs-0.1.0-windows-x64-rocm.exe", "qcs-0.1.0-windows-x64-rocm.zip"},
-                                  {"qcs-0.1.0-windows-x64-rocm-setup.zip", "qcs-0.1.0-windows-x64-rocm.zip"}])
+        self.assertEqual(options, [{"qcs-0.1.0-windows-x64-rocm-10.0.0.exe", "qcs-0.1.0-windows-x64-rocm-10.0.0.zip"},
+                                  {"qcs-0.1.0-windows-x64-rocm-10.0.0-setup.zip", "qcs-0.1.0-windows-x64-rocm-10.0.0.zip"}])
 
     def test_single_release_asset_limit_is_strictly_below_two_gib(self):
         release.require_asset_size(2 * 1024**3 - 1, "fixture.zip")
@@ -326,6 +341,7 @@ class FakeGitHub(FakeCI):
         self.fail_next = None
         self.lose_publish_response = False
         self.tag_create_error = None
+        self.asset_contents = {}
 
     def request(self, method, endpoint, data=None):
         prefix = "/repos/" + release.REPOSITORY
@@ -351,9 +367,10 @@ class FakeGitHub(FakeCI):
             if method == "PATCH":
                 self.calls.append((method, endpoint, data))
                 self.release.update(data)
-                self.release["published_at"] = "2026-01-01T04:00:00Z"
-                self.tag_sha = CANDIDATE
-                if self.lose_publish_response:
+                if data.get("draft") is False:
+                    self.release["published_at"] = "2026-01-01T04:00:00Z"
+                    self.tag_sha = CANDIDATE
+                if self.lose_publish_response and data.get("draft") is False:
                     self.lose_publish_response = False
                     raise OSError("SYNTHETIC response lost after server publish")
             return deepcopy(self.release)
@@ -364,6 +381,12 @@ class FakeGitHub(FakeCI):
     def asset_digest(self, asset):
         return asset["digest"].removeprefix("sha256:")
 
+    def asset_bytes(self, asset, *, max_bytes=32 * 1024 * 1024):
+        value = self.asset_contents[asset["id"]]
+        if len(value) > max_bytes or len(value) != asset["size"] or "sha256:" + hashlib.sha256(value).hexdigest() != asset["digest"]:
+            raise ValueError("Synthetic metadata bytes do not match")
+        return value
+
     def upload(self, release_id, path, name):
         if name == self.fail_next:
             self.fail_next = None
@@ -372,6 +395,7 @@ class FakeGitHub(FakeCI):
         result = {"id": len(self.assets) + 1, "name": name, "state": "uploaded", "size": path.stat().st_size,
                   "digest": "sha256:" + release.digest(path)}
         self.assets.append(result)
+        self.asset_contents[result["id"]] = path.read_bytes()
         return deepcopy(result)
 
 
@@ -620,8 +644,127 @@ class UploadTests(ExternalTest):
             if item["filename"].endswith(".exe"):
                 item["filename"] = item["filename"].removesuffix(".exe") + "-setup.zip"
         notes = release.release_notes(document, TAG)
-        self.assertIn(f"[ZIP 安装器](https://github.com/{release.REPOSITORY}/releases/download/{TAG}/qcs-{VERSION}-windows-x64-rocm-setup.zip)", notes)
-        self.assertNotIn(f"qcs-{VERSION}-windows-x64-rocm.exe)", notes)
+        self.assertIn(f"[ZIP 安装器](https://github.com/{release.REPOSITORY}/releases/download/{TAG}/qcs-{VERSION}-windows-x64-rocm-10.0.0-setup.zip)", notes)
+        self.assertNotIn(f"qcs-{VERSION}-windows-x64-rocm-10.0.0.exe)", notes)
+
+    def test_backend_labels_bind_platform_specific_sdk_versions(self):
+        body = release.release_notes(self.document, TAG)
+        windows, linux = body.split("### Linux x64")
+        self.assertIn("| Vulkan SDK 1.4.357.0 |", windows)
+        self.assertIn("| Vulkan SDK 1.4.313.0 |", linux)
+        self.assertEqual(body.count("| ROCm SDK 10.0.0 |"), 2)
+        self.assertIn("| CUDA 12.4 |", windows)
+        self.assertIn("| CUDA 12.8 |", linux)
+        self.assertEqual(body, release.release_notes(self.document, TAG))
+        for field, value in (("backend", "unknown"), ("toolkitVersion", ""), ("toolkitVersion", "driver-latest")):
+            inventory = deepcopy(release.variants())
+            inventory["windows-x64-rocm"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                release.release_notes(self.document, TAG, inventory)
+
+    def test_draft_resume_synchronizes_template_without_changing_assets(self):
+        self.upload()
+        before = deepcopy(self.api.assets)
+        self.api.release["body"] = "Manually changed draft"
+        result = self.upload()
+        self.assertEqual(result["uploaded"], [])
+        self.assertEqual(self.api.assets, before)
+        self.assertEqual(self.api.release["body"], release.release_notes(self.document, TAG))
+        self.assertEqual([data for method, _, data in self.api.calls if method == "PATCH"],
+                         [{"body": release.release_notes(self.document, TAG)}])
+
+    def test_publish_rejects_drifted_body_before_publishing(self):
+        self.upload()
+        self.api.release["body"] = "Manually changed draft"
+        with self.assertRaisesRegex(ValueError, "body differs"):
+            self.publish()
+        self.assertTrue(self.api.release["draft"])
+        self.assertFalse(any(method == "PATCH" for method, _, _ in self.api.calls))
+
+    def legacy_release(self):
+        self.upload()
+        self.publish()
+        inventory = deepcopy(release.variants())
+        document = deepcopy(self.document)
+        document["version"] = "0.2.0"
+        mapping = {}
+        for identifier, row in inventory.items():
+            row.pop("packageVariant", None)
+            for package in document["configurations"][identifier]["packages"]:
+                old_name = package["filename"]
+                extension = ".tar.gz" if old_name.endswith(".tar.gz") else "." + old_name.rsplit(".", 1)[1]
+                name = f"qcs-0.2.0-{identifier}{extension}"
+                mapping[old_name] = name
+                package["filename"] = name
+        for row in document["assets"]:
+            if row["name"] in mapping:
+                row["name"] = mapping[row["name"]]
+                row["path"] = "assets/" + row["name"]
+        for row in self.api.assets:
+            row["name"] = mapping.get(row["name"], row["name"])
+            if row["name"] == release.MANIFEST:
+                content = (json.dumps(document) + "\n").encode()
+                self.api.asset_contents[row["id"]] = content
+                row.update(size=len(content), digest="sha256:" + hashlib.sha256(content).hexdigest())
+        self.api.release.update(tag_name="v0.2.0", body="Old download table")
+        self.api.main_sha = "9" * 40
+        self.api.calls.clear()
+        return inventory, document
+
+    def test_historical_body_update_preserves_original_assets_and_is_idempotent(self):
+        inventory, document = self.legacy_release()
+        assets = deepcopy(self.api.assets)
+        before = len(self.api.download_calls)
+        with mock.patch.object(release, "historical_variants", return_value=inventory), \
+                mock.patch.object(release, "verify_ci_packages", side_effect=AssertionError("Historical notes must not need retained CI artifacts")), \
+                mock.patch.object(release, "identity_for", side_effect=AssertionError("Historical notes must not require old main")):
+            result = release.update_notes(release.SOURCE, "v0.2.0", CANDIDATE, api=self.api)
+            second = release.update_notes(release.SOURCE, "v0.2.0", CANDIDATE, api=self.api)
+        body = self.api.release["body"]
+        self.assertTrue(result["bodyUpdated"])
+        self.assertFalse(second["bodyUpdated"])
+        self.assertEqual(self.api.assets, assets)
+        self.assertEqual(len(self.api.download_calls), before)
+        self.assertIn("| ROCm SDK 10.0.0 |", body)
+        self.assertIn("/qcs-0.2.0-windows-x64-rocm.exe)", body)
+        self.assertNotIn("/qcs-0.2.0-windows-x64-rocm-10.0.0.exe)", body)
+        self.assertEqual([data for method, _, data in self.api.calls if method == "PATCH"], [{"body": body}])
+        self.assertEqual(body, release.release_notes(document, "v0.2.0", inventory))
+
+    def test_historical_body_update_rejects_wrong_commit_or_asset_before_write(self):
+        inventory, _ = self.legacy_release()
+        with mock.patch.object(release, "historical_variants", return_value=inventory):
+            with self.assertRaisesRegex(ValueError, "expected commit"):
+                release.update_notes(release.SOURCE, "v0.2.0", "8" * 40, api=self.api)
+            self.api.assets[0]["digest"] = "sha256:" + "8" * 64
+            with self.assertRaisesRegex(ValueError, "Remote asset differs"):
+                release.update_notes(release.SOURCE, "v0.2.0", CANDIDATE, api=self.api)
+        self.assertFalse(any(method == "PATCH" for method, _, _ in self.api.calls))
+
+
+class NotesOutputTests(ExternalTest):
+    def test_notes_cannot_change_or_add_files_inside_freeze(self):
+        manifest = self.file("freeze/qcs-release-manifest.json", b"original manifest")
+        for relative in ("freeze/qcs-release-manifest.json", "freeze/notes.md", "freeze/assets/notes.md"):
+            with self.subTest(output=relative), mock.patch.object(release, "notes") as render, \
+                    mock.patch.object(sys, "stderr", io.StringIO()):
+                self.assertEqual(release.main(["notes", "--tag", TAG, "--manifest", str(manifest),
+                                               "--output", str(self.root / relative)]), 1)
+                render.assert_not_called()
+        self.assertEqual(manifest.read_bytes(), b"original manifest")
+        self.assertEqual(list(manifest.parent.iterdir()), [manifest])
+
+    def test_notes_write_sibling_with_lf_or_print_stdout(self):
+        manifest = self.file("freeze/qcs-release-manifest.json")
+        output = self.root / "freeze-notes.md"
+        body = "## Windows\n\nDownload\n"
+        with mock.patch.object(release, "notes", return_value=body), mock.patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(release.main(["notes", "--tag", TAG, "--manifest", str(manifest),
+                                           "--output", str(output)]), 0)
+        self.assertEqual(output.read_bytes(), body.encode())
+        with mock.patch.object(release, "notes", return_value=body), mock.patch.object(sys, "stdout", io.StringIO()) as stream:
+            self.assertEqual(release.main(["notes", "--tag", TAG]), 0)
+            self.assertEqual(stream.getvalue(), body)
 
 
 class GitNormalizationTests(ExternalTest):
@@ -678,7 +821,7 @@ class SourceMaterialTests(ExternalTest):
     def setUp(self):
         super().setUp()
         self.package = {"name": "fixture", "url": "https://example.invalid/source.zip", "sha256": "a" * 64}
-        self.manifest = {"commit": CANDIDATE, "workingTreeModified": False,
+        self.manifest = {"commit": CANDIDATE, "sourceTree": IDENTITY["sourceTree"], "workingTreeModified": False,
                          "packages": [self.package], "projectFiles": [{"path": "README"}]}
         self.bundle = self.root / "sources.zip"
         self.write_bundle()
@@ -700,7 +843,7 @@ class SourceMaterialTests(ExternalTest):
         self.sources.verify_bundle.assert_called_once_with(self.bundle, candidate_commit=CANDIDATE)
 
     def test_dirty_or_wrong_source_candidate_rejected(self):
-        for key, value in (("commit", "2" * 40), ("workingTreeModified", True)):
+        for key, value in (("commit", "2" * 40), ("sourceTree", "3" * 40), ("workingTreeModified", True)):
             with self.subTest(key=key):
                 original = self.manifest[key]
                 self.manifest[key] = value
@@ -811,6 +954,32 @@ class ArtifactTransportTests(ExternalTest):
 
 
 class TransportTests(unittest.TestCase):
+    def test_small_metadata_checks_size_digest_and_drops_redirect_credentials(self):
+        api = release.GitHub("synthetic-secret")
+        api._opener = mock.Mock()
+        redirect = urllib.error.HTTPError("https://api.github.com/x", 302, "Found",
+                                          {"Location": "https://release-assets.githubusercontent.com/test?signature=x"}, None)
+        api._opener.open.side_effect = [redirect, io.BytesIO(b"metadata")]
+        asset = {"id": 1, "size": 8, "digest": "sha256:" + hashlib.sha256(b"metadata").hexdigest()}
+        self.assertEqual(api.asset_bytes(asset), b"metadata")
+        request = api._opener.open.call_args_list[1].args[0]
+        self.assertIsNone(request.get_header("Authorization"))
+        for content, supplied in ((b"short", asset["digest"]), (b"excess bytes", asset["digest"]),
+                                  (b"metadata", "sha256:" + "1" * 64)):
+            with self.subTest(content=content, digest=supplied):
+                api._opener.open.side_effect = None
+                api._opener.open.return_value = io.BytesIO(content)
+                with self.assertRaises(ValueError):
+                    api.asset_bytes({**asset, "digest": supplied})
+
+    def test_small_metadata_rejects_oversize_before_network(self):
+        api = release.GitHub("synthetic-secret")
+        api._opener = mock.Mock()
+        for size in (0, -1, True, "8", 32 * 1024 * 1024 + 1):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                api.asset_bytes({"id": 1, "size": size})
+        api._opener.open.assert_not_called()
+
     def test_missing_remote_digest_streams_content(self):
         api = release.GitHub("synthetic-secret")
         api._opener = mock.Mock()

@@ -31,9 +31,10 @@ public:
     static bool openHit(const SearchHit &hit, const AppSettings &settings, QString *error = nullptr);
     static bool revealFile(const QString &path, QString *error = nullptr);
     static bool setStartAtLogin(bool enabled, QString *error = nullptr);
-    static bool setStartAtLogin(bool enabled, const QString &profileDirectory,
+    // The saved target receives the user-selected base, not its profiles/vN child.
+    static bool setStartAtLogin(bool enabled, const QString &profileBaseDirectory,
                                 const QString &modelsDirectory, QString *error = nullptr);
-    static bool canSetStartAtLogin(const QString &profileDirectory, const QString &modelsDirectory);
+    static bool canSetStartAtLogin(const QString &profileBaseDirectory, const QString &modelsDirectory);
     static LoginStartupState startAtLoginState();
     static bool supportsStartAtLogin();
 signals:

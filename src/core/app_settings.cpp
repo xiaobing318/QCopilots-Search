@@ -1,5 +1,5 @@
 #include "app_settings.h"
-#include "model_catalog.h"
+#include "settings_version.h"
 
 #include <QCryptographicHash>
 #include <QFile>
@@ -76,8 +76,7 @@ bool readOpener(const QJsonObject &object, const QString &key, const QStringList
 
 QJsonObject AppSettings::toJson() const
 {
-    return {{QStringLiteral("version"), 3},
-            {QStringLiteral("modelId"), modelId},
+    return {{QStringLiteral("version"), settingsVersion},
             {QStringLiteral("roots"), QJsonArray::fromStringList(roots)},
             {QStringLiteral("excludes"), QJsonArray::fromStringList(excludes)},
             {QStringLiteral("generalFileRules"), generalFileRules.toJson()},
@@ -101,15 +100,11 @@ bool AppSettings::fromJson(const QJsonObject &object, AppSettings *settings, QSt
     if (!settings)
         return fail(error, QStringLiteral("Settings output is null"));
     const auto version = object.value(QStringLiteral("version"));
-    if (!version.isDouble() || (version.toDouble() != 1.0 && version.toDouble() != 2.0 && version.toDouble() != 3.0))
-        return fail(error, QStringLiteral("Unsupported or missing settings version"));
+    if (!version.isDouble() || version.toDouble() != settingsVersion)
+        return fail(error, QStringLiteral("Unsupported or missing settings version. This profile requires version %1. Older profiles are not migrated.").arg(settingsVersion));
+    if (object.contains(QStringLiteral("modelId")))
+        return fail(error, QStringLiteral("Setting 'modelId' is no longer supported. Remove this obsolete setting from the version %1 configuration.").arg(settingsVersion));
     AppSettings parsed;
-    if (object.contains(QStringLiteral("modelId"))) {
-        const auto selected = object.value(QStringLiteral("modelId"));
-        if (!selected.isString() || !findModel(selected.toString()))
-            return fail(error, QStringLiteral("Unsupported modelId: %1").arg(selected.toString()));
-        parsed.modelId = selected.toString();
-    }
     if (!readStrings(object, QStringLiteral("roots"), parsed.roots, error)
         || !readStrings(object, QStringLiteral("excludes"), parsed.excludes, error))
         return false;
@@ -127,9 +122,7 @@ bool AppSettings::fromJson(const QJsonObject &object, AppSettings *settings, QSt
             *field.destination = object.value(key).toBool();
         }
     }
-    const bool versionOne = version.toDouble() == 1.0;
-    parsed.migrationPending_ = version.toDouble() < 3.0 || !object.contains(QStringLiteral("modelId"))
-        || !object.contains(QStringLiteral("generalFileRules"));
+    parsed.migrationPending_ = !object.contains(QStringLiteral("generalFileRules"));
     if (object.contains(QStringLiteral("generalFileRules"))) {
         const auto rules = object.value(QStringLiteral("generalFileRules"));
         if (!rules.isObject())
@@ -140,12 +133,7 @@ bool AppSettings::fromJson(const QJsonObject &object, AppSettings *settings, QSt
         parsed.migrationPending_ = parsed.migrationPending_
             || rules.toObject().size() != parsed.generalFileRules.toJson().size();
     }
-    if (versionOne) {
-        if (parsed.includeCode) {
-            parsed.codeRoots = parsed.roots;
-            parsed.codeExcludes = parsed.excludes;
-        }
-    } else if (!readStrings(object, QStringLiteral("codeRoots"), parsed.codeRoots, error)
+    if (!readStrings(object, QStringLiteral("codeRoots"), parsed.codeRoots, error)
                || !readStrings(object, QStringLiteral("codeExcludes"), parsed.codeExcludes, error)) {
         return false;
     }
@@ -209,8 +197,7 @@ bool AppSettings::save(const QString &path, QString *error) const
 QString AppSettings::fingerprint() const
 {
     // Only options which affect indexing invalidate in-flight extraction jobs.
-    QJsonObject object{{QStringLiteral("modelId"), modelId},
-                       {QStringLiteral("roots"), QJsonArray::fromStringList(roots)},
+    QJsonObject object{{QStringLiteral("roots"), QJsonArray::fromStringList(roots)},
                        {QStringLiteral("excludes"), QJsonArray::fromStringList(excludes)},
                        {QStringLiteral("generalFileRules"), generalFileRules.toJson()},
                        {QStringLiteral("codeRoots"), QJsonArray::fromStringList(codeRoots)},

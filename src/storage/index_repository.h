@@ -54,10 +54,6 @@ public:
   IndexRepository &operator=(const IndexRepository &) = delete;
 
   bool open(const RuntimePaths &paths, QString *error = nullptr);
-  // Paths already select the model's independent index directory. An opened
-  // instance keeps its model identity and dimensions for its entire lifetime.
-  bool open(const RuntimePaths &paths, const QString &modelId,
-            QString *error = nullptr);
   bool replaceFile(const QString &path, const QString &version,
                    const QVector<Segment> &segments, bool code = false,
                    QString *error = nullptr,
@@ -83,7 +79,7 @@ public:
   bool updateFileMetadata(const QVector<FileMetadata> &files,
                           QString *error = nullptr,
                           const PublicationGate &publicationGate = {});
-  // Remove stale content before a reactivated model index becomes searchable.
+  // Remove stale content before reconciled index data becomes searchable.
   // The scan's exact indexed version prevents deleting a newer publication.
   bool invalidateChangedFiles(const QVector<FileMetadata> &files,
                               QString *error = nullptr,

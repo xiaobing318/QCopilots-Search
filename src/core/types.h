@@ -117,7 +117,6 @@ struct IndexProgress {
 inline constexpr int protocolVersion = 1;
 inline constexpr int maximumSearchResults = 500;
 inline constexpr int embeddingDimensions = 768;
-inline constexpr int maximumEmbeddingDimensions = 4096;
 inline constexpr qsizetype maxMessageBytes = 16 * 1024 * 1024;
 
 } // namespace qcopilots_search

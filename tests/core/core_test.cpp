@@ -1,4 +1,5 @@
 #include "core/app_settings.h"
+#include "core/settings_version.h"
 #include "core/runtime_paths.h"
 #include "core/ipc_directory.h"
 #include "core/pipeline_manifest.h"
@@ -38,10 +39,12 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
     }
     void explicitRuntimePaths();
+    void versionedProfileLeavesOlderDataUntouched();
     void nativeLockPaths();
     void runtimePathIdentity();
     void ipcIgnoresLongTemporaryDirectory();
 #ifdef Q_OS_UNIX
+    void versionedProfileRejectsRedirectToOlderData();
     void privateIpcDirectoryRejectsUnsafeEntries();
     void retainedSymbolicLinksAreExplicitlyRemoved_data();
     void retainedSymbolicLinksAreExplicitlyRemoved();
@@ -81,8 +84,9 @@ private slots:
     void generalFileRulesRejectInvalid_data();
     void generalFileRulesRejectInvalid();
     void generalFileRulesFingerprint();
-    void settingsV1Migration_data();
-    void settingsV1Migration();
+    void settingsRejectOtherVersions_data();
+    void settingsRejectOtherVersions();
+    void settingsRejectObsoleteModelSelection();
     void settingsRejectCorruption();
     void settingsRejectUnsupportedTypes();
     void settingsRejectInvalidOpeners_data();
@@ -127,6 +131,8 @@ void CoreTest::explicitRuntimePaths()
     const auto paths = RuntimePaths::resolve(env.path(QStringLiteral("中文 profile")),
                                             env.path(QStringLiteral("独立 模型")));
     QVERIFY(!QFileInfo::exists(paths.profileDir)); // Resolution is read-only.
+    QCOMPARE(paths.profileBaseDir, env.path(QStringLiteral("中文 profile")));
+    QCOMPARE(paths.profileDir, versionedProfileDirectory(paths.profileBaseDir));
     QString error;
     QVERIFY2(paths.ensure(&error), qPrintable(error));
     QVERIFY(paths.profileDir.contains(QStringLiteral("中文 profile")));
@@ -144,6 +150,34 @@ void CoreTest::explicitRuntimePaths()
     const sockaddr_un address{};
     QVERIFY(QFile::encodeName(paths.ipcName).size() + 2 <= qsizetype(sizeof(address.sun_path)));
 #endif
+}
+
+void CoreTest::versionedProfileLeavesOlderDataUntouched()
+{
+    TestEnvironment env(QStringLiteral("versioned-profile"));
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    ScopedEnvironment modelOverride("QCOPILOTS_SEARCH_MODEL_DIR", {});
+    const QStringList retained{QStringLiteral("qcs-settings.json"), QStringLiteral("qcs-service.lock"),
+        QStringLiteral("qcs-ipc-token"), QStringLiteral("qcs-gui.lock"), QStringLiteral("qcs-gui-token"),
+        QStringLiteral("index/qcs.sqlite3"), QStringLiteral("index/qcs-progress.json"),
+        QStringLiteral("models/retained.gguf"), QStringLiteral("logs/qcs-service.log"), QStringLiteral("tmp/owner.json")};
+    for (const auto &name : retained) QVERIFY(env.writeFile("data/" + name, "older-version-owned-data"));
+    const auto paths = RuntimePaths::resolve(env.path("data"));
+    QCOMPARE(paths.profileDir, env.path("data/profiles/v4"));
+    QCOMPARE(paths.modelDir, env.path("data/profiles/v4/models"));
+    QString error;
+    QVERIFY2(paths.ensure(&error), qPrintable(error));
+    QCOMPARE(RuntimePaths::resolve(paths.profileBaseDir, paths.modelDir).ipcName, paths.ipcName);
+    AppSettings settings;
+    QVERIFY(settings.roots.isEmpty());
+    QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
+    for (const auto &name : retained) {
+        QFile file(env.path("data/" + name));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(file.readAll(), QByteArray("older-version-owned-data"));
+    }
+    QVERIFY(!QFileInfo::exists(paths.databaseFile()));
+    QVERIFY(!QFileInfo::exists(QDir(paths.modelDir).filePath("retained.gguf")));
 }
 
 void CoreTest::ipcIgnoresLongTemporaryDirectory()
@@ -185,6 +219,26 @@ void CoreTest::ipcIgnoresLongTemporaryDirectory()
 }
 
 #ifdef Q_OS_UNIX
+void CoreTest::versionedProfileRejectsRedirectToOlderData()
+{
+    TestEnvironment env(QStringLiteral("profile-generation-link"));
+    QVERIFY2(env.isValid(), qPrintable(env.error()));
+    QVERIFY(env.writeFile("data/qcs-settings.json", "retained older configuration"));
+    QVERIFY(QDir().mkpath(env.path("data/profiles")));
+    TestSymbolicLink link;
+    QString error;
+    QVERIFY2(link.create(env.path("data/profiles/v4"), env.path("data"), &error), qPrintable(error));
+    const auto paths = RuntimePaths::resolve(env.path("data"));
+    QVERIFY(!paths.ensure(&error));
+    QVERIFY(error.contains("symbolic link"));
+    QVERIFY(!QFileInfo::exists(env.path("data/index")));
+    QFile old(env.path("data/qcs-settings.json"));
+    QVERIFY(old.open(QIODevice::ReadOnly));
+    QCOMPARE(old.readAll(), QByteArray("retained older configuration"));
+    old.close();
+    QVERIFY2(link.remove(&error), qPrintable(error));
+}
+
 void CoreTest::privateIpcDirectoryRejectsUnsafeEntries()
 {
     TestEnvironment env(QStringLiteral("ipc-permissions"));
@@ -333,9 +387,9 @@ void CoreTest::runtimePathIdentity()
     QVERIFY(one.ipcName != two.ipcName);
     QString error;
     QVERIFY2(one.ensure(&error), qPrintable(error));
-    QCOMPARE(RuntimePaths::resolve(one.profileDir, one.modelDir).ipcName, one.ipcName);
+    QCOMPARE(RuntimePaths::resolve(one.profileBaseDir, one.modelDir).ipcName, one.ipcName);
 #ifdef Q_OS_WIN
-    QCOMPARE(RuntimePaths::resolve(one.profileDir.toUpper(), one.modelDir).ipcName, one.ipcName);
+    QCOMPARE(RuntimePaths::resolve(one.profileBaseDir.toUpper(), one.modelDir).ipcName, one.ipcName);
 #endif
 }
 
@@ -348,10 +402,12 @@ void CoreTest::environmentOverrides()
     ScopedEnvironment model("QCOPILOTS_SEARCH_MODEL_DIR", env.path("env model").toUtf8());
     const auto fromEnvironment = RuntimePaths::resolve();
     QVERIFY(fromEnvironment.resolutionError.isEmpty());
-    QCOMPARE(fromEnvironment.profileDir, env.path("环境 profile"));
+    QCOMPARE(fromEnvironment.profileBaseDir, env.path("环境 profile"));
+    QCOMPARE(fromEnvironment.profileDir, versionedProfileDirectory(fromEnvironment.profileBaseDir));
     QCOMPARE(fromEnvironment.modelDir, env.path("env model"));
     const auto fromArguments = RuntimePaths::resolve(env.path("explicit profile"), env.path("explicit model"));
-    QCOMPARE(fromArguments.profileDir, env.path("explicit profile"));
+    QCOMPARE(fromArguments.profileBaseDir, env.path("explicit profile"));
+    QCOMPARE(fromArguments.profileDir, versionedProfileDirectory(fromArguments.profileBaseDir));
     QCOMPARE(fromArguments.modelDir, env.path("explicit model"));
     {
         ScopedEnvironment noModel("QCOPILOTS_SEARCH_MODEL_DIR", {});
@@ -435,7 +491,7 @@ void CoreTest::legacyProfileEnvironmentRejected()
     QVERIFY(!QFileInfo::exists(env.path("legacy-profile")));
     const auto explicitProfile = RuntimePaths::resolve(env.path("explicit-profile"));
     QVERIFY(explicitProfile.resolutionError.isEmpty());
-    QCOMPARE(explicitProfile.profileDir, env.path("explicit-profile"));
+    QCOMPARE(explicitProfile.profileBaseDir, env.path("explicit-profile"));
 }
 
 void CoreTest::invalidProfileSelection_data()
@@ -497,7 +553,7 @@ void CoreTest::invalidProfileSelection()
         QVERIFY(paths.ipcName.isEmpty());
     } else {
         QVERIFY(error.contains("not a directory"));
-        QCOMPARE(paths.profileDir, selected);
+        QCOMPARE(paths.profileBaseDir, selected);
     }
     QCOMPARE(QDir(env.root()).entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot),
              QStringList{QStringLiteral("occupied")});
@@ -776,7 +832,7 @@ void CoreTest::legacyProfileRejected()
     TestEnvironment env("legacy-profile");
     QVERIFY2(env.isValid(), qPrintable(env.error()));
     const auto paths = env.runtimePaths();
-    QVERIFY(env.writeFile("profile/" + relative, "old-owned-data"));
+    QVERIFY(env.writeFile("profile/profiles/v4/" + relative, "old-owned-data"));
     QString error;
     QVERIFY(!paths.validateProfileLayout(&error));
     QVERIFY(error.startsWith("legacy_profile_layout:"));
@@ -788,7 +844,7 @@ void CoreTest::legacyProfileRejected()
     QVERIFY(!QFileInfo::exists(paths.tempDir));
     QVERIFY(!QFileInfo::exists(paths.logDir));
     QVERIFY(!QFileInfo::exists(paths.modelDir));
-    QFile old(env.path("profile/" + relative));
+    QFile old(env.path("profile/profiles/v4/" + relative));
     QVERIFY(old.open(QIODevice::ReadOnly));
     QCOMPARE(old.readAll(), QByteArray("old-owned-data"));
 }
@@ -818,7 +874,7 @@ void CoreTest::settingsRoundTrip()
     first.mediaOpener.preset = QStringLiteral("mpv");
     first.mediaOpener.program = env.path(QStringLiteral("播放器/mpv"));
     first.mediaOpener.arguments = {QStringLiteral("--start={seconds}"), QStringLiteral("{path}")};
-    QCOMPARE(first.toJson().value(QStringLiteral("version")).toInt(), 3);
+    QCOMPARE(first.toJson().value(QStringLiteral("version")).toInt(), settingsVersion);
     QVERIFY2(first.save(paths.configFile, &error), qPrintable(error));
     AppSettings second;
     QVERIFY2(second.load(paths.configFile, &error), qPrintable(error));
@@ -885,7 +941,7 @@ void CoreTest::generalFileRulesUpgrade()
         QVERIFY2(reloaded.load(settingsPath, &error), qPrintable(error));
         QVERIFY(!reloaded.needsMigration());
         QCOMPARE(reloaded.toJson(), loaded.toJson());
-        QCOMPARE(reloaded.toJson().value("version").toInt(), 3);
+        QCOMPARE(reloaded.toJson().value("version").toInt(), settingsVersion);
         QCOMPARE(reloaded.toJson().value("generalFileRules").toObject().size(), 10);
     }
 }
@@ -1004,57 +1060,33 @@ void CoreTest::generalFileRulesFingerprint()
     QVERIFY(!error.isEmpty());
 }
 
-void CoreTest::settingsV1Migration_data()
+void CoreTest::settingsRejectOtherVersions_data()
 {
-    QTest::addColumn<bool>("includeCode");
-    QTest::newRow("code-enabled") << true;
-    QTest::newRow("code-disabled") << false;
+    QTest::addColumn<int>("version");
+    for (const int version : {0, 1, 2, 3, 5})
+        QTest::newRow(qPrintable(QString::number(version))) << version;
 }
 
-void CoreTest::settingsV1Migration()
+void CoreTest::settingsRejectOtherVersions()
 {
-    QFETCH(bool, includeCode);
-    TestEnvironment env(QStringLiteral("settings-v1"));
+    QFETCH(int, version);
+    TestEnvironment env(QStringLiteral("settings-unsupported-version"));
     QVERIFY2(env.isValid(), qPrintable(env.error()));
-    AppSettings original;
-    original.roots = {env.path(QStringLiteral("原始 资料"))};
-    original.excludes = {env.path(QStringLiteral("原始 资料/排除"))};
-    original.includeCode = includeCode;
-    original.language = QStringLiteral("zh_CN");
-    auto legacy = original.toJson();
-    legacy[QStringLiteral("version")] = 1;
-    legacy.remove(QStringLiteral("codeRoots"));
-    legacy.remove(QStringLiteral("codeExcludes"));
-    legacy.remove(QStringLiteral("pdfOpener"));
-    legacy.remove(QStringLiteral("mediaOpener"));
-    const QByteArray legacyBytes = QJsonDocument(legacy).toJson(QJsonDocument::Indented);
-    QVERIFY(env.writeFile(QStringLiteral("settings.json"), legacyBytes));
-
-    AppSettings migrated;
+    AppSettings retained;
+    retained.roots = {env.path(QStringLiteral("retained"))};
+    retained.language = QStringLiteral("zh_CN");
+    const auto before = retained.toJson();
+    auto legacy = AppSettings{}.toJson();
+    legacy[QStringLiteral("version")] = version;
+    const QByteArray bytes = QJsonDocument(legacy).toJson();
+    QVERIFY(env.writeFile(QStringLiteral("settings.json"), bytes));
     QString error;
-    QVERIFY2(migrated.load(env.path(QStringLiteral("settings.json")), &error), qPrintable(error));
-    QVERIFY(migrated.needsMigration());
-    QCOMPARE(migrated.roots, original.roots);
-    QCOMPARE(migrated.excludes, original.excludes);
-    QCOMPARE(migrated.language, original.language);
-    QCOMPARE(migrated.codeRoots, includeCode ? original.roots : QStringList{});
-    QCOMPARE(migrated.codeExcludes, includeCode ? original.excludes : QStringList{});
-    QCOMPARE(migrated.pdfOpener.preset, QStringLiteral("system"));
-    QCOMPARE(migrated.mediaOpener.preset, QStringLiteral("system"));
-
+    QVERIFY(!retained.load(env.path(QStringLiteral("settings.json")), &error));
+    QVERIFY(error.contains("version"));
+    QCOMPARE(retained.toJson(), before);
     QFile file(env.path(QStringLiteral("settings.json")));
     QVERIFY(file.open(QIODevice::ReadOnly));
-    QCOMPARE(file.readAll(), legacyBytes); // Loading must not write before the profile lock is held.
-    file.close();
-    QVERIFY2(migrated.save(file.fileName(), &error), qPrintable(error));
-    QVERIFY(file.open(QIODevice::ReadOnly));
-    const auto saved = QJsonDocument::fromJson(file.readAll()).object();
-    file.close();
-    QCOMPARE(saved.value(QStringLiteral("version")).toInt(), 3);
-    AppSettings reloaded;
-    QVERIFY2(reloaded.load(file.fileName(), &error), qPrintable(error));
-    QVERIFY(!reloaded.needsMigration());
-    QCOMPARE(reloaded.toJson(), migrated.toJson());
+    QCOMPARE(file.readAll(), bytes);
 }
 
 void CoreTest::settingsRejectCorruption()
@@ -1073,6 +1105,23 @@ void CoreTest::settingsRejectCorruption()
     QVERIFY(error.contains("1 MiB"));
 }
 
+void CoreTest::settingsRejectObsoleteModelSelection()
+{
+    AppSettings retained;
+    retained.language = QStringLiteral("zh_CN");
+    const auto before = retained.toJson();
+    QVERIFY(!before.contains(QStringLiteral("modelId")));
+    for (const auto &value : {QJsonValue("embeddinggemma-2"), QJsonValue("retired-model"),
+                              QJsonValue(QJsonValue::Null), QJsonValue(12)}) {
+        auto json = AppSettings{}.toJson();
+        json.insert(QStringLiteral("modelId"), value);
+        QString error;
+        QVERIFY(!AppSettings::fromJson(json, &retained, &error));
+        QVERIFY(error.contains(QStringLiteral("modelId")));
+        QCOMPARE(retained.toJson(), before);
+    }
+}
+
 void CoreTest::settingsRejectUnsupportedTypes()
 {
     AppSettings original;
@@ -1081,7 +1130,7 @@ void CoreTest::settingsRejectUnsupportedTypes()
     const auto before = parsed.toJson();
     QString error;
     auto json = original.toJson();
-    json["version"] = 4;
+    json["version"] = settingsVersion + 1;
     QVERIFY(!AppSettings::fromJson(json, &parsed, &error));
     QCOMPARE(parsed.toJson(), before);
     json = original.toJson();
@@ -1151,7 +1200,7 @@ void CoreTest::settingsRejectInvalidOpeners()
     parsed.pdfOpener.preset = QStringLiteral("sumatra");
     parsed.mediaOpener.preset = QStringLiteral("mpv");
     auto legacy = parsed.toJson();
-    legacy[QStringLiteral("version")] = 1;
+    legacy.remove(QStringLiteral("generalFileRules"));
     QString error;
     QVERIFY2(AppSettings::fromJson(legacy, &parsed, &error), qPrintable(error));
     QVERIFY(parsed.needsMigration());
@@ -1260,7 +1309,7 @@ void CoreTest::invalidVectors()
     object["embedding"] = QJsonArray{1.0, "bad", 2.0};
     QVERIFY(Segment::fromJson(object).embedding.isEmpty());
     QJsonArray tooMany;
-    for (int i = 0; i <= maximumEmbeddingDimensions; ++i)
+    for (int i = 0; i <= embeddingDimensions; ++i)
         tooMany.append(0.0);
     object["embedding"] = tooMany;
     QVERIFY(Segment::fromJson(object).embedding.isEmpty());

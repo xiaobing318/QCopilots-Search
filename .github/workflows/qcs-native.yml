@@ -142,7 +142,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.QCOPILOTS_SEARCH_MODEL_DIR }}
-          key: qcs-models-${{ hashFiles('qcs-src/config/qcs-models.lock.json') }}-${{ matrix.id == 'linux-x64-cpu' && 'gemma-qwen2b-qwen8b' || (matrix.id == 'windows-x64-cpu' || matrix.id == 'macos-arm64-metal') && 'gemma-qwen2b' || 'gemma' }}-v2
+          key: qcs-models-${{ hashFiles('qcs-src/config/qcs-models.lock.json') }}-gemma-v3
       - name: Bootstrap locked Qt and backend SDK
         timeout-minutes: 60
         run: python "qcs-src/.github/scripts/qcs-native-ci.py" bootstrap
@@ -167,10 +167,6 @@ jobs:
       - name: Package and verify portable deployment
         timeout-minutes: 45
         run: python "qcs-src/.github/scripts/qcs-native-ci.py" package
-      - name: Verify Qwen models in final native packages
-        if: matrix.id == 'windows-x64-cpu' || matrix.id == 'linux-x64-cpu' || matrix.id == 'macos-arm64-metal'
-        timeout-minutes: 120
-        run: python "qcs-src/.github/scripts/qcs-native-ci.py" multimodel
       - name: Install and remove the final installer
         if: runner.os == 'Windows' || runner.os == 'Linux'
         timeout-minutes: 45

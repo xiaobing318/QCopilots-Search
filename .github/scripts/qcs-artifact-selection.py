@@ -26,11 +26,16 @@ MAX_ASSET_BYTES = 2 * 1024**3 - 1
 SOURCE = Path(__file__).resolve().parents[2]
 
 
-def variants():
-    path = SOURCE / "config" / "build-variants.json"
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+def validate_variants(manifest: dict, sdk_lock: dict) -> dict:
+    """Validate current package naming against its candidate SDK lock."""
     if not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 1:
         raise ValueError("Unsupported build variant manifest")
+    if (not isinstance(sdk_lock, dict) or type(sdk_lock.get("schemaVersion")) is not int
+            or sdk_lock["schemaVersion"] != 1 or not isinstance(manifest.get("upstream"), dict)
+            or not isinstance(manifest["upstream"].get("commit"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", manifest["upstream"]["commit"])
+            or sdk_lock.get("upstreamCommit") != manifest["upstream"]["commit"]):
+        raise ValueError("Build variants and GPU SDK lock must identify the same upstream commit")
     rows = manifest.get("variants")
     if not isinstance(rows, list) or not rows:
         raise ValueError("Build variant manifest has no configurations")
@@ -41,6 +46,31 @@ def variants():
             raise ValueError("Build variant manifest contains an invalid configuration ID")
         if identifier in result:
             raise ValueError("Build variant manifest contains duplicate configuration IDs")
+        os_name, backend = variant.get("os"), variant.get("backend")
+        if os_name not in ("windows", "linux", "macos") or backend not in ("cpu", "cuda", "hip", "vulkan", "metal"):
+            raise ValueError("Build variant manifest contains an unsupported platform or backend")
+        toolkit = variant.get("toolkitVersion")
+        if backend in ("cuda", "hip", "vulkan"):
+            if not isinstance(toolkit, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", toolkit):
+                raise ValueError("GPU package requires a concrete toolkit version")
+            try:
+                if backend == "cuda":
+                    entry = sdk_lock["cuda"][os_name][toolkit]
+                    if not isinstance(entry, dict) or (os_name == "linux" and entry.get("container") != variant.get("container")):
+                        raise ValueError("CUDA package and SDK lock use different containers")
+                else:
+                    family = "rocm" if backend == "hip" else "vulkan"
+                    entry = sdk_lock[family][os_name]
+                    key = "sdkVersion" if backend == "vulkan" and os_name == "linux" else "version"
+                    if entry[key] != toolkit:
+                        raise ValueError("Package toolkit version does not match the GPU SDK lock")
+            except (KeyError, TypeError) as error:
+                raise ValueError("Package toolkit version is absent from the GPU SDK lock") from error
+        elif toolkit != ("system" if backend == "metal" else ""):
+            raise ValueError("CPU and Metal packages must use their declared toolkit convention")
+        expected_package = identifier + "-" + toolkit if backend in ("hip", "vulkan") else identifier
+        if variant.get("packageVariant") != expected_package:
+            raise ValueError("packageVariant does not match the configuration and locked toolkit version")
         generators = variant.get("generators")
         if (not isinstance(generators, list) or not generators
                 or not all(isinstance(value, str) and value in EXTENSIONS for value in generators)
@@ -48,6 +78,12 @@ def variants():
             raise ValueError("Unsupported or repeated configuration package generator")
         result[identifier] = variant
     return result
+
+
+def variants():
+    manifest = json.loads((SOURCE / "config/build-variants.json").read_text(encoding="utf-8"))
+    sdk_lock = json.loads((SOURCE / "config/gpu-sdk.lock.json").read_text(encoding="utf-8"))
+    return validate_variants(manifest, sdk_lock)
 
 
 def configurations():
@@ -62,13 +98,18 @@ def project_version(source: Path) -> str:
     return match.group(1)
 
 
-def package_names(configuration: str, version: str) -> set[str]:
+def package_stem(configuration: str, version: str) -> str:
     if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("Invalid package version")
     inventory = variants()
     if not isinstance(configuration, str) or configuration not in inventory:
         raise ValueError("Unknown package configuration")
-    prefix = f"qcs-{version}-{configuration}"
+    return f"qcs-{version}-{inventory[configuration]['packageVariant']}"
+
+
+def package_names(configuration: str, version: str) -> set[str]:
+    prefix = package_stem(configuration, version)
+    inventory = variants()
     return {prefix + EXTENSIONS[value] for value in inventory[configuration]["generators"]}
 
 

@@ -17,13 +17,11 @@ public:
     static constexpr int Dimension = 768;
     static constexpr int VectorVersion = 1;
     EmbeddingRuntime();
-    explicit EmbeddingRuntime(const QString& modelId);
     ~EmbeddingRuntime();
     EmbeddingRuntime(const EmbeddingRuntime&) = delete;
     EmbeddingRuntime& operator=(const EmbeddingRuntime&) = delete;
 
     bool load(const QString& modelDir, bool textOnly, QString* error = nullptr);
-    bool load(const QString& modelRoot, const QString& modelId, bool textOnly, QString* error = nullptr);
     void close();
     bool isLoaded() const;
     bool isTextOnly() const;
@@ -50,14 +48,10 @@ public:
     QVector<float> embedImage(const QString& path, int budget = 140, QString* error = nullptr);
     QVector<float> embedAudio(const QString& path, QString* error = nullptr);
     static QString prompt(const QString& text, PromptKind kind, const QString& title = {});
-    static QString promptForModel(const QString& modelId, const QString& text,
-                                 PromptKind kind, const QString& title = {});
     static QString fingerprint();
     static QString textModelName();
     static QString mediaModelName();
     static bool verifyModels(const QString& modelDir, bool textOnly, QString* error = nullptr);
-    static bool verifyModels(const QString& modelRoot, const QString& modelId,
-                             bool textOnly, QString* error = nullptr);
 
 private:
     class Private;

@@ -1,11 +1,13 @@
 #include "login_startup.h"
 #include "login_startup_target.h"
+#include "core/settings_version.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QLocale>
 #include <QSaveFile>
 #include <QSettings>
 #include <QStandardPaths>
@@ -231,7 +233,12 @@ static bool nativeLoginStartupSetEnabled(bool enabled, QString *error) {
 namespace {
 QString loginTargetFile() {
     const QString root = RuntimePaths::defaultProfileDirectory();
-    return root.isEmpty() ? QString{} : QDir(root).filePath(QStringLiteral("qcs-login-startup.json"));
+    return root.isEmpty() ? QString{} : QDir(versionedProfileDirectory(root)).filePath(QStringLiteral("qcs-login-startup.json"));
+}
+QString missingLoginTargetMessage() {
+    return QLocale::system().language() == QLocale::Chinese
+        ? QStringLiteral("本版本尚未设置登录启动。请手动打开 QCopilots Search，并在设置中重新启用登录启动。")
+        : QStringLiteral("Login startup has not been configured for this version. Open QCopilots Search manually and enable login startup again in Settings.");
 }
 }
 
@@ -247,9 +254,12 @@ LoginStartupState loginStartupState() {
         return state;
     LoginStartupTarget target;
     QString error;
+    if (!QFileInfo::exists(loginTargetFile()))
+        return {LoginStartupStatus::Error, missingLoginTargetMessage()};
     if (!readLoginStartupTarget(loginTargetFile(), &target, &error))
         return {LoginStartupStatus::Error, error};
-    state.profileDir = target.profileDir;
+    state.profileBaseDir = target.profileBaseDir;
+    state.profileDir = RuntimePaths::resolve(target.profileBaseDir, target.modelDir).profileDir;
     state.modelDir = target.modelDir;
     return state;
 }
@@ -278,7 +288,7 @@ bool loginStartupSetEnabled(bool enabled, QString *error) {
         return fail(error, QStringLiteral("Login startup cannot be changed from an isolated development or test session."));
     const auto paths = RuntimePaths::resolve();
     if (!paths.validateProfileLayout(error)) return false;
-    return loginStartupSetEnabled(enabled, paths.profileDir, paths.modelDir, error);
+    return loginStartupSetEnabled(enabled, paths.profileBaseDir, paths.modelDir, error);
 }
 
 RuntimePaths resolveLoginStartupPaths(const QString &profile, const QString &models, bool loginLaunch) {
@@ -286,12 +296,17 @@ RuntimePaths resolveLoginStartupPaths(const QString &profile, const QString &mod
         return RuntimePaths::resolve(profile, models);
     LoginStartupTarget target;
     QString error;
+    if (!QFileInfo::exists(loginTargetFile())) {
+        RuntimePaths paths;
+        paths.resolutionError = missingLoginTargetMessage();
+        return paths;
+    }
     if (!readLoginStartupTarget(loginTargetFile(), &target, &error)) {
         RuntimePaths paths;
         paths.resolutionError = error;
         return paths;
     }
-    return RuntimePaths::resolve(target.profileDir, target.modelDir);
+    return RuntimePaths::resolve(target.profileBaseDir, target.modelDir);
 }
 
 void prepareLoginStartupDetection() {

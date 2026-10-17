@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -36,7 +37,7 @@ def package_suffixes(platform):
 
 
 def package_name(platform, suffix):
-    return f"qcs-{selection.project_version(SCRIPT.parents[2])}-{platform}{suffix}"
+    return selection.package_stem(platform, selection.project_version(SCRIPT.parents[2])) + suffix
 
 
 def iso(value):
@@ -155,6 +156,140 @@ class ArtifactSelectionTests(unittest.TestCase):
         self.assertEqual(len(selection.CONFIGURATIONS), 11)
         self.assertEqual(selection.PLATFORMS, selection.CONFIGURATIONS)
         self.assertFalse(any(identifier.startswith("macos-x64") for identifier in selection.CONFIGURATIONS))
+
+    def test_rocm_and_vulkan_packages_include_the_exact_locked_sdk_version(self):
+        expected = {
+            "windows-x64-rocm": "windows-x64-rocm-10.0.0",
+            "linux-x64-rocm": "linux-x64-rocm-10.0.0",
+            "windows-x64-vulkan": "windows-x64-vulkan-1.4.357.0",
+            "linux-x64-vulkan": "linux-x64-vulkan-1.4.313.0",
+        }
+        for identifier, package_variant in expected.items():
+            with self.subTest(identifier=identifier):
+                self.assertEqual(selection.package_stem(identifier, "0.3.0"), "qcs-0.3.0-" + package_variant)
+        for identifier in selection.CONFIGURATIONS:
+            if identifier not in expected:
+                self.assertEqual(selection.package_stem(identifier, "0.3.0"), "qcs-0.3.0-" + identifier)
+        self.assertEqual(selection.package_name_options("windows-x64-rocm", "0.3.0"), [
+            {"qcs-0.3.0-windows-x64-rocm-10.0.0.exe", "qcs-0.3.0-windows-x64-rocm-10.0.0.zip"},
+            {"qcs-0.3.0-windows-x64-rocm-10.0.0-setup.zip", "qcs-0.3.0-windows-x64-rocm-10.0.0.zip"},
+        ])
+
+    def test_current_manifest_rejects_missing_unsafe_or_inconsistent_package_names(self):
+        manifest = json.loads((selection.SOURCE / "config/build-variants.json").read_text(encoding="utf-8"))
+        lock = json.loads((selection.SOURCE / "config/gpu-sdk.lock.json").read_text(encoding="utf-8"))
+        for identifier in selection.CONFIGURATIONS:
+            for incorrect in (None, "", identifier + "-wrong", "../package", "package/name", "package\n"):
+                with self.subTest(identifier=identifier, incorrect=incorrect):
+                    changed = deepcopy(manifest)
+                    row = next(row for row in changed["variants"] if row["id"] == identifier)
+                    if incorrect is None:
+                        del row["packageVariant"]
+                    else:
+                        row["packageVariant"] = incorrect
+                    with self.assertRaisesRegex(ValueError, "packageVariant"):
+                        selection.validate_variants(changed, lock)
+
+    def test_toolkit_version_must_match_sdk_lock_even_with_consistent_package_name(self):
+        manifest = json.loads((selection.SOURCE / "config/build-variants.json").read_text(encoding="utf-8"))
+        lock = json.loads((selection.SOURCE / "config/gpu-sdk.lock.json").read_text(encoding="utf-8"))
+        for row in manifest["variants"]:
+            if row["backend"] not in ("cuda", "hip", "vulkan"):
+                continue
+            with self.subTest(identifier=row["id"]):
+                changed = deepcopy(manifest)
+                variant = next(item for item in changed["variants"] if item["id"] == row["id"])
+                variant["toolkitVersion"] = "99.0.0"
+                if variant["backend"] in ("hip", "vulkan"):
+                    variant["packageVariant"] = variant["id"] + "-99.0.0"
+                with self.assertRaisesRegex(ValueError, "SDK lock"):
+                    selection.validate_variants(changed, lock)
+        changed_lock = deepcopy(lock)
+        changed_lock["upstreamCommit"] = "f" * 40
+        with self.assertRaisesRegex(ValueError, "upstream commit"):
+            selection.validate_variants(manifest, changed_lock)
+
+    def test_unversioned_or_wrong_sdk_artifacts_cannot_satisfy_current_gate(self):
+        original = deepcopy(self.artifacts)
+        for platform in ("windows-x64-rocm", "linux-x64-rocm", "windows-x64-vulkan", "linux-x64-vulkan"):
+            current = selection.package_stem(platform, selection.project_version(SCRIPT.parents[2]))
+            old = f"qcs-{selection.project_version(SCRIPT.parents[2])}-{platform}"
+            for replacement in (old, old + "-99.0.0"):
+                with self.subTest(platform=platform, replacement=replacement):
+                    self.artifacts = deepcopy(original)
+                    for artifact_row in self.artifacts:
+                        if artifact_row["name"].startswith(current):
+                            artifact_row["name"] = replacement + artifact_row["name"][len(current):]
+                    result = self.inspect()
+                    self.assertFalse(result["passed"])
+                    self.assertNotIn(platform, result["selected"])
+
+    def cmake_variant(self, variant, module=None):
+        cmake = shutil.which("cmake")
+        self.assertIsNotNone(cmake, "Package variant tests require the project CMake toolchain")
+        script = self.root / "select-package-variant.cmake"
+        script.write_text('set(WIN32 "${QCS_TEST_WIN32}")\nset(APPLE "${QCS_TEST_APPLE}")\n'
+                          'include("${QCS_VARIANTS_MODULE}")\n'
+                          'qcopilots_search_select_variant()\n'
+                          'if(NOT QCOPILOTS_SEARCH_PACKAGE_VARIANT STREQUAL QCS_EXPECTED_PACKAGE_VARIANT)\n'
+                          '  message(FATAL_ERROR "Unexpected package variant: ${QCOPILOTS_SEARCH_PACKAGE_VARIANT}")\n'
+                          'endif()\n', encoding="utf-8")
+        return subprocess.run([cmake,
+            "-DQCS_VARIANTS_MODULE=" + str(module or selection.SOURCE / "cmake/qcs-gpu-variants.cmake"),
+            "-DQCOPILOTS_SEARCH_VARIANT=" + variant["id"],
+            "-DQCS_EXPECTED_PACKAGE_VARIANT=" + variant["packageVariant"],
+            "-DQCS_TEST_WIN32=" + ("TRUE" if variant["os"] == "windows" else "FALSE"),
+            "-DQCS_TEST_APPLE=" + ("TRUE" if variant["os"] == "macos" else "FALSE"),
+            "-DCMAKE_SYSTEM_NAME=" + {"windows": "Windows", "linux": "Linux", "macos": "Darwin"}[variant["os"]],
+            "-DCMAKE_SYSTEM_PROCESSOR=" + {"x64": "AMD64", "arm64": "arm64"}[variant["arch"]],
+            "-P", str(script)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+
+    def test_cmake_exports_same_package_names_for_all_eleven_variants(self):
+        for variant in selection.variants().values():
+            with self.subTest(identifier=variant["id"]):
+                result = self.cmake_variant(variant)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cmake_package_variant_is_visible_outside_runtime_subdirectory(self):
+        source = self.root / "cmake-scope"
+        (source / "runtime").mkdir(parents=True)
+        (source / "CMakeLists.txt").write_text(
+            'cmake_minimum_required(VERSION 3.28)\nproject(package_contract NONE)\n'
+            'add_subdirectory(runtime)\n'
+            'if(NOT QCOPILOTS_SEARCH_PACKAGE_VARIANT STREQUAL "windows-x64-vulkan-1.4.357.0")\n'
+            '  message(FATAL_ERROR "Package identity was lost outside the runtime directory")\n'
+            'endif()\n', encoding="utf-8")
+        (source / "runtime/CMakeLists.txt").write_text(
+            'set(WIN32 TRUE)\nset(APPLE FALSE)\nset(CMAKE_SYSTEM_NAME Windows)\n'
+            'set(CMAKE_SYSTEM_PROCESSOR AMD64)\ninclude("${QCS_VARIANTS_MODULE}")\n'
+            'qcopilots_search_select_variant()\n', encoding="utf-8")
+        result = subprocess.run([shutil.which("cmake"), "-S", str(source), "-B", str(self.root / "scope-build"),
+            "-DQCS_VARIANTS_MODULE=" + str(selection.SOURCE / "cmake/qcs-gpu-variants.cmake"),
+            "-DQCOPILOTS_SEARCH_VARIANT=windows-x64-vulkan"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cmake_rejects_wrong_sdk_and_unversioned_package_name(self):
+        copied = self.root / "candidate"
+        (copied / "cmake").mkdir(parents=True)
+        (copied / "config").mkdir()
+        module = copied / "cmake/qcs-gpu-variants.cmake"
+        shutil.copy2(selection.SOURCE / "cmake/qcs-gpu-variants.cmake", module)
+        shutil.copy2(selection.SOURCE / "config/gpu-sdk.lock.json", copied / "config/gpu-sdk.lock.json")
+        manifest = json.loads((selection.SOURCE / "config/build-variants.json").read_text(encoding="utf-8"))
+        for platform in ("windows-x64-rocm", "linux-x64-rocm", "windows-x64-vulkan", "linux-x64-vulkan"):
+            for mode in ("wrong-sdk", "old-name"):
+                with self.subTest(platform=platform, mode=mode):
+                    changed = deepcopy(manifest)
+                    variant = next(row for row in changed["variants"] if row["id"] == platform)
+                    if mode == "wrong-sdk":
+                        variant.update(toolkitVersion="99.0.0", packageVariant=platform + "-99.0.0")
+                    else:
+                        variant["packageVariant"] = platform
+                    self.write_document(copied / "config/build-variants.json", changed)
+                    result = self.cmake_variant(variant, module)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("GPU SDK lock" if mode == "wrong-sdk" else "packageVariant", result.stderr)
 
     def test_only_packages_artifact_names_can_satisfy_gate(self):
         expected = package_name("windows-x64-cpu", ".exe")

@@ -1,5 +1,5 @@
 #include "runtime_paths.h"
-#include "model_catalog.h"
+#include "settings_version.h"
 #include "ipc_directory.h"
 
 #include <QCryptographicHash>
@@ -211,10 +211,27 @@ RuntimePaths RuntimePaths::resolve(const QString &profile, const QString &models
                                                "for --profile-dir or QCS_HOME: %1").arg(selectedProfile);
         return paths;
     }
-    paths.profileDir = canonicalWithMissingTail(selectedProfile);
+    paths.profileBaseDir = canonicalWithMissingTail(selectedProfile);
+    const QString generationDirectory = versionedProfileDirectory(paths.profileBaseDir);
+    paths.profileDir = canonicalWithMissingTail(generationDirectory);
+#ifdef Q_OS_WIN
+    constexpr auto pathSensitivity = Qt::CaseInsensitive;
+#else
+    constexpr auto pathSensitivity = Qt::CaseSensitive;
+#endif
+    // A user-selected base may be an alias. Once canonicalized, its generated
+    // subtree must not redirect writes into another (possibly older) profile.
+    if (paths.profileDir.compare(generationDirectory, pathSensitivity) != 0) {
+        paths.resolutionError = QStringLiteral("Versioned profile directory must not redirect through a symbolic link: %1").arg(generationDirectory);
+        return paths;
+    }
     QString selectedModels = models;
     if (selectedModels.isEmpty())
         selectedModels = qEnvironmentVariable("QCOPILOTS_SEARCH_MODEL_DIR");
+    if (!selectedModels.isEmpty() && !isAbsoluteFilesystemPath(selectedModels)) {
+        paths.resolutionError = QStringLiteral("An absolute model directory is required for --model-dir or QCOPILOTS_SEARCH_MODEL_DIR: %1").arg(selectedModels);
+        return paths;
+    }
     paths.modelDir = selectedModels.isEmpty()
         ? QDir(paths.profileDir).filePath(QStringLiteral("models"))
         : canonicalWithMissingTail(selectedModels);
@@ -392,24 +409,4 @@ QString RuntimePaths::databaseFile() const
     return QDir(indexDir).filePath(QStringLiteral("qcs.sqlite3"));
 }
 
-RuntimePaths RuntimePaths::forModelIndex(const QString &modelId) const
-{
-    RuntimePaths result = *this;
-    if (!findModel(modelId)) {
-        result.resolutionError = QStringLiteral("Unsupported modelId: %1").arg(modelId);
-        return result;
-    }
-    // Always derive from the profile, so repeated mapping never nests indexes.
-    const QString originalIndex = QDir(profileDir).filePath(QStringLiteral("index"));
-    RuntimePaths original = *this;
-    original.indexDir = originalIndex;
-    QString layoutError;
-    if (!original.validateProfileLayout(&layoutError)) {
-        result.resolutionError = layoutError;
-        return result;
-    }
-    result.indexDir = modelId == defaultModelId() ? originalIndex
-        : QDir(originalIndex).filePath(QStringLiteral("models/") + modelId);
-    return result;
-}
 } // namespace qcopilots_search

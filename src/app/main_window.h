@@ -52,7 +52,7 @@ protected:
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
 private:
-    enum class ErrorSource { Other, IndexProgress, SearchWarning };
+    enum class ErrorSource { Other, IndexProgress, SearchWarning, SettingsReload };
     QString label(const char *en, const char *zh) const;
     void buildUi();
     void applyLanguage();
@@ -71,7 +71,7 @@ private:
     void applySettings(const QJsonObject &json);
     void updateProgress(const QJsonObject &progress);
     void updateRuntimeStatus();
-    void showSettings(bool firstRun = false, bool modelsPage = false);
+    void showSettings(bool firstRun = false);
     void showModels();
     void openCurrent();
     void selectResult(int row);
@@ -125,7 +125,7 @@ private:
     int modelReloadAttempts_ = 0;
     QList<SearchHit> hits_, popupHits_;
     QHash<QString, QString> pending_;
-    QHash<QString, QPointer<SettingsDialog>> settingsOperations_, modelStatusRequests_;
+    QHash<QString, QPointer<SettingsDialog>> settingsOperations_;
     QNetworkAccessManager *network_;
 };
 }

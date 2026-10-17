@@ -13,13 +13,14 @@ struct LoginStartupState {
     QString message;
     QString profileDir;
     QString modelDir;
+    QString profileBaseDir;
 };
 
 // Explicit development paths and Qt test mode never access user login settings.
 bool loginStartupSessionAllowed();
 bool loginStartupSupported();
 bool loginStartupSetEnabled(bool enabled, QString *error = nullptr);
-bool loginStartupSetEnabled(bool enabled, const QString &profileDir,
+bool loginStartupSetEnabled(bool enabled, const QString &profileBaseDir,
                             const QString &modelDir, QString *error = nullptr);
 // Resolve only after native launch detection is complete. A sign-in launch
 // loads the persisted target, while manual and isolated launches use arguments

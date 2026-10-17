@@ -29,12 +29,10 @@ class ModelFiles final : public QObject {
     Q_OBJECT
 public:
     explicit ModelFiles(QString modelDir, QObject* parent = nullptr);
-    ModelFiles(QString modelRoot, const QString& modelId, QObject* parent = nullptr);
     ModelFiles(QString modelDir, QList<ModelArtifact> artifacts, QObject* parent = nullptr);
     ~ModelFiles() override;
 
     static QList<ModelArtifact> manifest();
-    static QList<ModelArtifact> manifest(const QString& modelId);
     bool verify(QString* error = nullptr) const;
     bool importFile(const QString& source, const QString& fileName, QString* error = nullptr);
     bool isBusy() const { return busy_; }

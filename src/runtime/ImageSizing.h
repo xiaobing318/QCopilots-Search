@@ -14,8 +14,6 @@ public:
     // Input order follows the reference. QSize stores the result as width, height.
     // Invalid dimensions, budgets or unrepresentable results return nullopt.
     static std::optional<QSize> targetSize(int height, int width, int budget);
-    static int qwenTokenBudget(int budget);
-    static std::optional<QSize> qwenTargetSize(int height, int width, int budget);
 
     // source must contain width * height * 3 bytes of packed RGB pixels.
     // Returns empty for null input or invalid/unrepresentable dimensions.

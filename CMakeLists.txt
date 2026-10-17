@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(qcs VERSION 0.2.0 LANGUAGES C CXX)
+project(qcs VERSION 0.3.0 LANGUAGES C CXX)
 
 file(REAL_PATH "${CMAKE_SOURCE_DIR}" _qcopilots_source)
 file(REAL_PATH "${CMAKE_BINARY_DIR}" _qcopilots_binary)

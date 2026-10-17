@@ -1329,14 +1329,14 @@ private slots:
         QVERIFY(std::abs(matches.first().distance) < 1.0e-5f);
     }
 
-    void multimodalDimensions_data()
+    void persistedDimensions_data()
     {
         QTest::addColumn<int>("dimensions");
-        QTest::newRow("qwen-2b") << 2048;
-        QTest::newRow("qwen-8b") << 4096;
+        QTest::newRow("short-vector") << 17;
+        QTest::newRow("wide-vector") << 127;
     }
 
-    void multimodalDimensions()
+    void persistedDimensions()
     {
         QFETCH(int, dimensions);
         test::TestTemporaryDir temporary(temporaryTemplate());
@@ -1360,7 +1360,7 @@ private slots:
         QCOMPARE(matches.size(), qsizetype(1));
         QCOMPARE(matches.first().id, qint64(32));
         QVERIFY(std::abs(matches.first().distance) < 1.0e-5f);
-        VectorIndex mismatched(temporary.path(), dimensions == 2048 ? 4096 : 2048);
+        VectorIndex mismatched(temporary.path(), dimensions + 1);
         QVERIFY(!mismatched.loadManifest(&error));
         QVERIFY(!error.isEmpty());
         QCOMPARE(mismatched.snapshot()->size(), qsizetype(0));

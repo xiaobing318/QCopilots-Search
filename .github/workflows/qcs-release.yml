@@ -1,0 +1,117 @@
+name: qcs release
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Create or resume a draft, or publish its original frozen materials
+        type: choice
+        options: [draft, publish]
+        default: draft
+        required: true
+      candidate_sha:
+        description: Full 40-character commit SHA of the current main branch
+        type: string
+        required: true
+      ci_run_id:
+        description: Successful qcs native builds run ID for this exact candidate
+        type: string
+        required: true
+      ci_attempt:
+        description: Successful latest native workflow attempt
+        type: string
+        default: '1'
+        required: true
+      tag:
+        description: Release tag matching the project version, for example v0.3.0
+        type: string
+        required: true
+      freeze_run_id:
+        description: Original qcs release run ID, required for publish or draft recovery
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: qcs-release
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONUTF8: '1'
+  QCS_RELEASE_ACTION: ${{ inputs.action }}
+  QCS_RELEASE_CANDIDATE: ${{ inputs.candidate_sha }}
+  QCS_RELEASE_CI_RUN: ${{ inputs.ci_run_id }}
+  QCS_RELEASE_CI_ATTEMPT: ${{ inputs.ci_attempt }}
+  QCS_RELEASE_TAG: ${{ inputs.tag }}
+  QCS_RELEASE_FREEZE_RUN: ${{ inputs.freeze_run_id }}
+
+jobs:
+  preflight:
+    name: Validate release candidate
+    if: github.repository == 'xiaobing318/QCopilots-Search' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout the workflow commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate main, native CI and requested frozen materials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/qcs-release-ci.py preflight
+
+  release:
+    name: Release
+    if: github.repository == 'xiaobing318/QCopilots-Search' && github.ref == 'refs/heads/main'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout the workflow commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare or restore the original release freeze
+        id: stage
+        timeout-minutes: 100
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/qcs-release-ci.py stage
+      - name: Upload immutable release freeze
+        id: upload_freeze
+        if: steps.stage.outputs.new_freeze == 'true'
+        timeout-minutes: 30
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.stage.outputs.freeze_name }}
+          path: |
+            ${{ steps.stage.outputs.freeze_dir }}/qcs-release-manifest.json
+            ${{ steps.stage.outputs.freeze_dir }}/assets/SHA256SUMS
+            ${{ steps.stage.outputs.freeze_dir }}/assets/qcs-source-materials-${{ steps.stage.outputs.candidate_short }}.zip
+          compression-level: 0
+          archive: true
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload draft or publish verified release
+        timeout-minutes: 60
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/qcs-release-ci.py finish
+      - name: Record release and recovery instructions
+        if: always()
+        env:
+          QCS_RELEASE_JOB_STATUS: ${{ job.status }}
+        run: python3 -B .github/scripts/qcs-release-ci.py summary

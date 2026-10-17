@@ -130,11 +130,11 @@ private slots:
         TestEnvironment env(QStringLiteral("gui-instance-中文"));
         QVERIFY2(env.isValid(), qPrintable(env.error()));
         const auto paths = env.runtimePaths();
-        Child first(env, paths.profileDir, QStringLiteral("first"));
+        Child first(env, paths.profileBaseDir, QStringLiteral("first"));
         QVERIFY(first.start());
         QVERIFY2(first.waitFor("ready\n"), qPrintable(first.diagnostics()));
         // Relative components and Windows case aliases address the same profile.
-        auto alias = QDir(paths.profileDir).filePath(QStringLiteral("../profile/./"));
+        auto alias = QDir(paths.profileBaseDir).filePath(QStringLiteral("../profile/./"));
         QCOMPARE(RuntimePaths::resolve(alias).ipcName, paths.ipcName);
 #ifdef Q_OS_WIN
         alias = alias.toUpper();
@@ -165,8 +165,8 @@ private slots:
         QVERIFY2(env.isValid(), qPrintable(env.error()));
         const auto a = RuntimePaths::resolve(env.path(QStringLiteral("one")));
         const auto b = RuntimePaths::resolve(env.path(QStringLiteral("two")));
-        Child first(env, a.profileDir, QStringLiteral("first"));
-        Child second(env, b.profileDir, QStringLiteral("second"));
+        Child first(env, a.profileBaseDir, QStringLiteral("first"));
+        Child second(env, b.profileBaseDir, QStringLiteral("second"));
         QVERIFY(first.start());
         QVERIFY(second.start());
         QVERIFY2(first.waitFor("ready\n"), qPrintable(first.diagnostics()));
@@ -180,13 +180,49 @@ private slots:
         QVERIFY(second.waitFor("shown\n"));
     }
 
+    void versionedInstancePreservesLegacyLockAndToken()
+    {
+        TestEnvironment env(QStringLiteral("gui-legacy-isolation"));
+        QVERIFY2(env.isValid(), qPrintable(env.error()));
+        const auto paths = env.runtimePaths();
+        QVERIFY(env.writeFile(QStringLiteral("profile/qcs-gui-token"), "legacy-token\n"));
+        QVERIFY(env.writeFile(QStringLiteral("profile/qcs-settings.json"), "{\"version\":3}\n"));
+        const QString legacyLockPath = QDir(paths.profileBaseDir).filePath(QStringLiteral("qcs-gui.lock"));
+        QLockFile legacyLock(nativeLockFilePath(legacyLockPath));
+        legacyLock.setStaleLockTime(0);
+        QVERIFY(legacyLock.tryLock());
+        QFile legacyLockContents(legacyLockPath);
+        QVERIFY(legacyLockContents.open(QIODevice::ReadOnly));
+        const QByteArray originalLock = legacyLockContents.readAll();
+        legacyLockContents.close();
+        QString error;
+        {
+            GuiInstance current(paths);
+            QCOMPARE(current.start(&error), GuiInstance::Result::Primary);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY(QFileInfo::exists(QDir(paths.profileDir).filePath(QStringLiteral("qcs-gui.lock"))));
+            QVERIFY(!QFileInfo::exists(QDir(paths.profileDir).filePath(QStringLiteral("profiles/v4"))));
+        }
+        QVERIFY(legacyLock.isLocked());
+        QVERIFY(legacyLockContents.open(QIODevice::ReadOnly));
+        QCOMPARE(legacyLockContents.readAll(), originalLock);
+        legacyLockContents.close();
+        QFile token(QDir(paths.profileBaseDir).filePath(QStringLiteral("qcs-gui-token")));
+        QVERIFY(token.open(QIODevice::ReadOnly));
+        QCOMPARE(token.readAll(), QByteArrayLiteral("legacy-token\n"));
+        token.close();
+        QFile settings(QDir(paths.profileBaseDir).filePath(QStringLiteral("qcs-settings.json")));
+        QVERIFY(settings.open(QIODevice::ReadOnly));
+        QCOMPARE(settings.readAll(), QByteArrayLiteral("{\"version\":3}\n"));
+    }
+
     void racingLaunchesElectOneOwner()
     {
         TestEnvironment env(QStringLiteral("gui-race"));
         QVERIFY2(env.isValid(), qPrintable(env.error()));
         const auto paths = env.runtimePaths();
-        Child first(env, paths.profileDir, QStringLiteral("first"));
-        Child second(env, paths.profileDir, QStringLiteral("second"));
+        Child first(env, paths.profileBaseDir, QStringLiteral("first"));
+        Child second(env, paths.profileBaseDir, QStringLiteral("second"));
         QVERIFY(first.start());
         QVERIFY(second.start());
         QTRY_VERIFY_WITH_TIMEOUT(first.process.state() == QProcess::NotRunning
@@ -262,7 +298,7 @@ private slots:
         TestEnvironment env(QStringLiteral("gui-crash"));
         QVERIFY2(env.isValid(), qPrintable(env.error()));
         const auto paths = env.runtimePaths();
-        Child first(env, paths.profileDir, QStringLiteral("first"));
+        Child first(env, paths.profileBaseDir, QStringLiteral("first"));
         QVERIFY(first.start());
         QVERIFY2(first.waitFor("ready\n"), qPrintable(first.diagnostics()));
         GuiInstance probe(paths);
@@ -310,7 +346,7 @@ private slots:
         TestEnvironment env(QStringLiteral("gui-token"));
         QVERIFY2(env.isValid(), qPrintable(env.error()));
         const auto paths = env.runtimePaths();
-        Child owner(env, paths.profileDir, QStringLiteral("owner"));
+        Child owner(env, paths.profileBaseDir, QStringLiteral("owner"));
         QVERIFY(owner.start());
         QVERIFY2(owner.waitFor("ready\n"), qPrintable(owner.diagnostics()));
         GuiInstance probe(paths);
@@ -339,7 +375,7 @@ private slots:
         TestEnvironment env(QStringLiteral("gui-invalid"));
         QVERIFY2(env.isValid(), qPrintable(env.error()));
         const auto paths = env.runtimePaths();
-        Child owner(env, paths.profileDir, QStringLiteral("owner"));
+        Child owner(env, paths.profileBaseDir, QStringLiteral("owner"));
         QVERIFY(owner.start());
         QVERIFY2(owner.waitFor("ready\n"), qPrintable(owner.diagnostics()));
         GuiInstance probe(paths);
@@ -406,8 +442,8 @@ private slots:
         QString error;
         QVERIFY2(paths.ensure(&error), qPrintable(error));
         qcopilots_search::test::TestSymbolicLink link;
-        QVERIFY2(link.create(env.path(QStringLiteral("alias")), paths.profileDir, &error), qPrintable(error));
-        Child first(env, paths.profileDir, QStringLiteral("first"));
+        QVERIFY2(link.create(env.path(QStringLiteral("alias")), paths.profileBaseDir, &error), qPrintable(error));
+        Child first(env, paths.profileBaseDir, QStringLiteral("first"));
         QVERIFY(first.start());
         QVERIFY2(first.waitFor("ready\n"), qPrintable(first.diagnostics()));
         GuiInstance second(RuntimePaths::resolve(env.path(QStringLiteral("alias"))));

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime, timezone
 import hashlib
 import http.client
@@ -16,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +31,7 @@ SCHEMA = 4
 USER_PACKAGE_COUNT = 21
 RELEASE_ASSET_COUNT = USER_PACKAGE_COUNT + 3
 WORKFLOW_PATH = ".github/workflows/qcs-native.yml"
+SPACE_RESERVE = 3 * 1024**3
 
 
 def module(name):
@@ -260,7 +263,8 @@ def validate_sources(bundle, identity, source):
     require_passed(result, "Corresponding source verification failed")
     with zipfile.ZipFile(bundle) as archive:
         manifest = json.loads(archive.read("source-manifest.json"))
-        if manifest.get("commit") != identity["checkoutCommit"] or manifest.get("workingTreeModified") is not False:
+        if (manifest.get("commit") != identity["checkoutCommit"] or manifest.get("sourceTree") != identity["sourceTree"]
+                or manifest.get("workingTreeModified") is not False):
             raise ValueError("Corresponding sources belong to another or modified candidate")
         locked = {item["name"]: item for item in sources.entries()}
         supplied = {item["name"]: item for item in manifest["packages"]}
@@ -296,6 +300,15 @@ def build_sources(source, candidate, work, cache):
     return safe_file(destination, f"qcs-source-materials-{candidate[:12]}.zip")
 
 
+def require_free_space(directory, additional, reserve=SPACE_RESERVE):
+    """Budget actual remaining bytes before starting large sequential downloads."""
+    if type(additional) is not int or additional < 0:
+        raise ValueError("Invalid release download size budget")
+    available = shutil.disk_usage(directory).free
+    if available < additional + reserve:
+        raise ValueError(f"Insufficient release disk space: available={available}, required={additional + reserve}")
+
+
 def prepare(source, candidate, run_id, attempt, output, source_cache=None, api=None):
     identity = identity_for(source, candidate)
     output = external(output, source)
@@ -312,6 +325,16 @@ def prepare(source, candidate, run_id, attempt, output, source_cache=None, api=N
         stage = work / "candidate"
         (stage / "assets").mkdir(parents=True)
         version, packages, artifact_ids = project_version(source), {}, set()
+        source_bundle = build_sources(source, candidate, work, cache)
+        validate_sources(source_bundle, identity, source)
+        require_asset_size(source_bundle.stat().st_size, source_bundle.name)
+        frozen_source = stage / "assets" / source_bundle.name
+        # Both paths are inside this same temporary filesystem. Moving retains
+        # the exact verified bytes without a second nearly 1 GB source archive.
+        source_bundle.rename(frozen_source)
+        required = sum(artifact["artifactSize"] for selected in selection["selected"].values()
+                       for artifact in selected["artifacts"])
+        require_free_space(stage, required)
         for configuration, selected in sorted(selection["selected"].items()):
             rows = selected_artifacts(configuration, selected, version, attempt, artifact_ids)
             packages[configuration] = {**selected, "packages": []}
@@ -328,11 +351,6 @@ def prepare(source, candidate, run_id, attempt, output, source_cache=None, api=N
                     "bytes": artifact["artifactSize"], "sha256": artifact["artifactDigest"].removeprefix("sha256:")})
         if len(assets) != USER_PACKAGE_COUNT:
             raise ValueError("Release requires exactly 21 user packages")
-        source_bundle = build_sources(source, candidate, work, cache)
-        validate_sources(source_bundle, identity, source)
-        require_asset_size(source_bundle.stat().st_size, source_bundle.name)
-        frozen_source = stage / "assets" / source_bundle.name
-        shutil.copyfile(source_bundle, frozen_source)
         assets.append(record(stage, frozen_source, name=frozen_source.name, role="sources", configuration="all"))
         checksum = stage / "assets/SHA256SUMS"
         checksum.write_text("".join(f"{item['sha256']}  {item['name']}\n" for item in sorted(assets, key=lambda item: item["name"])), encoding="utf-8")
@@ -539,6 +557,37 @@ class GitHub:
             raise ValueError("Remote release asset was truncated")
         return value.hexdigest()
 
+    def asset_bytes(self, asset, *, max_bytes=32 * 1024 * 1024):
+        """Read only small release metadata, never a user package or source ZIP."""
+        size = asset.get("size")
+        if type(size) is not int or not 0 < size <= max_bytes:
+            raise ValueError("Release metadata asset exceeds its size limit")
+        asset_id = positive_id(asset.get("id"))
+        headers = self.headers()
+        headers["Accept"] = "application/octet-stream"
+        request = urllib.request.Request(f"https://api.github.com/repos/{REPOSITORY}/releases/assets/{asset_id}", headers=headers)
+        try:
+            response = self._opener.open(request, timeout=120)
+        except urllib.error.HTTPError as error:
+            parsed = urllib.parse.urlsplit(error.headers.get("Location", ""))
+            if (error.code not in (301, 302, 303, 307, 308) or parsed.scheme != "https"
+                    or parsed.hostname not in ("release-assets.githubusercontent.com", "objects.githubusercontent.com")
+                    or parsed.port not in (None, 443) or parsed.username or parsed.password):
+                raise ApiError(error.code) from None
+            request = urllib.request.Request(parsed.geturl(), headers={"User-Agent": "QCopilots-Search-release"})
+            try:
+                response = self._opener.open(request, timeout=120)
+            except urllib.error.HTTPError as error:
+                raise ApiError(error.code) from None
+        with response:
+            content = response.read(size + 1)
+        if len(content) != size:
+            raise ValueError("Release metadata asset size differs from its remote record")
+        supplied = asset.get("digest")
+        if supplied is not None and supplied != "sha256:" + hashlib.sha256(content).hexdigest():
+            raise ValueError("Release metadata asset SHA-256 differs from its remote record")
+        return content
+
     def upload(self, release_id, path, name):
         endpoint = f"/repos/{REPOSITORY}/releases/{positive_id(release_id)}/assets?" + urllib.parse.urlencode({"name": name})
         connection = http.client.HTTPSConnection("uploads.github.com", timeout=300)
@@ -716,8 +765,28 @@ def remote_assets(api, release_id, expected, *, complete=False):
     return found
 
 
-def release_notes(document, tag):
+def backend_label(variant):
+    backend = variant.get("backend")
+    if backend in ("cpu", "metal"):
+        return {"cpu": "CPU", "metal": "Metal"}[backend]
+    if backend not in ("cuda", "hip", "vulkan"):
+        raise ValueError("Release variant has an unsupported backend")
+    toolkit = variant.get("toolkitVersion", "")
+    if not isinstance(toolkit, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", toolkit):
+        raise ValueError("Release GPU variant has no exact toolkit version")
+    if backend == "cuda":
+        label = variant.get("cudaLabel", toolkit)
+        if not isinstance(label, str) or not re.fullmatch(r"[0-9]+\.[0-9]+", label) or not (toolkit == label or toolkit.startswith(label + ".")):
+            raise ValueError("Release CUDA label differs from its toolkit version")
+        return "CUDA " + label
+    return ("ROCm SDK " if backend == "hip" else "Vulkan SDK ") + toolkit
+
+
+def release_notes(document, tag, inventory=None):
     """List platform downloads and supporting assets with exact frozen filenames."""
+    inventory = variants() if inventory is None else inventory
+    if tag != "v" + document["version"] or set(document["configurations"]) != set(inventory):
+        raise ValueError("Release notes tag or variant inventory differs from the frozen release")
     prefix = f"https://github.com/{REPOSITORY}/releases/download/{urllib.parse.quote(tag, safe='')}"
     def link(name, label):
         return f"[{label}]({prefix}/{urllib.parse.quote(name, safe='')})"
@@ -727,7 +796,7 @@ def release_notes(document, tag):
         for configuration, selected in sorted(document["configurations"].items()):
             if not configuration.startswith(platform + "-"):
                 continue
-            backend = configuration.split("-", 2)[2]
+            backend = backend_label(inventory[configuration])
             installer, portable = [], []
             for item in selected["packages"]:
                 name = item["filename"]
@@ -747,6 +816,171 @@ def release_notes(document, tag):
     return "\n".join(rows)
 
 
+def historical_variants(source, candidate, api):
+    """Read the tagged commit as data, without checking out or running old code."""
+    if not isinstance(candidate, str) or not re.fullmatch(r"[0-9a-f]{40}", candidate):
+        raise ValueError("Historical release candidate is not an immutable commit")
+    result = subprocess.run(["git", "-C", str(source), "show", candidate + ":config/build-variants.json"],
+                            capture_output=True, check=False)
+    if result.returncode == 0:
+        content = result.stdout
+    else:
+        blob = api.request("GET", f"/repos/{REPOSITORY}/contents/config/build-variants.json?ref={candidate}")
+        if blob.get("encoding") != "base64" or type(blob.get("size")) is not int or not 0 < blob["size"] <= 1024 * 1024:
+            raise ValueError("Historical build variant configuration is unavailable or oversized")
+        content = base64.b64decode("".join(blob.get("content", "").split()), validate=True)
+        if (len(content) != blob["size"] or hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() != blob.get("sha")):
+            raise ValueError("Historical build variant blob identity differs")
+    if len(content) > 1024 * 1024:
+        raise ValueError("Historical build variant configuration is oversized")
+    document = json.loads(content.decode("utf-8-sig"))
+    if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 1:
+        raise ValueError("Unsupported historical build variant schema")
+    inventory = {}
+    for row in document.get("variants", []):
+        identifier = row.get("id", "")
+        if (not re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", identifier) or identifier in inventory
+                or row.get("os") not in ("windows", "linux", "macos")
+                or not identifier.startswith(row["os"] + "-")):
+            raise ValueError("Historical build variant identity is invalid or duplicated")
+        package_variant = row.get("packageVariant", identifier)
+        if not isinstance(package_variant, str) or not re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", package_variant):
+            raise ValueError("Historical package variant is invalid")
+        generators = row.get("generators")
+        if (not isinstance(generators, list) or not generators or len(generators) != len(set(generators))
+                or any(generator not in _SELECTOR.EXTENSIONS for generator in generators)):
+            raise ValueError("Historical package generators are invalid")
+        backend_label(row)
+        inventory[identifier] = row
+    if not inventory:
+        raise ValueError("Historical build variant inventory is empty")
+    return inventory
+
+
+def historical_asset_inventory(document, inventory):
+    """Validate old filenames with their own catalog, never today's package rules."""
+    if (type(document.get("schemaVersion")) is not int or document["schemaVersion"] != SCHEMA
+            or document.get("kind") != "release" or document.get("repository") != REPOSITORY
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", document.get("version", ""))
+            or set(document.get("configurations", {})) != set(inventory)):
+        raise ValueError("Historical release manifest schema or inventory is invalid")
+    candidate = document.get("identity", {}).get("candidateHead", "")
+    if (not re.fullmatch(r"[0-9a-f]{40}", candidate)
+            or document["identity"].get("checkoutCommit") != candidate
+            or document["identity"].get("workingTreeModified") is not False):
+        raise ValueError("Historical release manifest candidate is invalid")
+    expected = {}
+    for identifier, selected in document["configurations"].items():
+        row = inventory[identifier]
+        stem = f"qcs-{document['version']}-{row.get('packageVariant', identifier)}"
+        names = {stem + _SELECTOR.EXTENSIONS[generator] for generator in row["generators"]}
+        alternatives = [names]
+        if identifier == "windows-x64-rocm":
+            alternatives.append(names - {stem + ".exe"} | {stem + "-setup.zip"})
+        packages = selected.get("packages", [])
+        actual = [item.get("filename") for item in packages]
+        if len(actual) != len(set(actual)) or set(actual) not in alternatives:
+            raise ValueError("Historical release package names differ from its candidate configuration")
+        for item in packages:
+            name = item["filename"]
+            if name in expected:
+                raise ValueError("Historical release package names are duplicated")
+            require_asset_size(item.get("bytes"), name)
+            if not re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", "")):
+                raise ValueError("Historical release package digest is invalid")
+            expected[name] = {"path": "assets/" + name, "name": name, "bytes": item["bytes"],
+                              "sha256": item["sha256"], "role": "user-package", "configuration": identifier}
+    if len(expected) != USER_PACKAGE_COUNT:
+        raise ValueError("Historical release must contain exactly 21 user packages")
+    source_name = f"qcs-source-materials-{candidate[:12]}.zip"
+    rows = document.get("assets", [])
+    if len(rows) != USER_PACKAGE_COUNT + 2 or len({item.get("name") for item in rows}) != len(rows):
+        raise ValueError("Historical release asset inventory is incomplete or duplicated")
+    for item in rows:
+        name = item.get("name")
+        if name in (source_name, "SHA256SUMS"):
+            require_asset_size(item.get("bytes"), name)
+            if not re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", "")):
+                raise ValueError("Historical supporting asset digest is invalid")
+            expected[name] = {"path": "assets/" + name, "name": name, "bytes": item["bytes"],
+                              "sha256": item["sha256"], "role": "sources" if name == source_name else "checksums",
+                              "configuration": "all"}
+        if item != expected.get(name):
+            raise ValueError("Historical release asset metadata differs from its package inventory")
+    if set(expected) != {item["name"] for item in rows} or source_name not in expected or "SHA256SUMS" not in expected:
+        raise ValueError("Historical release supporting assets are missing")
+    return expected
+
+
+def published_notes_context(source, tag, api, expected_commit=None):
+    current = find_release(api, tag)
+    if current is None:
+        raise ValueError("No published release exists for the requested tag")
+    release_id = positive_id(current.get("id"))
+    rows = paginated(api, f"/repos/{REPOSITORY}/releases/{release_id}/assets")
+    named = {item.get("name"): item for item in rows}
+    if len(rows) != RELEASE_ASSET_COUNT or len(named) != len(rows) or MANIFEST not in named:
+        raise ValueError("Published release does not have the exact 24-asset inventory")
+    content = api.asset_bytes(named[MANIFEST])
+    document = json.loads(content.decode("utf-8-sig"),
+                          parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON number")))
+    candidate = document.get("identity", {}).get("candidateHead")
+    if expected_commit is not None and candidate != expected_commit:
+        raise ValueError("Published release differs from the explicitly expected commit")
+    validate_published(current, tag, candidate)
+    validate_tag(api, tag, candidate, required=True)
+    inventory = historical_variants(source, candidate, api)
+    expected = historical_asset_inventory(document, inventory)
+    expected[MANIFEST] = {"name": MANIFEST, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+    if set(named) != set(expected):
+        raise ValueError("Published release assets differ from its original manifest")
+    for name, item in named.items():
+        # Body-only maintenance never downloads multi-gigabyte user assets.
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", item.get("digest") or ""):
+            raise ValueError("Published asset has no remotely verifiable SHA-256: " + name)
+        check_remote_asset(api, item, expected[name])
+        positive_id(item.get("id"))
+    identity_fields = ("id", "tag_name", "target_commitish", "name", "draft", "prerelease", "created_at", "published_at", "immutable")
+    asset_fields = ("id", "name", "state", "size", "digest", "browser_download_url", "created_at", "updated_at")
+    return {"release": current, "document": document, "body": release_notes(document, tag, inventory),
+            "identity": {field: current.get(field) for field in identity_fields},
+            "assets": sorted(({field: item.get(field) for field in asset_fields} for item in rows), key=lambda item: item["name"]),
+            "manifestSha256": hashlib.sha256(content).hexdigest(),
+            "latestId": positive_id(api.request("GET", f"/repos/{REPOSITORY}/releases/latest").get("id"))}
+
+
+def notes(source, tag, manifest_path=None, api=None):
+    if manifest_path is not None:
+        return release_notes(verify_freeze(manifest_path, source), tag)
+    return published_notes_context(source, tag, api or GitHub(authentication()))["body"]
+
+
+def update_notes(source, tag, expected_commit, api=None):
+    if not isinstance(expected_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        raise ValueError("Body-only release maintenance requires an expected immutable commit")
+    api = api or GitHub(authentication())
+    before = published_notes_context(source, tag, api, expected_commit)
+    repeated = published_notes_context(source, tag, api, expected_commit)
+    fields = ("identity", "assets", "manifestSha256", "latestId", "body")
+    if any(before[field] != repeated[field] for field in fields) or before["release"].get("body") != repeated["release"].get("body"):
+        raise ValueError("Published release changed during body update preflight")
+    changed = before["release"].get("body") != before["body"]
+    if changed:
+        try:
+            api.request("PATCH", f"/repos/{REPOSITORY}/releases/{before['identity']['id']}", {"body": before["body"]})
+        except (OSError, ApiError, urllib.error.URLError, http.client.HTTPException):
+            # A lost response can be acknowledged only by the verified readback.
+            after = published_notes_context(source, tag, api, expected_commit)
+            if after["release"].get("body") != before["body"]:
+                raise
+    after = published_notes_context(source, tag, api, expected_commit)
+    if any(before[field] != after[field] for field in fields) or after["release"].get("body") != before["body"]:
+        raise ValueError("Release body update did not preserve the tag, release identity and all assets")
+    return {"tag": tag, "candidateCommit": expected_commit, "releaseId": before["identity"]["id"],
+            "bodyUpdated": changed, "assetsUnchanged": True, "assetCount": len(before["assets"]),
+            "bodySha256": hashlib.sha256(before["body"].encode("utf-8")).hexdigest()}
+
+
 def upload_draft(manifest_path, source, tag, title=None, api=None):
     document = verify_freeze(manifest_path, source)
     root, candidate = manifest_path.parent.resolve(), document["identity"]["candidateHead"]
@@ -762,6 +996,14 @@ def upload_draft(manifest_path, source, tag, title=None, api=None):
             "body": release_notes(document, tag)})
     release_id = validate_draft(release, tag, candidate)
     existing = remote_assets(api, release_id, expected)
+    body = release_notes(document, tag)
+    if release.get("body") != body:
+        validate_draft(api.request("GET", prefix + f"/releases/{release_id}"), tag, candidate)
+        api.request("PATCH", prefix + f"/releases/{release_id}", {"body": body})
+        synchronized = api.request("GET", prefix + f"/releases/{release_id}")
+        validate_draft(synchronized, tag, candidate)
+        if synchronized.get("body") != body:
+            raise ValueError("Draft body does not match the deterministic release template")
     uploaded, reused = [], sorted(existing)
     for name, item in expected.items():
         if name in existing:
@@ -774,7 +1016,10 @@ def upload_draft(manifest_path, source, tag, title=None, api=None):
         check_remote_asset(api, remote, item)
         uploaded.append(name)
     final = remote_assets(api, release_id, expected, complete=True)
-    validate_draft(api.request("GET", prefix + f"/releases/{release_id}"), tag, candidate)
+    final_release = api.request("GET", prefix + f"/releases/{release_id}")
+    validate_draft(final_release, tag, candidate)
+    if final_release.get("body") != body:
+        raise ValueError("Draft body changed during asset upload")
     validate_tag(api, tag, candidate)
     if digest(manifest_path) != manifest_hash:
         raise ValueError("Freeze manifest changed during upload")
@@ -807,6 +1052,9 @@ def publish(manifest_path, source, tag, api=None):
         raise ValueError("No prepared draft exists for this tag. Run upload-draft first")
     already_published = release.get("draft") is False
     release_id = (validate_published if already_published else validate_draft)(release, tag, candidate)
+    body = release_notes(document, tag)
+    if release.get("body") != body:
+        raise ValueError("Release body differs from the deterministic template. Run upload-draft to synchronize a draft")
     final = remote_assets(api, release_id, expected, complete=True)
     prefix = f"/repos/{REPOSITORY}/releases/{release_id}"
     # Check the local bytes and current branch again after the remote inventory.
@@ -816,6 +1064,8 @@ def publish(manifest_path, source, tag, api=None):
     verify_ci_packages(api, document)
     validate_tag(api, tag, candidate, required=already_published)
     latest_release = api.request("GET", prefix)
+    if latest_release.get("body") != body:
+        raise ValueError("Release body changed during publication preflight")
     if already_published:
         validate_published(latest_release, tag, candidate)
     else:
@@ -832,6 +1082,8 @@ def publish(manifest_path, source, tag, api=None):
             validate_published(api.request("GET", prefix), tag, candidate)
     published = api.request("GET", prefix)
     validate_published(published, tag, candidate)
+    if published.get("body") != body:
+        raise ValueError("Published release body differs from the deterministic template")
     validate_tag(api, tag, candidate, required=True)
     final = remote_assets(api, release_id, expected, complete=True)
     latest = api.request("GET", f"/repos/{REPOSITORY}/releases/latest")
@@ -843,6 +1095,11 @@ def publish(manifest_path, source, tag, api=None):
         "url": f"https://github.com/{REPOSITORY}/releases/tag/{urllib.parse.quote(tag, safe='')}",
         "assets": [{"name": name, "id": positive_id(final[name]["id"]), "bytes": item["bytes"],
                     "sha256": item["sha256"]} for name, item in sorted(expected.items())]}
+
+
+def restore(source, candidate, run_id, attempt, tag, freeze_run_id, output, api=None):
+    return module("qcs-release-freeze").restore(SimpleNamespace(**globals()), source, candidate, run_id,
+                                              attempt, tag, freeze_run_id, output, api=api)
 
 
 def main(argv=None):
@@ -867,6 +1124,23 @@ def main(argv=None):
     publish_parser.add_argument("--manifest", type=Path, required=True)
     publish_parser.add_argument("--tag", required=True)
     publish_parser.add_argument("--repository", choices=(REPOSITORY,), default=REPOSITORY)
+    notes_parser = commands.add_parser("notes", help="Render deterministic download notes from a freeze or published release")
+    notes_parser.add_argument("--source-dir", type=Path, default=SOURCE)
+    notes_parser.add_argument("--manifest", type=Path)
+    notes_parser.add_argument("--tag", required=True)
+    notes_parser.add_argument("--output", type=Path)
+    update_parser = commands.add_parser("update-notes", help="Update only a published release body, preserving its tag and assets")
+    update_parser.add_argument("--source-dir", type=Path, default=SOURCE)
+    update_parser.add_argument("--tag", required=True)
+    update_parser.add_argument("--expected-commit", required=True)
+    restore_parser = commands.add_parser("restore", help="Restore original freeze bytes from a release workflow and native CI artifacts")
+    restore_parser.add_argument("--source-dir", type=Path, default=SOURCE)
+    restore_parser.add_argument("--freeze-run-id", required=True)
+    restore_parser.add_argument("--candidate-commit", required=True)
+    restore_parser.add_argument("--run-id", required=True)
+    restore_parser.add_argument("--attempt", type=int, required=True)
+    restore_parser.add_argument("--tag", required=True)
+    restore_parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.action == "prepare":
@@ -875,6 +1149,22 @@ def main(argv=None):
             result = {"manifest": str(path), "sha256": digest(path), "published": False}
         elif args.action == "publish":
             result = publish(args.manifest.resolve(), args.source_dir.resolve(), args.tag)
+        elif args.action == "restore":
+            result = restore(args.source_dir.resolve(), args.candidate_commit, args.run_id, args.attempt,
+                             args.tag, args.freeze_run_id, args.output_dir)
+        elif args.action == "update-notes":
+            result = update_notes(args.source_dir.resolve(), args.tag, args.expected_commit)
+        elif args.action == "notes":
+            manifest = args.manifest.resolve() if args.manifest else None
+            output = external(args.output, args.source_dir.resolve(), (manifest.parent,) if manifest else ()) if args.output else None
+            body = notes(args.source_dir.resolve(), args.tag, manifest)
+            if output:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(body, encoding="utf-8", newline="\n")
+                result = {"notes": str(output), "sha256": digest(output)}
+            else:
+                print(body, end="")
+                return 0
         else:
             result = upload_draft(args.manifest.resolve(), args.source_dir.resolve(), args.tag, args.title)
         print(json.dumps(result, ensure_ascii=False, indent=2))

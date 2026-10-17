@@ -1,5 +1,6 @@
 #include "service_client.h"
 
+#include "core/app_settings.h"
 #include "core/types.h"
 #include "ipc_protocol.h"
 #include "ipc_security.h"
@@ -83,7 +84,10 @@ void ServiceClient::ensureService(int timeoutMs)
         return;
     }
     QString error;
-    if (!paths_.ensure(&error)) {
+    // The service validates its configuration before creating business data.
+    // A client may reconnect to an already running service while a bad edit
+    // remains on disk, so it only prepares the private IPC parent here.
+    if (!paths_.validateProfileLayout(&error) || !paths_.ensureIpcDirectory(&error)) {
         // Keep errors asynchronous so callers can retain the request ID first.
         QTimer::singleShot(0, this, [this, error] {
             failPending(QStringLiteral("profile_unavailable"), error);
@@ -240,6 +244,12 @@ void ServiceClient::socketError(QLocalSocket::LocalSocketError)
 
 bool ServiceClient::launchService(QString *error)
 {
+    // This path is reached only after connecting to the current endpoint has
+    // failed. Report bad cold-start settings directly instead of hiding the
+    // detached service's diagnostic behind a connection timeout.
+    AppSettings settings;
+    if (!settings.load(paths_.configFile, error))
+        return false;
     QString name = QStringLiteral("qcs-service");
 #ifdef Q_OS_WIN
     name += QStringLiteral(".exe");
@@ -262,7 +272,7 @@ bool ServiceClient::launchService(QString *error)
     }
     QProcess process;
     process.setProgram(executable);
-    process.setArguments({QStringLiteral("--profile-dir"), paths_.profileDir,
+    process.setArguments({QStringLiteral("--profile-dir"), paths_.profileBaseDir,
                           QStringLiteral("--model-dir"), paths_.modelDir});
     process.setWorkingDirectory(QCoreApplication::applicationDirPath());
     process.setStandardInputFile(QProcess::nullDevice());

@@ -9,10 +9,10 @@ namespace qcopilots_search::embedding_math {
 // Normalize query vectors once in float precision before comparing them with
 // the persisted FP16 vectors. The same arithmetic is used by exact and ANN
 // candidate scoring.
-inline QVector<float> normalized(const QVector<float> &values, int dimensions = embeddingDimensions)
+inline QVector<float> normalized(const QVector<float> &values)
 {
-    if (dimensions <= 0 || values.size() != dimensions)
-        throw std::runtime_error("Embedding dimensions do not match the selected model");
+    if (values.size() != embeddingDimensions)
+        throw std::runtime_error("Embedding must contain exactly 768 values");
     double squared = 0;
     for (float value : values) {
         if (!std::isfinite(value))

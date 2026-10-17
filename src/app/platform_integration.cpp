@@ -147,17 +147,17 @@ bool PlatformIntegration::setStartAtLogin(bool enabled, QString *error) {
         return failure(error, QStringLiteral("Login startup cannot be changed from a test session or a session with explicit directory arguments."));
     const auto paths = RuntimePaths::resolve();
     if (!paths.validateProfileLayout(error)) return false;
-    return setStartAtLogin(enabled, paths.profileDir, paths.modelDir, error);
+    return setStartAtLogin(enabled, paths.profileBaseDir, paths.modelDir, error);
 }
-bool PlatformIntegration::canSetStartAtLogin(const QString &profileDirectory, const QString &modelsDirectory) {
-    return RuntimePaths::isAbsoluteFilesystemPath(profileDirectory)
+bool PlatformIntegration::canSetStartAtLogin(const QString &profileBaseDirectory, const QString &modelsDirectory) {
+    return RuntimePaths::isAbsoluteFilesystemPath(profileBaseDirectory)
         && RuntimePaths::isAbsoluteFilesystemPath(modelsDirectory) && supportsStartAtLogin();
 }
-bool PlatformIntegration::setStartAtLogin(bool enabled, const QString &profileDirectory,
+bool PlatformIntegration::setStartAtLogin(bool enabled, const QString &profileBaseDirectory,
                                          const QString &modelsDirectory, QString *error) {
-    if (!canSetStartAtLogin(profileDirectory, modelsDirectory))
+    if (!canSetStartAtLogin(profileBaseDirectory, modelsDirectory))
         return failure(error, QStringLiteral("Login startup requires a supported normal session and absolute profile and model directories."));
-    return loginStartupSetEnabled(enabled, profileDirectory, modelsDirectory, error);
+    return loginStartupSetEnabled(enabled, profileBaseDirectory, modelsDirectory, error);
 }
 LoginStartupState PlatformIntegration::startAtLoginState() {
     if (!loginStartupSessionAllowed())

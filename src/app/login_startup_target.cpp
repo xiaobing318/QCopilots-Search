@@ -32,7 +32,7 @@ bool validLocator(const QString &locatorFile, QString *error)
 bool normalizeTarget(const LoginStartupTarget &target, LoginStartupTarget *normalized,
                      QString *error)
 {
-    for (const auto &path : {target.profileDir, target.modelDir}) {
+    for (const auto &path : {target.profileBaseDir, target.modelDir}) {
         if (!RuntimePaths::isAbsoluteFilesystemPath(path))
             return fail(error, QStringLiteral("Login startup requires absolute profile and model directories: %1")
                                    .arg(path));
@@ -46,9 +46,9 @@ bool normalizeTarget(const LoginStartupTarget &target, LoginStartupTarget *norma
         if ((info.exists() || info.isSymbolicLink()) && !info.isDir())
             return fail(error, QStringLiteral("Login startup target is not a directory: %1").arg(parent));
     }
-    const RuntimePaths paths = RuntimePaths::resolve(target.profileDir, target.modelDir);
+    const RuntimePaths paths = RuntimePaths::resolve(target.profileBaseDir, target.modelDir);
     if (!paths.validateProfileLayout(error)) return false;
-    *normalized = {paths.profileDir, paths.modelDir};
+    *normalized = {paths.profileBaseDir, paths.modelDir};
     return true;
 }
 
@@ -61,11 +61,11 @@ bool decode(const QByteArray &bytes, LoginStartupTarget *target, QString *error)
                                .arg(parseError.errorString()));
     const auto object = document.object();
     if (!object.value(QStringLiteral("version")).isDouble()
-        || object.value(QStringLiteral("version")).toDouble() != 1.0
-        || !object.value(QStringLiteral("profileDir")).isString()
+        || object.value(QStringLiteral("version")).toDouble() != 2.0
+        || !object.value(QStringLiteral("profileBaseDir")).isString()
         || !object.value(QStringLiteral("modelDir")).isString())
-        return fail(error, QStringLiteral("Login startup locator requires version 1 and profileDir/modelDir strings."));
-    return normalizeTarget({object.value(QStringLiteral("profileDir")).toString(),
+        return fail(error, QStringLiteral("Login startup locator requires version 2 and profileBaseDir/modelDir strings."));
+    return normalizeTarget({object.value(QStringLiteral("profileBaseDir")).toString(),
                             object.value(QStringLiteral("modelDir")).toString()}, target, error);
 }
 
@@ -125,7 +125,7 @@ bool sameTarget(const LoginStartupTarget &left, const LoginStartupTarget &right)
 #else
     constexpr auto sensitivity = Qt::CaseSensitive;
 #endif
-    return left.profileDir.compare(right.profileDir, sensitivity) == 0
+    return left.profileBaseDir.compare(right.profileBaseDir, sensitivity) == 0
         && left.modelDir.compare(right.modelDir, sensitivity) == 0;
 }
 
@@ -136,7 +136,9 @@ bool accessibleTarget(const LoginStartupTarget &target, QString *error)
     // Windows' DOS read-only attribute.
     QNtfsPermissionCheckGuard permissionChecks;
 #endif
-    for (const auto &path : {target.profileDir, target.modelDir}) {
+    const auto paths = RuntimePaths::resolve(target.profileBaseDir, target.modelDir);
+    if (!paths.validateProfileLayout(error)) return false;
+    for (const auto &path : {paths.profileDir, paths.modelDir}) {
         const QFileInfo info(path);
         if (!info.exists() || !info.isDir())
             return fail(error, QStringLiteral("Saved login startup directory is unavailable: %1").arg(path));
@@ -147,8 +149,8 @@ bool accessibleTarget(const LoginStartupTarget &target, QString *error)
         )
             return fail(error, QStringLiteral("Saved login startup directory is not accessible: %1").arg(path));
     }
-    if (!QFileInfo(target.profileDir).isWritable())
-        return fail(error, QStringLiteral("Saved login startup profile is not writable: %1").arg(target.profileDir));
+    if (!QFileInfo(paths.profileDir).isWritable())
+        return fail(error, QStringLiteral("Saved login startup profile is not writable: %1").arg(paths.profileDir));
     // A verified shared model directory may be read-only.
     return true;
 }
@@ -239,8 +241,8 @@ bool updateLoginStartupTarget(const QString &locatorFile, const LoginStartupTarg
     }
 
     const QByteArray bytes = QJsonDocument(QJsonObject{
-        {QStringLiteral("version"), 1},
-        {QStringLiteral("profileDir"), normalized.profileDir},
+        {QStringLiteral("version"), 2},
+        {QStringLiteral("profileBaseDir"), normalized.profileBaseDir},
         {QStringLiteral("modelDir"), normalized.modelDir}
     }).toJson(QJsonDocument::Indented);
     if (!validLocator(pendingFile(locatorFile), error)

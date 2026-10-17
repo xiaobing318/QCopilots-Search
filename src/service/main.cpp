@@ -10,12 +10,12 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("qcs-service"));
     QCoreApplication::setOrganizationName(QStringLiteral("qcopilots-search"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QCoreApplication::setApplicationVersion(QStringLiteral(QCOPILOTS_SEARCH_VERSION));
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("QCopilots Search local indexing and search service"));
     parser.addHelpOption();
     parser.addVersionOption();
-    parser.addOption({QStringLiteral("profile-dir"), QStringLiteral("Isolated application profile directory"), QStringLiteral("path")});
+    parser.addOption({QStringLiteral("profile-dir"), QStringLiteral("Application data base directory (uses profiles/v4 below it)"), QStringLiteral("path")});
     parser.addOption({QStringLiteral("model-dir"), QStringLiteral("Verified model directory"), QStringLiteral("path")});
     parser.addOption({QStringLiteral("index-device"), QStringLiteral("Index GPU selector JSON with backend, deviceId and name. Repeat to select multiple GPUs. Default uses all compatible GPUs"), QStringLiteral("json")});
     parser.process(app);

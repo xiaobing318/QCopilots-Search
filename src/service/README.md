@@ -1,6 +1,6 @@
 # 本地服务协议
 
-`qcs-service` 是运行配置目录的唯一数据库写入者。GUI 与 CLI 链接 `qcs-client`，通过 `ServiceClient` 异步发送请求。调用者使用同一个 `RuntimePaths`，无需依赖工作目录。
+`qcs-service` 是运行配置目录的唯一数据库写入者。GUI 与 CLI 链接 `qcs-client`，通过 `ServiceClient` 异步发送请求。调用者使用同一个 `RuntimePaths`，无需依赖工作目录。`--profile-dir` 与 `QCS_HOME` 指向数据基目录，父进程传递 `profileBaseDir`，服务使用其下的 `profiles/v4` 作为最终 `profileDir`，不读取基目录中的旧版配置或索引。
 
 服务先取得配置目录中的 `QLockFile`，再创建仅允许当前用户访问的本地 IPC。每次服务启动生成独立认证 token，保存在配置目录的 `qcs-ipc-token`。Unix token 文件权限为 `0600`，Windows 同时依靠 named pipe 的当前用户访问控制。客户端只在成功连接并验证对端用户后读取 token。
 
@@ -13,7 +13,7 @@ macOS 使用 `getpeereid`、Linux 使用 `SO_PEERCRED` 双向验证对端有效 
 | 方法 | 参数 | 结果 |
 | --- | --- | --- |
 | `status` | 空对象 | `progress`、`repository`、`settings`、模型状态、监控能力及失败文件 |
-| `settings.get` | 空对象 | 版本化设置对象 |
+| `settings.get` | 空对象 | `version: 4` 的设置对象，不含模型选择字段 |
 | `settings.set` | 要修改的设置字段 | 验证、原子保存后的完整设置 |
 | `settings.reload` | 空对象 | 重新读取配置文件并通过统一验证入口应用，不回写文件 |
 | `search` | `query`、`kind`、`root`、`code`、`limit`、`semantic` | `hits`、是否执行语义查询及降级原因 |
@@ -22,10 +22,8 @@ macOS 使用 `getpeereid`、Linux 使用 `SO_PEERCRED` 双向验证对端有效 
 | `index.start`、`index.reconcile` | 空对象 | 索引进度 |
 | `index.pause`、`index.resume` | 空对象 | 持久化暂停状态及索引进度 |
 | `index.retry` | 空对象 | 清除已记录失败后重新扫描 |
-| `models.list` | 空对象 | 三款内置模型目录和当前配置模型 ID |
-| `models.status` | 可选 `modelId` | 目标文件状态、能力、维度、索引目录和活动模型身份 |
-| `models.select` | `modelId` | 校验并实际加载预检后应用模型，返回完整设置 |
-| `models.reload` | 空对象 | 重新校验当前模型，返回模型状态，不改变选择 |
+| `models.status` | 空对象 | Gemma 文件状态、能力、维度、索引目录及加载状态 |
+| `models.reload` | 空对象 | 重新校验并加载 Gemma，返回模型状态 |
 | `cancel` | `id` 为被取消请求的 ID | 是否找到并取消请求 |
 | `shutdown` | 空对象 | 接受退出请求后关闭本配置的服务 |
 
@@ -47,14 +45,14 @@ GPU 初始化或推理故障会隔离对应设备，将未完成文件交给健�
 
 单个文件达到 5000 个片段上限时，已有前缀保持可搜索，状态明确报告部分索引。持久化终态阻止周期性对账从头覆盖这些片段，只有文件版本变化、管线变化或显式 `index.retry` 才重新处理。
 
-`modelId` 默认是 `embeddinggemma-2`，也可选择 `qwen3-vl-embedding-2b` 或 `qwen3-vl-embedding-8b`。每个模型拥有独立的 SQLite、关键词索引、ANN 和进度日志。Gemma 保留原索引目录，其他模型位于按 ID 命名的子目录。切回已有模型时先核对文件元数据，删除变化文件的过期内容，复用未变化文件的索引。这个核对在暂停提取时仍会运行。暂时离线目录的磁盘缓存保留，但未经本轮核对的结果不可见。
+应用只支持 `embeddinggemma-2`，索引固定为 768 维。SQLite、关键词索引、ANN 和进度位于新版 profile 内，服务不打开其他模型目录。配置、`models.status` 和 `models.reload` 均拒绝模型选择参数。来源元数据核对使变化文件的过期内容失效，复用未变化文件的索引。这个核对在暂停提取时仍会运行。暂时离线目录的磁盘缓存保留，但未经本轮核对的结果不可见。
 
-切换请求先异步校验文件摘要，再通过隔离 worker 的 `model.probe` 完成实际模型加载、文本及图片自检。只有目标索引打开和设置原子保存也成功，才发布新模型和索引。预检失败保留原活动设置及索引。加载预检可能持续数分钟，客户端可为相关请求设置十分钟超时。下载或导入文件本身不切换模型。
+`settings.set` 与 `settings.reload` 共用验证和应用入口。旧配置格式、未来格式、非法 JSON 或废弃模型选择字段会明确失败，活动设置保持不变。在线重载不会覆盖手工编辑的磁盘文件，需要修正后再次重载。模型管理对话框在成功下载或导入并校验后调用 `models.reload`，加载过程使用隔离 worker，失败原因保持可见。
 
-`status` 的 `configuredModelId` 表示配置目标，`activeModelId` 仅在模型已通过加载预检时非空。`dimensions`、`embeddingFingerprint` 和 `capabilities` 描述当前索引契约，能力字段为 `text`、`image`、`videoFrames` 和 `audio`。`models.status` 的 `filesPresent` 仅检查文件大小，`filesVerified` 表示已完成完整校验，不应将文件存在解释为可加载。Qwen 不支持音频语义，音频仍可按文件名检索，视频保留画面语义检索。
+`status` 的 `modelId` 固定为 `embeddinggemma-2`，`dimensions`、`embeddingFingerprint` 和 `capabilities` 描述 Gemma 索引契约，能力字段为 `text`、`image`、`videoFrames` 和 `audio`。文件完整性、实际加载状态和错误分别报告，不应将文件存在解释为可加载。worker 请求与结果携带固定模型身份、维度和契约指纹，服务在入库和查询前核验。
 
-`models.status.indexState` 区分尚未建立的 `not-built`、非活动且需要核对的 `cached`、正在核对的 `reconciling`、当前目录没有文件的 `empty`、暂停且有待处理文件的 `pending`、正在建立的 `indexing`、存在失败文件的 `partial` 及已完成的 `ready`。这些状态使用当前服务维护的目录与任务信息，查看未选模型不会打开另一个数据库写入者。
+`models.status.indexState` 区分正在核对的 `reconciling`、当前目录没有文件的 `empty`、暂停且有待处理文件的 `pending`、正在建立的 `indexing`、存在失败文件的 `partial` 及已完成的 `ready`。这些状态使用当前服务维护的目录与任务信息，服务可响应时当前数据库已打开。
 
-模型暂缺或当前模型重载失败时，服务保留所选模型的索引身份和已有向量，以关键词模式处理新内容。新生成的关键词版本单独标记，恢复模型后只补做这些文件。所有异步数据库任务持有原索引的共享引用，任务代次阻止迟到结果进入新的索引，快速切回时复用仍存活的数据库实例。
+模型暂缺或重载失败时，服务保留 Gemma 的索引身份和已有向量，以关键词模式处理新内容。新生成的关键词版本单独标记，恢复模型后只补做这些文件。异步数据库任务持有索引的共享引用，任务代次、文件源版本和管线指纹检查阻止迟到结果覆盖当前数据。
 
-测试入口为 `qcs-tests-client` 和 `qcs-tests-service`。前者使用模拟本地服务验证传输与客户端契约，后者启动实际服务和实际工作进程，验证隔离、恢复、索引、预览及分类切换。模型切换故障测试通过 `qcs-service-core` 的 C++ 构造接口注入存储提交失败，并通过真实 IPC 验证错误、降级与恢复。每个用例使用独立 `TestEnvironment`，测试不会连接正常应用的运行配置。
+测试入口为 `qcs-tests-client` 和 `qcs-tests-service`。前者使用模拟本地服务验证传输与客户端契约，后者启动实际服务和实际工作进程，验证隔离、恢复、索引、预览及分类切换。故障测试覆盖存储提交失败、配置重载失败、模型暂缺后的关键词降级与恢复。每个用例使用独立 `TestEnvironment`，测试不会连接正常应用的运行配置。

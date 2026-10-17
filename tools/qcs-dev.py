@@ -54,18 +54,6 @@ def package_directory(root, config):
     return root / "pkg" / config
 
 
-def model_ids(args, *, include_default=False):
-    requested = list(dict.fromkeys(getattr(args, "model", None) or []))
-    if not requested:
-        return ["embeddinggemma-2"]
-    models = helper_module("tools/qcs-model-catalog.py", "qcs_dev_models")
-    default, available = models.catalog()
-    for identifier in requested:
-        if identifier not in available:
-            raise ValueError("Unknown model preset: " + identifier)
-    return list(dict.fromkeys(([default] if include_default else []) + requested))
-
-
 def checked_model_cli_output(output, model, *, model_root=None):
     """Bind a built CLI's offline result to this checkout's current model lock."""
     phase = "manifest" if model_root is None else "verification"
@@ -88,7 +76,7 @@ def checked_model_cli_output(output, model, *, model_root=None):
             or any(actual_capabilities[key] is not value for key, value in capabilities.items())):
         reject("model identity, dimensions or capabilities do not match")
     if model_root is not None:
-        directory = model_root if model["id"] == "embeddinggemma-2" else model_root / model["id"]
+        directory = model_root
         actual = result.get("directory")
         if (result.get("valid") is not True or result.get("filesVerified") is not True
                 or not isinstance(actual, str) or not Path(actual).is_absolute()
@@ -866,23 +854,6 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
         run(["cmake", "--build", build, "--config", args.config, "--parallel", args.jobs], cwd=root, env=environment)
     elif action == "test":
         run_tests(args, root, build, reports, environment)
-    elif action == "test-models":
-        selected_models = model_ids(args)
-        if "embeddinggemma-2" in selected_models:
-            raise ValueError("test-models requires explicit Qwen --model selections. The complete test action covers Gemma.")
-        model_root = (args.model_dir or root.parent / "models").expanduser().resolve()
-        oracle_reports = args.report_dir.expanduser().resolve() if args.report_dir else reports
-        assert_external(oracle_reports)
-        for identifier in selected_models:
-            run([sys.executable, "-B", SOURCE / "tools/qcs-test-runner.py",
-                 "--label", "qcs-tests-qwen-vectors-" + identifier,
-                 "--root", root / "runs" / args.config, "--timeout", "7200", "--",
-                 executable(build, "qcs-tests-qwen-vectors", required=True),
-                 "--model", identifier, "--model-root", model_root,
-                 "--fixtures", SOURCE / "tests/runtime/fixtures/qwen"], cwd=root, env=environment)
-            write_json(oracle_reports / ("oracle-" + identifier + ".json"),
-                       {"modelId": identifier, "passed": True, "realModel": True,
-                        "fixtureSha256": hashlib.sha256((SOURCE / "tests/runtime/fixtures/qwen" / (identifier + ".json")).read_bytes()).hexdigest()})
     elif action == "run":
         runtime_environment = dict(environment, QCOPILOTS_SEARCH_TESSDATA_DIR=str(development_tessdata(build)))
         runtime_root = build
@@ -928,11 +899,6 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
         command = [sys.executable, SOURCE / "tools/qcs-verify-package.py", "--build-root", root, "--variant", args.variant]
         if getattr(args, "model_timeout", 600) != 600:
             command.extend(["--model-timeout", args.model_timeout])
-        if getattr(args, "model", None):
-            selected_models = model_ids(args)
-            if len(selected_models) != 1:
-                raise ValueError("verify-package accepts one --model. Use check for multiple presets.")
-            command.extend(["--model", selected_models[0]])
         if args.keyword_only:
             command.append("--keyword-only")
         elif args.model_dir:
@@ -953,32 +919,23 @@ def execute_action(action, args, root, build, stage, reports, sdk_root, prefix, 
         common = [executable(build, "qcs-cli", required=True), "--model-dir", models,
                   "--profile-dir", root / "runs" / args.config / "model-management"]
         catalog = helper_module("tools/qcs-model-catalog.py", "qcs_dev_model_contract")
-        selected_models = [catalog.selected(identifier) for identifier in model_ids(args)]
-        # Preflight every requested preset before permitting any download.
-        for model in selected_models:
-            identifier = model["id"]
-            selection = ["--model", identifier]
-            name = "models" if identifier == "embeddinggemma-2" else "models-" + identifier
-            manifest = subprocess.run([str(item) for item in [*common, "models", "manifest", *selection]], cwd=root,
-                                      env=environment, capture_output=True)
-            (reports / (name + "-manifest.json")).write_bytes(manifest.stdout)
-            if manifest.returncode:
-                (reports / (name + "-manifest.stderr.log")).write_bytes(manifest.stderr)
-                raise RuntimeError("CLI model manifest failed for " + identifier +
-                                   ". Run qcs-dev build to rebuild qcs-cli before downloading models.")
-            checked_model_cli_output(manifest.stdout, model)
-        for model in selected_models:
-            identifier = model["id"]
-            selection = ["--model", identifier]
-            name = "models" if identifier == "embeddinggemma-2" else "models-" + identifier
-            run([*common, "--timeout", "1800000", "--progress", "models", "download", *selection], cwd=root, env=environment)
-            result = subprocess.run([str(item) for item in [*common, "models", "verify", *selection]], cwd=root,
-                                    env=environment, capture_output=True)
-            (reports / (name + ".json")).write_bytes(result.stdout)
-            (reports / (name + ".stderr.log")).write_bytes(result.stderr)
-            if result.returncode:
-                raise subprocess.CalledProcessError(result.returncode, common, result.stdout, result.stderr)
-            checked_model_cli_output(result.stdout, model, model_root=models)
+        model = catalog.selected()
+        # Reject a stale executable before permitting any model download.
+        manifest = subprocess.run([str(item) for item in [*common, "models", "manifest"]], cwd=root,
+                                  env=environment, capture_output=True)
+        (reports / "models-manifest.json").write_bytes(manifest.stdout)
+        if manifest.returncode:
+            (reports / "models-manifest.stderr.log").write_bytes(manifest.stderr)
+            raise RuntimeError("CLI model manifest failed. Run qcs-dev build to rebuild qcs-cli before downloading models.")
+        checked_model_cli_output(manifest.stdout, model)
+        run([*common, "--timeout", "1800000", "--progress", "models", "download"], cwd=root, env=environment)
+        result = subprocess.run([str(item) for item in [*common, "models", "verify"]], cwd=root,
+                                env=environment, capture_output=True)
+        (reports / "models.json").write_bytes(result.stdout)
+        (reports / "models.stderr.log").write_bytes(result.stderr)
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, common, result.stdout, result.stderr)
+        checked_model_cli_output(result.stdout, model, model_root=models)
     elif action == "sources":
         dependency_root = root / "deps" / args.config
         run([sys.executable, SOURCE / "tools/qcs-source-bundle.py", "--build-root", root,
@@ -1069,12 +1026,7 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "stages": [{"action": action, "generator": generator, "status": "notRun"}
                            for action, generator in check_plan(platform.system())]}
-    selected_models = model_ids(args, include_default=True)
-    document["models"] = selected_models
-    for identifier in selected_models[1:]:
-        for action in ("test-models", "verify-package"):
-            document["stages"].append({"action": action, "generator": None,
-                                       "modelId": identifier, "status": "notRun"})
+    document["modelId"] = "embeddinggemma-2"
     report_path = directory / "check-report.json"
     write_json(reports / "latest-check.json", {"report": str(report_path), "variant": args.variant})
     local_args = copy.copy(args)
@@ -1084,10 +1036,7 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
     try:
         for index, record in enumerate(document["stages"]):
             local_args.generator = record["generator"]
-            local_args.model = selected_models if record["action"] == "models" else [record.get("modelId", selected_models[0])]
-            local_args.report_dir = (directory if record["action"] == "test-models" else
-                                    directory / ("package-" + record["modelId"] if "modelId" in record
-                                                 else "tests" if record["action"] == "test" else "package"))
+            local_args.report_dir = directory / ("tests" if record["action"] == "test" else "package")
             log = directory / f"{index + 1:02d}-{record['action']}.log"
             log.write_text("", encoding="utf-8")
             record.update(status="running", startedAt=datetime.now(timezone.utc).isoformat(), log=log.name)
@@ -1126,13 +1075,14 @@ def run_check(args, root, build, stage, reports, sdk_root, prefix, environment):
 
 def main():
     release_actions = {"release-prepare": "prepare", "release-upload-draft": "upload-draft",
-                       "release-publish": "publish"}
+                       "release-publish": "publish", "release-notes": "notes",
+                       "release-update-notes": "update-notes", "release-restore": "restore"}
     if len(sys.argv) > 1 and sys.argv[1] in release_actions:
         action = release_actions[sys.argv[1]]
         run([sys.executable, SOURCE / "tools/qcs-release.py", action, *sys.argv[2:]], cwd=SOURCE)
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "test-models", "run", "install", "package", "verify-package", "models", "sources", "symbols", "installers", "check", "release-prepare", "release-upload-draft", "release-publish", "clean"])
+    parser.add_argument("action", choices=["bootstrap", "doctor", "configure", "build", "test", "run", "install", "package", "verify-package", "models", "sources", "symbols", "installers", "check", "release-prepare", "release-upload-draft", "release-publish", "release-notes", "release-update-notes", "release-restore", "clean"])
     default_root = SOURCE.parent.parent / (SOURCE.parent.name + "-compilations") / PRODUCT
     parser.add_argument("--build-root", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_BUILD_ROOT") or default_root)
     parser.add_argument("--variant", default=os.environ.get("QCOPILOTS_SEARCH_VARIANT") or None,
@@ -1142,7 +1092,6 @@ def main():
     parser.add_argument("--config", choices=["Release", "Debug", "RelWithDebInfo"], default="Release")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 2))
     parser.add_argument("--model-dir", type=Path, default=os.environ.get("QCOPILOTS_SEARCH_MODEL_DIR") or None)
-    parser.add_argument("--model", action="append", default=[], help="Model preset for models/test-models/check/verify-package. Repeat except for verify-package.")
     parser.add_argument("--model-timeout", type=int, default=600, help="Seconds for each packaged model request (1-3600)")
     parser.add_argument("--keyword-only", action="store_true", help="Partial verify-package without models, insufficient for release")
     parser.add_argument("--test-label", help="CTest label regex for a partial developer run, never a complete check")
@@ -1162,14 +1111,6 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.model_timeout <= 3600:
         parser.error("--model-timeout must be between 1 and 3600 seconds")
-    if args.model and args.action not in ("models", "test-models", "check", "verify-package"):
-        parser.error("--model applies only to models, test-models, check and verify-package")
-    if args.action == "test-models" and not args.model:
-        parser.error("test-models requires at least one Qwen --model selection")
-    if args.keyword_only and args.model:
-        parser.error("--model cannot be combined with --keyword-only")
-    if args.model:
-        model_ids(args)
     args.variant = build_variant(args.variant)["id"]
     if args.candidate_commit and not re.fullmatch(r"[0-9a-f]{40}", args.candidate_commit):
         parser.error("--candidate-commit must be a full Git commit SHA")

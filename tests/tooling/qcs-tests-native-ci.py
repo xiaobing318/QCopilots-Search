@@ -1308,23 +1308,20 @@ class RunnerIsolationTests(unittest.TestCase):
                 self.assertEqual(identity["runId"], environment["GITHUB_RUN_ID"])
                 self.assertEqual(identity["runAttempt"], environment["GITHUB_RUN_ATTEMPT"])
                 self.assertEqual(identity["configuration"], "windows-x64-cpu")
-                for path in (parent / "sdk", temporary / "qcs-model-cache/gemma-qwen2b", root / "runs/Release"):
+                for path in (parent / "sdk", temporary / "qcs-model-cache/gemma", root / "runs/Release"):
                     self.assertTrue(path.is_dir())
             exported = (temporary / "environment").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(exported), 10)
             self.assertEqual(sum(line.startswith("QCOPILOTS_SEARCH_TEST_ROOT=") for line in exported), 2)
 
-    def test_model_cache_is_stable_per_required_set_while_run_data_stays_unique(self):
+    def test_model_cache_is_shared_while_run_data_stays_unique(self):
         with tempfile.TemporaryDirectory(prefix="qcs-cache-中文 ",
                 dir=os.environ.get("QCOPILOTS_SEARCH_TEST_ROOT") or None) as directory:
             temporary = Path(directory).resolve()
-            expected_groups = {"windows-x64-cpu": "gemma-qwen2b",
-                               "linux-x64-cpu": "gemma-qwen2b-qwen8b",
-                               "macos-arm64-metal": "gemma-qwen2b"}
             roots, caches = set(), {}
             developer = native.developer_workflow()
             for identifier in native.variants():
-                group = expected_groups.get(identifier, "gemma")
+                group = "gemma"
                 for attempt in (1, 2):
                     with self.subTest(variant=identifier, attempt=attempt):
                         environment = {**self.environment(temporary), "QCOPILOTS_SEARCH_CI_ID": identifier,
@@ -1350,9 +1347,9 @@ class RunnerIsolationTests(unittest.TestCase):
                         else:
                             caches[group] = cache
                             marker.write_text(group, encoding="utf-8")
-            self.assertEqual(len(set(caches.values())), 3)
+            self.assertEqual(len(set(caches.values())), 1)
             self.assertEqual({path.name for path in (temporary / "qcs-model-cache").iterdir()},
-                             {"gemma", "gemma-qwen2b", "gemma-qwen2b-qwen8b"})
+                             {"gemma"})
 
     def test_initialized_ci_root_is_accepted_by_real_developer_bootstrap_guard(self):
         with tempfile.TemporaryDirectory(prefix="qcs-owner-中文 ",
@@ -2004,7 +2001,7 @@ class NativeStageDependencyTests(unittest.TestCase):
     """Verify workflow ordering and default failure propagation before upload."""
 
     ACTIONS = ("initialize", "toolchain", "bootstrap", "doctor", "configure", "build", "models",
-               "test", "install", "package", "multimodel", "installers", "products")
+               "test", "install", "package", "installers", "products")
 
     def setUp(self):
         self.workflow = (native.SOURCE / ".github/workflows/qcs-native.yml").read_text(encoding="utf-8")
@@ -2027,36 +2024,14 @@ class NativeStageDependencyTests(unittest.TestCase):
             with self.subTest(action=action):
                 conditions = re.findall(r"^        if: (.+)$", self.step(action), re.MULTILINE)
                 expected = {"installers": ["runner.os == 'Windows' || runner.os == 'Linux'"],
-                            "toolchain": ["matrix.container != ''"],
-                            "multimodel": ["matrix.id == 'windows-x64-cpu' || matrix.id == 'linux-x64-cpu' || matrix.id == 'macos-arm64-metal'"]}
+                            "toolchain": ["matrix.container != ''"]}
                 self.assertEqual(conditions, expected.get(action, []))
 
-    def test_additional_models_verify_final_packages_in_a_bounded_sequence(self):
-        expected = {"windows-x64-cpu": ("qwen3-vl-embedding-2b",),
-                    "linux-x64-cpu": ("qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"),
-                    "macos-arm64-metal": ("qwen3-vl-embedding-2b",)}
-        for identifier in native.variants():
-            self.assertEqual(native.additional_models(identifier), expected.get(identifier, ()))
-        with mock.patch.object(native, "variant", return_value={"id": "linux-x64-cpu"}), \
-                mock.patch.object(native, "REPORTS", Path("external-reports"), create=True), \
-                mock.patch.object(native, "dev") as dev:
-            native.multimodel()
-        self.assertEqual(dev.call_args_list, [
-            mock.call("models", "--model", "qwen3-vl-embedding-2b"),
-            mock.call("test-models", "--model", "qwen3-vl-embedding-2b"),
-            mock.call("verify-package", "--model", "qwen3-vl-embedding-2b",
-                      "--model-timeout", "1800", "--report-dir", str(Path("external-reports/package-qwen3-vl-embedding-2b")), display=True),
-            mock.call("models", "--model", "qwen3-vl-embedding-8b"),
-            mock.call("test-models", "--model", "qwen3-vl-embedding-8b"),
-            mock.call("verify-package", "--model", "qwen3-vl-embedding-8b",
-                      "--model-timeout", "1800", "--report-dir", str(Path("external-reports/package-qwen3-vl-embedding-8b")), display=True)])
-        self.assertIn("hashFiles('qcs-src/config/qcs-models.lock.json')", self.workflow)
+    def test_model_cache_is_locked_without_cross_catalog_fallback(self):
         cache = next(step for step in self.steps if step.startswith("Restore immutable model cache"))
         self.assertIn("path: ${{ env.QCOPILOTS_SEARCH_MODEL_DIR }}", cache)
+        self.assertIn("key: qcs-models-${{ hashFiles('qcs-src/config/qcs-models.lock.json') }}-gemma-v3", cache)
         self.assertNotIn("restore-keys:", cache)
-        for identifier in native.variants():
-            group = native.model_cache_group(identifier)
-            self.assertIn("'" + group + "'", cache)
 
     def test_container_toolchain_is_selected_after_python_and_before_configure(self):
         python = next(step for step in self.steps if "uses: actions/setup-python@" in step)
@@ -2133,7 +2108,7 @@ class NativePackageProductsTests(unittest.TestCase):
         suffixes = {"NSIS": ".exe", "ZIP": ".zip", "DEB": ".deb", "TGZ": ".tar.gz", "DragNDrop": ".dmg"}
         files = []
         for generator in selected["generators"]:
-            path = root / f"qcs-{self.version}-{identifier}{suffixes[generator]}"
+            path = root / f"qcs-{self.version}-{selected['packageVariant']}{suffixes[generator]}"
             path.write_bytes(b"synthetic package bytes for output contract only")
             files.append(path)
         return selected, files
@@ -2154,7 +2129,7 @@ class NativePackageProductsTests(unittest.TestCase):
 
     def test_stable_package_name_keeps_provenance_inside_the_package(self):
         packaging = (native.SOURCE / "cmake/qcs-package.cmake").read_text(encoding="utf-8")
-        self.assertIn('set(CPACK_PACKAGE_FILE_NAME "qcs-${PROJECT_VERSION}-${QCOPILOTS_SEARCH_VARIANT}")', packaging)
+        self.assertIn('set(CPACK_PACKAGE_FILE_NAME "qcs-${PROJECT_VERSION}-${QCOPILOTS_SEARCH_PACKAGE_VARIANT}")', packaging)
         self.assertIn('include(qcs-package-identity)', packaging)
         self.assertIn('RENAME build-identity.json', packaging)
         identity = (native.SOURCE / "cmake/qcs-package-identity.cmake").read_text(encoding="utf-8")
@@ -2213,7 +2188,7 @@ class NativePackageProductsTests(unittest.TestCase):
                 selected, files = self.package_set(root, identifier)
                 if any(path.suffix == ".exe" for path in files):
                     next(path for path in files if path.suffix == ".exe").unlink()
-                setup = root / f"qcs-{self.version}-{identifier}-setup.zip"
+                setup = root / f"qcs-{self.version}-{selected['packageVariant']}-setup.zip"
                 setup.write_bytes(b"unsupported installer fallback")
                 with self.assertRaisesRegex(RuntimeError, "Unexpected package output"):
                     native.package_files(root, selected)

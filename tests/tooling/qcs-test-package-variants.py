@@ -26,11 +26,11 @@ CANDIDATE = "1" * 40
 VARIANTS = {
     "schemaVersion": 1,
     "variants": [
-        {"id": "windows-x64-cpu", "backend": "cpu"},
-        {"id": "windows-x64-vulkan", "backend": "vulkan"},
-        {"id": "windows-x64-rocm", "backend": "hip"},
-        {"id": "windows-x64-cuda-12.4", "backend": "cuda"},
-        {"id": "macos-arm64-metal", "backend": "metal"},
+        {"id": "windows-x64-cpu", "backend": "cpu", "packageVariant": "windows-x64-cpu"},
+        {"id": "windows-x64-vulkan", "backend": "vulkan", "toolkitVersion": "1.4.357.0", "packageVariant": "windows-x64-vulkan-1.4.357.0"},
+        {"id": "windows-x64-rocm", "backend": "hip", "toolkitVersion": "10.0.0", "packageVariant": "windows-x64-rocm-10.0.0"},
+        {"id": "windows-x64-cuda-12.4", "backend": "cuda", "toolkitVersion": "12.4", "packageVariant": "windows-x64-cuda-12.4"},
+        {"id": "macos-arm64-metal", "backend": "metal", "packageVariant": "macos-arm64-metal"},
     ],
 }
 
@@ -76,6 +76,8 @@ class PackageVariantTests(unittest.TestCase):
         self.identity = {
             "schemaVersion": 1,
             "variant": "windows-x64-cuda-12.4",
+            "packageVariant": "windows-x64-cuda-12.4",
+            "toolkitVersion": "12.4",
             "backend": "cuda",
             "version": "0.1.0",
             "attempt": 2,
@@ -427,7 +429,8 @@ class PackageVariantTests(unittest.TestCase):
         cases = (("candidateCommit", "1234567"), ("candidateCommit", "A" * 40),
                  ("attempt", True), ("attempt", 0), ("attempt", "2"),
                  ("version", ""), ("schemaVersion", 2), ("schemaVersion", True),
-                 ("variant", "missing-variant"),
+                 ("variant", "missing-variant"), ("packageVariant", "windows-x64-rocm"),
+                 ("toolkitVersion", "12.8"),
                  ("backend", "hip"), ("workingTreeModified", "false"),
                  ("workingTreeModified", 1), ("workingTreeModified", 0))
         for field, value in cases:
@@ -435,6 +438,29 @@ class PackageVariantTests(unittest.TestCase):
                 self.identity = {**baseline, field: value}
                 self.write_identity()
                 with self.assertRaises(RuntimeError):
+                    self.validate_identity()
+
+    def test_sdk_package_identity_and_outer_name_are_bound(self):
+        for selected in VARIANTS["variants"]:
+            identity = {**self.identity, "variant": selected["id"], "backend": selected["backend"],
+                        "packageVariant": selected["packageVariant"], "toolkitVersion": selected.get("toolkitVersion", "")}
+            self.identity = identity
+            self.write_identity()
+            self.validate_identity()
+            suffix = ".dmg" if selected["id"].startswith("macos-") else ".zip"
+            name = "qcs-0.1.0-" + identity["packageVariant"] + suffix
+            package.validate_package_name(Path(name), identity)
+            if selected["id"] == "windows-x64-rocm":
+                package.validate_package_name(Path("qcs-0.1.0-" + identity["packageVariant"] + "-setup.zip"), identity)
+            for wrong in (name.replace("0.1.0", "0.3.0", 1), name.replace(identity["packageVariant"], "other"), name + ".bak"):
+                with self.subTest(name=wrong), self.assertRaisesRegex(RuntimeError, "filename"):
+                    package.validate_package_name(Path(wrong), identity)
+            if selected["backend"] in ("hip", "vulkan"):
+                with self.assertRaisesRegex(RuntimeError, "filename"):
+                    package.validate_package_name(Path("qcs-0.1.0-" + selected["id"] + suffix), identity)
+                self.identity["toolkitVersion"] = "0.0.0"
+                self.write_identity()
+                with self.assertRaisesRegex(RuntimeError, "SDK"):
                     self.validate_identity()
 
     def test_identity_rejects_missing_or_ambiguous_identity(self):
@@ -473,7 +499,8 @@ class PackageVariantTests(unittest.TestCase):
         for filename in ("build-variants.json", "dependencies.lock.json", "gpu-sdk.lock.json", "gpu-license-sources.lock.json"):
             resources.mkdir(parents=True, exist_ok=True)
             (resources / filename).write_bytes((self.materials / filename).read_bytes())
-        self.identity.update(variant="macos-arm64-metal", backend="metal")
+        self.identity.update(variant="macos-arm64-metal", backend="metal",
+                             packageVariant="macos-arm64-metal", toolkitVersion="")
         write_json(resources / "build-identity.json", self.identity)
         self.assertEqual(package.validate_build_identity(binary, self.application, {"commit": CANDIDATE}),
                          self.identity)

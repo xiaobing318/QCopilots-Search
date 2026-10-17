@@ -6,7 +6,7 @@
 namespace qcopilots_search {
 
 struct LoginStartupTarget {
-    QString profileDir;
+    QString profileBaseDir;
     QString modelDir;
 };
 

@@ -50,10 +50,10 @@ const QList<ModelDescriptor> &modelCatalog()
             model.dimensions = object.value("dimensions").toInt();
             model.supportsVision = object.value("supportsVision").toBool();
             model.supportsAudio = object.value("supportsAudio").toBool();
-            if (!idPattern.match(model.id).hasMatch() || ids.contains(model.id)
+            if (!idPattern.match(model.id).hasMatch() || model.id != defaultModelId() || ids.contains(model.id)
                 || model.name.isEmpty() || !revisionPattern.match(model.revision).hasMatch()
-                || model.dimensions <= 0 || model.dimensions > 4096
-                || (model.adapter != "embeddinggemma-2" && model.adapter != "qwen3-vl-embedding"))
+                || model.dimensions != 768 || !model.supportsVision || !model.supportsAudio
+                || model.adapter != "embeddinggemma-2")
                 throw std::logic_error("Invalid embedded model descriptor");
             QSet<QString> names;
             for (const auto &entry : object.value("artifacts").toArray()) {
@@ -76,7 +76,7 @@ const QList<ModelDescriptor> &modelCatalog()
             ids.insert(model.id);
             models.append(model);
         }
-        if (models.isEmpty() || !ids.contains(defaultModelId()))
+        if (models.size() != 1 || !ids.contains(defaultModelId()))
             throw std::logic_error("Incomplete embedded model catalog");
         return models;
     }();
@@ -92,7 +92,7 @@ const ModelDescriptor *findModel(const QString &id)
 QString modelDirectory(const QString &root, const QString &id)
 {
     if (root.trimmed().isEmpty() || !findModel(id)) return {};
-    return id == defaultModelId() ? QDir(root).absolutePath() : QDir(root).absoluteFilePath(id);
+    return QDir(root).absolutePath();
 }
 
 QJsonObject ModelDescriptor::toJson() const
@@ -114,27 +114,13 @@ QJsonObject ModelDescriptor::toJson() const
 
 QJsonObject modelPipelineContract(const QString &id)
 {
-    const auto *model = findModel(id);
-    if (!model) return {};
-    if (id == defaultModelId()) return embeddingPipelineContract();
-    return {{"revision", 1}, {"model", model->id}, {"modelRevision", model->revision},
-            {"artifacts", model->toJson().value("artifacts")},
-            {"llamaCpp", QStringLiteral("620d2225cc436ab0b001e3200e590e3b286ef9ab")},
-            {"adapter", model->adapter}, {"dimensions", model->dimensions},
-            {"instruction", QStringLiteral("Represent the user's input.")},
-            {"template", QStringLiteral("ChatML-system-user-assistant-generation-prefix,last-token-tokenizer-postprocessor-endoftext")},
-            {"tokenization", QStringLiteral("UTF-8,special-tokens,truncate-user-reserving-template-suffix-and-endoftext")},
-            {"context", QStringLiteral("text-query=512,full-multimodal=2048,batch=256,ubatch=256,single-sequence")},
-            {"output", QStringLiteral("decoder,last-pooling,L2-normalized,full-dimension")},
-            {"image", QStringLiteral("Qwen-smart-resize-grid=32,ties-to-even,Pillow-bicubic-RGB,budgets=160/320/640/1280/1280,min=4,max=1280,mRoPE,deepstack")},
-            {"audio", QStringLiteral("unsupported,keyword-only,video-frames-only")}};
+    return findModel(id) ? embeddingPipelineContract() : QJsonObject{};
 }
 
 QString modelPipelineFingerprint(const QString &id)
 {
     if (!findModel(id)) return {};
-    if (id == defaultModelId()) return embeddingPipelineFingerprint();
-    return pipelineContractFingerprint(QStringLiteral("qcs-embedding-v2"), modelPipelineContract(id));
+    return embeddingPipelineFingerprint();
 }
 
 } // namespace qcopilots_search

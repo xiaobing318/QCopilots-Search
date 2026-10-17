@@ -56,24 +56,28 @@ private slots:
             LoginStartupTarget saved;
             QString readError;
             hiddenDuringRegistration = !readLoginStartupTarget(locator, &saved, &readError)
-                && saved.profileDir.isEmpty() && readError.contains(QStringLiteral("lock"));
+                && saved.profileBaseDir.isEmpty() && readError.contains(QStringLiteral("lock"));
             return true;
         }, &error), qPrintable(error));
         QVERIFY(called);
         QVERIFY(hiddenDuringRegistration);
-        QVERIFY(!QFileInfo::exists(target.profileDir));
+        QVERIFY(!QFileInfo::exists(target.profileBaseDir));
         QVERIFY(!QFileInfo::exists(target.modelDir));
         LoginStartupTarget saved;
         QVERIFY(!readLoginStartupTarget(locator, &saved, &error));
         QVERIFY(error.contains(QStringLiteral("unavailable")));
-        QVERIFY(!QFileInfo::exists(target.profileDir));
+        QVERIFY(!QFileInfo::exists(target.profileBaseDir));
         QVERIFY(!QFileInfo::exists(target.modelDir));
-        QVERIFY(QDir().mkpath(target.profileDir));
+        QVERIFY(QDir().mkpath(RuntimePaths::resolve(target.profileBaseDir, target.modelDir).profileDir));
         QVERIFY(QDir().mkpath(target.modelDir));
         QVERIFY2(readLoginStartupTarget(locator, &saved, &error), qPrintable(error));
-        const auto resolved = RuntimePaths::resolve(target.profileDir, target.modelDir);
-        QCOMPARE(saved.profileDir, resolved.profileDir);
+        const auto resolved = RuntimePaths::resolve(target.profileBaseDir, target.modelDir);
+        QCOMPARE(saved.profileBaseDir, resolved.profileBaseDir);
         QCOMPARE(saved.modelDir, resolved.modelDir);
+        const auto serialized = QJsonDocument::fromJson(storedBytes(locator)).object();
+        QCOMPARE(serialized.value("version").toInt(), 2);
+        QCOMPARE(serialized.value("profileBaseDir").toString(), resolved.profileBaseDir);
+        QVERIFY(!serialized.contains("profileDir"));
         QVERIFY(!QFileInfo::exists(locator + QStringLiteral(".lock")));
         QVERIFY(!QFileInfo::exists(locator + QStringLiteral(".pending")));
     }
@@ -112,7 +116,7 @@ private slots:
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
         const QString locator = environment.path(QStringLiteral("target.json"));
         const auto original = targetFor(environment, QStringLiteral("original"));
-        QVERIFY(QDir().mkpath(original.profileDir));
+        QVERIFY(QDir().mkpath(RuntimePaths::resolve(original.profileBaseDir, original.modelDir).profileDir));
         QVERIFY(QDir().mkpath(original.modelDir));
         QString error;
         QVERIFY2(updateLoginStartupTarget(locator, original, true,
@@ -124,7 +128,7 @@ private slots:
                 LoginStartupTarget saved;
                 QString readError;
                 hiddenDuringRegistration = !readLoginStartupTarget(locator, &saved, &readError)
-                    && saved.profileDir.isEmpty() && readError.contains(QStringLiteral("lock"));
+                    && saved.profileBaseDir.isEmpty() && readError.contains(QStringLiteral("lock"));
                 *reason = QStringLiteral("registration failed");
                 return false;
             }, &error));
@@ -132,7 +136,7 @@ private slots:
         QCOMPARE(storedBytes(locator), before);
         LoginStartupTarget saved;
         QVERIFY2(readLoginStartupTarget(locator, &saved, &error), qPrintable(error));
-        QCOMPARE(saved.profileDir, RuntimePaths::resolve(original.profileDir, original.modelDir).profileDir);
+        QCOMPARE(saved.profileBaseDir, RuntimePaths::resolve(original.profileBaseDir, original.modelDir).profileBaseDir);
     }
 
     void takeoverRejectsPreviousOwner()
@@ -169,14 +173,14 @@ private slots:
         QString error;
         QVERIFY2(updateLoginStartupTarget(locator, target, true,
             [](bool, QString *) { return true; }, &error), qPrintable(error));
-        target.profileDir += QStringLiteral("/./");
+        target.profileBaseDir += QStringLiteral("/./");
         target.modelDir += QStringLiteral("/./");
         bool disabled = false;
         bool hiddenDuringDisable = false;
         QVERIFY2(updateLoginStartupTarget(locator, target, false, [&](bool enabled, QString *) {
             disabled = !enabled;
             LoginStartupTarget saved;
-            hiddenDuringDisable = !readLoginStartupTarget(locator, &saved) && saved.profileDir.isEmpty();
+            hiddenDuringDisable = !readLoginStartupTarget(locator, &saved) && saved.profileBaseDir.isEmpty();
             return true;
         }, &error), qPrintable(error));
         QVERIFY(disabled);
@@ -208,7 +212,7 @@ private slots:
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
         const QString locator = environment.path(QStringLiteral("target.json"));
         const auto target = targetFor(environment, QStringLiteral("data"));
-        QVERIFY(QDir().mkpath(target.profileDir));
+        QVERIFY(QDir().mkpath(RuntimePaths::resolve(target.profileBaseDir, target.modelDir).profileDir));
         QVERIFY(QDir().mkpath(target.modelDir));
         QString error;
         QVERIFY2(updateLoginStartupTarget(locator, target, true,
@@ -217,7 +221,7 @@ private slots:
         LoginStartupTarget saved;
         QVERIFY(!readLoginStartupTarget(locator, &saved, &error));
         QVERIFY(error.contains(QStringLiteral("Use current directories at sign-in")));
-        QVERIFY(saved.profileDir.isEmpty());
+        QVERIFY(saved.profileBaseDir.isEmpty());
         bool called = false;
         QVERIFY(!updateLoginStartupTarget(locator, target, false,
             [&](bool, QString *) { called = true; return true; }, &error));
@@ -232,7 +236,7 @@ private slots:
             [](bool, QString *) { return true; }, &error), qPrintable(error));
         QVERIFY(!QFileInfo::exists(locator + QStringLiteral(".pending")));
         QVERIFY2(readLoginStartupTarget(locator, &saved, &error), qPrintable(error));
-        QCOMPARE(saved.profileDir, RuntimePaths::resolve(target.profileDir, target.modelDir).profileDir);
+        QCOMPARE(saved.profileBaseDir, RuntimePaths::resolve(target.profileBaseDir, target.modelDir).profileBaseDir);
     }
 
 #ifdef Q_OS_WIN
@@ -273,7 +277,7 @@ private slots:
         const QString locator = environment.path(QStringLiteral("target.json"));
         const auto original = targetFor(environment, QStringLiteral("original"));
         const auto replacement = targetFor(environment, QStringLiteral("replacement"));
-        QVERIFY(QDir().mkpath(replacement.profileDir));
+        QVERIFY(QDir().mkpath(RuntimePaths::resolve(replacement.profileBaseDir, replacement.modelDir).profileDir));
         QVERIFY(QDir().mkpath(replacement.modelDir));
         QString error;
         QVERIFY2(updateLoginStartupTarget(locator, original, true,
@@ -296,14 +300,14 @@ private slots:
         QVERIFY(QFileInfo::exists(locator + QStringLiteral(".pending")));
         LoginStartupTarget saved;
         QVERIFY(!readLoginStartupTarget(locator, &saved, &error));
-        QVERIFY(saved.profileDir.isEmpty());
+        QVERIFY(saved.profileBaseDir.isEmpty());
         CloseHandle(reader.value);
         reader.value = INVALID_HANDLE_VALUE;
         QVERIFY2(updateLoginStartupTarget(locator, replacement, true,
             [](bool, QString *) { return true; }, &error), qPrintable(error));
         QVERIFY(!QFileInfo::exists(locator + QStringLiteral(".pending")));
         QVERIFY2(readLoginStartupTarget(locator, &saved, &error), qPrintable(error));
-        QCOMPARE(saved.profileDir, RuntimePaths::resolve(replacement.profileDir, replacement.modelDir).profileDir);
+        QCOMPARE(saved.profileBaseDir, RuntimePaths::resolve(replacement.profileBaseDir, replacement.modelDir).profileBaseDir);
     }
 #endif
 
@@ -313,13 +317,13 @@ private slots:
         QTest::newRow("invalid-json") << QByteArray("{");
         QTest::newRow("array") << QByteArray("[]");
         QTest::newRow("missing-fields") << QByteArray("{}");
-        QTest::newRow("relative-profile") << QByteArray("{\"version\":1,\"profileDir\":\"relative\",\"modelDir\":\"$ABS\"}");
-        QTest::newRow("relative-models") << QByteArray("{\"version\":1,\"profileDir\":\"$ABS\",\"modelDir\":\"relative\"}");
-        QTest::newRow("empty-profile") << QByteArray("{\"version\":1,\"profileDir\":\"\",\"modelDir\":\"$ABS\"}");
-        QTest::newRow("wrong-version") << QByteArray("{\"version\":2,\"profileDir\":\"$ABS\",\"modelDir\":\"$ABS\"}");
-        QTest::newRow("fractional-version") << QByteArray("{\"version\":1.5,\"profileDir\":\"$ABS\",\"modelDir\":\"$ABS\"}");
-        QTest::newRow("string-version") << QByteArray("{\"version\":\"1\",\"profileDir\":\"$ABS\",\"modelDir\":\"$ABS\"}");
-        QTest::newRow("nul") << QByteArray("{\"version\":1,\"profileDir\":\"$ABS\\u0000tail\",\"modelDir\":\"$ABS\"}");
+        QTest::newRow("relative-profile") << QByteArray("{\"version\":2,\"profileBaseDir\":\"relative\",\"modelDir\":\"$ABS\"}");
+        QTest::newRow("relative-models") << QByteArray("{\"version\":2,\"profileBaseDir\":\"$ABS\",\"modelDir\":\"relative\"}");
+        QTest::newRow("empty-profile") << QByteArray("{\"version\":2,\"profileBaseDir\":\"\",\"modelDir\":\"$ABS\"}");
+        QTest::newRow("wrong-version") << QByteArray("{\"version\":1,\"profileBaseDir\":\"$ABS\",\"modelDir\":\"$ABS\"}");
+        QTest::newRow("fractional-version") << QByteArray("{\"version\":1.5,\"profileBaseDir\":\"$ABS\",\"modelDir\":\"$ABS\"}");
+        QTest::newRow("string-version") << QByteArray("{\"version\":\"1\",\"profileBaseDir\":\"$ABS\",\"modelDir\":\"$ABS\"}");
+        QTest::newRow("nul") << QByteArray("{\"version\":2,\"profileBaseDir\":\"$ABS\\u0000tail\",\"modelDir\":\"$ABS\"}");
     }
 
     void invalidLocator()
@@ -334,7 +338,7 @@ private slots:
         LoginStartupTarget saved;
         QVERIFY(!readLoginStartupTarget(locator, &saved, &error));
         QVERIFY(!error.isEmpty());
-        QVERIFY(saved.profileDir.isEmpty());
+        QVERIFY(saved.profileBaseDir.isEmpty());
         bool called = false;
         const auto target = targetFor(environment, QStringLiteral("data"));
         QVERIFY(!updateLoginStartupTarget(locator, target, false,
@@ -344,7 +348,7 @@ private slots:
         // Enabling can repair a corrupt locator.
         QVERIFY2(updateLoginStartupTarget(locator, target, true,
             [](bool, QString *) { return true; }, &error), qPrintable(error));
-        QVERIFY(QDir().mkpath(target.profileDir));
+        QVERIFY(QDir().mkpath(RuntimePaths::resolve(target.profileBaseDir, target.modelDir).profileDir));
         QVERIFY(QDir().mkpath(target.modelDir));
         QVERIFY2(readLoginStartupTarget(locator, &saved, &error), qPrintable(error));
     }
@@ -369,14 +373,14 @@ private slots:
         QString error;
         QVERIFY2(updateLoginStartupTarget(locator, target, true,
             [](bool, QString *) { return true; }, &error), qPrintable(error));
-        if (createProfile) QVERIFY(QDir().mkpath(target.profileDir));
+        if (createProfile) QVERIFY(QDir().mkpath(RuntimePaths::resolve(target.profileBaseDir, target.modelDir).profileDir));
         if (createModels) QVERIFY(QDir().mkpath(target.modelDir));
         LoginStartupTarget saved{QStringLiteral("old-value"), QStringLiteral("old-value")};
         QVERIFY(!readLoginStartupTarget(locator, &saved, &error));
         QVERIFY(error.contains(QStringLiteral("unavailable")));
-        QVERIFY(saved.profileDir.isEmpty());
+        QVERIFY(saved.profileBaseDir.isEmpty());
         QVERIFY(saved.modelDir.isEmpty());
-        QCOMPARE(QFileInfo::exists(target.profileDir), createProfile);
+        QCOMPARE(QFileInfo::exists(target.profileBaseDir), createProfile);
         QCOMPARE(QFileInfo::exists(target.modelDir), createModels);
     }
 
@@ -387,7 +391,7 @@ private slots:
         QVERIFY2(environment.isValid(), qPrintable(environment.error()));
         const QString locator = environment.path(QStringLiteral("target.json"));
         const auto target = targetFor(environment, QStringLiteral("data"));
-        QVERIFY(QDir().mkpath(target.profileDir));
+        QVERIFY(QDir().mkpath(RuntimePaths::resolve(target.profileBaseDir, target.modelDir).profileDir));
         QVERIFY(QDir().mkpath(target.modelDir));
         QString error;
         QVERIFY2(updateLoginStartupTarget(locator, target, true,
@@ -399,7 +403,7 @@ private slots:
         QVERIFY(QFile::setPermissions(target.modelDir,
             QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
         QVERIFY2(readable, qPrintable(error));
-        QCOMPARE(saved.modelDir, RuntimePaths::resolve(target.profileDir, target.modelDir).modelDir);
+        QCOMPARE(saved.modelDir, RuntimePaths::resolve(target.profileBaseDir, target.modelDir).modelDir);
     }
 #endif
 
@@ -420,7 +424,7 @@ private slots:
         LoginStartupTarget saved;
         QVERIFY(!readLoginStartupTarget(locator, &saved, &error));
         QVERIFY(error.contains(QStringLiteral("lock")));
-        QVERIFY(saved.profileDir.isEmpty());
+        QVERIFY(saved.profileBaseDir.isEmpty());
     }
 
     void invalidUpdatePath_data()
@@ -449,7 +453,7 @@ private slots:
         QString error;
         QVERIFY(!updateLoginStartupTarget(locator, {path, target.modelDir}, true, nativeSet, &error));
         QVERIFY(!error.isEmpty());
-        QVERIFY(!updateLoginStartupTarget(locator, {target.profileDir, path}, true, nativeSet, &error));
+        QVERIFY(!updateLoginStartupTarget(locator, {target.profileBaseDir, path}, true, nativeSet, &error));
         QVERIFY(!error.isEmpty());
         QVERIFY(!updateLoginStartupTarget(path, target, true, nativeSet, &error));
         QVERIFY(!error.isEmpty());
@@ -469,6 +473,30 @@ private slots:
         QVERIFY(!readLoginStartupTarget(environment.path(QStringLiteral("absent/target.json")), &target, &error));
         QVERIFY(!error.isEmpty());
         QVERIFY(!QFileInfo::exists(environment.path(QStringLiteral("absent"))));
+    }
+
+    void versionedLocatorDoesNotReadOrReplaceOlderTarget()
+    {
+        TestEnvironment environment(QStringLiteral("login-version-isolation"));
+        QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+        const QByteArray oldBytes("{\"version\":1,\"profileDir\":\"old-target\"}\n");
+        QVERIFY(environment.writeFile("qcs-login-startup.json", oldBytes));
+        const QString legacy = environment.path("qcs-login-startup.json");
+        QLockFile oldLock(legacy + ".lock");
+        QVERIFY(oldLock.tryLock());
+        const QString locator = environment.path("profiles/v4/qcs-login-startup.json");
+        LoginStartupTarget saved;
+        QString error;
+        QVERIFY(!readLoginStartupTarget(locator, &saved, &error));
+        QVERIFY(saved.profileBaseDir.isEmpty());
+        QCOMPARE(storedBytes(legacy), oldBytes);
+        QVERIFY(!QFileInfo::exists(environment.path("profiles")));
+        const auto target = targetFor(environment, QStringLiteral("new-data"));
+        QVERIFY2(updateLoginStartupTarget(locator, target, true,
+            [](bool enabled, QString *) { return enabled; }, &error), qPrintable(error));
+        QCOMPARE(storedBytes(legacy), oldBytes);
+        QCOMPARE(QJsonDocument::fromJson(storedBytes(locator)).object().value("version").toInt(), 2);
+        QVERIFY(!QFileInfo::exists(target.profileBaseDir));
     }
 
     void missingLocatorCannotDisableNativeState()
@@ -502,7 +530,7 @@ private slots:
         const auto nativeSet = [&](bool, QString *) { called = true; return true; };
         QVERIFY(!updateLoginStartupTarget(locator, {badPath, target.modelDir}, true, nativeSet, &error));
         QVERIFY(error.contains(QStringLiteral("not a directory")));
-        QVERIFY(!updateLoginStartupTarget(locator, {target.profileDir, badPath}, true, nativeSet, &error));
+        QVERIFY(!updateLoginStartupTarget(locator, {target.profileBaseDir, badPath}, true, nativeSet, &error));
         QVERIFY(error.contains(QStringLiteral("not a directory")));
         QVERIFY(!called);
         QVERIFY(!QFileInfo::exists(locator));

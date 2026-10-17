@@ -41,7 +41,7 @@ public:
     {
         process.setProgram(QString::fromUtf8(QCOPILOTS_SEARCH_RECOVERY_CHILD));
         process.setArguments({QStringLiteral("--test-root"), environment.root(),
-                              QStringLiteral("--profile-dir"), paths.profileDir,
+                              QStringLiteral("--profile-dir"), paths.profileBaseDir,
                               QStringLiteral("--fault-token"), token});
         // Windows process creation cannot use an over-MAX_PATH current directory.
         // Inherit the valid launcher directory there while passing absolute paths.
@@ -77,6 +77,7 @@ bool writeOwnership(const TestEnvironment &environment, const RuntimePaths &path
     if (!paths.ensure(error))
         return false;
     const QJsonObject ownership{{QStringLiteral("token"), token},
+                               {QStringLiteral("profileBase"), QFileInfo(paths.profileBaseDir).canonicalFilePath()},
                                {QStringLiteral("profile"), QFileInfo(paths.profileDir).canonicalFilePath()}};
     QSaveFile marker(environment.path(QStringLiteral("qcs-recovery-owner.json")));
     const QByteArray bytes = QJsonDocument(ownership).toJson(QJsonDocument::Compact);

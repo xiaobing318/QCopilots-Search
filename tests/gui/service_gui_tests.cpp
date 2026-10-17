@@ -91,7 +91,7 @@ private slots:
         QVERIFY2(settings.save(paths.configFile, &error), qPrintable(error));
         ScopedService service(paths);
         service.process.setProgram(QStringLiteral(QCOPILOTS_SEARCH_SERVICE_EXECUTABLE));
-        service.process.setArguments({"--profile-dir", paths.profileDir, "--model-dir", paths.modelDir});
+        service.process.setArguments({"--profile-dir", paths.profileBaseDir, "--model-dir", paths.modelDir});
         service.process.setWorkingDirectory(env.root());
         service.process.start();
         QVERIFY2(service.process.waitForStarted(10000), qPrintable(service.process.errorString()));

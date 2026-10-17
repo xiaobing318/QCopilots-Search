@@ -4,7 +4,7 @@
 
 ## 代码与模块
 
-应用使用 C++20 和 Qt Widgets。自有目标、程序、测试、安装资源和脚本使用 `qcs` 前缀，GUI 为 `qcs-gui`，其他程序为 `qcs-cli`、`qcs-service` 和 `qcs-worker`。仓库名称为 `QCopilots-Search`，显示名称为 QCopilots Search，C++ 命名空间为 `qcopilots_search`。用户数据根使用 `QCS_HOME`，其他配置变量遵循现有 `QCOPILOTS_SEARCH_*` 命名。
+应用使用 C++20 和 Qt Widgets。自有目标、程序、测试、安装资源和脚本使用 `qcs` 前缀，GUI 为 `qcs-gui`，其他程序为 `qcs-cli`、`qcs-service` 和 `qcs-worker`。仓库名称为 `QCopilots-Search`，显示名称为 QCopilots Search，C++ 命名空间为 `qcopilots_search`。数据基目录使用 `QCS_HOME`，当前配置格式 v4 的数据位于其下的 `profiles/v4`，不自动读取或迁移旧格式数据。其他配置变量遵循现有 `QCOPILOTS_SEARCH_*` 命名。
 
 数据库写入由服务协调，耗时提取与推理放在工作进程。保持明确错误与取消语义，不用固定结果、伪造向量或吞掉异常替代实际行为。增加格式时同时覆盖正常输入、损坏输入、定位和资源释放。
 
@@ -22,7 +22,7 @@
 
 ## 测试与评审
 
-有可写状态的测试使用唯一临时根，尊重 `QCOPILOTS_SEARCH_TEST_ROOT`，为子进程显式传递相同 profile/model 路径。不得读取或修改真实用户数据与系统登录启动配置。静态夹具只读，结束前关闭本次进程、连接和文件，创建或清理失败必须使测试失败。
+有可写状态的测试使用唯一临时根，尊重 `QCOPILOTS_SEARCH_TEST_ROOT`，为子进程显式传递相同数据基目录与模型目录。最终 profile 由 `RuntimePaths` 统一追加 `profiles/v4`，不能将已追加版本的路径再次作为基目录传入。不得读取或修改真实用户数据与系统登录启动配置。静态夹具只读，结束前关闭本次进程、连接和文件，创建或清理失败必须使测试失败。
 
 同一测试并行运行不能共享可写目录。路径用例动态生成中文、空格与所需长度，不把开发者用户名或固定盘符写入测试。网络测试使用系统分配端口。模型只在校验后共享，真实推理测试不能以关键词兜底替代。
 

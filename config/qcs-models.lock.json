@@ -27,58 +27,6 @@
           "sha256": "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f"
         }
       ]
-    },
-    {
-      "id": "qwen3-vl-embedding-2b",
-      "name": "Qwen3-VL-Embedding-2B",
-      "repository": "mradermacher/Qwen3-VL-Embedding-2B-GGUF",
-      "revision": "ac21c8784ed86e50391e32ed945f21e42140b1f6",
-      "adapter": "qwen3-vl-embedding",
-      "dimensions": 2048,
-      "supportsVision": true,
-      "supportsAudio": false,
-      "textFile": "Qwen3-VL-Embedding-2B.Q8_0.gguf",
-      "mediaFile": "Qwen3-VL-Embedding-2B.mmproj-f16.gguf",
-      "artifacts": [
-        {
-          "name": "Qwen3-VL-Embedding-2B.Q8_0.gguf",
-          "url": "https://huggingface.co/mradermacher/Qwen3-VL-Embedding-2B-GGUF/resolve/ac21c8784ed86e50391e32ed945f21e42140b1f6/Qwen3-VL-Embedding-2B.Q8_0.gguf",
-          "size": 1834428576,
-          "sha256": "26fadde153b2266d244de4752c2dcba35be78872bdeeb005390b74689d45d851"
-        },
-        {
-          "name": "Qwen3-VL-Embedding-2B.mmproj-f16.gguf",
-          "url": "https://huggingface.co/mradermacher/Qwen3-VL-Embedding-2B-GGUF/resolve/ac21c8784ed86e50391e32ed945f21e42140b1f6/Qwen3-VL-Embedding-2B.mmproj-f16.gguf",
-          "size": 819395200,
-          "sha256": "521c481325245b7cb043fd33cfd891abf31c1925f504235fb8ca9d6b1dd5eb9d"
-        }
-      ]
-    },
-    {
-      "id": "qwen3-vl-embedding-8b",
-      "name": "Qwen3-VL-Embedding-8B",
-      "repository": "mradermacher/Qwen3-VL-Embedding-8B-GGUF",
-      "revision": "ffa49879fdb91ed1a436fbc84f37b123f714bb13",
-      "adapter": "qwen3-vl-embedding",
-      "dimensions": 4096,
-      "supportsVision": true,
-      "supportsAudio": false,
-      "textFile": "Qwen3-VL-Embedding-8B.Q6_K.gguf",
-      "mediaFile": "Qwen3-VL-Embedding-8B.mmproj-f16.gguf",
-      "artifacts": [
-        {
-          "name": "Qwen3-VL-Embedding-8B.Q6_K.gguf",
-          "url": "https://huggingface.co/mradermacher/Qwen3-VL-Embedding-8B-GGUF/resolve/ffa49879fdb91ed1a436fbc84f37b123f714bb13/Qwen3-VL-Embedding-8B.Q6_K.gguf",
-          "size": 6215396608,
-          "sha256": "c619330e39cad3b87be5a8216fcc9b19801362cda3d38e36f60dbc4f38b1046b"
-        },
-        {
-          "name": "Qwen3-VL-Embedding-8B.mmproj-f16.gguf",
-          "url": "https://huggingface.co/mradermacher/Qwen3-VL-Embedding-8B-GGUF/resolve/ffa49879fdb91ed1a436fbc84f37b123f714bb13/Qwen3-VL-Embedding-8B.mmproj-f16.gguf",
-          "size": 1159030304,
-          "sha256": "c507828405f645670c829be93fa57fb890af5b7abbe2583435f4a8042d1f8ba8"
-        }
-      ]
     }
   ]
 }

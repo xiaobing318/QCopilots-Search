@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -25,6 +26,10 @@ sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parent.parent
 NSIS_LIMIT = 2**31 - 1
 ROCM_VARIANT = "windows-x64-rocm"
+_selection_spec = importlib.util.spec_from_file_location(
+    "qcs_windows_package_names", SOURCE / ".github/scripts/qcs-artifact-selection.py")
+_selection = importlib.util.module_from_spec(_selection_spec)
+_selection_spec.loader.exec_module(_selection)
 
 
 def digest(path: Path) -> str:
@@ -237,8 +242,8 @@ def _package_in_directory(build: Path, output: Path, config: str, variant: str, 
     build, output = external(build), external(output)
     values = cpack_values(build / "CPackConfig.cmake")
     name = values["CPACK_PACKAGE_FILE_NAME"]
-    if variant not in name:
-        raise RuntimeError("CPack package filename does not contain the requested variant")
+    if name != _selection.package_stem(variant, values["CPACK_PACKAGE_VERSION"]):
+        raise RuntimeError("CPack package filename does not match the requested variant and locked SDK")
     output.mkdir(parents=True, exist_ok=True)
     previous_diagnostics = diagnostic_stamps(output)
     started = time.time()

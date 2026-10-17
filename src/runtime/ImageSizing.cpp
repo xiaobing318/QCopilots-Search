@@ -200,51 +200,6 @@ std::optional<QSize> ImageSizing::targetSize(int height, int width, int budget)
     return QSize(static_cast<int>(targetWidth), static_cast<int>(targetHeight));
 }
 
-int ImageSizing::qwenTokenBudget(int budget)
-{
-    switch (budget) {
-    case 70: return 160;
-    case 140: return 320;
-    case 280: return 640;
-    case 560: case 1120: return 1280;
-    default: return 0;
-    }
-}
-
-std::optional<QSize> ImageSizing::qwenTargetSize(int height, int width, int budget)
-{
-    const int tokens = qwenTokenBudget(budget);
-    if (height <= 0 || width <= 0 || !tokens
-        || double(std::max(height, width)) / std::min(height, width) > 200.0)
-        return std::nullopt;
-    constexpr int side = 32;
-    constexpr double minPixels = 4.0 * side * side;
-    const double maxPixels = double(tokens) * side * side;
-    // Match Python round(), including exact half-grid ties, independently of
-    // the process floating-point rounding mode.
-    const auto roundGrid = [](int value) -> qint64 {
-        const qint64 units = value / side;
-        const int remainder = value % side;
-        return (units + (remainder > side / 2 || (remainder == side / 2 && (units & 1)))) * side;
-    };
-    qint64 h = std::max<qint64>(side, roundGrid(height));
-    qint64 w = std::max<qint64>(side, roundGrid(width));
-    const double pixels = double(height) * width;
-    if (double(h) * w > maxPixels) {
-        const double scale = std::sqrt(pixels / maxPixels);
-        h = qint64(std::floor(height / scale / side)) * side;
-        w = qint64(std::floor(width / scale / side)) * side;
-    } else if (double(h) * w < minPixels) {
-        const double scale = std::sqrt(minPixels / pixels);
-        h = qint64(std::ceil(height * scale / side)) * side;
-        w = qint64(std::ceil(width * scale / side)) * side;
-    }
-    if (h <= 0 || w <= 0 || h > std::numeric_limits<int>::max()
-        || w > std::numeric_limits<int>::max() || double(h) * w > maxPixels)
-        return std::nullopt;
-    return QSize(int(w), int(h));
-}
-
 QByteArray ImageSizing::resizeBicubic(const unsigned char* source, int width, int height,
                                     int toWidth, int toHeight)
 {

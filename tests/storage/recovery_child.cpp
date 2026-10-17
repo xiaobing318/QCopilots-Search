@@ -29,11 +29,14 @@ void require(bool condition, const QString &message)
 RuntimePaths ownedPaths(const QCommandLineParser &parser)
 {
     const QFileInfo rootInfo(parser.value(QStringLiteral("test-root")));
-    const QFileInfo profileInfo(parser.value(QStringLiteral("profile-dir")));
+    const QFileInfo baseInfo(parser.value(QStringLiteral("profile-dir")));
+    const auto paths = RuntimePaths::resolve(baseInfo.absoluteFilePath());
+    const QFileInfo profileInfo(paths.profileDir);
     const QString root = rootInfo.canonicalFilePath();
     const QString profile = profileInfo.canonicalFilePath();
     require(rootInfo.isAbsolute() && rootInfo.isDir() && !rootInfo.isSymLink()
                 && rootInfo.fileName().startsWith(QStringLiteral("qcs-t-"))
+                && baseInfo.isAbsolute() && baseInfo.isDir() && !baseInfo.isSymLink()
                 && profileInfo.isAbsolute() && profileInfo.isDir() && !profileInfo.isSymLink()
                 && !root.isEmpty() && !profile.isEmpty(),
             QStringLiteral("Recovery child requires an owned test directory"));
@@ -50,9 +53,10 @@ RuntimePaths ownedPaths(const QCommandLineParser &parser)
     const QJsonObject ownership = QJsonDocument::fromJson(marker.readAll()).object();
     const QString token = parser.value(QStringLiteral("fault-token"));
     require(!token.isEmpty() && ownership.value(QStringLiteral("token")).toString() == token
+                && ownership.value(QStringLiteral("profileBase")).toString() == baseInfo.canonicalFilePath()
                 && ownership.value(QStringLiteral("profile")).toString() == profile,
             QStringLiteral("Recovery child ownership token or profile mismatch"));
-    return RuntimePaths::resolve(profile);
+    return paths;
 }
 } // namespace
 
@@ -64,7 +68,7 @@ int main(int argc, char **argv)
     QCommandLineParser parser;
     parser.addOptions({
         {{QStringLiteral("test-root")}, QStringLiteral("Owned test root"), QStringLiteral("path")},
-        {{QStringLiteral("profile-dir")}, QStringLiteral("Owned child profile"), QStringLiteral("path")},
+        {{QStringLiteral("profile-dir")}, QStringLiteral("Owned child profile base"), QStringLiteral("path")},
         {{QStringLiteral("fault-token")}, QStringLiteral("Parent ownership token"), QStringLiteral("token")}
     });
     try {

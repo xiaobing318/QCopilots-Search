@@ -38,9 +38,6 @@ constexpr qint64 copyBufferBytes = 1024 * 1024;
 ModelFiles::ModelFiles(QString modelDir, QObject* parent)
     : ModelFiles(std::move(modelDir), manifest(), parent) {}
 
-ModelFiles::ModelFiles(QString modelRoot, const QString& modelId, QObject* parent)
-    : ModelFiles(qcopilots_search::modelDirectory(modelRoot, modelId), manifest(modelId), parent) {}
-
 ModelFiles::ModelFiles(QString modelDir, QList<ModelArtifact> artifacts, QObject* parent)
     : QObject(parent), modelDir_(modelDir.trimmed().isEmpty() ? QString{} : QDir(modelDir).absolutePath()),
       artifacts_(std::move(artifacts)), network_(new QNetworkAccessManager(this)) {}
@@ -56,13 +53,7 @@ ModelFiles::~ModelFiles()
 
 QList<ModelArtifact> ModelFiles::manifest()
 {
-    return manifest(defaultModelId());
-}
-
-QList<ModelArtifact> ModelFiles::manifest(const QString& modelId)
-{
-    const auto *model = findModel(modelId);
-    return model ? model->artifacts : QList<ModelArtifact>{};
+    return modelCatalog().first().artifacts;
 }
 
 bool ModelFiles::validateManifest(QString* error) const

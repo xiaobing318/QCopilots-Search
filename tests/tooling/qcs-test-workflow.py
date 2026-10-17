@@ -935,7 +935,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                      lambda value: value["artifacts"].pop(),
                      lambda value: value["artifacts"][0].update(sha256="0" * 64),
                      lambda value: value["artifacts"][0].update(bytes=1),
-                     lambda value: value.update(modelId="qwen3-vl-embedding-2b"),
+                     lambda value: value.update(modelId="unsupported-model"),
                      lambda value: value.update(dimensions=2048),
                      lambda value: value["artifacts"].__setitem__(1, value["artifacts"][0]),
                      lambda value: value.update(directory=str(self.root / "elsewhere"))]
@@ -954,63 +954,13 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
             with self.subTest(first=actual[:2]), self.assertRaises(RuntimeError):
                 package_verifier.validate_vector(actual, reference)
 
-    def test_model_presets_keep_distinct_artifacts_directories_and_dimensions(self):
-        for identifier, dimensions in (("qwen3-vl-embedding-2b", 2048), ("qwen3-vl-embedding-8b", 4096)):
-            artifacts = package_verifier.MODEL_CATALOG.artifacts(identifier)
-            result = {"valid": True, "directory": str(self.root / identifier), "modelId": identifier,
-                      "dimensions": dimensions, "artifacts": [
-                {"name": name, "present": True, "bytes": size, "expectedBytes": size, "sha256": digest}
-                for name, (size, digest) in artifacts.items()]}
-            self.assertEqual(package_verifier.model_verification(result, self.root, identifier), result)
-            with self.assertRaises(RuntimeError):
-                package_verifier.model_verification(result, self.root)
-            vector = [1.0] + [0.0] * (dimensions - 1)
-            self.assertEqual(package_verifier.validate_vector(vector, vector, dimensions)["dimensions"], dimensions)
-            with self.assertRaises(RuntimeError):
-                package_verifier.validate_vector(vector, vector)
-        args = argparse.Namespace(model=["qwen3-vl-embedding-8b", "qwen3-vl-embedding-2b", "qwen3-vl-embedding-8b"])
-        self.assertEqual(workflow.model_ids(args, include_default=True),
-                         ["embeddinggemma-2", "qwen3-vl-embedding-8b", "qwen3-vl-embedding-2b"])
-        with self.assertRaisesRegex(ValueError, "Unknown model"):
-            workflow.model_ids(argparse.Namespace(model=["missing-model"]))
 
-    def test_qwen_package_reference_requires_matching_locked_identity_and_input_bytes(self):
-        import hashlib
-        source = self.root / "reference-source"
-        fixture_root = source / "tests/runtime/fixtures"
-        fixture_dir = fixture_root / "qwen"
-        fixture_dir.mkdir(parents=True)
-        screenshot = fixture_root / "screen.png"
-        screenshot.write_bytes(b"synthetic input bytes, not real numerical acceptance")
-        identifier = "qwen3-vl-embedding-2b"
-        vector = [1.0] + [0.0] * 2047
-        document = {"schemaVersion": 1, "modelId": identifier, "dimensions": 2048,
-                    "minimumCosine": 0.99, "provenance": {"synthetic": True}, "inputs": [
-            {"id": "query-en", "kind": "query", "text": "query", "vector": vector,
-             "sha256": hashlib.sha256(b"query").hexdigest()},
-            {"id": "document-en", "kind": "document", "text": "document", "title": "Reference.txt", "vector": vector,
-             "sha256": hashlib.sha256(b"document").hexdigest()},
-            {"id": "image-screen-640", "kind": "image", "image": "../screen.png", "budget": 280, "vector": vector,
-             "sha256": hashlib.sha256(screenshot.read_bytes()).hexdigest()}]}
-        manifest = fixture_dir / (identifier + ".json")
-        manifest.write_text(json.dumps(document), encoding="utf-8")
-        with patch.object(package_verifier, "SOURCE", source):
-            observed, _, files, document_id, _ = package_verifier.qwen_reference_inputs(identifier, self.root / "copied")
-            self.assertEqual(observed["dimensions"], 2048)
-            self.assertEqual(files[document_id].read_text(encoding="utf-8"), "document")
-            screenshot.write_bytes(b"tampered")
-            with self.assertRaisesRegex(RuntimeError, "bytes changed"):
-                package_verifier.qwen_reference_inputs(identifier, self.root / "tampered")
-            document["modelId"] = "qwen3-vl-embedding-8b"
-            manifest.write_text(json.dumps(document), encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "identity"):
-                package_verifier.qwen_reference_inputs(identifier, self.root / "wrong-model")
 
     def test_package_service_waits_for_the_selected_model_after_ipc_becomes_ready(self):
         from unittest.mock import Mock
-        model = {"id": "qwen3-vl-embedding-2b", "dimensions": 2048}
+        model = {"id": "embeddinggemma-2", "dimensions": 768}
         ready = {"modelLoading": False, "modelAvailable": True, "modelId": model["id"],
-                 "configuredModelId": model["id"], "activeModelId": model["id"], "dimensions": 2048}
+                 "dimensions": 768}
         service = Mock()
         service.poll.return_value = None
         invoke = Mock(side_effect=[{"modelLoading": True, "modelAvailable": False}, ready])
@@ -1022,7 +972,7 @@ add_subdirectory("${VENDOR_SOURCE}" "${QCOPILOTS_SEARCH_NATIVE_BINARY_ROOT}/cons
                 "modelAvailable": False, "modelError": "actual load failed"}), model, True, 60)
         with patch.object(package_verifier.time, "monotonic", side_effect=[0, 61]), \
                 self.assertRaisesRegex(RuntimeError, "did not activate"):
-            package_verifier.wait_service_ready(service, Mock(return_value={**ready, "modelId": "embeddinggemma-2"}), model, True, 60)
+            package_verifier.wait_service_ready(service, Mock(return_value={**ready, "modelId": "unsupported-model"}), model, True, 60)
 
     def test_package_query_waits_for_every_index_worker_to_exit_after_pause(self):
         from unittest.mock import Mock, call

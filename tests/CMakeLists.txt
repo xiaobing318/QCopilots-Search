@@ -97,8 +97,13 @@ qcopilots_search_add_test(NAME qcs-tests-source-bundle
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-source-bundle.py" -v)
 qcopilots_search_add_test(NAME qcs-tests-package-verification
   COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-package-verification.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-release-workflow
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-release-workflow.py" -v)
+qcopilots_search_add_test(NAME qcs-tests-release-restore
+  COMMAND "${Python3_EXECUTABLE}" -B "${PROJECT_SOURCE_DIR}/tests/tooling/qcs-test-release-restore.py" -v)
 set_tests_properties(qcs-tests-native-ci qcs-tests-deb-ci qcs-tests-test-policy qcs-tests-check qcs-tests-gpu-check
   qcs-tests-artifact-selection qcs-tests-source-bundle qcs-tests-package-verification
+  qcs-tests-release-workflow qcs-tests-release-restore
   PROPERTIES LABELS "unit;tooling" TIMEOUT 240)
 
 qcopilots_search_add_test(NAME qcs-tests-runner

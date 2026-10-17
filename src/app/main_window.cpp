@@ -186,13 +186,7 @@ MainWindow::MainWindow(const RuntimePaths &paths, AppBackend *backend, bool useT
         }
     });
     refresh_.setInterval(2500);
-    connect(&refresh_, &QTimer::timeout, this, [this] {
-        if (!connected_) return;
-        if (!pending_.values().contains("status")) send("status");
-        if (auto *dialog = findChild<SettingsDialog *>(); dialog && dialog->isVisible()
-            && !pending_.values().contains("models.status"))
-            modelStatusRequests_.insert(send("models.status", {{"modelId", dialog->selectedModelId()}}), dialog);
-    });
+    connect(&refresh_, &QTimer::timeout, this, [this] { if (connected_ && !pending_.values().contains("status")) send("status"); });
     refresh_.start();
     auto *find = new QShortcut(QKeySequence::Find, this);
     connect(find, &QShortcut::activated, this, &MainWindow::showSearch);
@@ -361,8 +355,7 @@ void MainWindow::applyLanguage() {
     refreshFiles_->setText(label("Refresh files", "刷新文件列表"));
     loadMore_->setText(label("Load more files", "加载更多文件"));
     if (popupRefreshFiles_) popupRefreshFiles_->setText(refreshFiles_->text());
-    modelButton_->setText(label("Manage models", "管理模型"));
-    modelButton_->setToolTip(modelAvailable_ ? label("The current model passed loading preflight. Manage or switch models.", "当前模型已通过加载预检。可管理或切换模型。") : label("Keyword search is available. Download and apply a model for semantic search.", "关键词搜索可用。下载并应用模型以启用语义搜索。"));
+    modelButton_->setText(modelAvailable_ ? label("Model ready", "模型已就绪") : label("Add model", "添加模型"));
     settingsButton_->setText(label("Settings", "设置"));
     indexButton_->setText(label("Rescan", "重新扫描"));
     pauseButton_->setText(indexState_ == "paused" ? label("Resume", "继续") : label("Pause", "暂停"));
@@ -485,7 +478,6 @@ QJsonObject MainWindow::searchContext(bool popup) const {
     return {{"query", (popup ? popupQuery_ : query_)->text().trimmed()},
         {"code", code}, {"kind", popup || code ? "" : kind_->currentData().toString()},
         {"root", popup ? "" : root_->currentData().toString()},
-        {"modelId", settings_.modelId},
         {"configuredRoots", QJsonArray::fromStringList(code ? settings_.codeRoots : settings_.roots)},
         {"configuredExcludes", QJsonArray::fromStringList(code ? settings_.codeExcludes : settings_.excludes)}};
 }
@@ -499,7 +491,7 @@ void MainWindow::sendSearch(bool popup) {
     const auto context = searchContext(popup);
     const bool browse = context.value("query").toString().isEmpty();
     auto parameters = context;
-    parameters.remove("configuredRoots"); parameters.remove("configuredExcludes"); parameters.remove("modelId");
+    parameters.remove("configuredRoots"); parameters.remove("configuredExcludes");
     parameters.insert("limit", popup ? 12 : 100);
     if (browse) parameters.remove("query"); else parameters.insert("semantic", true);
     auto &state = popup ? popupBrowse_ : browse_;
@@ -530,7 +522,7 @@ void MainWindow::loadMoreFiles(bool popup) {
     if (!connected_ || !context.value("query").toString().isEmpty() || state.loading || state.stale || state.cursor.isEmpty()
         || context != (popup ? popupDisplayedContext_ : displayedSearchContext_)) return;
     auto parameters = context;
-    parameters.remove("query"); parameters.remove("configuredRoots"); parameters.remove("configuredExcludes"); parameters.remove("modelId");
+    parameters.remove("query"); parameters.remove("configuredRoots"); parameters.remove("configuredExcludes");
     parameters.insert("limit", popup ? 12 : 100);
     parameters.insert("cursor", state.cursor);
     QString &request = popup ? popupSearch_ : currentSearch_;
@@ -668,19 +660,13 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
             documentRequest_.clear();
             preview_->setDocumentPreview(data, append);
         }
-    } else if (method == "models.status") {
-        if (auto dialog = modelStatusRequests_.take(id)) dialog->setModelStatus(data);
-    } else if (method == "settings.get" || method == "settings.set" || method == "settings.reload" || method == "models.select") {
+    } else if (method == "settings.get" || method == "settings.set" || method == "settings.reload") {
         applySettings(data.contains("settings") ? data.value("settings").toObject() : data);
+        if (method == "settings.reload") clearError(ErrorSource::SettingsReload);
         if (auto dialog = settingsOperations_.take(id)) {
-            dialog->setModelOperationPending(false);
-            if (method == "settings.reload") {
-                connect(dialog.data(), &QObject::destroyed, this, [this] { showSettings(false, true); });
-                dialog->reject();
-            } else {
-                const auto request = send("models.status", {{"modelId", dialog->selectedModelId()}});
-                modelStatusRequests_.insert(request, dialog);
-            }
+            dialog->setReloadPending(false);
+            connect(dialog.data(), &QObject::destroyed, this, [this] { showSettings(); });
+            dialog->reject();
         }
         if (method != "settings.get") send("status");
         if (!shownOnboarding_ && onboarding_) {
@@ -710,8 +696,7 @@ void MainWindow::handleResponse(const QString &id, const QJsonObject &data) {
 void MainWindow::handleFailure(const QString &id, const QString &code, const QString &message) {
     const QString method = pending_.take(id);
     if (method.isEmpty()) return;
-    if (auto dialog = modelStatusRequests_.take(id)) { dialog->setModelStatusError(message.isEmpty() ? code : message); return; }
-    if (auto dialog = settingsOperations_.take(id)) dialog->setModelError(message.isEmpty() ? code : message);
+    if (auto dialog = settingsOperations_.take(id)) dialog->setReloadError(message.isEmpty() ? code : message);
     if (method == "search" || method == "files.list") {
         if (!resultRequests_.contains(id)) return;
         const auto request = resultRequests_.take(id);
@@ -750,7 +735,8 @@ void MainWindow::handleFailure(const QString &id, const QString &code, const QSt
         if (id == documentRequest_ && preview_->currentHit().path == documentPath_) { preview_->documentPreviewFailed(message); documentRequest_.clear(); }
         return;
     }
-    showError(message.isEmpty() ? code : message);
+    showError(message.isEmpty() ? code : message,
+        method == "settings.reload" ? ErrorSource::SettingsReload : ErrorSource::Other);
     if (id == currentSearch_) summary_->setText(label("Search failed", "搜索失败"));
     if (id == popupSearch_ && popupStatus_) popupStatus_->setText(message);
     if (method == "shutdown") QApplication::quit();
@@ -761,21 +747,7 @@ void MainWindow::applySettings(const QJsonObject &json) {
     if (!AppSettings::fromJson(json, &parsed, &error)) { showError(error); return; }
     const auto previousContext = searchContext(false);
     const auto previousPopupContext = popup_ ? searchContext(true) : QJsonObject{};
-    const bool modelChanged = settingsLoaded_ && settings_.modelId != parsed.modelId;
     settings_ = parsed;
-    if (modelChanged) {
-        for (const auto &request : {currentSearch_, popupSearch_, documentRequest_}) {
-            if (!request.isEmpty()) { backend_->cancel(request); pending_.remove(request); resultRequests_.remove(request); }
-        }
-        currentSearch_.clear(); popupSearch_.clear(); documentRequest_.clear();
-        hits_.clear(); results_->clear(); selectResult(-1);
-        popupHits_.clear();
-        if (popupResults_) popupResults_->clear();
-        browse_ = {}; popupBrowse_ = {};
-        displayedSearchContext_ = {}; popupDisplayedContext_ = {};
-        modelAvailable_ = false;
-        runtime_.insert("loaded", false);
-    }
     language_ = settings_.language == "system" ? QLocale::system().name() : settings_.language;
     code_->setEnabled(settings_.includeCode);
     if (!settings_.includeCode) code_->setChecked(false);
@@ -784,7 +756,6 @@ void MainWindow::applySettings(const QJsonObject &json) {
     if (!settingsLoaded_ || previousContext != searchContext(false)) debounce_.start();
     if (popup_ && popup_->isVisible() && (!settingsLoaded_ || previousPopupContext != searchContext(true))) popupDebounce_.start();
     settingsLoaded_ = true;
-    if (auto *dialog = findChild<SettingsDialog *>()) dialog->updateConfiguredModel(settings_.modelId);
 }
 void MainWindow::refreshRoots() {
     const QSignalBlocker rootBlocker(root_);
@@ -820,9 +791,9 @@ void MainWindow::updateProgress(const QJsonObject &value) {
     if (!error.isEmpty()) showError(error, ErrorSource::IndexProgress);
     else clearError(ErrorSource::IndexProgress);
 }
-void MainWindow::showSettings(bool firstRun, bool modelsPage) {
-    if (auto *existing = findChild<SettingsDialog *>()) { if (modelsPage) existing->showModelsPage(); existing->raise(); existing->activateWindow(); return; }
-    const bool allowStartup = PlatformIntegration::canSetStartAtLogin(paths_.profileDir, paths_.modelDir);
+void MainWindow::showSettings(bool firstRun) {
+    if (auto *existing = findChild<SettingsDialog *>()) { existing->raise(); existing->activateWindow(); return; }
+    const bool allowStartup = PlatformIntegration::canSetStartAtLogin(paths_.profileBaseDir, paths_.modelDir);
     SettingsDialog::StartupOptions startup;
     startup.allowed = allowStartup;
     startup.profileDir = paths_.profileDir;
@@ -834,7 +805,7 @@ void MainWindow::showSettings(bool firstRun, bool modelsPage) {
         const auto settings = dialog->settings();
         if (allowStartup && dialog->startupChangeRequested()) {
             QString error;
-            if (!PlatformIntegration::setStartAtLogin(settings.startAtLogin, paths_.profileDir, paths_.modelDir, &error)) { showError(error); return; }
+            if (!PlatformIntegration::setStartAtLogin(settings.startAtLogin, paths_.profileBaseDir, paths_.modelDir, &error)) { showError(error); return; }
         }
         auto changes = settings.toJson();
         // Pausing belongs to the service's live task state. A preferences dialog
@@ -843,36 +814,22 @@ void MainWindow::showSettings(bool firstRun, bool modelsPage) {
         // These JSON-only rules have no controls here. Preserve the service's
         // current values, including updates made while this dialog was open.
         changes.remove("generalFileRules");
-        // A model switch made by another client must survive a preferences-only
-        // save from a dialog opened before that switch.
-        if (!dialog->modelChangeRequested()) changes.remove("modelId");
         send("settings.set", changes, 600000);
-    });
-    const auto requestModelStatus = [this, dialog](const QString &modelId) {
-        modelStatusRequests_.insert(send("models.status", {{"modelId", modelId}}), dialog);
-    };
-    connect(dialog, &SettingsDialog::modelStatusRequested, this, requestModelStatus);
-    connect(dialog, &SettingsDialog::manageModelRequested, this, [this, dialog, requestModelStatus](const QString &modelId) {
-        auto *models = new ModelDialog(paths_.modelDir, language_, modelId, dialog);
-        models->setAttribute(Qt::WA_DeleteOnClose);
-        connect(models, &ModelDialog::modelsReady, dialog, [dialog, requestModelStatus, modelId] {
-            dialog->noteVerifiedModel(modelId);
-            requestModelStatus(modelId);
-        });
-        models->open();
-    });
-    connect(dialog, &SettingsDialog::applyModelRequested, this, [this, dialog](const QString &modelId) {
-        settingsOperations_.insert(send("models.select", {{"modelId", modelId}}, 600000), dialog);
     });
     connect(dialog, &SettingsDialog::reloadSettingsRequested, this, [this, dialog] {
         settingsOperations_.insert(send("settings.reload", {}, 600000), dialog);
     });
-    if (modelsPage) dialog->showModelsPage();
     dialog->open();
-    requestModelStatus(dialog->selectedModelId());
 }
 void MainWindow::showModels() {
-    showSettings(false, true);
+    if (auto *existing = findChild<ModelDialog *>()) { existing->raise(); existing->activateWindow(); return; }
+    auto *dialog = new ModelDialog(paths_.modelDir, language_, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dialog, &ModelDialog::modelFilesInstalled, this, [this] {
+        modelReloadAttempts_ = 0;
+        send("models.reload", {}, 120000);
+    });
+    dialog->open();
 }
 void MainWindow::showError(const QString &message, ErrorSource source) {
     errorSource_ = source;
